@@ -8,53 +8,23 @@
 //! 达到 `max_turns` 报错、空回复报错。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
 use crate::application::error::ApplicationError;
 use crate::application::port::{
     ApprovalGate, ApprovalRequest, Clock, EvidenceSink, ModelGateway, ModelReply,
-    ModelRequest, ToolInvoker,
+    ModelRequest,
 };
+use crate::application::tool_registry::ToolRegistry;
 use crate::domain::agent::{AgentSpec, AgentTurn};
 use crate::domain::budget::{Budget, Consumption};
+use crate::domain::context::{compact, ContextBudget};
 use crate::domain::evidence::AuditEvent;
 use crate::domain::ids::SessionId;
 use crate::domain::policy::{PolicyDecision, PolicyEngine, PolicyVerdict};
 use crate::domain::session::Session;
 use crate::domain::tool::{ToolCall, ToolOutcome, ToolSpec};
-
-/// 工具目录：模型可见的规格，加上统一的执行入口。
-///
-/// 规格与执行分开，是为了让"模型看到什么"和"Harness 真做什么"可以独立演进：
-/// 换一个沙箱执行器，模型看到的工具定义不用动。
-///
-/// 不派生 `Debug`：里面是 `Arc<dyn ToolInvoker>`，而端口没有要求实现者可调试。
-pub struct ToolCatalog {
-    specs: Vec<ToolSpec>,
-    invoker: Arc<dyn ToolInvoker>,
-}
-
-impl ToolCatalog {
-    /// 用一个执行入口和一批规格构造目录。
-    pub fn new(invoker: Arc<dyn ToolInvoker>, specs: Vec<ToolSpec>) -> Self {
-        Self { specs, invoker }
-    }
-
-    /// 模型可见的全部规格。
-    pub fn specs(&self) -> &[ToolSpec] {
-        &self.specs
-    }
-
-    /// 按名字查规格。查不到说明模型指名了一个没注册的工具。
-    pub fn find(&self, name: &str) -> Option<&ToolSpec> {
-        self.specs.iter().find(|spec| spec.name == name)
-    }
-
-    /// 统一的执行入口。
-    pub fn invoker(&self) -> &Arc<dyn ToolInvoker> {
-        &self.invoker
-    }
-}
 
 /// 运行状态机。
 ///
@@ -95,10 +65,61 @@ struct PendingRound {
     outcomes: Vec<ToolOutcome>,
 }
 
+/// 取消开关：`run()` 在每一轮问模型之前检查它。
+///
+/// 通过 [`AgentRunner::cancel_handle`] 克隆给外部。取消是协作式的——
+/// 不打断执行中的工具（run_command 有自己的超时），在下一个安全停点
+/// （下一轮问模型之前）生效。
+#[derive(Debug, Clone, Default)]
+pub struct CancelHandle {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancelHandle {
+    /// 请求取消当前运行。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// 是否已被请求取消。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+/// `AgentRunner` 的全部外部依赖。
+///
+/// 收敛成一个结构体而不是一串位置参数：位置参数到第七八个就没人分得清
+/// 哪个是哪个，加一个依赖还要惊动所有调用点；结构体带字段名，构造点
+/// 自解释。没有 `Default`——没有合理的默认模型，缺依赖就该在构造点写明。
+pub struct AgentDependencies {
+    /// 模型网关。
+    pub model: Arc<dyn ModelGateway>,
+    /// 工具注册表：规格与执行入口绑在一起，加工具只在一处发生。
+    pub tools: ToolRegistry,
+    /// 审批闸门：副作用操作执行前的拦截点。
+    pub approvals: Arc<dyn ApprovalGate>,
+    /// 证据汇：审计事件的落点。
+    pub evidence: Arc<dyn EvidenceSink>,
+    /// 时钟：时间戳与耗时的唯一来源。
+    pub clock: Arc<dyn Clock>,
+    /// 策略引擎：决定每个调用是放行、要审批、还是直接拒绝。
+    ///
+    /// 它是领域类型而不是端口 trait——它无 IO、无外部依赖，
+    /// 直接持有比再开一个端口更简单。
+    pub policy: PolicyEngine,
+    /// 上下文预算：发给模型前按它裁剪历史。
+    pub context_budget: ContextBudget,
+}
+
 /// ReAct 循环的编排器。
 pub struct AgentRunner {
     model: Arc<dyn ModelGateway>,
-    tools: ToolCatalog,
+    /// 工具注册表：规格与执行入口绑在一起，加工具只在一处发生。
+    tools: ToolRegistry,
+    /// 注册表里全部规格的缓存，问模型时塞进请求。
+    /// 注册表构造后不变，缓存一次省得每轮克隆整张表。
+    visible_specs: Vec<ToolSpec>,
     approvals: Arc<dyn ApprovalGate>,
     evidence: Arc<dyn EvidenceSink>,
     clock: Arc<dyn Clock>,
@@ -107,6 +128,13 @@ pub struct AgentRunner {
     /// 它是领域类型而不是端口 trait——它无 IO、无外部依赖，
     /// 直接持有比再开一个端口更简单。
     policy: PolicyEngine,
+    /// 上下文预算：发给模型前按它裁剪历史。
+    ///
+    /// 裁剪只改"发给模型时怎么看"，不改 `session` 本身——
+    /// 证据、审计与将来的恢复都要完整历史。
+    context_budget: ContextBudget,
+    /// 取消开关，克隆给外部。
+    cancel: CancelHandle,
     spec: AgentSpec,
     session: Session,
     state: RunState,
@@ -117,13 +145,8 @@ pub struct AgentRunner {
 impl AgentRunner {
     /// 组装一个 runner。
     ///
-    /// `invoker` 是全部工具共用的执行入口；`spec.tools` 声明模型能看到哪些。
-    /// 两者的名字必须对得上——目录只按名字查找，找不到就生成拒绝观察，
-    /// 让模型自己纠正，而不是崩溃。
-    ///
-    /// `policy` 是新增的依赖：P1 之前"要不要审批"由 `ToolAnnotations`
-    /// 单独决定，现在规则引擎接管这件事。它不是端口 trait，
-    /// 所以不算改接缝。
+    /// 全部外部依赖装进 [`AgentDependencies`]：字段名自解释，
+    /// 加新依赖不惊动既有调用点。
     ///
     /// `session_id` 由调用方传入而不是内部生成：证据文件要按会话 ID 命名，
     /// 而文件必须在 runner 开工前就打开。内部生成会让"证据文件名"和
@@ -132,22 +155,29 @@ impl AgentRunner {
         spec: AgentSpec,
         session_id: SessionId,
         task: impl Into<String>,
-        model: Arc<dyn ModelGateway>,
-        invoker: Arc<dyn ToolInvoker>,
-        approvals: Arc<dyn ApprovalGate>,
-        evidence: Arc<dyn EvidenceSink>,
-        clock: Arc<dyn Clock>,
-        policy: PolicyEngine,
+        deps: AgentDependencies,
     ) -> Self {
-        let tools = ToolCatalog::new(invoker, spec.tools.clone());
-        let session = Session::new(session_id, task);
-        Self {
+        let AgentDependencies {
             model,
             tools,
             approvals,
             evidence,
             clock,
             policy,
+            context_budget,
+        } = deps;
+        let visible_specs = tools.specs();
+        let session = Session::new(session_id, task);
+        Self {
+            model,
+            tools,
+            visible_specs,
+            approvals,
+            evidence,
+            clock,
+            policy,
+            context_budget,
+            cancel: CancelHandle::default(),
             spec,
             session,
             state: RunState::AwaitingModel,
@@ -159,6 +189,17 @@ impl AgentRunner {
     /// 会话 ID。
     pub fn session_id(&self) -> &SessionId {
         self.session.id()
+    }
+
+    /// 完整会话历史。裁剪不影响这里：`session` 始终是全量真相。
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// 取消把手，克隆给外部。外部在任何时刻调用 `cancel()`，
+    /// `run()` 都会在下一轮问模型之前停下。
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.cancel.clone()
     }
 
     /// 推进一步。调用方决定何时停——这是超时/取消/恢复的挂点。
@@ -198,13 +239,14 @@ impl AgentRunner {
             RunState::Evaluating(calls) => {
                 let call = self.next_call(&calls)?.clone();
                 // 未注册的工具不进审批也不执行，直接拒绝。
-                let Some(spec) = self.tools.find(&call.name) else {
+                let Some(entry) = self.tools.find(&call.name) else {
                     let outcome = ToolOutcome::refused(unregistered_tool_message(
                         &call.name,
-                        self.tools.specs(),
+                        &self.visible_specs,
                     ));
                     return self.record_and_advance(call, outcome).await;
                 };
+                let spec = &entry.spec;
 
                 // 策略裁决优先于注解：注解只是默认策略的输入之一，
                 // 配置一条规则就能覆盖它。
@@ -270,7 +312,7 @@ impl AgentRunner {
 
             RunState::Dispatching(calls) => {
                 let call = self.next_call(&calls)?.clone();
-                let outcome = self.tools.invoker().invoke(&call).await;
+                let outcome = self.tools.invoke(&call).await;
                 self.record_and_advance(call, outcome).await
             }
 
@@ -283,17 +325,37 @@ impl AgentRunner {
     /// # Errors
     ///
     /// 见 [`Self::step`]；另外达到 `max_turns` 仍无最终答案时返回
-    /// [`ApplicationError::BudgetExhausted`]。
+    /// [`ApplicationError::BudgetExhausted`]，整体耗时超过
+    /// `Budget::max_wall_clock` 时返回 [`ApplicationError::WallClockExhausted`]，
+    /// 外部取消时返回 [`ApplicationError::Cancelled`]——三者可区分，
+    /// 调用方能分辨"跑超了"还是"被叫停了"。
     pub async fn run(&mut self, budget: &Budget) -> Result<AgentOutcome, ApplicationError> {
+        let start = self.clock.now();
         loop {
-            // 只在"准备问模型"之前查预算：正在分发的轮次要允许跑完，
-            // 否则已经花出去的 token 会废在半途。
-            if matches!(self.state, RunState::AwaitingModel)
-                && budget.exhausted(&self.consumption)
-            {
-                return Err(ApplicationError::BudgetExhausted {
-                    max_turns: budget.max_turns,
-                });
+            // 耗时每个循环都重测：Consumption 只是"已测量结果"的容器，
+            // 测量必须走 Clock 端口，domain 不取时间。
+            self.consumption.elapsed = self.clock.elapsed_since(start);
+            // 取消、超时与轮数预算都只在"准备问模型"之前查：正在分发的
+            // 轮次要允许跑完，已花出去的 token 不废在半途。
+            if matches!(self.state, RunState::AwaitingModel) {
+                if self.cancel.is_cancelled() {
+                    return Err(ApplicationError::Cancelled);
+                }
+                if budget.exhausted(&self.consumption) {
+                    // exhausted 命中后先分清维度：两种超限的对策不同，
+                    // 错误要能指导调用方动作。
+                    if let Some(limit) = budget.max_wall_clock {
+                        if self.consumption.elapsed >= limit {
+                            return Err(ApplicationError::WallClockExhausted {
+                                elapsed: self.consumption.elapsed,
+                                limit,
+                            });
+                        }
+                    }
+                    return Err(ApplicationError::BudgetExhausted {
+                        max_turns: budget.max_turns,
+                    });
+                }
             }
             if let RunState::Completed(answer) = self.step().await? {
                 return Ok(AgentOutcome {
@@ -306,12 +368,23 @@ impl AgentRunner {
 
     /// 问一次模型，并把"思考"记进证据。
     async fn ask_model(&mut self) -> Result<ModelReply, ApplicationError> {
-        // 先克隆 Arc：否则请求借着 self.session 和 self.spec，
-        // 而它们紧接着就要被改写。
+        // 先克隆 Arc：否则请求借着 self 的字段，而它们紧接着就要被改写。
         let model = self.model.clone();
+        // 裁剪是发给模型前的视图变换：请求里只放模型真正看到的东西。
+        // 丢了历史就留一条证据，事后翻 JSONL 能对出"第 N 轮模型看到了什么"。
+        let (history, report) = compact(&self.session, &self.context_budget);
+        if !report.dropped.is_empty() {
+            self.record(AuditEvent::ContextCompacted {
+                turn: self.session.rounds() + 1,
+                rounds_before: report.rounds_before,
+                rounds_after: report.rounds_after,
+                dropped: report.dropped,
+            });
+        }
         let request = ModelRequest {
-            session: &self.session,
+            history,
             spec: &self.spec,
+            tools: &self.visible_specs,
         };
         let reply = model.complete(request).await?;
         self.consumption.record_turn();
@@ -435,7 +508,7 @@ fn denied_by_policy_message(name: &str, decision: &PolicyDecision) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::port::{BoxFuture, Decision};
+    use crate::application::port::{BoxFuture, Decision, ToolInvoker};
     use rig::completion::Message;
     use crate::domain::agent::AgentRole;
     use crate::domain::evidence::{AuditEvent, TokenUsage};
@@ -447,12 +520,23 @@ mod tests {
     use rig::test_utils::{MockCompletionModel, MockTurn};
     use serde_json::json;
 
-    fn spec_with(tools: Vec<ToolSpec>) -> AgentSpec {
+    fn spec_with() -> AgentSpec {
         AgentSpec {
             role: AgentRole::Coder,
             system_prompt: "系统提示".to_owned(),
-            tools,
         }
+    }
+
+    /// 把一组规格包成注册表，全部指向同一个执行器。
+    ///
+    /// 测试里大多数场景只关心"模型调了什么"，不关心谁执行。
+    fn registry_with(invoker: Arc<dyn ToolInvoker>, specs: Vec<ToolSpec>) -> ToolRegistry {
+        ToolRegistry::new(
+            specs
+                .into_iter()
+                .map(|spec| crate::application::tool_registry::ToolEntry { spec, invoker: invoker.clone() })
+                .collect(),
+        )
     }
 
     /// 只读工具规格。
@@ -546,16 +630,22 @@ mod tests {
         let mock = MockCompletionModel::from_turns(turns);
         let evidence = Arc::new(MemoryEvidenceSink::new());
         let approvals = Arc::new(CountingGate::default());
+        // 全部规格共用一个 RecordingInvoker：这些测试只关心循环行为，
+        // 不关心具体工具做什么。
+        let registry = registry_with(Arc::new(RecordingInvoker::default()), tools);
         let runner = AgentRunner::new(
-            spec_with(tools),
+            spec_with(),
             SessionId::new("test-session"),
             "读一下 Cargo.toml",
-            Arc::new(RigChatGateway::new(mock.clone().erase())),
-            Arc::new(RecordingInvoker::default()),
-            approvals.clone(),
-            evidence.clone(),
-            Arc::new(crate::infrastructure::clock::SystemClock),
-            policy,
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+                tools: registry,
+                approvals: approvals.clone(),
+                evidence: evidence.clone(),
+                clock: Arc::new(crate::infrastructure::clock::SystemClock),
+                policy,
+                context_budget: ContextBudget::default(),
+            },
         );
         Harness {
             runner,
@@ -789,15 +879,21 @@ mod tests {
             MockTurn::text("不让写，那我只汇报"),
         ]);
         let mut runner = AgentRunner::new(
-            spec_with(vec![read_file_spec(), write_file_spec()]),
+            spec_with(),
             SessionId::new("test-session"),
             "写个文件",
-            Arc::new(RigChatGateway::new(mock.clone().erase())),
-            Arc::new(RecordingInvoker::default()),
-            Arc::new(DenyAllGate),
-            Arc::new(MemoryEvidenceSink::new()),
-            Arc::new(crate::infrastructure::clock::SystemClock),
-            PolicyEngine::new(),
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+                tools: registry_with(
+                    Arc::new(RecordingInvoker::default()),
+                    vec![read_file_spec(), write_file_spec()],
+                ),
+                approvals: Arc::new(DenyAllGate),
+                evidence: Arc::new(MemoryEvidenceSink::new()),
+                clock: Arc::new(crate::infrastructure::clock::SystemClock),
+                policy: PolicyEngine::new(),
+                context_budget: ContextBudget::default(),
+            },
         );
 
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
@@ -915,14 +1011,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_finds_spec_by_name() {
-        let catalog = ToolCatalog::new(
+    fn registry_finds_spec_by_name() {
+        let registry = registry_with(
             Arc::new(RecordingInvoker::default()),
             vec![read_file_spec(), write_file_spec()],
         );
-        assert!(catalog.find("read_file").is_some());
-        assert!(catalog.find("list_dir").is_none());
-        assert_eq!(catalog.specs().len(), 2);
+        assert!(registry.find("read_file").is_some());
+        assert!(registry.find("list_dir").is_none());
+        assert_eq!(registry.specs().len(), 2);
     }
 
     #[test]
@@ -1061,6 +1157,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_policy_gates_run_command() {
+        // P2 验收点：新加的最危险工具 run_command（open_world）没有在
+        // 策略引擎里登记任何规则，默认策略按注解自动把它送进闸门——
+        // "加高危工具不需要改策略引擎"正是 P1 接缝设计的验收点。
+        let run_command_spec = ToolSpec {
+            name: "run_command".to_owned(),
+            description: "跑命令".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(false, true, false, true),
+        };
+        let mut harness = harness(
+            vec![
+                MockTurn::tool_call("call_1", "run_command", json!({"command": "cargo test"})),
+                MockTurn::text("跑完了"),
+            ],
+            vec![read_file_spec(), run_command_spec],
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(
+            harness.approvals.requested_tools(),
+            vec!["run_command"],
+            "默认策略下 run_command 必须过审批闸门"
+        );
+    }
+
+    #[tokio::test]
     async fn deny_rule_refuses_without_asking_the_gate() {
         let policy = policy_with("write_file", PolicyVerdict::Deny, "P1 禁止写文件");
         let mut harness = harness_with_policy(
@@ -1125,5 +1249,264 @@ mod tests {
             .filter(|e| matches!(e.event, AuditEvent::PolicyEvaluated { .. }))
             .collect();
         assert_eq!(evaluated.len(), 1, "每次策略裁决都该留证");
+    }
+
+    // ── P3：上下文预算与历史裁剪 ────────────────────────────────────────
+
+    /// 观察内容随调用参数变化的执行器：裁剪测试要能区分"第几轮的观察"。
+    struct EchoInvoker;
+
+    impl ToolInvoker for EchoInvoker {
+        fn invoke<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolOutcome> {
+            Box::pin(async move {
+                let path = call
+                    .arguments
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                ToolOutcome::success(format!("OBSERVATION_FOR_{path}"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn context_budget_drops_old_observations_from_requests_but_not_from_session() {
+        let mut turns = Vec::new();
+        for index in 1..=6 {
+            turns.push(MockTurn::tool_call(
+                format!("call_{index}"),
+                "read_file",
+                json!({"path": format!("r{index}.txt")}),
+            ));
+        }
+        turns.push(MockTurn::text("六轮都看完了"));
+        let mock = MockCompletionModel::from_turns(turns);
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mut runner = AgentRunner::new(
+            spec_with(),
+            SessionId::new("test-session"),
+            "读六个文件",
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+                tools: registry_with(Arc::new(EchoInvoker), vec![read_file_spec()]),
+                approvals: Arc::new(CountingGate::default()),
+                evidence: evidence.clone(),
+                clock: Arc::new(crate::infrastructure::clock::SystemClock),
+                policy: PolicyEngine::new(),
+                context_budget: ContextBudget {
+                    max_rounds: 2,
+                    keep_task: true,
+                },
+            },
+        );
+
+        runner.run(&Budget::new(20)).await.unwrap();
+
+        // 最后一次请求：任务在、占位说明在，只看得到第 5、6 轮的观察。
+        let rendered = serde_json::to_string(&history(&mock, mock.request_count() - 1)).unwrap();
+        assert!(rendered.contains("读六个文件"), "任务消息应保留: {rendered}");
+        assert!(rendered.contains("已省略"), "应有占位说明: {rendered}");
+        assert!(rendered.contains("OBSERVATION_FOR_r5.txt"), "{rendered}");
+        assert!(rendered.contains("OBSERVATION_FOR_r6.txt"), "{rendered}");
+        assert!(
+            !rendered.contains("OBSERVATION_FOR_r1.txt"),
+            "第 1 轮的观察不应出现在请求里: {rendered}"
+        );
+        assert!(
+            !rendered.contains("OBSERVATION_FOR_r4.txt"),
+            "第 4 轮的观察也不应出现: {rendered}"
+        );
+
+        // Session 是全量真相：6 轮工具调用与观察一个不少
+        // （最终答案走 RunState::Completed，不进历史——P0 起的行为）。
+        assert_eq!(runner.session().rounds(), 6);
+        let observations = runner
+            .session()
+            .turns()
+            .iter()
+            .filter(|turn| matches!(turn, crate::domain::session::Turn::Observation(_)))
+            .count();
+        assert_eq!(observations, 6);
+
+        // 裁剪要留痕：证据里能对出每轮丢了哪些历史。
+        let compacted: Vec<_> = evidence
+            .events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    AuditEvent::ContextCompacted { dropped, .. } if dropped.as_slice() == [1, 2, 3, 4]
+                )
+            })
+            .collect();
+        assert_eq!(compacted.len(), 1, "超预算的请求各留一条裁剪证据");
+    }
+
+    // ── P3：整体超时与取消 ──────────────────────────────────────────────
+
+    /// 可编排耗时的时钟：`elapsed_since` 返回共享计数器里的值。
+    /// 测试用它让"时间"在工具执行时跳跃，而不真 `sleep`——这正是
+    /// 时钟走端口而不是 domain 直接取时间换来的能力。
+    #[derive(Default)]
+    struct TimeWarpClock {
+        elapsed_ms: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl TimeWarpClock {
+        fn advance_ms(&self, millis: u64) {
+            self.elapsed_ms
+                .fetch_add(millis, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl Clock for TimeWarpClock {
+        fn now(&self) -> crate::application::port::Timestamp {
+            std::time::SystemTime::UNIX_EPOCH
+        }
+
+        fn elapsed_since(
+            &self,
+            _start: crate::application::port::Timestamp,
+        ) -> std::time::Duration {
+            std::time::Duration::from_millis(
+                self.elapsed_ms.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn wall_clock_budget_stops_the_run_with_a_distinguishable_error() {
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
+            MockTurn::text("不该被消费"),
+        ]);
+        let clock = Arc::new(TimeWarpClock::default());
+        // 每次工具执行"消耗"60 秒模拟时间：第一轮跑完就已越过 30 秒上限。
+        struct SlowInvoker {
+            clock: Arc<TimeWarpClock>,
+        }
+        impl ToolInvoker for SlowInvoker {
+            fn invoke<'a>(&'a self, _call: &'a ToolCall) -> BoxFuture<'a, ToolOutcome> {
+                self.clock.advance_ms(60_000);
+                Box::pin(async { ToolOutcome::success("文件内容") })
+            }
+        }
+        let mut runner = AgentRunner::new(
+            spec_with(),
+            SessionId::new("test-session"),
+            "任务",
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+                tools: registry_with(
+                    Arc::new(SlowInvoker { clock: clock.clone() }),
+                    vec![read_file_spec()],
+                ),
+                approvals: Arc::new(CountingGate::default()),
+                evidence: Arc::new(MemoryEvidenceSink::new()),
+                clock: clock.clone(),
+                policy: PolicyEngine::new(),
+                context_budget: ContextBudget::default(),
+            },
+        );
+
+        let error = runner
+            .run(&Budget::new(20).with_wall_clock(std::time::Duration::from_secs(30)))
+            .await
+            .unwrap_err();
+
+        let ApplicationError::WallClockExhausted { elapsed, limit } = &error else {
+            panic!("应当是墙钟超时错误，实际 {error:?}");
+        };
+        assert!(*elapsed >= std::time::Duration::from_secs(30), "{elapsed:?}");
+        assert_eq!(*limit, std::time::Duration::from_secs(30));
+        assert!(error.to_string().contains("上限"));
+        // 正在执行的轮次允许跑完：第一轮已提交，历史完整；
+        // 第二次问模型没有发生。
+        assert_eq!(runner.session().rounds(), 1);
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_before_the_next_model_call_and_keeps_history() {
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
+            MockTurn::text("不该被消费"),
+        ]);
+        // 把手归 runner 所有（构造后才能取），而 invoker 在构造 runner 之前
+        // 就得存在——用共享槽位交接，与生产代码"先建 runner、再分发把手"
+        // 的顺序一致。
+        let handle_slot = Arc::new(std::sync::OnceLock::new());
+        struct CancellingInvoker {
+            handle_slot: Arc<std::sync::OnceLock<CancelHandle>>,
+        }
+        impl ToolInvoker for CancellingInvoker {
+            fn invoke<'a>(&'a self, _call: &'a ToolCall) -> BoxFuture<'a, ToolOutcome> {
+                if let Some(handle) = self.handle_slot.get() {
+                    handle.cancel();
+                }
+                Box::pin(async { ToolOutcome::success("文件内容") })
+            }
+        }
+        let mut runner = AgentRunner::new(
+            spec_with(),
+            SessionId::new("test-session"),
+            "任务",
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+                tools: registry_with(
+                    Arc::new(CancellingInvoker { handle_slot: handle_slot.clone() }),
+                    vec![read_file_spec()],
+                ),
+                approvals: Arc::new(CountingGate::default()),
+                evidence: Arc::new(MemoryEvidenceSink::new()),
+                clock: Arc::new(crate::infrastructure::clock::SystemClock),
+                policy: PolicyEngine::new(),
+                context_budget: ContextBudget::default(),
+            },
+        );
+        handle_slot
+            .set(runner.cancel_handle())
+            .expect("取消把手只交接一次");
+
+        let error = runner.run(&Budget::new(20)).await.unwrap_err();
+
+        // 错误种类可区分：是"被叫停"，不是跑失败也不是超预算。
+        assert!(matches!(error, ApplicationError::Cancelled), "{error:?}");
+        assert!(error.to_string().contains("取消"));
+        // 取消是优雅的：执行中的轮次跑完并提交，历史完整；
+        // 取消之后不再问模型。
+        assert_eq!(runner.session().rounds(), 1);
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_wall_clock_means_elapsed_time_never_stops_the_run() {
+        // 回归保护：时钟报"已过 1 小时"，但预算没设时限——
+        // max_wall_clock = None 的行为必须与 P2 完全一致。
+        let clock = Arc::new(TimeWarpClock::default());
+        clock.advance_ms(3_600_000);
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
+            MockTurn::text("读完了"),
+        ]);
+        let mut runner = AgentRunner::new(
+            spec_with(),
+            SessionId::new("test-session"),
+            "任务",
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+                tools: registry_with(Arc::new(RecordingInvoker::default()), vec![read_file_spec()]),
+                approvals: Arc::new(CountingGate::default()),
+                evidence: Arc::new(MemoryEvidenceSink::new()),
+                clock,
+                policy: PolicyEngine::new(),
+                context_budget: ContextBudget::default(),
+            },
+        );
+
+        let outcome = runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(outcome.answer, "读完了");
+        assert_eq!(outcome.turns_used, 2);
     }
 }

@@ -19,7 +19,7 @@ use crate::application::port::{BoxFuture, ModelGateway, ModelReply, ModelRequest
 use crate::domain::agent::{AgentSpec, AgentTurn};
 use crate::domain::evidence::TokenUsage;
 use crate::domain::ids::CallId;
-use crate::domain::session::{ContextSlice, Session};
+use crate::domain::session::ContextSlice;
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 
 /// 模型网关：包住一个已擦除的 rig 模型。
@@ -44,7 +44,7 @@ impl ModelGateway for RigChatGateway {
         // 所以先取出模型再 move 进装箱的 future，不借用 self。
         let model = self.model.clone();
         Box::pin(async move {
-            let request = build_request(request.session, request.spec)?;
+            let request = build_request(&request.history, request.spec, request.tools)?;
             let response = model.call(request).await?;
             Ok(ModelReply {
                 turn: AgentTurn::from(&response),
@@ -54,15 +54,19 @@ impl ModelGateway for RigChatGateway {
     }
 }
 
-/// 把会话与规格翻译成 rig 的请求。
+/// 把裁剪后的历史片段与规格翻译成 rig 的请求。
 ///
 /// 消息顺序必须是 `[System, ...历史, 最后一条]`：`new()` 收下最后一条作为
 /// prompt，`messages()` 把其余历史插到它前面，`preamble()` 再插入系统提示。
+///
+/// 工具规格从 `ModelRequest.tools` 来（P2 起注册表是唯一清单），
+/// 不再从 `AgentSpec` 取。
 fn build_request(
-    session: &Session,
+    history: &[ContextSlice<'_>],
     spec: &AgentSpec,
+    tools: &[ToolSpec],
 ) -> Result<CompletionRequest, ApplicationError> {
-    let mut messages = session_to_messages(session);
+    let mut messages = slices_to_messages(history);
     // Session::new 总会把用户任务放进历史，所以这里必然取得到。
     // 真取不到就报错而不是 panic：这个函数本来就返回 Result，
     // 没有理由让一条畸形历史把整个进程带走。
@@ -71,19 +75,19 @@ fn build_request(
     Ok(CompletionRequest::new(prompt)
         .messages(messages)
         .preamble(spec.system_prompt.clone())
-        .tools(spec.tools.iter().map(ToolDefinition::from)))
+        .tools(tools.iter().map(ToolDefinition::from)))
 }
 
-/// 把会话历史翻译成 rig 的消息序列。
+/// 把历史片段翻译成 rig 的消息序列。
 ///
-/// 注意 User/Agent/Observation 的映射与配对：一条 `Agent` 帧产出助手消息
-/// （含 tool_calls），紧跟的 `Observation` 帧产出 tool 结果消息，
+/// 注意 User/Agent/Observation 的映射与配对：一条 `Round` 帧产出助手消息
+/// （含 tool_calls），紧跟的观察产出 tool 结果消息，
 /// 两者靠调用 ID 关联——顺序错了 OpenAI 兼容端点会直接 400。
-fn session_to_messages(session: &Session) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(session.turns().len());
-    for slice in session.slices() {
+fn slices_to_messages(history: &[ContextSlice<'_>]) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(history.len() * 2);
+    for slice in history {
         match slice {
-            ContextSlice::User(text) => messages.push(Message::user(text)),
+            ContextSlice::User(text) => messages.push(Message::user(text.as_ref())),
             ContextSlice::Round {
                 thought,
                 calls,
@@ -208,13 +212,13 @@ mod tests {
     use super::*;
     use crate::domain::agent::AgentRole;
     use crate::domain::ids::SessionId;
+    use crate::domain::session::Session;
     use serde_json::json;
 
-    fn spec_with(tools: Vec<ToolSpec>) -> AgentSpec {
+    fn spec_with() -> AgentSpec {
         AgentSpec {
             role: AgentRole::Coder,
             system_prompt: "系统提示".to_owned(),
-            tools,
         }
     }
 
@@ -248,7 +252,7 @@ mod tests {
             )
             .unwrap();
 
-        let messages = session_to_messages(&session);
+        let messages = slices_to_messages(&session.slices());
 
         assert_eq!(messages.len(), 3);
         assert!(matches!(&messages[0], Message::User { .. }));
@@ -269,7 +273,7 @@ mod tests {
             )
             .unwrap();
 
-        let messages = session_to_messages(&session);
+        let messages = slices_to_messages(&session.slices());
         let Message::User { content } = &messages[2] else {
             panic!("观察结果应当是 user 消息");
         };
@@ -311,7 +315,8 @@ mod tests {
     #[test]
     fn request_puts_system_prompt_first() {
         let session = Session::new(SessionId::new("s1"), "任务");
-        let request = build_request(&session, &spec_with(vec![read_file_spec()])).unwrap();
+        let request = build_request(&session.slices(), &spec_with(), &[read_file_spec()])
+            .unwrap();
 
         assert_eq!(request.system_instructions(), Some("系统提示"));
         assert_eq!(request.chat_history.len(), 2);

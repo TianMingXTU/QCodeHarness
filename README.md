@@ -190,6 +190,36 @@ flowchart TD
 | `LLM_MAX_TURNS` | 否 | ReAct 循环最大轮数，默认 20 |
 | `QCH_POLICY` | 否 | 策略配置文件路径，缺省用内置默认策略 |
 | `QCH_AUTO_APPROVE` | 否 | 设为 `1` 跳过人工审批，供 CI 使用 |
+| `QCH_MAX_WALL_CLOCK` | 否 | 整体墙钟上限（秒），超时返回可区分的错误；不设置则不限时 |
+
+### 上下文与预算
+
+长任务的历史不会无限发给模型：`AgentRunner` 按**上下文预算**裁剪请求历史——默认保留最近 16 轮完整片段，更早的轮次整体省略，并在原位插入一条占位说明（指出省略范围与找回方式 `search_text` / `read_file`）；最初的用户任务始终保留。裁剪只改"发给模型时怎么看"，会话本身始终是全量真相，每次裁剪都会留下 `ContextCompacted` 证据事件（控制台同步播报 `[上下文]` 行）。
+
+预算有三个维度，任一用尽即停，错误可区分：
+
+| 维度 | 默认 | 用尽时 |
+|------|------|--------|
+| 轮数 | `LLM_MAX_TURNS`（20） | `BudgetExhausted`，提示调大轮数 |
+| 墙钟 | 不限时（`QCH_MAX_WALL_CLOCK` 可设） | `WallClockExhausted`，带实际耗时与上限 |
+| 取消 | 外部调用 `cancel_handle()` | `Cancelled`，历史完整保留 |
+
+超时与取消都只在"准备问模型"之前生效：正在执行的工具轮次允许跑完，已花出去的 token 不废在半途。
+
+### 内置工具
+
+| 工具 | 风险 | 用途 |
+|------|------|------|
+| `read_file` | 只读 | 读取 workspace 内文本文件；默认最多显示前 400 行（`max_lines` 可调，上限 2000），超长附总行数并提示用 `search_text` 定位 |
+| `list_dir` | 只读 | 列出目录内容 |
+| `search_text` | 只读 | 递归搜索子串，输出 `路径:行号:内容`；跳过 `.git`/`target`/`node_modules`/`.qcodeharness` |
+| `git_status` | 只读 | `git status --porcelain`，空输出即工作区干净 |
+| `git_diff` | 只读 | `git diff`（`staged: true` 时 `--staged`），输出截断到 4000 字符 |
+| `write_file` | 破坏性 | 创建新文件或整体覆盖 |
+| `edit_file` | 破坏性 | 查找替换式修改；`old_string` 必须在文件中恰好出现一次，否则拒绝执行 |
+| `run_command` | 破坏性·开放世界 | 在 workspace 根下执行 shell 命令；超时默认 30s 上限 300s，超时终止进程；疑似密钥的环境变量（名字含 key/token/secret/password/credential）不会传入子进程；输出超过 8000 字符截断 |
+
+工具规格与执行入口绑定在同一个注册表里，`read_file` 与 `edit_file` 的分工写在各自描述中：新建或整体重写用 `write_file`，小段修改用 `edit_file`。
 
 ### 运行
 
@@ -198,6 +228,19 @@ cargo run -- "阅读 Cargo.toml，说明本项目用了哪些依赖"
 ```
 
 控制台会按轮次输出四段：轮次分隔线、`[思考]`、`[行动]`、`[观察]`，最后是 `──── 最终答案 ────` 与一行汇总（会话 ID、轮数、证据文件路径）。
+
+### 缺陷修复演练（隔离仓库）
+
+`tests/fixtures/broken-repo/` 是一个自带失败测试的小 crate（`greet` 忘了拼名字）。可以把它拷到任意目录，让 agent 真实修复它——这是观察 ReAct 循环 + 工具体系 + 审批闸门协同工作的最短路径：
+
+```powershell
+Copy-Item -Recurse tests/fixtures/broken-repo $env:TEMP\qch-demo
+Copy-Item policy.example.toml $env:TEMP\qch-demo\policy.toml
+$env:QCH_POLICY = "$env:TEMP\qch-demo\policy.toml"
+cargo run --manifest-path <主项目路径>\Cargo.toml -- "修复 broken-repo 里失败的测试"
+```
+
+过程中的典型节奏：`read_file` 看代码（免审）→ `edit_file` 改一行（要审批）→ `run_command cargo test`（要审批）→ 输出 `test result: ok` 后给出最终答案。
 
 ### 审批
 
@@ -220,6 +263,8 @@ cargo run -- "阅读 Cargo.toml，说明本项目用了哪些依赖"
 ### 策略配置
 
 `QCH_POLICY` 指向一份 TOML 文件，规则按数组顺序匹配，**第一条命中的生效**；都不命中则走默认策略（只读放行、非只读要审批）。想让某条 `Deny` 优先，就把它写在前面。
+
+仓库根目录的 [`policy.example.toml`](policy.example.toml) 是一份完整可用的示例：五个只读工具免审，三个副作用工具逐次审批，并在注释里说明通配 deny 兜底的用法与代价。下面的片段演示方向性写法：
 
 ```toml
 # policy.toml

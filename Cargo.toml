@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 
+# 库目标：集成测试（tests/）与其他前端通过它复用全部逻辑，
+# main.rs 只是薄壳。
+[lib]
+name = "qcode_harness"
+path = "src/lib.rs"
+
 [dependencies]
 dotenvy = "0.15.7"
 # 关闭默认的 rustls（会拉 aws-lc-rs，Windows 上需要 CMake/NASM），
@@ -16,7 +22,7 @@ thiserror = "2"
 # 策略配置用 TOML：人写的配置文件要能带注释解释"为什么禁这个工具"，
 # JSON 不支持注释，YAML 又多一个缩进地狱。toml 的表格数组正好表达规则列表。
 toml = "0.8"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "time", "process"] }
 
 [dev-dependencies]
 # 测试需要 rig 的 test-utils 提供 MockCompletionModel，

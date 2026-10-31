@@ -6,3 +6,4 @@
 pub mod port;
 pub mod agent_run;
 pub mod error;
+pub mod tool_registry;

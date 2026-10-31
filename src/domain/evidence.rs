@@ -78,6 +78,21 @@ pub enum AuditEvent {
         /// 裁决结论的说明。
         reason: String,
     },
+    /// 发给模型前按上下文预算裁剪了历史。
+    ///
+    /// 与 `Thought` 分开记：后者是"模型说了什么"，这条是"我们让它看到了
+    /// 什么"。事后翻 JSONL 要能回答"第 5 轮发给模型的历史里有没有第 1 轮"，
+    /// 靠的就是这条事件的 `dropped` 清单。
+    ContextCompacted {
+        /// 即将进入的轮次号。
+        turn: u32,
+        /// 裁剪前的完整轮数。
+        rounds_before: usize,
+        /// 裁剪后保留的轮数。
+        rounds_after: usize,
+        /// 被丢弃的轮次号。
+        dropped: Vec<u32>,
+    },
 }
 
 impl AuditEvent {
@@ -88,7 +103,8 @@ impl AuditEvent {
             | Self::ToolRequested { turn, .. }
             | Self::ToolObserved { turn, .. }
             | Self::ApprovalDecided { turn, .. }
-            | Self::PolicyEvaluated { turn, .. } => *turn,
+            | Self::PolicyEvaluated { turn, .. }
+            | Self::ContextCompacted { turn, .. } => *turn,
         }
     }
 }

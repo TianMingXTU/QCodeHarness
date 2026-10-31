@@ -3,7 +3,7 @@
 //! 领域层的 Agent 类型表达"一轮交互"的完整信息，不依赖 rig 的消息类型——
 //! rig 的 `AssistantContent` 是协议层的表示，会随框架版本变，不能渗进领域。
 
-use super::tool::{ToolCall, ToolSpec};
+use super::tool::ToolCall;
 
 /// Agent 角色。P0 只有单一编码助手；先留出枚举位置，
 /// 多 Agent 编排（P4/P5）时按角色分化行为，不必改调用方。
@@ -16,16 +16,18 @@ pub enum AgentRole {
 /// Agent 规格：一次运行所需的全部静态配置。
 ///
 /// 把配置收敛成一个不可变值对象，`AgentRunner` 就不必各自持有
-/// prompt、工具表——少了两处可能不同步的状态。预算不在其中：
-/// 它是每次运行可调的外部输入，由 `AgentRunner::run` 传入。
+/// prompt——少了一处可能不同步的状态。预算不在其中：它是每次运行
+/// 可调的外部输入，由 `AgentRunner::run` 传入。
+///
+/// 工具规格也不在这里：P2 起模型可见的工具由 `ToolRegistry` 提供，
+/// 与执行入口绑在一起（`ModelRequest.tools`），避免"spec 声明了工具
+/// 却没人执行它"的双源头漂移。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentSpec {
     /// 角色。
     pub role: AgentRole,
     /// 系统提示词，说明 ReAct 工作方式与约束。
     pub system_prompt: String,
-    /// 模型可见的工具规格；真正执行由应用层的工具目录负责。
-    pub tools: Vec<ToolSpec>,
 }
 
 /// 模型一轮回复的领域表示。

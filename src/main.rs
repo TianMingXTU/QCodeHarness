@@ -6,34 +6,31 @@
 //! - ReAct 循环本身在 `application::agent_run::AgentRunner`；
 //! - 本文件只做三件事：读环境变量、把各层实现组装起来、把结果打印出去。
 //!
-//! 循环里模型只提出"调用某个工具"的意图，文件读写都发生在
-//! `infrastructure::tool::file` 中并限制在 workspace 内——这是 Harness
-//! 掌控执行的根基。
-
-mod application;
-mod domain;
-mod infrastructure;
-mod interface;
+//! 全部逻辑在库目标（`src/lib.rs`）里，本文件只消费它——
+//! 集成测试因此能用与生产完全相同的装配路径。
 
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rig::providers::openai::OpenAIConfig;
+use qcode_harness::application::agent_run::AgentRunner;
+use qcode_harness::application::port::{ApprovalGate, EvidenceSink};
+use qcode_harness::application::tool_registry::ToolRegistry;
+use qcode_harness::domain::agent::{AgentRole, AgentSpec};
+use qcode_harness::domain::budget::Budget;
+use qcode_harness::domain::workspace::WorkspaceRoot;
+use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
+use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
+use qcode_harness::infrastructure::clock::SystemClock;
+use qcode_harness::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
+use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
+use qcode_harness::infrastructure::policy;
+use qcode_harness::infrastructure::tool::all_tools;
+use qcode_harness::interface::cli::{self, ConsoleReporter};
 
-use crate::application::agent_run::AgentRunner;
-use crate::application::port::EvidenceSink;
-use crate::domain::agent::{AgentRole, AgentSpec};
-use crate::domain::budget::Budget;
-use crate::domain::workspace::WorkspaceRoot;
-use crate::infrastructure::approval::auto::AutoApproveGate;
-use crate::infrastructure::approval::cli::CliApprovalGate;
-use crate::infrastructure::clock::SystemClock;
-use crate::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
-use crate::infrastructure::model::rig_chat::RigChatGateway;
-use crate::infrastructure::policy;
-use crate::infrastructure::tool::file::FileToolSet;
-use crate::interface::cli::{self, ConsoleReporter};
+use qcode_harness::application::agent_run::AgentDependencies;
 
 /// `LLM_MAX_TURNS` 未设置时的默认最大轮数。
 const DEFAULT_MAX_TURNS: u32 = 20;
@@ -66,6 +63,8 @@ struct LlmConfig {
     policy_path: Option<PathBuf>,
     /// 是否跳过人工审批。`--yes` 或 `QCH_AUTO_APPROVE=1` 时为真。
     auto_approve: bool,
+    /// 整体墙钟上限（秒）。未设置时不限时。
+    max_wall_clock: Option<Duration>,
 }
 
 impl LlmConfig {
@@ -73,11 +72,12 @@ impl LlmConfig {
     ///
     /// 必需变量：`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`；
     /// 可选变量：`LLM_MAX_TURNS`（默认 20）、`QCH_POLICY`（策略配置路径）、
-    /// `QCH_AUTO_APPROVE`（设为 `1` 时跳过人工审批）。
+    /// `QCH_AUTO_APPROVE`（设为 `1` 时跳过人工审批）、
+    /// `QCH_MAX_WALL_CLOCK`（整体墙钟上限，秒）。
     ///
     /// # Errors
     ///
-    /// 缺少必需变量、或 `LLM_MAX_TURNS` 不是合法整数时返回说明性错误。
+    /// 缺少必需变量、或数值变量不是合法数字时返回说明性错误。
     fn from_env() -> Result<Self, String> {
         let required = |name: &str| -> Result<String, String> {
             std::env::var(name)
@@ -89,6 +89,15 @@ impl LlmConfig {
                 .map_err(|_| format!("LLM_MAX_TURNS 不是合法整数: {text}"))?,
             Err(_) => DEFAULT_MAX_TURNS,
         };
+        let max_wall_clock = match std::env::var("QCH_MAX_WALL_CLOCK") {
+            Ok(text) => {
+                let seconds: u64 = text
+                    .parse()
+                    .map_err(|_| format!("QCH_MAX_WALL_CLOCK 不是合法秒数: {text}"))?;
+                Some(Duration::from_secs(seconds))
+            }
+            Err(_) => None,
+        };
         Ok(Self {
             base_url: required("LLM_BASE_URL")?,
             api_key: required("LLM_API_KEY")?,
@@ -96,6 +105,7 @@ impl LlmConfig {
             max_turns,
             policy_path: std::env::var_os("QCH_POLICY").map(PathBuf::from),
             auto_approve: std::env::var("QCH_AUTO_APPROVE").as_deref() == Ok("1"),
+            max_wall_clock,
         })
     }
 }
@@ -128,18 +138,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .client();
     let model = provider.chat(config.model.as_str());
 
-    let tools = FileToolSet::new(WorkspaceRoot::new(workspace.clone()));
+    // 工具注册表：组装入口一次给出全部内置工具，规格与执行入口已绑定。
+    let registry = ToolRegistry::new(all_tools(WorkspaceRoot::new(workspace.clone())));
     let spec = AgentSpec {
         role: AgentRole::Coder,
         system_prompt: SYSTEM_PROMPT.to_owned(),
-        tools: FileToolSet::specs(),
     };
 
     println!("任务: {}", args.task);
     println!("模型: {} @ {}", config.model, config.base_url);
     println!(
         "工具: {}",
-        spec.tools
+        registry
+            .specs()
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>()
@@ -157,7 +168,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 是在自己内部生成 ID 的——先建 runner 再取 ID 会让证据写进
     // 一个名字对不上的文件。所以这里自己生成，再交给 runner 用。
     let clock = Arc::new(SystemClock);
-    let session_id = crate::application::agent_run::new_session_id(&*clock);
+    let session_id = qcode_harness::application::agent_run::new_session_id(&*clock);
     let evidence_path = session_path(&workspace, session_id.as_str());
 
     // 证据走两个汇：控制台播报给人看，JSONL 落盘给事后查。
@@ -168,7 +179,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         reporter.clone() as Arc<dyn EvidenceSink>,
     ]));
 
-    let approvals: Arc<dyn crate::application::port::ApprovalGate> = if auto_approve {
+    let approvals: Arc<dyn ApprovalGate> = if auto_approve {
         Arc::new(AutoApproveGate)
     } else {
         Arc::new(CliApprovalGate::new())
@@ -178,15 +189,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
         spec,
         session_id,
         args.task,
-        Arc::new(RigChatGateway::new(model.erase())),
-        Arc::new(tools),
-        approvals,
-        evidence,
-        clock,
-        policy,
+        AgentDependencies {
+            model: Arc::new(RigChatGateway::new(model.erase())),
+            tools: registry,
+            approvals,
+            evidence,
+            clock,
+            policy,
+            context_budget: Default::default(),
+        },
     );
 
-    let outcome = runner.run(&Budget::new(config.max_turns)).await?;
+    let mut budget = Budget::new(config.max_turns);
+    if let Some(limit) = config.max_wall_clock {
+        budget = budget.with_wall_clock(limit);
+    }
+    // 错误要按 Display 打印而不是交给 Box<dyn Error> 的 Debug：错误消息里的
+    // 对策指引（"调大 LLM_MAX_TURNS"这类）是写给用户看的，Debug 格式会把
+    // 它变成一个结构体转储。
+    let outcome = match runner.run(&budget).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
     println!("\n──── 最终答案 ────\n{}", outcome.answer);
     println!(
         "\n（会话 {} · 共 {} 轮 · 证据已写入 {}）",
@@ -213,7 +240,7 @@ impl FanoutEvidenceSink {
 }
 
 impl EvidenceSink for FanoutEvidenceSink {
-    fn record(&self, at: crate::application::port::Timestamp, event: crate::domain::evidence::AuditEvent) {
+    fn record(&self, at: qcode_harness::application::port::Timestamp, event: qcode_harness::domain::evidence::AuditEvent) {
         for sink in &self.sinks {
             // catch_unwind 不能跨 await，但 record 是同步的，可以包住。
             // 用一个汇的 panic 不该让任务和其余证据一起陪葬。

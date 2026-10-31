@@ -95,6 +95,22 @@ impl ConsoleReporter {
                     println!("[策略] {reason}");
                 }
             }
+            AuditEvent::ContextCompacted {
+                rounds_before,
+                rounds_after,
+                dropped,
+                ..
+            } => {
+                // 历史被裁剪要让人知道：从这轮起模型看不到全文了，
+                // 它"忘了"早先的细节不是傻，是被裁掉的。
+                if !dropped.is_empty() {
+                    println!(
+                        "[上下文] 历史已裁剪：{rounds_before} 轮 → {rounds_after} 轮（省略第 {}-{} 轮）",
+                        dropped.first().copied().unwrap_or(0),
+                        dropped.last().copied().unwrap_or(0),
+                    );
+                }
+            }
             // 审批与 token 用量暂不进控制台，避免淹没主要流程。
             AuditEvent::ApprovalDecided { .. } => {}
         }

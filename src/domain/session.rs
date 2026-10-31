@@ -9,6 +9,8 @@
 //! 只会让模型收到一份自相矛盾的历史。把两次 push 收敛成一次
 //! [`Session::commit_round`]，顺序错误在编译期就不可能表达。
 
+use std::borrow::Cow;
+
 use super::agent::AgentTurn;
 use super::ids::SessionId;
 use super::tool::{ToolCall, ToolOutcome};
@@ -49,11 +51,15 @@ pub enum SessionError {
 /// 为什么不直接暴露 `&[Turn]`：`Turn` 是消息级的（Agent/Observation 交替），
 /// 调用方要自己向下看一格才能凑出"一轮"，很容易写错；而上下文窗口管理
 /// 又必须以"轮"为单位整体裁剪或摘要。`slices()` 一次把配对关系算好，
-/// P1 的裁剪就变成对切片的纯函数变换，循环本身不用改。
+/// P3 的裁剪就变成对切片的纯函数变换（见 `domain::context`），循环本身不用改。
+///
+/// `User` 用 `Cow`：真实历史里的用户消息借用自 `Session`，而裁剪时插入的
+/// "已省略历史"占位说明是合成的用户消息，没有可借用的原文——两种来源
+/// 要能装进同一个切片序列里发给模型。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContextSlice<'a> {
     /// 一条用户消息。
-    User(&'a str),
+    User(Cow<'a, str>),
     /// 模型一轮，`calls` 与 `observations` 同下标一一对应。
     Round {
         /// 轮次号，从 1 开始，与日志、证据对齐。
@@ -136,7 +142,7 @@ impl Session {
         let mut round = 0_u32;
         for (index, turn) in self.turns.iter().enumerate() {
             match turn {
-                Turn::User(text) => slices.push(ContextSlice::User(text)),
+                Turn::User(text) => slices.push(ContextSlice::User(Cow::Borrowed(text))),
                 Turn::Agent(agent) => {
                     round += 1;
                     // commit_round 保证 Observation 紧跟 Agent，
@@ -230,7 +236,7 @@ mod tests {
         assert_eq!(
             session.slices(),
             vec![
-                ContextSlice::User("任务"),
+                ContextSlice::User(Cow::Borrowed("任务")),
                 ContextSlice::Round {
                     number: 1,
                     thought: "结论",

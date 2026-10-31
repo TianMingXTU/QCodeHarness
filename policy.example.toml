@@ -1,0 +1,58 @@
+# QCodeHarness 策略配置示例。
+#
+# 用法：复制为任意名字，然后设环境变量 QCH_POLICY 指向它：
+#   PowerShell:  Copy-Item policy.example.toml my-policy.toml; $env:QCH_POLICY="my-policy.toml"
+#
+# 规则按数组顺序匹配，第一条命中的生效；都不命中走默认策略
+# （只读工具放行、非只读工具要求审批）。想让某条 deny 优先，把它写在前面。
+
+[[rules]]
+tool = "read_file"
+verdict = "allow"
+description = "读文件无副作用，免审"
+
+[[rules]]
+tool = "list_dir"
+verdict = "allow"
+description = "列目录无副作用，免审"
+
+[[rules]]
+tool = "search_text"
+verdict = "allow"
+description = "文本搜索无副作用，免审"
+
+[[rules]]
+tool = "git_status"
+verdict = "allow"
+description = "git status 只读，免审"
+
+[[rules]]
+tool = "git_diff"
+verdict = "allow"
+description = "git diff 只读，免审"
+
+[[rules]]
+tool = "write_file"
+verdict = "require_approval"
+description = "整体覆盖文件不可逆，每次都要人确认"
+
+[[rules]]
+tool = "edit_file"
+verdict = "require_approval"
+description = "修改文件内容，每次都要人确认"
+
+[[rules]]
+tool = "run_command"
+verdict = "require_approval"
+description = "shell 命令威力最大，每次都要人确认"
+
+# ── 兜底说明（不要照抄）────────────────────────────────────────
+# 可以再加一条不带 tool 字段的通配规则，把没列到的工具全部拒绝：
+#
+#   [[rules]]
+#   verdict = "deny"
+#   description = "未列入白名单的工具一律禁止"
+#
+# 但注意：这会把"以后新增的工具"也一并禁掉——模型每调一个新工具都会
+# 被拒，直到你把它显式加进配置。本示例不启用它：默认策略
+# （非只读要审批）已经是安全的兜底，deny 全禁适合 lockdown 场景。

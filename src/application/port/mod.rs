@@ -10,12 +10,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::domain::agent::{AgentSpec, AgentTurn};
 use crate::domain::evidence::{AuditEvent, TokenUsage};
-use crate::domain::session::Session;
-use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome};
+use crate::domain::session::ContextSlice;
+use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 use crate::application::error::ApplicationError;
 
 /// 装盒的未来。
@@ -29,12 +29,21 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type Timestamp = SystemTime;
 
 /// 一次模型调用的输入。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ModelRequest<'a> {
-    /// 会话历史：用户任务加上已提交的各轮。
-    pub session: &'a Session,
-    /// Agent 规格：系统提示词与模型可见的工具。
+    /// 发给模型的历史：按上下文预算裁剪后的片段（可能含占位说明）。
+    ///
+    /// P3 起不再携带整个 `&Session`：发给模型的历史可能被裁剪
+    /// （见 `domain::context`），而证据、审计与将来的恢复都依赖完整会话。
+    /// 请求里只放"模型真正看到的东西"，两者不能混为一谈。
+    pub history: Vec<ContextSlice<'a>>,
+    /// Agent 规格：系统提示词等静态配置。
     pub spec: &'a AgentSpec,
+    /// 模型可见的工具规格，由工具注册表提供。
+    ///
+    /// P2 起从 `AgentSpec` 挪到这里：规格与执行入口在注册表里绑成一体，
+    /// 网关要发请求时从这里取，避免两处清单漂移。
+    pub tools: &'a [ToolSpec],
 }
 
 /// 模型的一次回复。
@@ -106,4 +115,14 @@ pub trait EvidenceSink: Send + Sync {
 pub trait Clock: Send + Sync {
     /// 当前时间。
     fn now(&self) -> Timestamp;
+
+    /// 距 `start` 经过的时间。
+    ///
+    /// P3 加入（整体墙钟预算需要量时长）。用墙钟差值实现而不是单独的
+    /// 单调时钟：多一个时刻字段就要改 `now()` 的返回类型，牵动全部实现与
+    /// 序列化，而本场景是"一次运行几分钟"的尺度，系统时钟回拨的风险
+    /// 可以接受。默认实现让已有实现零改动接入。
+    fn elapsed_since(&self, start: Timestamp) -> Duration {
+        start.elapsed().unwrap_or(Duration::ZERO)
+    }
 }

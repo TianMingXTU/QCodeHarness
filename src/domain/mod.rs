@@ -9,5 +9,6 @@ pub mod tool;
 pub mod agent;
 pub mod session;
 pub mod budget;
+pub mod context;
 pub mod evidence;
 pub mod policy;
