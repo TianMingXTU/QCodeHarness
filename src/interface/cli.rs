@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 
 use crate::application::port::{EvidenceSink, Timestamp};
-use crate::domain::evidence::{AuditEvent, Evidence};
+use crate::domain::evidence::AuditEvent;
 use crate::domain::tool::ToolCall;
 use crate::infrastructure::evidence::memory::MemoryEvidenceSink;
 
@@ -15,20 +15,38 @@ use crate::infrastructure::evidence::memory::MemoryEvidenceSink;
 const OBSERVE_PREVIEW_CHARS: usize = 400;
 
 /// 用法说明，参数缺失时打印。
-pub const USAGE: &str = "用法: cargo run -- \"任务描述\"\n示例: cargo run -- \"阅读 Cargo.toml，说明本项目用了哪些依赖\"";
+pub const USAGE: &str = "\
+用法: cargo run -- [--yes] \"任务描述\"
+示例: cargo run -- \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
+      cargo run -- --yes \"非交互场景下跑同一个任务\"";
 
 /// 解析出的命令行参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CliArgs {
     /// 要完成的任务描述。
     pub task: String,
+    /// 跳过人工审批，所有工具自动放行。
+    pub auto_approve: bool,
 }
 
-/// 取第一个位置参数作为任务。
+/// 解析命令行参数。
 ///
-/// P0 只用 `std::env::args`，不接 `clap`——一个位置参数不值得引一个依赖。
+/// 只用 `std::env::args`，不接 `clap`——两个参数不值得引一个依赖。
+/// `--yes` 是唯一支持的开关，且必须出现在任务描述之前。
 pub fn parse_args() -> Option<CliArgs> {
-    std::env::args().nth(1).map(|task| CliArgs { task })
+    let mut args = std::env::args().skip(1);
+    let mut auto_approve = false;
+
+    // 先吃掉开关，剩下的第一个位置参数就是任务。
+    // 这样 `cargo run -- --yes "任务"` 和 `cargo run -- "任务"` 都能用。
+    let task = loop {
+        match args.next()?.as_str() {
+            "--yes" => auto_approve = true,
+            other => break other.to_owned(),
+        }
+    };
+
+    Some(CliArgs { task, auto_approve })
 }
 
 /// 把审计事件渲染到控制台。
@@ -55,11 +73,6 @@ impl ConsoleReporter {
         }
     }
 
-    /// 已播报并留痕的事件，按发生顺序。
-    pub fn events(&self) -> Vec<Evidence> {
-        self.trail.events()
-    }
-
     /// 播报一条事件。
     fn report(&self, event: &AuditEvent) {
         self.announce_turn(event.turn());
@@ -74,6 +87,13 @@ impl ConsoleReporter {
             }
             AuditEvent::ToolObserved { outcome, .. } => {
                 println!("[观察] {}", preview(&outcome.content));
+            }
+            AuditEvent::PolicyEvaluated { verdict, reason, .. } => {
+                // 只播报被拒绝的裁决：放行和"要审批"对读者没有新信息，
+                // 而拒绝必须让人立刻看见——那是模型被拦下来的地方。
+                if matches!(verdict, crate::domain::policy::PolicyVerdict::Deny) {
+                    println!("[策略] {reason}");
+                }
             }
             // 审批与 token 用量暂不进控制台，避免淹没主要流程。
             AuditEvent::ApprovalDecided { .. } => {}

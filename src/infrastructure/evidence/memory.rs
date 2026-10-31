@@ -22,6 +22,10 @@ impl MemoryEvidenceSink {
     }
 
     /// 已记录的事件，按发生顺序。
+    ///
+    /// 只给测试用：生产的证据汇是 JSONL，查询证据应该去读文件，
+    /// 而不是从内存里捞——进程退出就没了。
+    #[cfg(test)]
     pub fn events(&self) -> Vec<Evidence> {
         self.lock().clone()
     }

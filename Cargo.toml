@@ -13,6 +13,9 @@ rig = { package = "rig-core", version = "0.45.0", default-features = false, feat
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2"
+# 策略配置用 TOML：人写的配置文件要能带注释解释"为什么禁这个工具"，
+# JSON 不支持注释，YAML 又多一个缩进地狱。toml 的表格数组正好表达规则列表。
+toml = "0.8"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs"] }
 
 [dev-dependencies]

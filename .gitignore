@@ -1,3 +1,5 @@
 /target
 # 本地密钥，绝不入库
 .env
+# 运行时证据（.qcodeharness/sessions/*.jsonl），每次运行都会产生
+.qcodeharness/

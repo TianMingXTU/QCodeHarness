@@ -3,6 +3,7 @@
 //! 领域层的工具定义不依赖 rig，只在基础设施层翻译成 rig 的 `ToolDefinition`。
 //! 这样"模型看到什么"与"Harness 用什么框架执行"可以独立变化。
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::ids::CallId;
@@ -12,7 +13,7 @@ use super::ids::CallId;
 /// rig 的 `ToolAnnotations` 早已存在，但原有代码完全没有填写，
 /// 等于把"哪些工具能改文件"这件事只留在了 prompt 里。这里在领域侧
 /// 用自己的类型表达同一组语义，由基础设施层翻译过去。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ToolAnnotations {
     /// 是否只读。只读是"确定无副作用"的唯一可靠信号。
     pub read_only: bool,
@@ -48,7 +49,7 @@ impl ToolAnnotations {
 }
 
 /// 工具规格：向模型描述一个可调用能力，并携带它的风险注解。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     /// 工具名，模型用它来指名调用。
     pub name: String,
@@ -63,7 +64,7 @@ pub struct ToolSpec {
 /// 模型提出的一次工具调用意图。
 ///
 /// 注意这只是"意图"：领域层记录它，但执行与否、何时执行由应用层决定。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// 模型给出的调用 ID，观察结果凭此送回。
     pub id: CallId,
@@ -74,7 +75,7 @@ pub struct ToolCall {
 }
 
 /// 工具执行结果的三种结局。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutcomeStatus {
     /// 正常完成。
     Success,
@@ -85,7 +86,7 @@ pub enum OutcomeStatus {
 }
 
 /// 一次工具执行的观察结果，会被回填给模型。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolOutcome {
     /// 给模型看的文本内容。失败时这里是原因说明。
     pub content: String,

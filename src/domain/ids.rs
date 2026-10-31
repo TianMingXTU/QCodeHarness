@@ -9,8 +9,10 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// 会话标识。一次 `AgentRunner::run()` 对应一个会话。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(String);
 
 impl SessionId {
@@ -34,7 +36,7 @@ impl fmt::Display for SessionId {
 /// 工具调用标识，由模型在提出调用时给出。
 ///
 /// Harness 执行完毕后凭此 ID 把观察结果送回模型，因此它是配对关系的锚点。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CallId(String);
 
 impl CallId {

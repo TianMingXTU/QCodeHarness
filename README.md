@@ -176,6 +176,78 @@ flowchart TD
 
 建议将项目架构展示页保存为 `docs/architecture.html`，与本 README 一同维护。当前 README 为技术方案说明，**实际安装命令、运行示例和目录结构将在首个可运行版本提交后补充**，避免提供尚不存在的操作步骤。
 
+## 9.5 运行方式
+
+### 环境变量
+
+复制 `.env.example` 为 `.env` 并填入真实值（PowerShell：`Copy-Item .env.example .env`）：
+
+| 变量 | 必需 | 说明 |
+|------|------|------|
+| `LLM_BASE_URL` | 是 | OpenAI 兼容服务地址，请求发往 `{LLM_BASE_URL}/chat/completions` |
+| `LLM_API_KEY` | 是 | API Key |
+| `LLM_MODEL` | 是 | 模型名称 |
+| `LLM_MAX_TURNS` | 否 | ReAct 循环最大轮数，默认 20 |
+| `QCH_POLICY` | 否 | 策略配置文件路径，缺省用内置默认策略 |
+| `QCH_AUTO_APPROVE` | 否 | 设为 `1` 跳过人工审批，供 CI 使用 |
+
+### 运行
+
+```powershell
+cargo run -- "阅读 Cargo.toml，说明本项目用了哪些依赖"
+```
+
+控制台会按轮次输出四段：轮次分隔线、`[思考]`、`[行动]`、`[观察]`，最后是 `──── 最终答案 ────` 与一行汇总（会话 ID、轮数、证据文件路径）。
+
+### 审批
+
+默认情况下，每个非只读工具执行前都会停下来问：
+
+```
+──── 审批请求 ────
+工具:   write_file
+参数:   {"path":"src/main.rs","content":"..."}
+风险:   破坏性 · 非幂等
+批准执行？[y] 允许  [n] 否决  [a] 本会话允许此工具  [q] 中止运行:
+```
+
+`y` 放行本次、`n` 否决并追问原因（原因会回填给模型）、`a` 在本会话内信任该工具、`q` 中止整个运行。
+
+**fail-closed**：空输入、无法识别的输入、stdin 关闭（EOF）一律视为否决。终端没人看着的时候，工具不会被放过去。
+
+`--yes` 参数或 `QCH_AUTO_APPROVE=1` 可退回全自动放行，供脚本和 CI 使用。
+
+### 策略配置
+
+`QCH_POLICY` 指向一份 TOML 文件，规则按数组顺序匹配，**第一条命中的生效**；都不命中则走默认策略（只读放行、非只读要审批）。想让某条 `Deny` 优先，就把它写在前面。
+
+```toml
+# policy.toml
+
+[[rules]]
+tool = "read_file"
+verdict = "require_approval"
+description = "读敏感目录要人工确认"
+
+[[rules]]
+tool = "write_file"
+verdict = "allow"
+description = "src/ 下的写入在信任范围内，免审"
+
+# 通配规则（不写 tool 字段匹配所有工具）放在最后兜底
+[[rules]]
+verdict = "deny"
+description = "其余工具一律禁止"
+```
+
+`verdict` 取值 `allow` / `require_approval` / `deny`，大小写不敏感。无法识别的值按 `require_approval` 处理——宁可多问一句，不能因为一个拼写错误放过高危工具。
+
+### 证据文件
+
+每次运行的审计事件追加写入 `<workspace>/.qcodeharness/sessions/<session_id>.jsonl`，每行一条 JSON，含 `sequence`、`recorded_at`（秒级 Unix 时间戳）和 `event`。运行结束后可从汇总行直接拿到文件路径。
+
+证据汇故障不会中断 ReAct 循环：单条写入失败时丢弃该条并在 stderr 打一条警告。
+
 ## 10. 预期成果
 
 最终交付不仅是一款可运行的 AI 编程工具，还包括可读的 Rust 工程代码、架构设计、自动化测试、评测基线、故障处理记录和真实开发使用案例。项目价值将主要通过**代码任务完成情况、工程安全性和可复现证据**进行检验。

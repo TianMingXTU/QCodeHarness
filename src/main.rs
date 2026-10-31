@@ -16,17 +16,22 @@ mod infrastructure;
 mod interface;
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rig::providers::openai::OpenAIConfig;
 
 use crate::application::agent_run::AgentRunner;
+use crate::application::port::EvidenceSink;
 use crate::domain::agent::{AgentRole, AgentSpec};
 use crate::domain::budget::Budget;
 use crate::domain::workspace::WorkspaceRoot;
 use crate::infrastructure::approval::auto::AutoApproveGate;
+use crate::infrastructure::approval::cli::CliApprovalGate;
 use crate::infrastructure::clock::SystemClock;
+use crate::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
 use crate::infrastructure::model::rig_chat::RigChatGateway;
+use crate::infrastructure::policy;
 use crate::infrastructure::tool::file::FileToolSet;
 use crate::interface::cli::{self, ConsoleReporter};
 
@@ -57,13 +62,18 @@ struct LlmConfig {
     model: String,
     /// ReAct 循环的最大轮数，防止模型无限调用工具。
     max_turns: u32,
+    /// 策略配置文件路径。未设置时用内置默认策略。
+    policy_path: Option<PathBuf>,
+    /// 是否跳过人工审批。`--yes` 或 `QCH_AUTO_APPROVE=1` 时为真。
+    auto_approve: bool,
 }
 
 impl LlmConfig {
     /// 从环境变量读取配置。
     ///
     /// 必需变量：`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`；
-    /// 可选变量：`LLM_MAX_TURNS`（默认 20）。
+    /// 可选变量：`LLM_MAX_TURNS`（默认 20）、`QCH_POLICY`（策略配置路径）、
+    /// `QCH_AUTO_APPROVE`（设为 `1` 时跳过人工审批）。
     ///
     /// # Errors
     ///
@@ -84,6 +94,8 @@ impl LlmConfig {
             api_key: required("LLM_API_KEY")?,
             model: required("LLM_MODEL")?,
             max_turns,
+            policy_path: std::env::var_os("QCH_POLICY").map(PathBuf::from),
+            auto_approve: std::env::var("QCH_AUTO_APPROVE").as_deref() == Ok("1"),
         })
     }
 }
@@ -101,6 +113,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = LlmConfig::from_env()?;
     let workspace = std::env::current_dir()?;
 
+    // 命令行开关优先于环境变量：显式敲 --yes 的意图比配置文件里的默认值更强。
+    let auto_approve = args.auto_approve || config.auto_approve;
+
+    // 策略配置读失败要让进程停下来：一个没人看懂的策略文件比没有策略更危险。
+    let policy = policy::load(config.policy_path.as_deref())
+        .map_err(|error| format!("策略配置加载失败: {error}"))?;
+
     // OpenAI 兼容端点必须走 chat()（/chat/completions）。
     // 不要用 completion()：它对 OpenAI 方言默认指向 Responses API（/responses），
     // DeepSeek 等兼容网关并不支持。
@@ -109,7 +128,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .client();
     let model = provider.chat(config.model.as_str());
 
-    let tools = FileToolSet::new(WorkspaceRoot::new(workspace));
+    let tools = FileToolSet::new(WorkspaceRoot::new(workspace.clone()));
     let spec = AgentSpec {
         role: AgentRole::Coder,
         system_prompt: SYSTEM_PROMPT.to_owned(),
@@ -126,25 +145,84 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if auto_approve {
+        println!("审批: 自动放行（QCH_AUTO_APPROVE 或 --yes）");
+    } else {
+        println!("审批: 交互式（每次副作用工具执行前询问）");
+    }
 
     let reporter = Arc::new(ConsoleReporter::new(config.max_turns));
+
+    // 会话 ID 必须在这里先定下来：证据文件名要用它，而 AgentRunner
+    // 是在自己内部生成 ID 的——先建 runner 再取 ID 会让证据写进
+    // 一个名字对不上的文件。所以这里自己生成，再交给 runner 用。
+    let clock = Arc::new(SystemClock);
+    let session_id = crate::application::agent_run::new_session_id(&*clock);
+    let evidence_path = session_path(&workspace, session_id.as_str());
+
+    // 证据走两个汇：控制台播报给人看，JSONL 落盘给事后查。
+    // 组合而不是二选一——运行时想看进度，出事后要能复盘，两者都需要。
+    let jsonl = JsonlEvidenceSink::open(&evidence_path)?;
+    let evidence = Arc::new(FanoutEvidenceSink::new(vec![
+        Arc::new(jsonl),
+        reporter.clone() as Arc<dyn EvidenceSink>,
+    ]));
+
+    let approvals: Arc<dyn crate::application::port::ApprovalGate> = if auto_approve {
+        Arc::new(AutoApproveGate)
+    } else {
+        Arc::new(CliApprovalGate::new())
+    };
+
     let mut runner = AgentRunner::new(
         spec,
+        session_id,
         args.task,
         Arc::new(RigChatGateway::new(model.erase())),
         Arc::new(tools),
-        Arc::new(AutoApproveGate),
-        reporter.clone(),
-        Arc::new(SystemClock),
+        approvals,
+        evidence,
+        clock,
+        policy,
     );
 
     let outcome = runner.run(&Budget::new(config.max_turns)).await?;
     println!("\n──── 最终答案 ────\n{}", outcome.answer);
     println!(
-        "\n（会话 {} · 共 {} 轮 · 证据 {} 条）",
+        "\n（会话 {} · 共 {} 轮 · 证据已写入 {}）",
         runner.session_id().as_str(),
         outcome.turns_used,
-        reporter.events().len()
+        evidence_path.display()
     );
     Ok(())
+}
+
+/// 把同一条事件分发给多个证据汇。
+///
+/// 一个坏汇不能连累其他汇：JSONL 自身已经会降级（打警告后丢弃），
+/// 这里再包一层是防止将来某个汇 panic 把整个循环带崩。
+struct FanoutEvidenceSink {
+    sinks: Vec<Arc<dyn EvidenceSink>>,
+}
+
+impl FanoutEvidenceSink {
+    /// 用一组汇构造分发器。
+    fn new(sinks: Vec<Arc<dyn EvidenceSink>>) -> Self {
+        Self { sinks }
+    }
+}
+
+impl EvidenceSink for FanoutEvidenceSink {
+    fn record(&self, at: crate::application::port::Timestamp, event: crate::domain::evidence::AuditEvent) {
+        for sink in &self.sinks {
+            // catch_unwind 不能跨 await，但 record 是同步的，可以包住。
+            // 用一个汇的 panic 不该让任务和其余证据一起陪葬。
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sink.record(at, event.clone());
+            }));
+            if result.is_err() {
+                eprintln!("警告：某个证据汇处理事件时 panic，已跳过该汇");
+            }
+        }
+    }
 }

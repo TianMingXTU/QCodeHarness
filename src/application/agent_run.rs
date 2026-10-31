@@ -19,6 +19,7 @@ use crate::domain::agent::{AgentSpec, AgentTurn};
 use crate::domain::budget::{Budget, Consumption};
 use crate::domain::evidence::AuditEvent;
 use crate::domain::ids::SessionId;
+use crate::domain::policy::{PolicyDecision, PolicyEngine, PolicyVerdict};
 use crate::domain::session::Session;
 use crate::domain::tool::{ToolCall, ToolOutcome, ToolSpec};
 
@@ -101,6 +102,11 @@ pub struct AgentRunner {
     approvals: Arc<dyn ApprovalGate>,
     evidence: Arc<dyn EvidenceSink>,
     clock: Arc<dyn Clock>,
+    /// 策略引擎：决定每个调用是放行、要审批、还是直接拒绝。
+    ///
+    /// 它是领域类型而不是端口 trait——它无 IO、无外部依赖，
+    /// 直接持有比再开一个端口更简单。
+    policy: PolicyEngine,
     spec: AgentSpec,
     session: Session,
     state: RunState,
@@ -114,23 +120,34 @@ impl AgentRunner {
     /// `invoker` 是全部工具共用的执行入口；`spec.tools` 声明模型能看到哪些。
     /// 两者的名字必须对得上——目录只按名字查找，找不到就生成拒绝观察，
     /// 让模型自己纠正，而不是崩溃。
+    ///
+    /// `policy` 是新增的依赖：P1 之前"要不要审批"由 `ToolAnnotations`
+    /// 单独决定，现在规则引擎接管这件事。它不是端口 trait，
+    /// 所以不算改接缝。
+    ///
+    /// `session_id` 由调用方传入而不是内部生成：证据文件要按会话 ID 命名，
+    /// 而文件必须在 runner 开工前就打开。内部生成会让"证据文件名"和
+    /// "runner 自报的会话 ID"变成两个值。
     pub fn new(
         spec: AgentSpec,
+        session_id: SessionId,
         task: impl Into<String>,
         model: Arc<dyn ModelGateway>,
         invoker: Arc<dyn ToolInvoker>,
         approvals: Arc<dyn ApprovalGate>,
         evidence: Arc<dyn EvidenceSink>,
         clock: Arc<dyn Clock>,
+        policy: PolicyEngine,
     ) -> Self {
         let tools = ToolCatalog::new(invoker, spec.tools.clone());
-        let session = Session::new(new_session_id(&*clock), task);
+        let session = Session::new(session_id, task);
         Self {
             model,
             tools,
             approvals,
             evidence,
             clock,
+            policy,
             spec,
             session,
             state: RunState::AwaitingModel,
@@ -188,17 +205,44 @@ impl AgentRunner {
                     ));
                     return self.record_and_advance(call, outcome).await;
                 };
-                if spec.annotations.requires_approval() {
-                    let request = ApprovalRequest {
-                        turn: self.session.rounds() + 1,
-                        call,
-                        annotations: spec.annotations,
-                    };
-                    self.state = RunState::AwaitingApproval(request.clone());
-                    Ok(RunState::AwaitingApproval(request))
-                } else {
-                    self.state = RunState::Dispatching(calls.clone());
-                    Ok(RunState::Dispatching(calls))
+
+                // 策略裁决优先于注解：注解只是默认策略的输入之一，
+                // 配置一条规则就能覆盖它。
+                let decision = self.policy.evaluate(&call, spec);
+                self.record(AuditEvent::PolicyEvaluated {
+                    turn: self.session.rounds() + 1,
+                    tool: call.name.clone(),
+                    verdict: decision.verdict,
+                    rule_index: decision.rule_index,
+                    reason: decision.reason.clone(),
+                });
+
+                match decision.verdict {
+                    // 放行：不过闸门，直接进执行。
+                    PolicyVerdict::Allow => {
+                        self.state = RunState::Dispatching(calls.clone());
+                        Ok(RunState::Dispatching(calls))
+                    }
+                    // 要审批：停在闸门前，策略理由一并带上，
+                    // 让人（或未来的自动闸门）知道是哪条规则要他点头。
+                    PolicyVerdict::RequireApproval => {
+                        let request = ApprovalRequest {
+                            turn: self.session.rounds() + 1,
+                            call,
+                            annotations: spec.annotations,
+                        };
+                        self.state = RunState::AwaitingApproval(request.clone());
+                        Ok(RunState::AwaitingApproval(request))
+                    }
+                    // 拒绝：连闸门都不问，直接给模型一条拒绝观察。
+                    // 内容里带上命中规则的理由，模型才知道该换哪条路。
+                    PolicyVerdict::Deny => {
+                        let outcome = ToolOutcome::refused(denied_by_policy_message(
+                            &call.name,
+                            &decision,
+                        ));
+                        self.record_and_advance(call, outcome).await
+                    }
                 }
             }
 
@@ -356,7 +400,10 @@ impl AgentRunner {
 ///
 /// 不引 `uuid`：P0 只需要"一次运行内唯一、日志里能认出来"。
 /// 进程号加纳秒时间戳已经够用，且不给依赖树添新东西。
-fn new_session_id(clock: &dyn Clock) -> SessionId {
+///
+/// 公开是因为 `main.rs` 要先知道 ID 才能给证据文件命名——
+/// 否则 runner 内部生成一个、外部算另一个，文件名和内容就对不上了。
+pub fn new_session_id(clock: &dyn Clock) -> SessionId {
     let nanos = clock
         .now()
         .duration_since(UNIX_EPOCH)
@@ -369,6 +416,20 @@ fn new_session_id(clock: &dyn Clock) -> SessionId {
 fn unregistered_tool_message(name: &str, specs: &[ToolSpec]) -> String {
     let available: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
     format!("未注册的工具 `{name}`，可用工具: {}", available.join(", "))
+}
+
+/// 策略拒绝的说明。
+///
+/// 必须带上规则理由：只说"被禁止"的话，模型无法判断是换参数、换工具、
+/// 还是这条路根本走不通，只会盲目重试同一个调用。
+fn denied_by_policy_message(name: &str, decision: &PolicyDecision) -> String {
+    match decision.rule_index {
+        Some(index) => format!(
+            "工具 `{name}` 被策略规则 #{index} 拒绝：{}。请换一种方式完成，不要重试同一调用。",
+            decision.reason
+        ),
+        None => format!("工具 `{name}` 被默认策略拒绝：{}", decision.reason),
+    }
 }
 
 #[cfg(test)]
@@ -473,17 +534,28 @@ mod tests {
 
     /// 用脚本化的模型回合组装 runner：不需要 API key，也不走网络。
     fn harness(turns: Vec<MockTurn>, tools: Vec<ToolSpec>) -> Harness {
+        harness_with_policy(turns, tools, PolicyEngine::new())
+    }
+
+    /// 同上，但可指定策略引擎。
+    fn harness_with_policy(
+        turns: Vec<MockTurn>,
+        tools: Vec<ToolSpec>,
+        policy: PolicyEngine,
+    ) -> Harness {
         let mock = MockCompletionModel::from_turns(turns);
         let evidence = Arc::new(MemoryEvidenceSink::new());
         let approvals = Arc::new(CountingGate::default());
         let runner = AgentRunner::new(
             spec_with(tools),
+            SessionId::new("test-session"),
             "读一下 Cargo.toml",
             Arc::new(RigChatGateway::new(mock.clone().erase())),
             Arc::new(RecordingInvoker::default()),
             approvals.clone(),
             evidence.clone(),
             Arc::new(crate::infrastructure::clock::SystemClock),
+            policy,
         );
         Harness {
             runner,
@@ -718,12 +790,14 @@ mod tests {
         ]);
         let mut runner = AgentRunner::new(
             spec_with(vec![read_file_spec(), write_file_spec()]),
+            SessionId::new("test-session"),
             "写个文件",
             Arc::new(RigChatGateway::new(mock.clone().erase())),
             Arc::new(RecordingInvoker::default()),
             Arc::new(DenyAllGate),
             Arc::new(MemoryEvidenceSink::new()),
             Arc::new(crate::infrastructure::clock::SystemClock),
+            PolicyEngine::new(),
         );
 
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
@@ -771,13 +845,8 @@ mod tests {
         let outcome_turns = outcome.turns_used;
 
         assert_eq!(outcome_turns, 3);
-        assert!(
-            harness
-                .runner
-                .session_id()
-                .to_string()
-                .starts_with("session-")
-        );
+        // 会话 ID 由调用方给定，runner 原样使用、不改写。
+        assert_eq!(harness.runner.session_id().as_str(), "test-session");
 
         // 协议层验证配对：最后一个请求的历史里，每个带 tool_calls 的
         // 助手消息后面必须紧跟一条 tool 结果消息，否则 OpenAI 兼容端点会 400。
@@ -929,5 +998,132 @@ mod tests {
     fn token_usage_defaults_to_zero() {
         assert_eq!(TokenUsage::default().input_tokens, 0);
         assert_eq!(TokenUsage::default().output_tokens, 0);
+    }
+
+    // ── P1：策略引擎接入 ────────────────────────────────────────────────
+
+    /// 拒绝观察的内容。
+    fn refusal_text(mock: &MockCompletionModel, index: usize) -> String {
+        let messages = history(mock, index);
+        let Message::User { content } = messages.last().unwrap() else {
+            panic!("观察结果应当是 user 消息");
+        };
+        let Some(UserContent::ToolResult(result)) = content.first() else {
+            panic!("应当是 tool 结果内容");
+        };
+        result.content[0].as_text().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn default_policy_still_gates_write_file() {
+        // P0 行为不能变：默认策略下 write_file 仍要过闸门。
+        let mut harness = harness(
+            vec![
+                MockTurn::tool_call("call_1", "write_file", json!({"path": "a.txt"})),
+                MockTurn::text("写完了"),
+            ],
+            vec![read_file_spec(), write_file_spec()],
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(harness.approvals.requested_tools(), vec!["write_file"]);
+    }
+
+    /// 构造只含一条规则的引擎，测试里配策略用。
+    fn policy_with(tool: &str, verdict: PolicyVerdict, description: &str) -> PolicyEngine {
+        PolicyEngine::with_rules(vec![crate::domain::policy::PolicyRule {
+            tool: Some(tool.to_owned()),
+            scope: None,
+            verdict,
+            description: description.to_owned(),
+        }])
+    }
+
+    #[tokio::test]
+    async fn allow_rule_skips_the_gate_entirely() {
+        let policy = policy_with("write_file", PolicyVerdict::Allow, "测试信任目录，免审");
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call("call_1", "write_file", json!({"path": "a.txt"})),
+                MockTurn::text("写完了"),
+            ],
+            vec![read_file_spec(), write_file_spec()],
+            policy,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert!(
+            harness.approvals.requested_tools().is_empty(),
+            "Allow 规则不应问闸门"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_rule_refuses_without_asking_the_gate() {
+        let policy = policy_with("write_file", PolicyVerdict::Deny, "P1 禁止写文件");
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call("call_1", "write_file", json!({"path": "a.txt"})),
+                MockTurn::text("不让写，那我只汇报"),
+            ],
+            vec![read_file_spec(), write_file_spec()],
+            policy,
+        );
+
+        let outcome = harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(outcome.answer, "不让写，那我只汇报");
+        assert!(
+            harness.approvals.requested_tools().is_empty(),
+            "Deny 规则不该问闸门"
+        );
+        // 拒绝观察要说明是哪条规则、为什么，模型才知道换路。
+        let text = refusal_text(&harness.mock, 1);
+        assert!(text.contains("write_file"), "应点名工具: {text}");
+        assert!(text.contains("策略规则 #0"), "应指明规则序号: {text}");
+        assert!(text.contains("P1 禁止写文件"), "应带上规则理由: {text}");
+    }
+
+    #[tokio::test]
+    async fn require_approval_rule_gates_a_read_only_tool() {
+        // 反过来也成立：只读工具也能被规则要求审批。
+        let policy = policy_with("read_file", PolicyVerdict::RequireApproval, "敏感目录要审");
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call("call_1", "read_file", json!({"path": "secret"})),
+                MockTurn::text("看完了"),
+            ],
+            vec![read_file_spec()],
+            policy,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(harness.approvals.requested_tools(), vec!["read_file"]);
+    }
+
+    #[tokio::test]
+    async fn every_policy_verdict_leaves_an_audit_event() {
+        let policy = policy_with("read_file", PolicyVerdict::Deny, "禁读");
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
+                MockTurn::text("完"),
+            ],
+            vec![read_file_spec()],
+            policy,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        let evaluated: Vec<_> = harness
+            .evidence
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e.event, AuditEvent::PolicyEvaluated { .. }))
+            .collect();
+        assert_eq!(evaluated.len(), 1, "每次策略裁决都该留证");
     }
 }
