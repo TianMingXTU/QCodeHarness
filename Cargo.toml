@@ -1,0 +1,23 @@
+[package]
+name = "QCodeHarness"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+[dependencies]
+dotenvy = "0.15.7"
+# 关闭默认的 rustls（会拉 aws-lc-rs，Windows 上需要 CMake/NASM），
+# 改用 native-tls：Windows 上直接走系统 schannel。
+# 依赖重命名为 rig，代码里用 `rig::` 引用；lib 本名是 rig_core。
+rig = { package = "rig-core", version = "0.45.0", default-features = false, features = ["reqwest", "native-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs"] }
+
+[dev-dependencies]
+# 测试需要 rig 的 test-utils 提供 MockCompletionModel，
+# 用假的模型响应驱动 AgentRunner，避免真实网络调用。
+# 注意：这里必须重新声明 rig 而不能追加到上面的 feature 列表，
+# 否则 test-utils 会进入正式产物。
+rig = { package = "rig-core", version = "0.45.0", default-features = false, features = ["reqwest", "native-tls", "test-utils"] }
