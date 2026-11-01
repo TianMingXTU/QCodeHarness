@@ -28,7 +28,8 @@ pub struct WorkflowTemplate {
 pub struct StepTemplate {
     /// 步骤说明。
     pub description: String,
-    /// 这一步期望 Agent 扮演的角色（P4 统一 `Coder`，P5 再分）。
+    /// 这一步期望 Agent 扮演的角色。P5 起编排器按它查档案装配
+    /// （系统提示词 + 工具子集），不再是统一的 Coder。
     pub role: AgentRole,
     /// 完成判据。
     pub done_when: String,
@@ -56,11 +57,13 @@ pub struct WorkflowCatalog {
 
 impl WorkflowCatalog {
     /// 四个内置模板，步骤对齐架构文档 §04 与 README §4.3。
+    /// 角色分派原则：只读分析交给 Planner/Reviewer，动手改动交给
+    /// Coder，跑命令收集结果交给 Tester——角色能做的事与步骤要做的
+    /// 事必须对得上，否则模型拿着只读工具被要求改文件，只会反复受挫。
     pub fn builtin() -> Self {
-        // 所有步骤统一 Coder：P4 不做多 Agent 调度，role 只是占位。
-        let step = |description: &str, done_when: &str| StepTemplate {
+        let step = |role: AgentRole, description: &str, done_when: &str| StepTemplate {
             description: description.to_owned(),
-            role: AgentRole::Coder,
+            role,
             done_when: done_when.to_owned(),
         };
         Self {
@@ -71,21 +74,29 @@ impl WorkflowCatalog {
                     name: "修 Bug".to_owned(),
                     steps: vec![
                         step(
-                            "复现并定位问题：{goal}。先读相关代码与测试，找出根因。",
+                            AgentRole::Planner,
+                            // Planner 是只读角色，跑不了测试；"复现"由
+                            // 后面的 Tester 步骤做，这里只要求读码定位。
+                            "定位问题：{goal}。先读相关代码与测试，找出根因。",
                             "说清问题根因，引用读到的代码或测试输出",
                         ),
                         step(
+                            AgentRole::Coder,
                             // "已完成修复"的出口必须给：实测（Xing4.0-29B）
                             // 第 1 步常顺手把修复做掉，判据若只认"已修改"，
                             // 弱模型会为字面达标反复提交空修改直到预算耗尽。
-                            "针对根因实施最小修改，修复 {goal}；若前面的步骤已完成修复，核实改动正确并说明即可，不要重复修改。",
+                            // 不提"根因"——步骤产出不跨步传递，指代会落空，
+                            // 步骤说明必须自包含（模块头注释）。
+                            "实施最小修改，修复 {goal}；若前面的步骤已完成修复，核实改动正确并说明即可，不要重复修改。",
                             "相关代码已修改（或确认此前已修复且测试通过），改动范围最小且不引入无关变更",
                         ),
                         step(
+                            AgentRole::Tester,
                             "运行测试验证 {goal} 已修复，且没有破坏其他行为。",
                             "测试真实跑过并通过，或如实说明失败原因",
                         ),
                         step(
+                            AgentRole::Coder,
                             "汇总 {goal} 的改动内容与遗留风险。",
                             "给出结论、依据与遗留风险",
                         ),
@@ -97,20 +108,28 @@ impl WorkflowCatalog {
                     name: "加功能".to_owned(),
                     steps: vec![
                         step(
+                            AgentRole::Planner,
                             "理解需求：{goal}。读现有结构，弄清要改哪些地方。",
                             "列出需要改动的位置与理由",
                         ),
                         step(
+                            AgentRole::Planner,
                             "规划 {goal} 的实现步骤与边界。",
                             "给出可执行的实现清单",
                         ),
                         step(
-                            "按计划编写 {goal} 的实现。",
+                            AgentRole::Coder,
+                            // 不提"按计划"——Planner 的产出不跨步传递，
+                            // Coder 只能自己读码定位，文本必须自包含。
+                            "编写 {goal} 的实现。",
                             "功能代码已就位，风格与现有代码一致",
                         ),
                         step(
-                            "为 {goal} 补充测试并验证。",
-                            "新增测试通过，既有测试未被破坏",
+                            AgentRole::Tester,
+                            // Tester 是只读 + 命令角色，写不了新测试；
+                            // 验证（跑既有测试、实测新行为）才是它的职责。
+                            "验证 {goal} 的实现：运行相关测试与功能验证，确认新行为生效。",
+                            "相关测试通过，既有测试未被破坏",
                         ),
                     ],
                 },
@@ -119,16 +138,23 @@ impl WorkflowCatalog {
                     kind: TaskKind::Review,
                     name: "代码评审".to_owned(),
                     steps: vec![
-                        step("读取待评审的 diff 与相关文件，评审对象：{goal}。", "准确复述改动范围"),
                         step(
+                            AgentRole::Reviewer,
+                            "读取待评审的 diff 与相关文件，评审对象：{goal}。",
+                            "准确复述改动范围",
+                        ),
+                        step(
+                            AgentRole::Reviewer,
                             "理解 {goal} 相关的上下文：调用方、依赖与既有约定。",
                             "指出改动影响到的模块",
                         ),
                         step(
+                            AgentRole::Reviewer,
                             "识别 {goal} 中的风险、bug 与规范问题。",
                             "列出问题清单，按严重程度排序",
                         ),
                         step(
+                            AgentRole::Reviewer,
                             "对 {goal} 给出是否建议合并的结论。",
                             "给出明确结论、理由与改进建议",
                         ),
@@ -140,18 +166,22 @@ impl WorkflowCatalog {
                     name: "重构".to_owned(),
                     steps: vec![
                         step(
+                            AgentRole::Tester,
                             "建立行为基线：先跑通 {goal} 相关的现有测试。",
                             "基线测试通过，或如实记录当前失败项",
                         ),
                         step(
+                            AgentRole::Coder,
                             "分批实施 {goal} 的改造，每批保持行为等价。",
                             "改造完成且未改变外部行为",
                         ),
                         step(
-                            "回归测试：验证 {goal} 改造后行为与基线一致。",
-                            "基线测试全部通过",
+                            AgentRole::Tester,
+                            "回归测试：运行 {goal} 相关的既有测试与功能验证，确认改造后行为与改造前一致、未被破坏。",
+                            "相关测试全部通过，行为与改造前一致",
                         ),
                         step(
+                            AgentRole::Reviewer,
                             "对比 {goal} 改造前后的结果，汇总收益与风险。",
                             "给出对比结论与遗留风险",
                         ),
@@ -193,9 +223,55 @@ mod tests {
                     step.description
                 );
                 assert!(!step.description.contains("{goal}"), "占位符必须被替换干净");
-                assert_eq!(step.role, AgentRole::Coder, "P4 统一 Coder");
             }
         }
+    }
+
+    #[test]
+    fn builtin_templates_dispatch_roles_per_the_table() {
+        // 角色表是 P5-1e 的验收项：只读分析交给 Planner/Reviewer，
+        // 动手改动交给 Coder，跑命令收集结果交给 Tester。
+        let catalog = WorkflowCatalog::builtin();
+        let roles_of = |kind: TaskKind| -> Vec<AgentRole> {
+            catalog
+                .find(kind)
+                .unwrap()
+                .expand("目标")
+                .iter()
+                .map(|step| step.role)
+                .collect()
+        };
+        assert_eq!(
+            roles_of(TaskKind::BugFix),
+            vec![
+                AgentRole::Planner,
+                AgentRole::Coder,
+                AgentRole::Tester,
+                AgentRole::Coder,
+            ]
+        );
+        assert_eq!(
+            roles_of(TaskKind::Feature),
+            vec![
+                AgentRole::Planner,
+                AgentRole::Planner,
+                AgentRole::Coder,
+                AgentRole::Tester,
+            ]
+        );
+        assert_eq!(
+            roles_of(TaskKind::Review),
+            vec![AgentRole::Reviewer; 4]
+        );
+        assert_eq!(
+            roles_of(TaskKind::Refactor),
+            vec![
+                AgentRole::Tester,
+                AgentRole::Coder,
+                AgentRole::Tester,
+                AgentRole::Reviewer,
+            ]
+        );
     }
 
     #[test]
@@ -220,6 +296,6 @@ mod tests {
         let steps = template.expand("把模块拆小");
         // 第一步的说明里有 {goal}，第四步的"对比结果"没有占位符也不该被改动。
         assert!(steps[0].description.contains("把模块拆小"));
-        assert!(steps[2].done_when == "基线测试全部通过");
+        assert!(steps[2].done_when == "相关测试全部通过，行为与改造前一致");
     }
 }

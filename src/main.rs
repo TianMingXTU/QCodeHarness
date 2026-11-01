@@ -18,12 +18,12 @@ use rig::providers::openai::OpenAIConfig;
 use qcode_harness::application::agent_run::{
     new_session_id, AgentDependencies, AgentRunner, RunState,
 };
+use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{ApprovalGate, EvidenceSink};
 use qcode_harness::application::snapshot::{RunSnapshot, SessionStore};
 use qcode_harness::application::tool_registry::ToolRegistry;
-use qcode_harness::domain::agent::{AgentRole, AgentSpec};
 use qcode_harness::domain::budget::Budget;
 use qcode_harness::domain::context::ContextBudget;
 use qcode_harness::domain::ids::{SessionId, TaskId};
@@ -35,6 +35,8 @@ use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
 use qcode_harness::infrastructure::clock::SystemClock;
 use qcode_harness::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
 use qcode_harness::infrastructure::evidence::memory::MemoryEvidenceSink;
+use qcode_harness::infrastructure::mcp;
+use qcode_harness::infrastructure::mcp::config::McpConfig;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 use qcode_harness::infrastructure::policy;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
@@ -44,18 +46,8 @@ use qcode_harness::interface::cli::{self, ConsoleReporter};
 /// `LLM_MAX_TURNS` 未设置时的默认最大轮数。
 const DEFAULT_MAX_TURNS: u32 = 20;
 
-/// 系统提示词：向模型说明 ReAct 工作方式与约束。
-const SYSTEM_PROMPT: &str = "\
-你是一个运行在受控 workspace 中的编码助手，按照 ReAct 循环完成任务：
-1. 思考：简述当前掌握的信息与下一步计划；
-2. 行动：调用提供的工具执行一步操作，避免一次做多余的事；
-3. 观察：Harness 会把工具执行结果回填给你，基于结果继续思考。
-
-约束：
-- 文件操作只能使用 workspace 内的相对路径；
-- 观察到错误时如实分析原因，不要假设操作成功；
-- 任务完成、或确认无法完成时，停止调用工具，直接输出最终答案；
-- 最终答案要包含：结论、依据（引用你读到的内容或执行结果）、遗留风险。";
+// 系统提示词随角色分发：P5 起各角色的提示词在 `AgentProfile::builtin()`
+// 里（按角色提供"能做什么、不许做什么"），这里不再有全局提示词。
 
 /// 运行所需的模型服务配置，来自 `.env` 或进程环境变量。
 #[derive(Debug, Clone)]
@@ -169,7 +161,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let model = provider.chat(config.model.as_str());
 
     // 工具注册表：组装入口一次给出全部内置工具，规格与执行入口已绑定。
-    let registry = ToolRegistry::new(all_tools(WorkspaceRoot::new(workspace.clone())));
+    // MCP 工具随后并入：配置了 QCH_MCP_CONFIG 才连接，缺文件即 MCP 关闭。
+    let workspace_root = WorkspaceRoot::new(workspace.clone());
+    let mut tool_entries = all_tools(workspace_root);
+    if let Some(config_path) = std::env::var_os("QCH_MCP_CONFIG").map(PathBuf::from) {
+        // 配置文件存在但非法要让进程停下来：用户明确想接 MCP，静默跳过
+        // 会让模型拿着残缺的工具清单跑任务（与策略配置同一哲学）。
+        let mcp_config = McpConfig::load(&config_path)
+            .map_err(|error| format!("{error}（文件: {}）", config_path.display()))?;
+        if let Some(mcp_config) = mcp_config {
+            let (sources, warnings) = mcp::connect_all(&mcp_config).await;
+            for warning in &warnings {
+                eprintln!("警告：{warning}");
+            }
+            for source in &sources {
+                println!(
+                    "MCP: server `{}` 提供了 {} 个工具",
+                    source.server(),
+                    source.tool_count()
+                );
+                tool_entries.extend(source.entries());
+            }
+        }
+    }
+    let registry = ToolRegistry::new(tool_entries);
 
     let approvals: Arc<dyn ApprovalGate> = if auto_approve {
         Arc::new(AutoApproveGate)
@@ -215,11 +230,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             rounds_of(&snapshot),
             state_label(&snapshot.state),
         );
+        // 恢复的会话属于某个角色，工具集必须按同一份档案裁剪——
+        // 白名单是硬边界，编排与恢复两条路径共用一条滤网（AgentRoster）。
+        // 不裁的话，中断的只读步骤恢复后会带着全量注册表上场，
+        // 提示词说"你没有写能力"，模型手里却握着 write_file。
+        let role_tools =
+            AgentRoster::builtin().filter_registry(snapshot.spec.role, &registry);
         let runner = match AgentRunner::resume(
             snapshot,
             AgentDependencies {
                 model: Arc::new(RigChatGateway::new(model.erase())),
-                tools: registry,
+                tools: role_tools,
                 approvals,
                 evidence,
                 clock,
@@ -245,11 +266,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let Some(kind) = TaskKind::parse_name(kind_text) else {
         eprintln!("未知的任务类型 {kind_text}；可用: bug-fix / feature / review / refactor");
         std::process::exit(2);
-    };
-
-    let spec = AgentSpec {
-        role: AgentRole::Coder,
-        system_prompt: SYSTEM_PROMPT.to_owned(),
     };
 
     println!("任务: {task}");
@@ -300,7 +316,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // 快照落盘随运行自动开启；--resume 可从任一步的会话恢复。
         session_store: Some(store.clone()),
     };
-    let mut orchestrator = Orchestrator::new(deps, budget, spec, evidence_factory);
+    let mut orchestrator = Orchestrator::new(deps, budget, evidence_factory);
     let mut task = orchestrator.create_task(task_id, kind, &task);
 
     let outcome = match orchestrator.run(&mut task).await {
@@ -354,8 +370,9 @@ fn list_sessions(store: &dyn qcode_harness::application::snapshot::SessionStore)
         match store.load(&id) {
             Ok(Some(snapshot)) => {
                 println!(
-                    "  {}  已 {} 轮  停在: {}",
+                    "  {}  [{}]  已 {} 轮  停在: {}",
                     id.as_str(),
+                    snapshot.spec.role.name(),
                     rounds_of(&snapshot),
                     state_label(&snapshot.state),
                 );

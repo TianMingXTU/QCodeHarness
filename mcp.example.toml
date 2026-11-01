@@ -1,0 +1,12 @@
+# MCP Server 配置示例。启动 Harness 前用 QCH_MCP_CONFIG 指向本文件：
+#   PowerShell: $env:QCH_MCP_CONFIG = "mcp.example.toml"
+#
+# 仓库自带一个演示 Server（examples/mcp-echo-server.rs），先编译：
+#   cargo build --examples
+# 再按你的 target 目录调整下面的 command（相对路径按 Harness 的
+# 启动目录解析）。
+
+[[mcp_servers]]
+name = "demo"
+command = "target/debug/examples/mcp-echo-server.exe"
+args = []

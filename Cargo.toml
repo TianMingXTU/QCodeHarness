@@ -22,7 +22,13 @@ thiserror = "2"
 # 策略配置用 TOML：人写的配置文件要能带注释解释"为什么禁这个工具"，
 # JSON 不支持注释，YAML 又多一个缩进地狱。toml 的表格数组正好表达规则列表。
 toml = "0.8"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "time", "process"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "time", "process", "io-util"] }
+# MCP（Model Context Protocol）官方 Rust SDK：P5-2 经它接入外部工具。
+# 只选 client + stdio 子进程传输 + 通用 async-rw 传输，明确关掉默认
+# features——默认集会拉 reqwest/SSE 一族，进而引入 rustls（Windows 上
+# 需要 CMake/NASM，见上面 rig 的注释）。这三个 feature 不碰 HTTP/TLS，
+# `cargo tree -i rustls` 为空是 P5-2 的验收项之一。
+rmcp = { version = "3.8.0", default-features = false, features = ["client", "transport-child-process", "transport-async-rw"] }
 
 [dev-dependencies]
 # 测试需要 rig 的 test-utils 提供 MockCompletionModel，
@@ -30,3 +36,8 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "ti
 # 注意：这里必须重新声明 rig 而不能追加到上面的 feature 列表，
 # 否则 test-utils 会进入正式产物。
 rig = { package = "rig-core", version = "0.45.0", default-features = false, features = ["reqwest", "native-tls", "test-utils"] }
+# 进程内协议测试要用 rmcp 的 server 栈起一个测试 Server（内存 duplex，不碰
+# 网络）；examples/mcp-echo-server.rs 演示 Server 的 stdio 传输也要
+# transport-io（只是 tokio 的 io-std/net，无 HTTP/TLS）。这两个 feature 只在
+# 测试构建生效，release 产物的 rmcp feature 集不变。
+rmcp = { version = "3.8.0", features = ["server", "transport-io"] }

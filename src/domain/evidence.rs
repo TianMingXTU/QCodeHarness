@@ -25,6 +25,16 @@ pub struct TokenUsage {
 /// 可审计事件。每条都带轮次号，便于和日志、会话历史对齐。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AuditEvent {
+    /// 一步开始执行，记录执行者的角色。
+    ///
+    /// 每步一个会话与证据文件，但 JSONL 里原本没有说明"这是谁跑的"；
+    /// 事后翻证据要能不借助快照就回答这个问题，靠的就是这条事件。
+    StepStarted {
+        /// 即将开始的轮次号（恒为 1，此事件先于任何模型交互）。
+        turn: u32,
+        /// 执行这一步的角色。
+        role: super::agent::AgentRole,
+    },
     /// 模型产出了一轮思考。文本可能为空（模型直接给调用）。
     Thought {
         /// 轮次号，从 1 开始。
@@ -122,7 +132,8 @@ impl AuditEvent {
     /// 事件所属的轮次号，从 1 开始。
     pub fn turn(&self) -> u32 {
         match self {
-            Self::Thought { turn, .. }
+            Self::StepStarted { turn, .. }
+            | Self::Thought { turn, .. }
             | Self::ToolRequested { turn, .. }
             | Self::ToolObserved { turn, .. }
             | Self::ApprovalDecided { turn, .. }

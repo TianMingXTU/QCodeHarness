@@ -6,6 +6,7 @@
 //! - 审批、证据收集、时钟的具体实现
 
 pub mod model;
+pub mod mcp;
 pub mod tool;
 pub mod approval;
 pub mod evidence;

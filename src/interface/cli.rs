@@ -176,6 +176,11 @@ impl ConsoleReporter {
                 // 摘要失败只提示不报错：历史退回占位说明，任务继续跑。
                 println!("[摘要] 生成失败，继续用占位说明");
             }
+            AuditEvent::StepStarted { role, .. } => {
+                // 每步开始时报出角色：读者要知道接下来是"谁"在干活，
+                // 尤其是编排把不同角色串起来的时候。
+                println!("[角色] {} 开始执行", role.name());
+            }
             // 审批与 token 用量暂不进控制台，避免淹没主要流程。
             AuditEvent::ApprovalDecided { .. } => {}
         }

@@ -7,12 +7,61 @@ use serde::{Deserialize, Serialize};
 
 use super::tool::ToolCall;
 
-/// Agent 角色。P0 只有单一编码助手；先留出枚举位置，
-/// 多 Agent 编排（P4/P5）时按角色分化行为，不必改调用方。
+/// Agent 角色。P0 只有单一编码助手；P5 起按角色分化行为——
+/// 不同角色看到不同的系统提示词、拿到不同的工具子集（见
+/// `domain::agent_profile`），编排器按步骤的角色分派。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentRole {
-    /// 编码助手：读写文件、回答问题。
+    /// 规划者：理解目标、拆解任务。只读工具。
+    Planner,
+    /// 编码者：读写文件、跑命令。全量工具。
     Coder,
+    /// 测试者：跑测试、收集结果。只读 + 命令。
+    Tester,
+    /// 评审者：读 diff、识别风险。只读工具。
+    Reviewer,
+}
+
+impl AgentRole {
+    /// 角色标识，用于日志、`--list-sessions` 输出与将来的策略规则。
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Planner => "planner",
+            Self::Coder => "coder",
+            Self::Tester => "tester",
+            Self::Reviewer => "reviewer",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_round_trips_through_serde() {
+        // 角色要进快照（AgentSpec 可序列化），扩展变体后每个变体都必须
+        // 能无损往返——漏掉任何一个，恢复时就报反序列化错误。
+        for role in [
+            AgentRole::Planner,
+            AgentRole::Coder,
+            AgentRole::Tester,
+            AgentRole::Reviewer,
+        ] {
+            let text = serde_json::to_string(&role).unwrap();
+            let restored: AgentRole = serde_json::from_str(&text).unwrap();
+            assert_eq!(restored, role);
+        }
+    }
+
+    #[test]
+    fn role_names_are_stable_identifiers() {
+        // 这些名字会出现在日志与 --list-sessions 里，改了就是对外变更。
+        assert_eq!(AgentRole::Planner.name(), "planner");
+        assert_eq!(AgentRole::Coder.name(), "coder");
+        assert_eq!(AgentRole::Tester.name(), "tester");
+        assert_eq!(AgentRole::Reviewer.name(), "reviewer");
+    }
 }
 
 /// Agent 规格：一次运行所需的全部静态配置。

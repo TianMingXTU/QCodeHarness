@@ -7,6 +7,7 @@ pub mod ids;
 pub mod workspace;
 pub mod tool;
 pub mod agent;
+pub mod agent_profile;
 pub mod session;
 pub mod budget;
 pub mod context;

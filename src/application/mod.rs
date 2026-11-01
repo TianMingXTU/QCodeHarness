@@ -4,6 +4,7 @@
 //! 对外依赖通过 `port` 中的 trait 注入，保持可测试性。
 
 pub mod port;
+pub mod agent_roster;
 pub mod agent_run;
 pub mod error;
 pub mod orchestrator;

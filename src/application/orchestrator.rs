@@ -1,16 +1,21 @@
 ﻿//! 任务编排器：按模板把任务拆成步骤，逐步驱动 `AgentRunner`。
 //!
 //! P4 的编排策略刻意简单可预测：每步一个全新 runner、独立会话，
-//! 跑完一步 `advance()` 一步，任一步失败立即停。多 Agent 调度（按
-//! `role` 选 Agent）留给 P5。
+//! 跑完一步 `advance()` 一步，任一步失败立即停。P5 起按步骤的角色
+//! 装配 runner：提示词与工具子集都来自角色档案（`AgentRoster`），
+//! 多 Agent 并行调度留给后续阶段。
 
 use std::sync::Arc;
 
+use crate::application::agent_roster::AgentRoster;
 use crate::application::agent_run::{new_session_id, AgentDependencies, AgentRunner};
 use crate::application::error::ApplicationError;
 use crate::application::port::EvidenceSink;
+use crate::application::tool_registry::ToolRegistry;
 use crate::domain::agent::AgentSpec;
+use crate::domain::agent_profile::AgentProfile;
 use crate::domain::budget::Budget;
+use crate::domain::evidence::AuditEvent;
 use crate::domain::ids::{SessionId, TaskId};
 use crate::domain::task::{Task, TaskError, TaskKind, TaskState};
 use crate::domain::workflow::WorkflowCatalog;
@@ -38,26 +43,34 @@ pub struct TaskOutcome {
 pub struct Orchestrator {
     deps: AgentDependencies,
     budget: Budget,
-    /// 每步 runner 的规格骨架。角色由步骤覆盖，系统提示词沿用装配方给的。
-    spec: AgentSpec,
+    /// 角色花名册：每步按角色查档案（提示词 + 工具白名单）。
+    roster: AgentRoster,
     templates: WorkflowCatalog,
     /// 每步的证据汇工厂。
     evidence_factory: EvidenceFactory,
 }
 
 impl Orchestrator {
-    /// 组装编排器。`budget` 与 `spec` 是编排级配置：每个步骤的 runner
-    /// 都用同一个预算与系统提示词。
-    pub fn new(
+    /// 组装编排器，用内置花名册。`budget` 是编排级配置：每个步骤的
+    /// runner 都用同一个预算。
+    pub fn new(deps: AgentDependencies, budget: Budget, evidence_factory: EvidenceFactory) -> Self {
+        Self::with_roster(deps, budget, evidence_factory, AgentRoster::builtin())
+    }
+
+    /// 用给定花名册组装（测试与将来的自定义配置用）。
+    ///
+    /// 花名册是装配的必要输入：某步的角色查不到档案时，该步显式报错
+    /// （[`ApplicationError::ProfileMissing`]），绝不静默退回默认角色。
+    pub fn with_roster(
         deps: AgentDependencies,
         budget: Budget,
-        spec: AgentSpec,
         evidence_factory: EvidenceFactory,
+        roster: AgentRoster,
     ) -> Self {
         Self {
             deps,
             budget,
-            spec,
+            roster,
             templates: WorkflowCatalog::builtin(),
             evidence_factory,
         }
@@ -130,10 +143,14 @@ impl Orchestrator {
 
     /// 执行第 `index` 步（0-based），返回该步的会话 ID 与最终答案。
     ///
+    /// 按步骤的角色装配 runner：系统提示词与工具子集都来自角色档案，
+    /// 不再是全局一份。工具子集是前置边界（模型根本看不到越权工具），
+    /// 策略引擎是兜底（子集内的工具仍要走裁决与审批）。
+    ///
     /// # Errors
     ///
-    /// 证据初始化、模型调用或预算耗尽时上抛；步骤失败的处理（标记任务、
-    /// 停止后续）由 [`Self::run`] 统一做。
+    /// 角色缺档案、证据初始化、模型调用或预算耗尽时上抛；步骤失败的
+    /// 处理（标记任务、停止后续）由 [`Self::run`] 统一做。
     async fn run_step(
         &self,
         task: &Task,
@@ -143,6 +160,17 @@ impl Orchestrator {
         // （TaskError::NoSteps），到这里越界只剩程序错误，直接下标访问。
         let step = &task.steps()[index];
         let total = task.steps().len();
+        let profile = self
+            .roster
+            .find(step.role)
+            .ok_or_else(|| ApplicationError::ProfileMissing {
+                step: index + 1,
+                role: step.role.name().to_owned(),
+            })?;
+        let spec = AgentSpec {
+            role: step.role,
+            system_prompt: profile.system_prompt.clone(),
+        };
         let prompt = format!(
             "任务：{goal}\n当前步骤（第 {now}/{total} 步）：{description}\n完成判据：{done_when}\n达成判据后停止调用工具，直接输出最终答案。",
             goal = task.goal(),
@@ -151,18 +179,35 @@ impl Orchestrator {
             description = step.description,
             done_when = step.done_when,
         );
-        let spec = AgentSpec {
-            role: step.role,
-            system_prompt: self.spec.system_prompt.clone(),
-        };
         let session_id = new_session_id(&*self.deps.clock);
         let evidence = (self.evidence_factory)(&session_id)
             .map_err(|error| ApplicationError::EvidenceInit(error.to_string()))?;
+        // 证据自述角色：JSONL 第一行就写明这步是谁跑的，事后翻证据
+        // 不必借助快照交叉对照。
+        evidence.record(
+            self.deps.clock.now(),
+            AuditEvent::StepStarted {
+                turn: 1,
+                role: step.role,
+            },
+        );
         let mut deps = self.deps.clone();
+        deps.tools = self.filtered_tools(profile);
         deps.evidence = evidence;
         let mut runner = AgentRunner::new(spec, session_id, prompt, deps);
         let outcome = runner.run(&self.budget).await?;
         Ok((runner.session_id().clone(), outcome.answer))
+    }
+
+    /// 档案限定的工具子集。
+    ///
+    /// `None` 表示不限，原样给出注册表；白名单则取交集。从白名单一侧
+    /// 过滤出该角色可见的工具集。裁剪逻辑在
+    /// [`AgentRoster::filter_registry`]：编排与恢复两条装配路径
+    /// 必须是同一条滤网，白名单才配叫硬边界。
+    fn filtered_tools(&self, profile: &AgentProfile) -> ToolRegistry {
+        self.roster
+            .filter_registry(profile.role, &self.deps.tools)
     }
 }
 
@@ -173,23 +218,18 @@ mod tests {
     use super::*;
     use crate::application::port::{ApprovalGate, EvidenceSink};
     use crate::application::tool_registry::ToolRegistry;
-    use crate::domain::agent::AgentRole;
     use crate::domain::policy::PolicyEngine;
+    use crate::domain::workspace::WorkspaceRoot;
     use crate::infrastructure::approval::auto::AutoApproveGate;
     use crate::infrastructure::clock::SystemClock;
     use crate::infrastructure::evidence::memory::MemoryEvidenceSink;
     use crate::infrastructure::model::rig_chat::RigChatGateway;
+    use crate::infrastructure::tool::all_tools;
 
     use rig::completion::Message;
     use rig::message::UserContent;
     use rig::test_utils::{MockCompletionModel, MockTurn};
-
-    fn spec() -> AgentSpec {
-        AgentSpec {
-            role: AgentRole::Coder,
-            system_prompt: "编排测试".to_owned(),
-        }
-    }
+    use serde_json::json;
 
     fn deps(mock: &MockCompletionModel) -> AgentDependencies {
         AgentDependencies {
@@ -211,6 +251,30 @@ mod tests {
         })
     }
 
+    /// 全量 8 个内置工具的注册表（真实规格），角色过滤测试的底座。
+    /// 工具本身不会被真的执行（模型脚本只返回文本或被拒绝的调用）。
+    fn full_registry() -> ToolRegistry {
+        let root = std::env::temp_dir().join(format!("qch-orch-tools-{}", std::process::id()));
+        ToolRegistry::new(all_tools(WorkspaceRoot::new(root)))
+    }
+
+    /// 请求里模型可见的工具名（按注册顺序）。
+    fn offered_tools(mock: &MockCompletionModel, index: usize) -> Vec<String> {
+        mock.requests()[index]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str().to_owned())
+            .collect()
+    }
+
+    /// 请求里发给模型的系统提示词。
+    fn system_prompt_of(mock: &MockCompletionModel, index: usize) -> String {
+        mock.requests()[index]
+            .system_instructions()
+            .expect("每步请求都应带系统提示词")
+            .to_owned()
+    }
+
     /// 请求历史里是否带着工具观察——步骤独立性测试的判据。
     fn contains_tool_result(message: &Message) -> bool {
         let Message::User { content } = message else {
@@ -230,7 +294,7 @@ mod tests {
             MockTurn::text("第4步产出"),
         ]);
         let mut orchestrator =
-            Orchestrator::new(deps(&mock), Budget::new(20), spec(), test_factory());
+            Orchestrator::new(deps(&mock), Budget::new(20), test_factory());
         let mut task = orchestrator.create_task(TaskId::new("t1"), TaskKind::BugFix, "修好它");
 
         // bug-fix 模板展开成 4 步，目标已替换进步骤说明。
@@ -288,7 +352,7 @@ mod tests {
             MockTurn::text("第3步产出"),
         ]);
         let mut orchestrator =
-            Orchestrator::new(deps(&mock), Budget::new(20), spec(), test_factory());
+            Orchestrator::new(deps(&mock), Budget::new(20), test_factory());
         let mut task = orchestrator.create_task(TaskId::new("t2"), TaskKind::Review, "评审一下");
 
         let error = orchestrator.run(&mut task).await.unwrap_err();
@@ -320,7 +384,7 @@ mod tests {
         // 空步骤任务（模板缺失的产物）必须报错，不能零调用"完成"。
         let mock = MockCompletionModel::from_turns(vec![]);
         let mut orchestrator =
-            Orchestrator::new(deps(&mock), Budget::new(20), spec(), test_factory());
+            Orchestrator::new(deps(&mock), Budget::new(20), test_factory());
         let mut task = Task::new(TaskId::new("t4"), TaskKind::Review, "空任务", vec![]);
 
         let error = orchestrator.run(&mut task).await.unwrap_err();
@@ -336,7 +400,7 @@ mod tests {
     async fn already_finished_task_is_rejected() {
         let mock = MockCompletionModel::from_turns(vec![MockTurn::text("完成")]);
         let mut orchestrator =
-            Orchestrator::new(deps(&mock), Budget::new(20), spec(), test_factory());
+            Orchestrator::new(deps(&mock), Budget::new(20), test_factory());
         let mut task = orchestrator.create_task(TaskId::new("t3"), TaskKind::Feature, "加个功能");
 
         // 已失败的任务是终态：直接拒绝，不做任何模型调用。
@@ -347,5 +411,119 @@ mod tests {
             "{error}"
         );
         assert_eq!(mock.requests().len(), 0, "终态任务不应触发任何模型调用");
+    }
+
+    #[tokio::test]
+    async fn each_step_sees_only_its_roles_tools_and_prompt() {
+        // bug-fix 四步的角色分别是 Planner/Coder/Tester/Coder：每步请求
+        // 里模型可见的工具必须是该角色档案的子集（Coder 不限 → 全量 8 个），
+        // 系统提示词必须是该角色自己的，而不是全局一份。
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::text("规划产出"),
+            MockTurn::text("实现产出"),
+            MockTurn::text("验证产出"),
+            MockTurn::text("汇总产出"),
+        ]);
+        let deps = AgentDependencies {
+            tools: full_registry(),
+            ..deps(&mock)
+        };
+        let mut orchestrator = Orchestrator::new(deps, Budget::new(20), test_factory());
+        let mut task = orchestrator.create_task(TaskId::new("t5"), TaskKind::BugFix, "修好它");
+
+        orchestrator.run(&mut task).await.unwrap();
+
+        assert_eq!(mock.requests().len(), 4);
+        // Planner：只读 5 件套，顺序跟随档案白名单。
+        assert_eq!(
+            offered_tools(&mock, 0),
+            ["read_file", "list_dir", "search_text", "git_status", "git_diff"]
+        );
+        // Coder：不限工具，全量 8 个。
+        assert_eq!(offered_tools(&mock, 1).len(), 8);
+        assert!(offered_tools(&mock, 1).contains(&"write_file".to_owned()));
+        // Tester：只读 + 命令；写文件与编辑文件不在其中。
+        assert_eq!(
+            offered_tools(&mock, 2),
+            ["read_file", "list_dir", "search_text", "run_command", "git_status", "git_diff"]
+        );
+        assert_eq!(offered_tools(&mock, 3).len(), 8);
+
+        // 每步的提示词不同：角色的，不是全局的。
+        let prompts: Vec<String> = (0..4).map(|index| system_prompt_of(&mock, index)).collect();
+        assert!(prompts[0].contains("规划者"), "第 1 步应是规划者提示词");
+        assert!(prompts[1].contains("实施者"), "第 2 步应是编码者提示词");
+        assert!(prompts[2].contains("测试者"), "第 3 步应是测试者提示词");
+        for (a, b) in prompts.iter().zip(prompts.iter().skip(1)) {
+            assert_ne!(a, b, "相邻步骤的提示词应不同");
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_cannot_use_tools_outside_the_subset() {
+        // 评审者妄想写文件：工具子集里根本没有 write_file，调用在分发前
+        // 就被"未注册"拒绝——硬边界兜住，任务不崩，模型拿到拒绝观察后
+        // 继续给出评审结论。
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_w1", "write_file", json!({"path": "x", "content": "y"})),
+            MockTurn::text("第 1 步评审结论"),
+            MockTurn::tool_call("call_w2", "edit_file", json!({})),
+            MockTurn::text("第 2 步评审结论"),
+            MockTurn::tool_call("call_w3", "run_command", json!({"command": "echo hi"})),
+            MockTurn::text("第 3 步评审结论"),
+            MockTurn::text("第 4 步评审结论"),
+        ]);
+        let deps = AgentDependencies {
+            tools: full_registry(),
+            ..deps(&mock)
+        };
+        let mut orchestrator = Orchestrator::new(deps, Budget::new(20), test_factory());
+        let mut task = orchestrator.create_task(TaskId::new("t6"), TaskKind::Review, "评审一下");
+
+        let outcome = orchestrator.run(&mut task).await.unwrap();
+
+        assert_eq!(task.state(), TaskState::Completed);
+        assert_eq!(outcome.answer, "第 4 步评审结论");
+        // 每步两问（妄想调用 + 拒绝后的结论），第 4 步一问。
+        assert_eq!(mock.requests().len(), 7);
+        // 评审步骤的请求里没有写工具——调用被拒是因为子集没有它，
+        // 不是因为审批拦下（未注册检查发生在策略与闸门之前）。
+        for index in [0, 2, 4] {
+            let tools = offered_tools(&mock, index);
+            assert!(!tools.contains(&"write_file".to_owned()), "{tools:?}");
+            assert!(!tools.contains(&"edit_file".to_owned()), "{tools:?}");
+            assert!(!tools.contains(&"run_command".to_owned()), "{tools:?}");
+        }
+        // 拒绝观察回到了模型手里，指明是未注册而不是执行失败。
+        let after_refusal = serde_json::to_string(&mock.requests()[1].chat_history).unwrap();
+        assert!(
+            after_refusal.contains("未注册的工具 `write_file`"),
+            "拒绝观察应回给模型: {after_refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_profile_fails_the_step_explicitly() {
+        // 空花名册：任何角色都没有档案。该步显式失败并标记任务失败，
+        // 绝不 panic、也绝不静默退回某个默认角色。
+        let mock = MockCompletionModel::from_turns(vec![]);
+        let mut orchestrator = Orchestrator::with_roster(
+            deps(&mock),
+            Budget::new(20),
+            test_factory(),
+            AgentRoster::new(vec![]),
+        );
+        let mut task = orchestrator.create_task(TaskId::new("t7"), TaskKind::BugFix, "修好它");
+
+        let error = orchestrator.run(&mut task).await.unwrap_err();
+
+        assert!(
+            matches!(&error, ApplicationError::StepFailed { step: 1, .. }),
+            "应报第 1 步失败，实际: {error}"
+        );
+        assert!(error.to_string().contains("没有档案"), "{error}");
+        assert!(error.to_string().contains("planner"), "{error}");
+        assert_eq!(task.state(), TaskState::Failed);
+        assert_eq!(mock.requests().len(), 0, "装配失败不应触发模型调用");
     }
 }

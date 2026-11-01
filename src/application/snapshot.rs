@@ -18,7 +18,10 @@ use crate::domain::session::SessionSnapshot;
 use super::agent_run::{PendingRound, RunState};
 
 /// 当前快照格式版本。每次快照结构发生不兼容变化时 +1。
-pub const RUN_FORMAT: u32 = 1;
+///
+/// v2（P5）：`AgentRole` 从单变体扩展为四变体，P4 快照里的角色序列化
+/// 形态随之改变——旧快照被显式拒绝而不是猜着解释。
+pub const RUN_FORMAT: u32 = 2;
 
 /// 一次运行的可序列化快照：恢复所需的全部状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,5 +194,19 @@ mod tests {
             StoreError::VersionMismatch { found: 999, expected: RUN_FORMAT }
         ));
         assert!(error.to_string().contains("v999"), "{error}");
+    }
+
+    #[test]
+    fn snapshot_from_previous_format_is_rejected() {
+        // P4 写的 v1 快照：AgentRole 扩展后序列化形态已变，必须明确拒绝
+        // 而不是猜着兼容——这是 acceptance 的硬要求，也是静默兼容更危险
+        // 的直接体现。
+        let mut snapshot = mid_round_snapshot();
+        snapshot.format_version = 1;
+        let error = snapshot.check_version().unwrap_err();
+        let StoreError::VersionMismatch { found: 1, expected } = error else {
+            panic!("应报版本不匹配")
+        };
+        assert_eq!(expected, 2);
     }
 }
