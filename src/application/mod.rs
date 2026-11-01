@@ -5,6 +5,8 @@
 
 pub mod port;
 pub mod agent_roster;
+pub mod report;
+pub mod benchmark;
 pub mod agent_run;
 pub mod error;
 pub mod orchestrator;

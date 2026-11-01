@@ -215,6 +215,9 @@ impl From<&Usage> for TokenUsage {
         Self {
             input_tokens: usage.input_tokens.unwrap_or(0),
             output_tokens: usage.output_tokens.unwrap_or(0),
+            // rig 的诚实策略照搬：无法定价时是 None，报表显示"未知"，
+            // 绝不折算成 0。
+            cost_usd: usage.cost.map(|cost| cost.total),
         }
     }
 }
@@ -248,6 +251,7 @@ mod tests {
     use crate::domain::agent::AgentRole;
     use crate::domain::ids::SessionId;
     use crate::domain::session::Session;
+    use rig::completion::Cost;
     use serde_json::json;
 
     fn spec_with() -> AgentSpec {
@@ -333,18 +337,23 @@ mod tests {
     }
 
     #[test]
-    fn usage_translates_token_counts() {
+    fn usage_translates_token_counts_and_cost() {
         // Usage 是 non_exhaustive，只能用 Default 再改字段。
         let mut usage = Usage::default();
         usage.input_tokens = Some(11);
         usage.output_tokens = Some(7);
+        // 0.25/0.5 在 f64 里精确，合计不会引入浮点误差。
+        usage.cost = Some(Cost::from_parts(0.25, 0.5, 0.0, 0.0));
         assert_eq!(
             TokenUsage::from(&usage),
             TokenUsage {
                 input_tokens: 11,
-                output_tokens: 7
+                output_tokens: 7,
+                cost_usd: Some(0.75),
             }
         );
+        // provider 未报告成本 → None（报表显示"未知"，绝不折算成 0）。
+        assert_eq!(TokenUsage::from(&Usage::default()).cost_usd, None);
     }
 
     #[tokio::test]

@@ -1,0 +1,8 @@
+id = "missing-import"
+kind = "bug-fix"
+description = "修复 bench-word-count 库：cargo test 报编译错误，找不到类型 HashMap。读 src/lib.rs 与 tests/count.rs，做最小修复，然后运行 cargo test 验证编译与全部测试通过。"
+
+[criteria]
+test_command = "cargo test"
+requires_changes = true
+answer_must_mention = []

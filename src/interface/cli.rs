@@ -19,10 +19,15 @@ pub const USAGE: &str = "\
 用法: cargo run -- [--yes] [--kind <模板>] \"任务描述\"
       cargo run -- --list-sessions
       cargo run -- [--yes] --resume <会话ID>
+      cargo run -- --report [--report-dir <目录>] [--json]
+      cargo run -- --benchmark
 示例: cargo run -- \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
       cargo run -- --yes \"非交互场景下跑同一个任务\"
       cargo run -- --list-sessions
-      cargo run -- --resume <会话ID>";
+      cargo run -- --resume <会话ID>
+      cargo run -- --report
+      cargo run -- --report --json
+      cargo run -- --benchmark";
 
 /// 解析出的命令行参数。
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +43,16 @@ pub struct CliArgs {
     pub list_sessions: bool,
     /// 任务模板名（`--kind <name>`），交给任务编排（P4-2）解析。
     pub kind: Option<String>,
+    /// 生成运行报表（`--report`）：读证据统计成功率、工具结局与成本。
+    /// 不需要模型配置。
+    pub report: bool,
+    /// 报表统计的证据根目录（`--report-dir <dir>`），在该目录的
+    /// `.qcodeharness/sessions/` 下找证据文件；缺省为当前工作区。
+    pub report_dir: Option<String>,
+    /// 报表输出 JSON（`--json`），只与 `--report` 搭配有效。
+    pub json: bool,
+    /// 跑 `benchmarks/` 下的基准任务集并打分（`--benchmark`）。
+    pub benchmark: bool,
 }
 
 /// 解析命令行参数。
@@ -55,6 +70,10 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut resume = None;
     let mut list_sessions = false;
     let mut kind = None;
+    let mut report = false;
+    let mut report_dir = None;
+    let mut json = false;
+    let mut benchmark = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut iter = argv.into_iter();
@@ -62,6 +81,16 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         match arg.as_str() {
             "--yes" => auto_approve = true,
             "--list-sessions" => list_sessions = true,
+            "--report" => report = true,
+            "--json" => json = true,
+            "--benchmark" => benchmark = true,
+            "--report-dir" => match iter.next() {
+                Some(dir) => report_dir = Some(dir),
+                None => {
+                    eprintln!("--report-dir 需要一个目录：--report-dir <目录>");
+                    return None;
+                }
+            },
             "--resume" => match iter.next() {
                 Some(id) => resume = Some(id),
                 None => {
@@ -85,14 +114,33 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         return None;
     }
     let task = positional.into_iter().next();
+    // 报表与基准都是不接任务描述的独立模式：带着描述跑只会让人以为
+    // 描述也生效了，直接拒掉。
+    if task.is_some() && (report || benchmark) {
+        eprintln!("--report / --benchmark 不接受任务描述");
+        return None;
+    }
     // 恢复模式沿用快照里的原任务：再塞一条用户消息会破坏
     // "助手轮次后面紧跟观察"的配对，也说不清哪条才是真任务。
     if task.is_some() && resume.is_some() {
         eprintln!("--resume 会沿用快照里的原任务，不能再另外指定任务描述");
         return None;
     }
-    if task.is_none() && resume.is_none() && !list_sessions {
-        eprintln!("缺少任务描述；恢复请用 --resume <id>，查看请用 --list-sessions\n\n{USAGE}");
+    // 搭错车的开关要当场指出来，静默忽略等于悄悄吃掉用户的意图。
+    if json && !report {
+        eprintln!("--json 需要与 --report 搭配");
+        return None;
+    }
+    if report_dir.is_some() && !report {
+        eprintln!("--report-dir 需要与 --report 搭配");
+        return None;
+    }
+    if benchmark && resume.is_some() {
+        eprintln!("--benchmark 不能与 --resume 搭配");
+        return None;
+    }
+    if task.is_none() && resume.is_none() && !list_sessions && !report && !benchmark {
+        eprintln!("缺少任务描述；恢复请用 --resume <id>，查看请用 --report，基准请用 --benchmark\n\n{USAGE}");
         return None;
     }
 
@@ -102,6 +150,10 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         resume,
         list_sessions,
         kind,
+        report,
+        report_dir,
+        json,
+        benchmark,
     })
 }
 
@@ -274,6 +326,46 @@ mod tests {
     #[test]
     fn missing_everything_is_none() {
         assert!(parse_from(std::iter::empty()).is_none());
+    }
+
+    #[test]
+    fn report_flags_parse_without_a_task() {
+        let args = parse_from(argv(&["--report", "--report-dir", "D:/runs", "--json"])).unwrap();
+
+        assert!(args.report);
+        assert_eq!(args.report_dir.as_deref(), Some("D:/runs"));
+        assert!(args.json);
+        assert!(args.task.is_none());
+    }
+
+    #[test]
+    fn benchmark_flag_needs_no_task() {
+        let args = parse_from(argv(&["--benchmark"])).unwrap();
+        assert!(args.benchmark);
+        assert!(args.task.is_none());
+    }
+
+    #[test]
+    fn json_without_report_is_rejected() {
+        let parsed = parse_from(argv(&["--json"]));
+        assert!(parsed.is_none(), "--json 单独使用只会让用户以为生效了");
+    }
+
+    #[test]
+    fn report_dir_without_report_is_rejected() {
+        let parsed = parse_from(argv(&["--report-dir", "x"]));
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn task_with_report_or_benchmark_is_rejected() {
+        assert!(parse_from(argv(&["--report", "修个 bug"])).is_none());
+        assert!(parse_from(argv(&["--benchmark", "修个 bug"])).is_none());
+    }
+
+    #[test]
+    fn benchmark_with_resume_is_rejected() {
+        assert!(parse_from(argv(&["--benchmark", "--resume", "s1"])).is_none());
     }
 
     fn call(name: &str, arguments: serde_json::Value) -> ToolCall {

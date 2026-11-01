@@ -10,16 +10,22 @@ use serde::{Deserialize, Serialize};
 
 use super::tool::{ToolCall, ToolOutcome};
 
-/// 一次模型调用的 token 用量。
+/// 一次模型调用的 token 用量与成本。
 ///
-/// 从 rig 的 `Usage` 平移而来。目前只取输入/输出两个计数；
-/// rig 还算 cost 等派生值，等真要按成本设预算时再补。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// 从 rig 的 `Usage` 平移而来。成本是 provider 报告的原值，不在领域层
+/// 用单价表推算——推算值会随价目表过时而失真，报表宁可显示"未知"。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// 输入 token 数（含系统提示与历史）。
     pub input_tokens: u64,
     /// 输出 token 数。
     pub output_tokens: u64,
+    /// 本次调用的成本（美元）。`None` 表示 provider 未报告且无法定价。
+    ///
+    /// 报表必须显示"未知"而不是 0：填 0 会让"免费"和"没查到"混为
+    /// 一谈，部分已知的合计是一个被低估的数字，比"未知"更危险。
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 /// 可审计事件。每条都带轮次号，便于和日志、会话历史对齐。

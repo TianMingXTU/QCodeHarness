@@ -1,0 +1,8 @@
+id = "greet-npe"
+kind = "bug-fix"
+description = "修复 bench-greet-npe 库：greet 在传入空名字时会 panic，测试 empty_name_gets_a_placeholder 失败。读 src/lib.rs 与 tests/greet.rs 找出根因，做最小修复，然后运行 cargo test 验证全部测试通过。"
+
+[criteria]
+test_command = "cargo test"
+requires_changes = true
+answer_must_mention = ["panic"]

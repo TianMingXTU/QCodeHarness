@@ -19,9 +19,11 @@ use qcode_harness::application::agent_run::{
     new_session_id, AgentDependencies, AgentRunner, RunState,
 };
 use qcode_harness::application::agent_roster::AgentRoster;
+use qcode_harness::application::benchmark::run_benchmark;
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{ApprovalGate, EvidenceSink};
+use qcode_harness::application::report::{render_json, render_text, BenchmarkReport};
 use qcode_harness::application::snapshot::{RunSnapshot, SessionStore};
 use qcode_harness::application::tool_registry::ToolRegistry;
 use qcode_harness::domain::budget::Budget;
@@ -35,6 +37,7 @@ use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
 use qcode_harness::infrastructure::clock::SystemClock;
 use qcode_harness::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
 use qcode_harness::infrastructure::evidence::memory::MemoryEvidenceSink;
+use qcode_harness::infrastructure::evidence::reader;
 use qcode_harness::infrastructure::mcp;
 use qcode_harness::infrastructure::mcp::config::McpConfig;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
@@ -143,6 +146,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return list_sessions(store.as_ref());
     }
 
+    // 报表同样不需要模型配置：只读证据统计，没配 API key 也能出报表。
+    if args.report {
+        return render_report(&workspace, args.report_dir.as_deref(), args.json);
+    }
+
     let config = LlmConfig::from_env()?;
 
     // 命令行开关优先于环境变量：显式敲 --yes 的意图比配置文件里的默认值更强。
@@ -159,6 +167,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_base_url(config.base_url.as_str())
         .client();
     let model = provider.chat(config.model.as_str());
+
+    // 上下文预算：默认只做确定性裁剪（占位说明）；设了阈值才为被裁
+    // 历史花摘要调用——摘要是多花一次模型调用的可选项，默认关。
+    // 基准与普通运行共用同一套预算口径。
+    let context_budget = config
+        .summarize_min_dropped
+        .map_or(ContextBudget::default(), |min| {
+            ContextBudget::default().with_summarize(min)
+        });
+
+    // ── 基准模式：跑 benchmarks/ 下的任务集并打分。放在全局工具装配
+    // 之前——运行器为每个任务重建以 fixture 拷贝为根的注册表，全局
+    // 注册表与 MCP 连接在这里用不上。──
+    if args.benchmark {
+        // 基准无人值守：交互式审批会把整场运行挂住，强制自动放行。
+        let deps = AgentDependencies {
+            model: Arc::new(RigChatGateway::new(model.erase())),
+            tools: ToolRegistry::new(vec![]),
+            approvals: Arc::new(AutoApproveGate),
+            clock: Arc::new(SystemClock),
+            policy,
+            context_budget,
+            evidence: Arc::new(MemoryEvidenceSink::new()),
+            // 基准会话不留快照：恢复它们只会把任务跑回当前工作区，
+            // 而不是当时的 fixture 拷贝。证据照常落盘，--report 统计得到。
+            session_store: None,
+        };
+        let mut budget = Budget::new(config.max_turns);
+        if let Some(limit) = config.max_wall_clock {
+            budget = budget.with_wall_clock(limit);
+        }
+        let benchmarks_root = workspace.join("benchmarks");
+        println!("基准任务集: {}", benchmarks_root.display());
+        println!("模型: {} @ {}", config.model, config.base_url);
+        let results = run_benchmark(&deps, &budget, &benchmarks_root, &workspace).await?;
+        let passed = results.iter().filter(|result| result.passed).count();
+        println!("\n通过 {passed}/{} 个任务", results.len());
+        if passed < results.len() {
+            // 基准是打分工具：有任务未通过就用非 0 退出码说话，
+            // 自动化流水线才能感知。
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     // 工具注册表：组装入口一次给出全部内置工具，规格与执行入口已绑定。
     // MCP 工具随后并入：配置了 QCH_MCP_CONFIG 才连接，缺文件即 MCP 关闭。
@@ -198,14 +250,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(limit) = config.max_wall_clock {
         budget = budget.with_wall_clock(limit);
     }
-
-    // 上下文预算：默认只做确定性裁剪（占位说明）；设了阈值才为被裁
-    // 历史花摘要调用——摘要是多花一次模型调用的可选项，默认关。
-    let context_budget = config
-        .summarize_min_dropped
-        .map_or(ContextBudget::default(), |min| {
-            ContextBudget::default().with_summarize(min)
-        });
 
     // ── 恢复模式：任务、系统提示词与历史都来自快照，不重新拼装。──
     if let Some(id_text) = args.resume {
@@ -359,8 +403,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// `--list-sessions`：列出可恢复的会话与各自停在哪里。
-fn list_sessions(store: &dyn qcode_harness::application::snapshot::SessionStore) -> Result<(), Box<dyn Error>> {
-    let ids = store.list()?;
+fn list_sessions(store: &dyn qcode_harness::application::snapshot::SessionStore) -> Result<(), Box<dyn Error>> {    let ids = store.list()?;
     if ids.is_empty() {
         println!("还没有可恢复的会话。跑完一个任务后，快照会自动存到 .qcodeharness/snapshots/。");
         return Ok(());
@@ -381,6 +424,26 @@ fn list_sessions(store: &dyn qcode_harness::application::snapshot::SessionStore)
             // 单个坏文件不拖垮整个清单：标注后继续列其他的。
             Err(error) => println!("  {}  （快照不可读: {error}）", id.as_str()),
         }
+    }
+    Ok(())
+}
+
+/// `--report`：从证据目录统计运行报表。`report_dir` 是证据根目录
+/// （找它的 `.qcodeharness/sessions/`），缺省为当前工作区。
+fn render_report(workspace: &Path, report_dir: Option<&str>, json: bool) -> Result<(), Box<dyn Error>> {
+    let root = report_dir.map_or(workspace.to_path_buf(), PathBuf::from);
+    let sessions_dir = root.join(".qcodeharness").join("sessions");
+    if !sessions_dir.is_dir() {
+        println!("{} 下还没有运行证据。", sessions_dir.display());
+        return Ok(());
+    }
+    let logs = reader::read_all(&sessions_dir).map_err(|error| format!("{error}"))?;
+    let report = BenchmarkReport::from_sessions(&logs);
+    if json {
+        let text = render_json(&report).map_err(|error| format!("{error}"))?;
+        println!("{text}");
+    } else {
+        println!("{}", render_text(&report));
     }
     Ok(())
 }
