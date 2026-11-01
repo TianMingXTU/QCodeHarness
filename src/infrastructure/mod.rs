@@ -11,3 +11,4 @@ pub mod approval;
 pub mod evidence;
 pub mod policy;
 pub mod clock;
+pub mod session_store;

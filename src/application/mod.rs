@@ -6,4 +6,7 @@
 pub mod port;
 pub mod agent_run;
 pub mod error;
+pub mod orchestrator;
+pub mod snapshot;
+pub mod summarizer;
 pub mod tool_registry;

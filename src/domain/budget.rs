@@ -6,10 +6,17 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// 一次运行的上限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     /// 最大 ReAct 轮数，即最大模型调用次数。防止模型无限调用工具。
+    ///
+    /// 开启历史摘要（[`ContextBudget::with_summarize`]）后，摘要调用
+    /// 也计入 `turns`，但它发生在轮内补摘要的挂点上、不在本闸门的
+    /// 检查点之间——实际调用数最多可能比 `max_turns` 多 1 次
+    /// （该轮的摘要 + 正式调用）。墙钟预算不受影响。
     pub max_turns: u32,
     /// 整体墙钟上限。`None` 表示不限时。
     ///
@@ -46,7 +53,9 @@ impl Budget {
 ///
 /// `elapsed` 只是"已测量结果"的容器：domain 不取时间（纯净性约束），
 /// 测量由调用方通过 `Clock` 端口完成（见 `application::port::Clock::elapsed_since`）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// 可序列化：恢复时要接着算轮数与墙钟预算，不能从零开始。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Consumption {
     /// 已经发生的模型调用次数。
     pub turns: u32,

@@ -4,12 +4,41 @@
 //! 最终超出模型输入上限直接报错。裁剪是"发给模型时怎么看历史"的纯函数
 //! 变换——[`Session`] 本身不被修改，证据、审计与将来的恢复都依赖完整历史。
 //!
-//! P3 只做确定性策略（保留近期 + 占位说明），不做 LLM 摘要：摘要是又一次
-//! 模型调用，不可预测还烧 token，属于 P4/P5 的记忆能力。
+//! 被裁掉的历史有两种呈现：占位说明（确定性、零成本），或一段已生成的
+//! 摘要（信息量大，但摘要本身是一次模型调用，挂在 `Session` 上只做一次）。
+//! `compact` 不调模型——摘要文本由调用方喂进来，这里只负责"有就用"。
 
 use std::borrow::Cow;
 
+use serde::{Deserialize, Serialize};
+
 use super::session::{ContextSlice, Session};
+
+/// 一段由模型生成的历史摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Summary {
+    /// 摘要覆盖的轮次范围（含）。
+    pub covers: (u32, u32),
+    /// 摘要文本，由模型生成。
+    pub text: String,
+}
+
+impl Summary {
+    /// 是否覆盖（含端点）给定的全部轮次。
+    pub fn covers_all(&self, rounds: &[u32]) -> bool {
+        rounds
+            .iter()
+            .all(|round| *round >= self.covers.0 && *round <= self.covers.1)
+    }
+}
+
+/// 摘要策略：控制"被裁掉多少轮才值得再花一次模型调用"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummarizePolicy {
+    /// 被裁轮次达到这个数才生成/更新摘要。调太高会一直用占位说明，
+    /// 调太低则摘要调用太频繁；1-2 适合短上下文预算，默认给 2。
+    pub min_dropped_to_summarize: usize,
+}
 
 /// 发给模型前，历史最多保留多少个完整轮次。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +48,8 @@ pub struct ContextBudget {
     /// 是否始终保留最初的用户任务。强烈建议 true——模型忘了自己在干什么，
     /// 后面每一轮都会跑偏。
     pub keep_task: bool,
+    /// 被裁历史是否用摘要替代占位说明。`None` 表示只用占位说明（P3 行为）。
+    pub summarize: Option<SummarizePolicy>,
 }
 
 impl ContextBudget {
@@ -27,7 +58,16 @@ impl ContextBudget {
         Self {
             max_rounds: usize::MAX,
             keep_task: true,
+            summarize: None,
         }
+    }
+
+    /// 开启摘要，被裁轮次达到 `min_dropped_to_summarize` 才生成。
+    pub fn with_summarize(mut self, min_dropped_to_summarize: usize) -> Self {
+        self.summarize = Some(SummarizePolicy {
+            min_dropped_to_summarize,
+        });
+        self
     }
 }
 
@@ -36,6 +76,8 @@ impl Default for ContextBudget {
         Self {
             max_rounds: DEFAULT_MAX_ROUNDS,
             keep_task: true,
+            // 默认不开摘要：多一次模型调用是不可忽略的成本，显式开启。
+            summarize: None,
         }
     }
 }
@@ -89,14 +131,14 @@ pub fn compact<'a>(
 
     let dropped = round_numbers[..drop_count].to_vec();
     let mut kept: Vec<ContextSlice<'a>> = Vec::with_capacity(budget.max_rounds + 2);
-    // 任务消息是历史的第一条用户消息。先它、后占位说明、再保留的轮次，
+    // 任务消息是历史的第一条用户消息。先它、后占位说明/摘要、再保留的轮次，
     // 顺序与"人先交代任务、再补一句摘要、然后是近期工作"一致。
     if budget.keep_task {
         if let Some(ContextSlice::User(task)) = slices.first() {
             kept.push(ContextSlice::User(task.clone()));
         }
     }
-    kept.push(ContextSlice::User(Cow::Owned(omitted_notice(&dropped))));
+    kept.push(ContextSlice::User(Cow::Owned(omitted_text(session, &dropped))));
     kept.extend(slices.iter().filter_map(|slice| match slice {
         ContextSlice::Round { number, .. } if !dropped.contains(number) => Some(slice.clone()),
         _ => None,
@@ -111,6 +153,16 @@ pub fn compact<'a>(
             dropped,
         },
     )
+}
+
+/// 被省略历史处显示的文本：有覆盖全部被裁轮次的摘要就用摘要，否则用
+/// 占位说明。摘要没覆盖全时宁可保守——把没被摘要的那几轮说成"已概括"
+/// 会诱导模型把没看过的内容当成看过的。
+fn omitted_text(session: &Session, dropped: &[u32]) -> String {
+    match session.summary() {
+        Some(summary) if summary.covers_all(dropped) => summary.text.clone(),
+        _ => omitted_notice(dropped),
+    }
 }
 
 /// 被省略历史的占位说明。
@@ -161,6 +213,7 @@ mod tests {
         ContextBudget {
             max_rounds,
             keep_task: true,
+            summarize: None,
         }
     }
 
@@ -210,6 +263,7 @@ mod tests {
         let no_task = ContextBudget {
             max_rounds: 1,
             keep_task: false,
+            summarize: None,
         };
         let (slices, _) = compact(&session, &no_task);
         let Some(ContextSlice::User(first)) = slices.first() else {
@@ -262,5 +316,77 @@ mod tests {
 
         assert_eq!(session.rounds(), rounds_before);
         assert_eq!(session.turns().len(), turns_before);
+    }
+
+    // ── 摘要：有则用、不全覆盖则退回占位、纯函数不调模型 ─────────────
+
+    /// 给会话挂一段覆盖 `from..=to` 轮的摘要。
+    fn with_summary(session: &mut Session, from: u32, to: u32) {
+        session.set_summary(Summary {
+            covers: (from, to),
+            text: format!("摘要：第 {from}-{to} 轮做了什么事"),
+        });
+    }
+
+    fn second_slice_text(slices: &[ContextSlice<'_>]) -> String {
+        match slices.get(1) {
+            Some(ContextSlice::User(text)) => text.to_string(),
+            other => panic!("第二位应是用户消息（占位/摘要），实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn without_summary_the_placeholder_behaviour_is_unchanged() {
+        let session = session_with_rounds(6);
+        let (slices, _) = compact(&session, &budget(2));
+
+        let text = second_slice_text(&slices);
+        assert!(text.contains("已省略第 1-4 轮"), "{text}");
+        assert!(!text.contains("摘要"), "没有摘要时不应出现摘要文本: {text}");
+    }
+
+    #[test]
+    fn summary_covering_all_dropped_rounds_replaces_the_placeholder() {
+        let mut session = session_with_rounds(6);
+        with_summary(&mut session, 1, 4);
+        let (slices, _) = compact(&session, &budget(2));
+
+        let text = second_slice_text(&slices);
+        assert!(text.contains("摘要：第 1-4 轮做了什么事"), "{text}");
+        assert!(!text.contains("已省略"), "摘要覆盖全部被裁轮次时不应再出现占位说明: {text}");
+    }
+
+    #[test]
+    fn partial_summary_falls_back_to_the_placeholder() {
+        let mut session = session_with_rounds(6);
+        // 摘要只覆盖第 1-2 轮，被裁的第 3、4 轮在覆盖范围外。
+        with_summary(&mut session, 1, 2);
+        let (slices, _) = compact(&session, &budget(2));
+
+        let text = second_slice_text(&slices);
+        assert!(text.contains("已省略第 1-4 轮"), "{text}");
+        assert!(!text.contains("摘要"), "部分覆盖时不得把没摘要的轮次说成已概括: {text}");
+    }
+
+    #[test]
+    fn compact_stays_pure_when_a_summary_is_set() {
+        let mut session = session_with_rounds(5);
+        with_summary(&mut session, 1, 3);
+        let summary_before = session.summary().cloned();
+        let turns_before = session.turns().len();
+
+        let (first, _) = compact(&session, &budget(2));
+        let (second, _) = compact(&session, &budget(2));
+
+        assert_eq!(first, second, "同一输入两次裁剪结果一致（无隐藏状态变更）");
+        assert_eq!(session.summary(), summary_before.as_ref(), "摘要不被裁剪改动");
+        assert_eq!(session.turns().len(), turns_before);
+        assert!(
+            first.iter().any(|slice| match slice {
+                ContextSlice::User(text) => text.contains("摘要"),
+                _ => false,
+            }),
+            "裁剪结果里应出现摘要文本"
+        );
     }
 }

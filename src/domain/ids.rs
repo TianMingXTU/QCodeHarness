@@ -56,3 +56,25 @@ impl fmt::Display for CallId {
         f.write_str(&self.0)
     }
 }
+
+/// 工程任务标识。一次编排（可能横跨多个会话）对应一个任务。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TaskId(String);
+
+impl TaskId {
+    /// 用给定文本构造。调用方负责保证其唯一性。
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    /// 只读访问内部文本。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}

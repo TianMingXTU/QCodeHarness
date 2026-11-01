@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use rig::error::ProviderError;
 
+use crate::application::snapshot::StoreError;
+use crate::domain::ids::SessionId;
 use crate::domain::session::SessionError;
+use crate::domain::task::TaskError;
 
 /// 应用层错误。
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +19,15 @@ pub enum ApplicationError {
     /// 模型调用失败（网络、鉴权、限流、协议错误）。
     #[error("模型调用失败: {0}")]
     Model(#[from] ProviderError),
+
+    /// 单次模型调用超过时限仍未响应。与 [`ApplicationError::Model`] 分开报：
+    /// 预算只在轮与轮之间检查，挂死的连接永远走不到检查点，必须在
+    /// 网关层把单次调用兜住。
+    #[error("模型调用超过 {seconds} 秒未响应，已中止；检查网络或服务状态后用 --resume 从断点继续")]
+    ModelTimeout {
+        /// 超时时限（秒）。
+        seconds: u64,
+    },
 
     /// 会话状态被破坏。正常流程不会出现，出现即编程错误。
     #[error("会话状态被破坏: {0}")]
@@ -28,9 +40,10 @@ pub enum ApplicationError {
         max_turns: u32,
     },
 
-    /// 整体墙钟超时。与轮数耗尽分开报：两者的对策不同——前者调大时限
-    /// 或拆小任务，后者调大 LLM_MAX_TURNS。
-    #[error("整体耗时 {elapsed:?} 超过上限 {limit:?}，任务终止；请调大 QCH_MAX_WALL_CLOCK 或拆小任务")]
+    /// 墙钟超时。与轮数耗尽分开报：两者的对策不同——前者调大时限
+    /// 或拆小任务，后者调大 LLM_MAX_TURNS。编排模式下每个步骤的
+    /// 会话各自计时，这里报的是该步会话的耗时。
+    #[error("耗时 {elapsed:?} 超过上限 {limit:?}，任务终止；请调大 QCH_MAX_WALL_CLOCK 或拆小任务")]
     WallClockExhausted {
         /// 实际耗时。
         elapsed: Duration,
@@ -56,4 +69,37 @@ pub enum ApplicationError {
     /// 正常流程不会出现；真出现说明 `RunState` 被外部篡改或状态机被跳过。
     #[error("内部状态错误：没有待配平的轮次")]
     NoPendingRound,
+
+    /// 快照读写失败。恢复路径上出现即终止：快照坏了还继续跑，
+    /// 等于拿着未知的历史做决策。
+    #[error("快照存储失败: {0}")]
+    Snapshot(#[from] StoreError),
+
+    /// 任务状态机拒绝。编排器驱动 `Task` 时才会撞上它。
+    #[error("任务状态错误: {0}")]
+    Task(#[from] TaskError),
+
+    /// 编排中某一步失败。原错误的对策指引在 `message` 里，
+    /// 外层再标明是哪一步，调用方才知道断在流程的哪个位置。
+    /// 已完成步骤的会话 ID 一并带出：失败时刻就能按 ID 翻证据
+    /// 或 `--resume`，不必再 `--list-sessions` 里找。
+    #[error("{message}")]
+    StepFailed {
+        /// 失败的步骤（1-based，给人看）。
+        step: usize,
+        /// 失败原因，含原错误信息。
+        message: String,
+        /// 本次运行中已完成步骤的会话 ID（失败的那步不在其中）。
+        step_sessions: Vec<SessionId>,
+    },
+
+    /// 证据文件初始化失败。与快照错误同理：没有证据的运行不可复盘，
+    /// 宁可让这一步失败也不要静默丢审计。
+    #[error("证据初始化失败: {0}")]
+    EvidenceInit(String),
+
+    /// 历史摘要生成失败。摘要只是优化：调用方应降级为占位说明并继续，
+    /// 而不是把这个错误抛给任务。
+    #[error("历史摘要生成失败: {0}")]
+    SummaryFailed(String),
 }

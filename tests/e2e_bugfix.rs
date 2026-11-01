@@ -123,6 +123,7 @@ async fn fixes_a_failing_test_in_an_isolated_repo() {
             clock: Arc::new(SystemClock),
             policy: PolicyEngine::new(),
             context_budget: Default::default(),
+            session_store: None,
         },
     );
 

@@ -3,11 +3,13 @@
 //! 领域层的 Agent 类型表达"一轮交互"的完整信息，不依赖 rig 的消息类型——
 //! rig 的 `AssistantContent` 是协议层的表示，会随框架版本变，不能渗进领域。
 
+use serde::{Deserialize, Serialize};
+
 use super::tool::ToolCall;
 
 /// Agent 角色。P0 只有单一编码助手；先留出枚举位置，
 /// 多 Agent 编排（P4/P5）时按角色分化行为，不必改调用方。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentRole {
     /// 编码助手：读写文件、回答问题。
     Coder,
@@ -22,7 +24,9 @@ pub enum AgentRole {
 /// 工具规格也不在这里：P2 起模型可见的工具由 `ToolRegistry` 提供，
 /// 与执行入口绑在一起（`ModelRequest.tools`），避免"spec 声明了工具
 /// 却没人执行它"的双源头漂移。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// 可序列化：快照要把它一起存，恢复时才能用回同一份系统提示词。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSpec {
     /// 角色。
     pub role: AgentRole,
@@ -34,7 +38,7 @@ pub struct AgentSpec {
 ///
 /// 刻意不是 rig 的 `AssistantContent`：领域只关心"想了什么、想调什么"，
 /// 不关心协议里还有哪些内容块类型。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentTurn {
     /// 模型本轮输出的文本，即"思考"；部分模型直接给调用而文本为空。
     pub text: String,

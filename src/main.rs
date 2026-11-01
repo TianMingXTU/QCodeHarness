@@ -10,27 +10,36 @@
 //! 集成测试因此能用与生产完全相同的装配路径。
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rig::providers::openai::OpenAIConfig;
-use qcode_harness::application::agent_run::AgentRunner;
+use qcode_harness::application::agent_run::{
+    new_session_id, AgentDependencies, AgentRunner, RunState,
+};
+use qcode_harness::application::error::ApplicationError;
+use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{ApprovalGate, EvidenceSink};
+use qcode_harness::application::snapshot::{RunSnapshot, SessionStore};
 use qcode_harness::application::tool_registry::ToolRegistry;
 use qcode_harness::domain::agent::{AgentRole, AgentSpec};
 use qcode_harness::domain::budget::Budget;
+use qcode_harness::domain::context::ContextBudget;
+use qcode_harness::domain::ids::{SessionId, TaskId};
+use qcode_harness::domain::session::Turn;
+use qcode_harness::domain::task::TaskKind;
 use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
 use qcode_harness::infrastructure::clock::SystemClock;
 use qcode_harness::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
+use qcode_harness::infrastructure::evidence::memory::MemoryEvidenceSink;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 use qcode_harness::infrastructure::policy;
+use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::tool::all_tools;
 use qcode_harness::interface::cli::{self, ConsoleReporter};
-
-use qcode_harness::application::agent_run::AgentDependencies;
 
 /// `LLM_MAX_TURNS` 未设置时的默认最大轮数。
 const DEFAULT_MAX_TURNS: u32 = 20;
@@ -63,8 +72,12 @@ struct LlmConfig {
     policy_path: Option<PathBuf>,
     /// 是否跳过人工审批。`--yes` 或 `QCH_AUTO_APPROVE=1` 时为真。
     auto_approve: bool,
-    /// 整体墙钟上限（秒）。未设置时不限时。
+    /// 墙钟上限（秒）。编排模式下每步的会话各自计时（单步上限）；
+    /// `--resume` 时是本次恢复运行的上限。未设置时不限时。
     max_wall_clock: Option<Duration>,
+    /// 被裁历史累积到多少轮才生成一次 LLM 摘要。未设置时不做摘要
+    /// （裁剪退回占位说明，P3 行为）。
+    summarize_min_dropped: Option<usize>,
 }
 
 impl LlmConfig {
@@ -73,7 +86,7 @@ impl LlmConfig {
     /// 必需变量：`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`；
     /// 可选变量：`LLM_MAX_TURNS`（默认 20）、`QCH_POLICY`（策略配置路径）、
     /// `QCH_AUTO_APPROVE`（设为 `1` 时跳过人工审批）、
-    /// `QCH_MAX_WALL_CLOCK`（整体墙钟上限，秒）。
+    /// `QCH_MAX_WALL_CLOCK`（墙钟上限，秒；编排模式下为单步上限）。
     ///
     /// # Errors
     ///
@@ -98,6 +111,15 @@ impl LlmConfig {
             }
             Err(_) => None,
         };
+        let summarize_min_dropped = match std::env::var("QCH_SUMMARIZE_MIN_DROPPED") {
+            Ok(text) => {
+                let count: usize = text
+                    .parse()
+                    .map_err(|_| format!("QCH_SUMMARIZE_MIN_DROPPED 不是合法整数: {text}"))?;
+                Some(count.max(1))
+            }
+            Err(_) => None,
+        };
         Ok(Self {
             base_url: required("LLM_BASE_URL")?,
             api_key: required("LLM_API_KEY")?,
@@ -106,6 +128,7 @@ impl LlmConfig {
             policy_path: std::env::var_os("QCH_POLICY").map(PathBuf::from),
             auto_approve: std::env::var("QCH_AUTO_APPROVE").as_deref() == Ok("1"),
             max_wall_clock,
+            summarize_min_dropped,
         })
     }
 }
@@ -120,8 +143,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     };
 
-    let config = LlmConfig::from_env()?;
     let workspace = std::env::current_dir()?;
+    let store = Arc::new(JsonSessionStore::new(&workspace));
+
+    // 列清单不需要模型配置：没配 API key 也应该能看有哪些会话可恢复。
+    if args.list_sessions {
+        return list_sessions(store.as_ref());
+    }
+
+    let config = LlmConfig::from_env()?;
 
     // 命令行开关优先于环境变量：显式敲 --yes 的意图比配置文件里的默认值更强。
     let auto_approve = args.auto_approve || config.auto_approve;
@@ -140,12 +170,90 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 工具注册表：组装入口一次给出全部内置工具，规格与执行入口已绑定。
     let registry = ToolRegistry::new(all_tools(WorkspaceRoot::new(workspace.clone())));
+
+    let approvals: Arc<dyn ApprovalGate> = if auto_approve {
+        Arc::new(AutoApproveGate)
+    } else {
+        Arc::new(CliApprovalGate::new())
+    };
+    let clock = Arc::new(SystemClock);
+    let reporter = Arc::new(ConsoleReporter::new(config.max_turns));
+
+    let mut budget = Budget::new(config.max_turns);
+    if let Some(limit) = config.max_wall_clock {
+        budget = budget.with_wall_clock(limit);
+    }
+
+    // 上下文预算：默认只做确定性裁剪（占位说明）；设了阈值才为被裁
+    // 历史花摘要调用——摘要是多花一次模型调用的可选项，默认关。
+    let context_budget = config
+        .summarize_min_dropped
+        .map_or(ContextBudget::default(), |min| {
+            ContextBudget::default().with_summarize(min)
+        });
+
+    // ── 恢复模式：任务、系统提示词与历史都来自快照，不重新拼装。──
+    if let Some(id_text) = args.resume {
+        let session_id = SessionId::new(id_text);
+        let Some(snapshot) = store
+            .load(&session_id)
+            .map_err(|error| format!("读取快照失败: {error}"))?
+        else {
+            eprintln!(
+                "没有找到会话 {} 的快照；用 --list-sessions 查看可恢复的会话",
+                session_id.as_str()
+            );
+            std::process::exit(1);
+        };
+        // 证据追加到同一份文件：恢复的运行是同一会话的延续，
+        // 复盘时一个 ID 看到全貌。
+        let evidence_path = session_path(&workspace, session_id.as_str());
+        let evidence = fanout_evidence(&evidence_path, reporter.clone())?;
+        println!(
+            "恢复会话 {}（已 {} 轮，停在: {}）",
+            session_id.as_str(),
+            rounds_of(&snapshot),
+            state_label(&snapshot.state),
+        );
+        let runner = match AgentRunner::resume(
+            snapshot,
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(model.erase())),
+                tools: registry,
+                approvals,
+                evidence,
+                clock,
+                policy,
+                context_budget,
+                session_store: Some(store.clone()),
+            },
+        ) {
+            Ok(runner) => runner,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+        run_and_report(runner, &budget, &evidence_path).await;
+        return Ok(());
+    }
+
+    let task = args.task.expect("parse_args 保证：非 list/resume 模式必有任务描述");
+
+    // --kind 选模板；不传默认 bug-fix（最常见）。
+    let kind_text = args.kind.as_deref().unwrap_or(TaskKind::BugFix.name());
+    let Some(kind) = TaskKind::parse_name(kind_text) else {
+        eprintln!("未知的任务类型 {kind_text}；可用: bug-fix / feature / review / refactor");
+        std::process::exit(2);
+    };
+
     let spec = AgentSpec {
         role: AgentRole::Coder,
         system_prompt: SYSTEM_PROMPT.to_owned(),
     };
 
-    println!("任务: {}", args.task);
+    println!("任务: {task}");
+    println!("类型: {} 模板", kind.name());
     println!("模型: {} @ {}", config.model, config.base_url);
     println!(
         "工具: {}",
@@ -162,52 +270,144 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("审批: 交互式（每次副作用工具执行前询问）");
     }
 
-    let reporter = Arc::new(ConsoleReporter::new(config.max_turns));
-
-    // 会话 ID 必须在这里先定下来：证据文件名要用它，而 AgentRunner
-    // 是在自己内部生成 ID 的——先建 runner 再取 ID 会让证据写进
-    // 一个名字对不上的文件。所以这里自己生成，再交给 runner 用。
-    let clock = Arc::new(SystemClock);
-    let session_id = qcode_harness::application::agent_run::new_session_id(&*clock);
-    let evidence_path = session_path(&workspace, session_id.as_str());
-
-    // 证据走两个汇：控制台播报给人看，JSONL 落盘给事后查。
-    // 组合而不是二选一——运行时想看进度，出事后要能复盘，两者都需要。
-    let jsonl = JsonlEvidenceSink::open(&evidence_path)?;
-    let evidence = Arc::new(FanoutEvidenceSink::new(vec![
-        Arc::new(jsonl),
-        reporter.clone() as Arc<dyn EvidenceSink>,
-    ]));
-
-    let approvals: Arc<dyn ApprovalGate> = if auto_approve {
-        Arc::new(AutoApproveGate)
-    } else {
-        Arc::new(CliApprovalGate::new())
+    // 每步一份证据：独立的 JSONL 文件（与会话 ID 同名）+ 一个新的控制台
+    // 播报器（轮次号每步从头计，复用旧播报器会丢步骤 2-4 的分隔线）。
+    let evidence_factory: EvidenceFactory = {
+        let workspace = workspace.clone();
+        Arc::new(move |session_id: &SessionId| {
+            let path = session_path(&workspace, session_id.as_str());
+            let jsonl = JsonlEvidenceSink::open(&path)?;
+            Ok(Arc::new(FanoutEvidenceSink::new(vec![
+                Arc::new(jsonl),
+                Arc::new(ConsoleReporter::new(config.max_turns)) as Arc<dyn EvidenceSink>,
+            ])) as Arc<dyn EvidenceSink>)
+        })
     };
 
-    let mut runner = AgentRunner::new(
-        spec,
-        session_id,
-        args.task,
-        AgentDependencies {
-            model: Arc::new(RigChatGateway::new(model.erase())),
-            tools: registry,
-            approvals,
-            evidence,
-            clock,
-            policy,
-            context_budget: Default::default(),
-        },
-    );
+    // 任务 ID 复用会话 ID 的生成策略：唯一、可读，证据/快照同名可互查。
+    let task_id = TaskId::new(new_session_id(&*clock).as_str());
 
-    let mut budget = Budget::new(config.max_turns);
-    if let Some(limit) = config.max_wall_clock {
-        budget = budget.with_wall_clock(limit);
+    let deps = AgentDependencies {
+        model: Arc::new(RigChatGateway::new(model.erase())),
+        tools: registry,
+        approvals,
+        clock,
+        policy,
+        context_budget,
+        // 编排器每步用工厂另造证据汇，这个占位不会被步骤用到；
+        // deps 的形状要求它有值。
+        evidence: Arc::new(MemoryEvidenceSink::new()),
+        // 快照落盘随运行自动开启；--resume 可从任一步的会话恢复。
+        session_store: Some(store.clone()),
+    };
+    let mut orchestrator = Orchestrator::new(deps, budget, spec, evidence_factory);
+    let mut task = orchestrator.create_task(task_id, kind, &task);
+
+    let outcome = match orchestrator.run(&mut task).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("{error}");
+            // 失败时刻把已完成步骤的会话 ID 给出来：证据文件按会话 ID
+            // 命名，用户拿到 ID 就能翻证据或 --resume，不用再翻目录。
+            if let ApplicationError::StepFailed { step_sessions, .. } = &error {
+                if !step_sessions.is_empty() {
+                    eprintln!(
+                        "已完成步骤的会话: {}",
+                        step_sessions
+                            .iter()
+                            .map(|id| id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
+            std::process::exit(1);
+        }
+    };
+
+    println!("\n──── 最终答案 ────\n{}", outcome.answer);
+    let (done, total) = task.progress();
+    println!(
+        "\n（任务 {} · {}/{} 步 · 步骤会话: {}）",
+        task.id(),
+        done,
+        total,
+        outcome
+            .step_sessions
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
+/// `--list-sessions`：列出可恢复的会话与各自停在哪里。
+fn list_sessions(store: &dyn qcode_harness::application::snapshot::SessionStore) -> Result<(), Box<dyn Error>> {
+    let ids = store.list()?;
+    if ids.is_empty() {
+        println!("还没有可恢复的会话。跑完一个任务后，快照会自动存到 .qcodeharness/snapshots/。");
+        return Ok(());
     }
+    println!("可恢复的会话（共 {} 个）：", ids.len());
+    for id in ids {
+        match store.load(&id) {
+            Ok(Some(snapshot)) => {
+                println!(
+                    "  {}  已 {} 轮  停在: {}",
+                    id.as_str(),
+                    rounds_of(&snapshot),
+                    state_label(&snapshot.state),
+                );
+            }
+            Ok(None) => {}
+            // 单个坏文件不拖垮整个清单：标注后继续列其他的。
+            Err(error) => println!("  {}  （快照不可读: {error}）", id.as_str()),
+        }
+    }
+    Ok(())
+}
+
+/// 快照历史里已提交的轮数：Agent 消息条数即轮数（与 `Session::rounds` 同口径）。
+fn rounds_of(snapshot: &RunSnapshot) -> u32 {
+    snapshot
+        .session
+        .turns
+        .iter()
+        .filter(|turn| matches!(turn, Turn::Agent(_)))
+        .count() as u32
+}
+
+/// 状态机位置的人话标签，给 `--list-sessions` 与 `--resume` 的提示用。
+fn state_label(state: &RunState) -> &'static str {
+    match state {
+        RunState::AwaitingModel => "等模型回复",
+        RunState::Evaluating(_) => "评估工具调用",
+        RunState::AwaitingApproval(_) => "等待人工审批",
+        RunState::Dispatching(_) => "执行工具中",
+        RunState::Completed(_) => "已完成",
+    }
+}
+
+/// 组装证据扇出：控制台播报给人看，JSONL 落盘给事后查。
+/// 新任务与恢复两条入口共用。
+fn fanout_evidence(
+    evidence_path: &Path,
+    reporter: Arc<ConsoleReporter>,
+) -> std::io::Result<Arc<dyn EvidenceSink>> {
+    let jsonl = JsonlEvidenceSink::open(evidence_path)?;
+    Ok(Arc::new(FanoutEvidenceSink::new(vec![
+        Arc::new(jsonl),
+        reporter as Arc<dyn EvidenceSink>,
+    ])))
+}
+
+/// 跑到底并汇报结果。新任务与恢复两条入口共用的尾巴。
+async fn run_and_report(mut runner: AgentRunner, budget: &Budget, evidence_path: &Path) {
     // 错误要按 Display 打印而不是交给 Box<dyn Error> 的 Debug：错误消息里的
     // 对策指引（"调大 LLM_MAX_TURNS"这类）是写给用户看的，Debug 格式会把
     // 它变成一个结构体转储。
-    let outcome = match runner.run(&budget).await {
+    let outcome = match runner.run(budget).await {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!("{error}");
@@ -221,7 +421,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         outcome.turns_used,
         evidence_path.display()
     );
-    Ok(())
 }
 
 /// 把同一条事件分发给多个证据汇。

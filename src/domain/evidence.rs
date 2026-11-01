@@ -93,6 +93,29 @@ pub enum AuditEvent {
         /// 被丢弃的轮次号。
         dropped: Vec<u32>,
     },
+    /// 为被裁历史额外花了一次模型调用生成摘要。
+    ///
+    /// 事后翻 JSONL 要能回答"这一轮为什么多了一次调用"——没有这条，
+    /// token 账对不上；有了它，摘要的覆盖范围与用量都可查。
+    SummaryGenerated {
+        /// 即将进入的轮次号。
+        turn: u32,
+        /// 摘要覆盖的轮次范围（含）。
+        covers: (u32, u32),
+        /// 这次摘要调用的 token 用量。
+        usage: TokenUsage,
+    },
+    /// 摘要调用失败，历史退回占位说明。
+    ///
+    /// 与 `SummaryGenerated` 成对：摘要是一次真实的模型调用，失败了也是
+    /// 花掉的时间与配额——没有这条，JSONL 里只看到多等了一会儿却什么
+    /// 都没发生，token 账与耗时都对不上。
+    SummaryFailed {
+        /// 即将进入的轮次号。
+        turn: u32,
+        /// 失败原因。
+        reason: String,
+    },
 }
 
 impl AuditEvent {
@@ -104,7 +127,9 @@ impl AuditEvent {
             | Self::ToolObserved { turn, .. }
             | Self::ApprovalDecided { turn, .. }
             | Self::PolicyEvaluated { turn, .. }
-            | Self::ContextCompacted { turn, .. } => *turn,
+            | Self::ContextCompacted { turn, .. }
+            | Self::SummaryGenerated { turn, .. }
+            | Self::SummaryFailed { turn, .. } => *turn,
         }
     }
 }

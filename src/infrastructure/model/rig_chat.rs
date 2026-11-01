@@ -6,6 +6,9 @@
 //! 真实模型和 `MockCompletionModel` 擦除后是同一类型，所以
 //! 生产和测试走的是同一条代码路径。
 
+use std::future::Future;
+use std::time::Duration;
+
 use rig::completion::{
     AssistantContent, AssistantMessage, CompletionRequest, CompletionResponse, Message,
     ToolAnnotations as RigToolAnnotations, ToolDefinition, Usage,
@@ -13,6 +16,7 @@ use rig::completion::{
 use rig::driver::DynModel;
 use rig::message::{CallId as RigCallId, ToolCall as RigToolCall, ToolFunction, ToolName, ToolResult, ToolResultContent};
 use rig::operation::Completion;
+use tokio::time::timeout;
 
 use crate::application::error::ApplicationError;
 use crate::application::port::{BoxFuture, ModelGateway, ModelReply, ModelRequest};
@@ -22,16 +26,32 @@ use crate::domain::ids::CallId;
 use crate::domain::session::ContextSlice;
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 
+/// 单次模型调用的默认时限。慢模型的完整输出实测可达 60 秒以上，
+/// 取 300 秒兜底"连接挂死"而非"生成得慢"；预算的墙钟维度只在
+/// 轮与轮之间生效，覆盖不到挂死的单次调用，所以这层必须在网关兜住。
+const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// 模型网关：包住一个已擦除的 rig 模型。
 #[derive(Clone, Debug)]
 pub struct RigChatGateway {
     model: DynModel<Completion>,
+    /// 单次调用的时限。reqwest 默认没有总超时：连接挂死时请求永远
+    /// 不返回，整个任务卡在"等模型回复"。
+    call_timeout: Duration,
 }
 
 impl RigChatGateway {
-    /// 用擦除后的模型构造网关。
+    /// 用擦除后的模型构造网关，带默认调用时限。
     pub fn new(model: DynModel<Completion>) -> Self {
-        Self { model }
+        Self {
+            model,
+            call_timeout: DEFAULT_MODEL_TIMEOUT,
+        }
+    }
+
+    /// 自定义单次调用时限（测试与特殊网络环境用）。
+    pub fn with_timeout(model: DynModel<Completion>, call_timeout: Duration) -> Self {
+        Self { model, call_timeout }
     }
 }
 
@@ -43,15 +63,30 @@ impl ModelGateway for RigChatGateway {
         // DynModel::call 内部克隆 Arc，返回 'static future，
         // 所以先取出模型再 move 进装箱的 future，不借用 self。
         let model = self.model.clone();
+        let call_timeout = self.call_timeout;
         Box::pin(async move {
             let request = build_request(&request.history, request.spec, request.tools)?;
-            let response = model.call(request).await?;
+            // 双层 ?：外层是调用时限（ModelTimeout），内层是 provider 错误（Model）。
+            let response = with_call_timeout(model.call(request), call_timeout).await??;
             Ok(ModelReply {
                 turn: AgentTurn::from(&response),
                 usage: TokenUsage::from(&response.usage),
             })
         })
     }
+}
+
+/// 给一次模型调用套上时限：超时返回 [`ApplicationError::ModelTimeout`]，
+/// 不让挂死的连接把整个任务冻在"等模型回复"。
+async fn with_call_timeout<F, T>(future: F, limit: Duration) -> Result<T, ApplicationError>
+where
+    F: Future<Output = T>,
+{
+    timeout(limit, future)
+        .await
+        .map_err(|_| ApplicationError::ModelTimeout {
+            seconds: limit.as_secs(),
+        })
 }
 
 /// 把裁剪后的历史片段与规格翻译成 rig 的请求。
@@ -310,6 +345,16 @@ mod tests {
                 output_tokens: 7
             }
         );
+    }
+
+    #[tokio::test]
+    async fn hung_model_call_is_cut_off_at_the_timeout() {
+        // 永不完成的 future 模拟挂死的连接：时限一到必须报错，
+        // 而不是把任务永远冻在"等模型回复"。
+        let error = with_call_timeout(std::future::pending::<CompletionResponse>(), Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApplicationError::ModelTimeout { seconds: 0 }), "{error}");
     }
 
     #[test]

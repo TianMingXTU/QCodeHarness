@@ -13,6 +13,10 @@ use crate::application::port::{BoxFuture, ToolInvoker};
 /// 一个工具的完整登记：模型看到的规格 + 真正执行它的入口。
 ///
 /// 两个字段绑在一起，spec 与执行器就不可能各自漂移。
+///
+/// 可克隆：编排器（P4）每步要用同一套依赖克隆出新的 runner，
+/// `Arc` 的克隆只是引用计数 +1，真正的工具实现不会跟着复制。
+#[derive(Clone)]
 pub struct ToolEntry {
     /// 模型可见的规格（名字、描述、参数 schema、风险注解）。
     pub spec: ToolSpec,
@@ -26,6 +30,7 @@ pub struct ToolEntry {
 /// 用 `Vec` 而不是 `HashMap`：工具数量是个位数到十几个，线性查找没有
 /// 可观测的开销；而 `Vec` 保序，"注册表里有哪些工具"能以注册顺序呈现，
 /// 调试时工具列表是稳定的。
+#[derive(Clone)]
 pub struct ToolRegistry {
     entries: Vec<ToolEntry>,
 }

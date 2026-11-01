@@ -12,6 +12,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::agent::{AgentSpec, AgentTurn};
 use crate::domain::evidence::{AuditEvent, TokenUsage};
 use crate::domain::session::ContextSlice;
@@ -77,7 +79,9 @@ pub trait ToolInvoker: Send + Sync {
 }
 
 /// 一次审批请求：某个工具即将以给定参数执行。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// 可序列化：快照要记下"停在哪次审批上"，恢复后才能把同一请求重新递给闸门。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     /// 当前轮次号。
     pub turn: u32,

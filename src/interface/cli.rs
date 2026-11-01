@@ -16,37 +16,93 @@ const OBSERVE_PREVIEW_CHARS: usize = 400;
 
 /// 用法说明，参数缺失时打印。
 pub const USAGE: &str = "\
-用法: cargo run -- [--yes] \"任务描述\"
+用法: cargo run -- [--yes] [--kind <模板>] \"任务描述\"
+      cargo run -- --list-sessions
+      cargo run -- [--yes] --resume <会话ID>
 示例: cargo run -- \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
-      cargo run -- --yes \"非交互场景下跑同一个任务\"";
+      cargo run -- --yes \"非交互场景下跑同一个任务\"
+      cargo run -- --list-sessions
+      cargo run -- --resume <会话ID>";
 
 /// 解析出的命令行参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CliArgs {
-    /// 要完成的任务描述。
-    pub task: String,
+    /// 要完成的任务描述。`--resume` 沿用快照里的原任务、
+    /// `--list-sessions` 只列清单，两种模式下可以缺省。
+    pub task: Option<String>,
     /// 跳过人工审批，所有工具自动放行。
     pub auto_approve: bool,
+    /// 要恢复的会话 ID（`--resume <id>`）。
+    pub resume: Option<String>,
+    /// 只列出可恢复的会话（`--list-sessions`），然后退出。
+    pub list_sessions: bool,
+    /// 任务模板名（`--kind <name>`），交给任务编排（P4-2）解析。
+    pub kind: Option<String>,
 }
 
 /// 解析命令行参数。
-///
-/// 只用 `std::env::args`，不接 `clap`——两个参数不值得引一个依赖。
-/// `--yes` 是唯一支持的开关，且必须出现在任务描述之前。
 pub fn parse_args() -> Option<CliArgs> {
-    let mut args = std::env::args().skip(1);
+    parse_from(std::env::args().skip(1))
+}
+
+/// 从给定参数列表解析。与 [`parse_args`] 的分工：后者读真实环境，
+/// 这个纯函数可测试。
+///
+/// 开关可以在任何位置出现；剩下的第一个位置参数是任务描述。
+/// 不接 `clap`——个位数开关不值得引一个依赖。
+pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut auto_approve = false;
+    let mut resume = None;
+    let mut list_sessions = false;
+    let mut kind = None;
+    let mut positional: Vec<String> = Vec::new();
 
-    // 先吃掉开关，剩下的第一个位置参数就是任务。
-    // 这样 `cargo run -- --yes "任务"` 和 `cargo run -- "任务"` 都能用。
-    let task = loop {
-        match args.next()?.as_str() {
+    let mut iter = argv.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
             "--yes" => auto_approve = true,
-            other => break other.to_owned(),
+            "--list-sessions" => list_sessions = true,
+            "--resume" => match iter.next() {
+                Some(id) => resume = Some(id),
+                None => {
+                    eprintln!("--resume 需要一个会话 ID：--resume <id>");
+                    return None;
+                }
+            },
+            "--kind" => match iter.next() {
+                Some(name) => kind = Some(name),
+                None => {
+                    eprintln!("--kind 需要一个模板名：--kind <模板名>");
+                    return None;
+                }
+            },
+            other => positional.push(other.to_owned()),
         }
-    };
+    }
 
-    Some(CliArgs { task, auto_approve })
+    if positional.len() > 1 {
+        eprintln!("任务描述只能是其中一个位置参数，请用引号包住完整描述");
+        return None;
+    }
+    let task = positional.into_iter().next();
+    // 恢复模式沿用快照里的原任务：再塞一条用户消息会破坏
+    // "助手轮次后面紧跟观察"的配对，也说不清哪条才是真任务。
+    if task.is_some() && resume.is_some() {
+        eprintln!("--resume 会沿用快照里的原任务，不能再另外指定任务描述");
+        return None;
+    }
+    if task.is_none() && resume.is_none() && !list_sessions {
+        eprintln!("缺少任务描述；恢复请用 --resume <id>，查看请用 --list-sessions\n\n{USAGE}");
+        return None;
+    }
+
+    Some(CliArgs {
+        task,
+        auto_approve,
+        resume,
+        list_sessions,
+        kind,
+    })
 }
 
 /// 把审计事件渲染到控制台。
@@ -111,6 +167,15 @@ impl ConsoleReporter {
                     );
                 }
             }
+            AuditEvent::SummaryGenerated { covers, .. } => {
+                // 多花的一次调用要有出处：这行告诉读者"刚才那次慢，
+                // 是在补历史摘要"。
+                println!("[摘要] 已生成第 {}-{} 轮的历史摘要", covers.0, covers.1);
+            }
+            AuditEvent::SummaryFailed { .. } => {
+                // 摘要失败只提示不报错：历史退回占位说明，任务继续跑。
+                println!("[摘要] 生成失败，继续用占位说明");
+            }
             // 审批与 token 用量暂不进控制台，避免淹没主要流程。
             AuditEvent::ApprovalDecided { .. } => {}
         }
@@ -160,6 +225,51 @@ mod tests {
     use crate::domain::ids::CallId;
     use crate::domain::tool::{OutcomeStatus, ToolOutcome};
     use serde_json::json;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn flags_can_appear_in_any_position() {
+        let args = parse_from(argv(&["--kind", "review", "--yes", "检查这段代码"])).unwrap();
+
+        assert_eq!(args.task.as_deref(), Some("检查这段代码"));
+        assert!(args.auto_approve);
+        assert_eq!(args.kind.as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn resume_takes_an_id_instead_of_a_task() {
+        let args = parse_from(argv(&["--yes", "--resume", "session-1"])).unwrap();
+
+        assert_eq!(args.resume.as_deref(), Some("session-1"));
+        assert!(args.task.is_none());
+        assert!(args.auto_approve);
+    }
+
+    #[test]
+    fn list_sessions_needs_no_task() {
+        let args = parse_from(argv(&["--list-sessions"])).unwrap();
+        assert!(args.list_sessions);
+    }
+
+    #[test]
+    fn resume_rejects_a_supplementary_task() {
+        let parsed = parse_from(argv(&["--resume", "session-1", "再干一票"]));
+        assert!(parsed.is_none(), "恢复 + 新任务会破坏历史配对，必须拒绝");
+    }
+
+    #[test]
+    fn dangling_switch_values_are_rejected() {
+        assert!(parse_from(argv(&["--resume"])).is_none());
+        assert!(parse_from(argv(&["--kind"])).is_none());
+    }
+
+    #[test]
+    fn missing_everything_is_none() {
+        assert!(parse_from(std::iter::empty()).is_none());
+    }
 
     fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {

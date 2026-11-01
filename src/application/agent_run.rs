@@ -9,13 +9,15 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::application::error::ApplicationError;
 use crate::application::port::{
     ApprovalGate, ApprovalRequest, Clock, EvidenceSink, ModelGateway, ModelReply,
     ModelRequest,
 };
+use crate::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
+use crate::application::summarizer::{render_slices, SummarizeInput, Summarizer};
 use crate::application::tool_registry::ToolRegistry;
 use crate::domain::agent::{AgentSpec, AgentTurn};
 use crate::domain::budget::{Budget, Consumption};
@@ -23,15 +25,22 @@ use crate::domain::context::{compact, ContextBudget};
 use crate::domain::evidence::AuditEvent;
 use crate::domain::ids::SessionId;
 use crate::domain::policy::{PolicyDecision, PolicyEngine, PolicyVerdict};
-use crate::domain::session::Session;
+use crate::domain::session::{ContextSlice, Session};
 use crate::domain::tool::{ToolCall, ToolOutcome, ToolSpec};
+
+/// 摘要连续失败的上限。给两次机会（瞬态故障实测存在），之后本次运行
+/// 不再重试：持续失败的摘要调用每轮都白花一次模型调用。
+const SUMMARY_FAILURE_LIMIT: u32 = 2;
 
 /// 运行状态机。
 ///
 /// 每一步都是可中断的挂点：超时在 `run` 外层包 `tokio::time::timeout`；
 /// 审批停在 [`RunState::AwaitingApproval`]，把状态序列化后等外部回复；
 /// 恢复就是反序列化状态继续 `step`。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// 可序列化：P4 起快照要把它原样存盘，恢复时从同一个位置继续。
+/// 变体名与语义自 P0 未变，只加了 serde。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RunState {
     /// 准备问模型。
     AwaitingModel,
@@ -57,12 +66,15 @@ pub struct AgentOutcome {
 /// 已交给模型、正在等观察的一轮。
 ///
 /// `outcomes` 的长度就是已处理的调用数，因此不需要单独的下标游标。
-#[derive(Debug)]
-struct PendingRound {
+///
+/// 公开且可序列化：快照要能表达"执行到半轮"的状态，恢复后
+/// `step()` 才能从下一条调用继续，已跑完的观察不会重跑。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PendingRound {
     /// 模型这一轮的完整回复。
-    turn: AgentTurn,
+    pub turn: AgentTurn,
     /// 与 `turn.calls` 同下标一一对应。
-    outcomes: Vec<ToolOutcome>,
+    pub outcomes: Vec<ToolOutcome>,
 }
 
 /// 取消开关：`run()` 在每一轮问模型之前检查它。
@@ -92,6 +104,10 @@ impl CancelHandle {
 /// 收敛成一个结构体而不是一串位置参数：位置参数到第七八个就没人分得清
 /// 哪个是哪个，加一个依赖还要惊动所有调用点；结构体带字段名，构造点
 /// 自解释。没有 `Default`——没有合理的默认模型，缺依赖就该在构造点写明。
+///
+/// 可克隆：编排器（P4-2）每步要克隆一份给新的 runner，`Arc` 字段
+/// 克隆只是引用计数 +1。
+#[derive(Clone)]
 pub struct AgentDependencies {
     /// 模型网关。
     pub model: Arc<dyn ModelGateway>,
@@ -110,6 +126,11 @@ pub struct AgentDependencies {
     pub policy: PolicyEngine,
     /// 上下文预算：发给模型前按它裁剪历史。
     pub context_budget: ContextBudget,
+    /// 快照存储。`None` 表示不做自动保存（单测、不需要恢复的场景）。
+    ///
+    /// 放在依赖里而不是 `run` 的参数里：保存时机是循环内部的事
+    /// （每轮提交后、进审批前），调用方没有更合适的插桩点。
+    pub session_store: Option<Arc<dyn SessionStore>>,
 }
 
 /// ReAct 循环的编排器。
@@ -133,6 +154,8 @@ pub struct AgentRunner {
     /// 裁剪只改"发给模型时怎么看"，不改 `session` 本身——
     /// 证据、审计与将来的恢复都要完整历史。
     context_budget: ContextBudget,
+    /// 快照存储的克隆。`None` 表示不自动保存。
+    session_store: Option<Arc<dyn SessionStore>>,
     /// 取消开关，克隆给外部。
     cancel: CancelHandle,
     spec: AgentSpec,
@@ -140,6 +163,14 @@ pub struct AgentRunner {
     state: RunState,
     consumption: Consumption,
     pending: Option<PendingRound>,
+    /// 墙钟测量锚点：本次 `run()` 的开始时刻。`run()` 入口重置，
+    /// 手动逐 `step()` 驱动时退化为"构造时刻"。
+    run_start: SystemTime,
+    /// 墙钟基数：进入本次 `run()` 前已累计的耗时（恢复时来自快照）。
+    elapsed_base: Duration,
+    /// 连续摘要失败次数。达到上限后本次运行不再重试摘要：
+    /// 持续失败的摘要调用每轮都白花一次模型调用，截断它。
+    summary_failures: u32,
 }
 
 impl AgentRunner {
@@ -165,9 +196,11 @@ impl AgentRunner {
             clock,
             policy,
             context_budget,
+            session_store,
         } = deps;
         let visible_specs = tools.specs();
         let session = Session::new(session_id, task);
+        let run_start = clock.now();
         Self {
             model,
             tools,
@@ -177,13 +210,109 @@ impl AgentRunner {
             clock,
             policy,
             context_budget,
+            session_store,
             cancel: CancelHandle::default(),
             spec,
             session,
             state: RunState::AwaitingModel,
             consumption: Consumption::default(),
             pending: None,
+            run_start,
+            elapsed_base: Duration::ZERO,
+            summary_failures: 0,
         }
+    }
+
+    /// 从快照恢复一个 runner，接着往下跑。
+    ///
+    /// 与 `new()` 的分工：`new()` 从零开始，`resume()` 接手一个已有的
+    /// 会话与状态机位置，两者共享同一套依赖注入方式。
+    /// 取消状态不跨恢复传递——恢复本身是一次新的"继续"意图，
+    /// 旧运行里的取消请求不该惩罚新运行。
+    ///
+    /// 恢复成功后立即把快照再存一次：刚恢复就又崩了的场景下，
+    /// 不能连恢复前的那份都没有（快照点还在旧位置）。
+    ///
+    /// # Errors
+    ///
+    /// 版本不匹配、历史损坏、或状态机位置与待配平轮次不配平（半轮缺
+    /// pending、正常点带 pending、调用清单错位）时返回
+    /// [`ApplicationError::Snapshot`]；历史配对错误经
+    /// [`ApplicationError::Session`] 上抛。
+    pub fn resume(snapshot: RunSnapshot, deps: AgentDependencies) -> Result<Self, ApplicationError> {
+        snapshot.check_version()?;
+        // 半轮状态全靠 pending 续跑（step() 从 outcomes.len() 推下一条调用），
+        // 缺了它 step() 只能报 NoPendingRound——把这种矛盾在入口就拦下。
+        let mid_round = matches!(
+            snapshot.state,
+            RunState::Evaluating(_) | RunState::AwaitingApproval(_) | RunState::Dispatching(_)
+        );
+        if mid_round && snapshot.pending.is_none() {
+            return Err(StoreError::Corrupt(
+                "快照停在半轮状态，但缺少待配平的轮次（pending）".to_owned(),
+            )
+            .into());
+        }
+        // 反向同样要配平：停在正常点（等待模型/已完成）却带着 pending，
+        // 恢复后 step() 会先去配一轮幽灵观察，把历史配错。
+        if !mid_round && snapshot.pending.is_some() {
+            return Err(StoreError::Corrupt(
+                "快照停在正常点，却带有未配平的轮次（pending）".to_owned(),
+            )
+            .into());
+        }
+        // 状态机里记的调用清单必须与待配平轮次一致：step() 按 state 里
+        // 的清单取下一个调用，按 pending 里的清单收观察，两边不一致
+        // 会让调用与观察错位配对。
+        if let (
+            Some(pending),
+            RunState::Evaluating(calls) | RunState::Dispatching(calls),
+        ) = (&snapshot.pending, &snapshot.state)
+        {
+            if calls != &pending.turn.calls {
+                return Err(StoreError::Corrupt(
+                    "状态机记录的调用清单与待配平轮次不一致".to_owned(),
+                )
+                .into());
+            }
+        }
+        let session = Session::from_snapshot(snapshot.session_id.clone(), snapshot.session)?;
+        let AgentDependencies {
+            model,
+            tools,
+            approvals,
+            evidence,
+            clock,
+            policy,
+            context_budget,
+            session_store,
+        } = deps;
+        let visible_specs = tools.specs();
+        let clock_now = clock.now();
+        // 墙钟基数要在 consumption 被移进 runner 之前取出。
+        let elapsed_base = snapshot.consumption.elapsed;
+        let mut runner = Self {
+            model,
+            tools,
+            visible_specs,
+            approvals,
+            evidence,
+            clock,
+            policy,
+            context_budget,
+            session_store,
+            spec: snapshot.spec,
+            session,
+            state: snapshot.state,
+            consumption: snapshot.consumption,
+            pending: snapshot.pending,
+            cancel: CancelHandle::default(),
+            run_start: clock_now,
+            elapsed_base,
+            summary_failures: 0,
+        };
+        runner.save_snapshot();
+        Ok(runner)
     }
 
     /// 会话 ID。
@@ -217,6 +346,9 @@ impl AgentRunner {
                 let reply = self.ask_model().await?;
                 if reply.turn.is_final_answer() {
                     self.state = RunState::Completed(reply.turn.text.clone());
+                    // 终态也存一次快照：任务完成的那一刻，"最后状态"对
+                    // --list-sessions 和事后排查都有价值。
+                    self.save_snapshot();
                     return Ok(RunState::Completed(reply.turn.text));
                 }
 
@@ -274,6 +406,9 @@ impl AgentRunner {
                             annotations: spec.annotations,
                         };
                         self.state = RunState::AwaitingApproval(request.clone());
+                        // 最重要的保存点：等人审批时人可能走开、进程可能被杀，
+                        // 快照必须先落盘，恢复后才能把同一个请求重新递给闸门。
+                        self.save_snapshot();
                         Ok(RunState::AwaitingApproval(request))
                     }
                     // 拒绝：连闸门都不问，直接给模型一条拒绝观察。
@@ -330,15 +465,19 @@ impl AgentRunner {
     /// 外部取消时返回 [`ApplicationError::Cancelled`]——三者可区分，
     /// 调用方能分辨"跑超了"还是"被叫停了"。
     pub async fn run(&mut self, budget: &Budget) -> Result<AgentOutcome, ApplicationError> {
-        let start = self.clock.now();
+        // 每次进入 run() 都重置测量锚点：基数是此前累计的耗时——恢复的
+        // 运行来自快照，接着算墙钟；全新运行的基数是零，行为不变。
+        self.run_start = self.clock.now();
+        self.elapsed_base = self.consumption.elapsed;
         loop {
             // 耗时每个循环都重测：Consumption 只是"已测量结果"的容器，
             // 测量必须走 Clock 端口，domain 不取时间。
-            self.consumption.elapsed = self.clock.elapsed_since(start);
+            self.refresh_elapsed();
             // 取消、超时与轮数预算都只在"准备问模型"之前查：正在分发的
             // 轮次要允许跑完，已花出去的 token 不废在半途。
             if matches!(self.state, RunState::AwaitingModel) {
                 if self.cancel.is_cancelled() {
+                    self.save_snapshot();
                     return Err(ApplicationError::Cancelled);
                 }
                 if budget.exhausted(&self.consumption) {
@@ -346,22 +485,32 @@ impl AgentRunner {
                     // 错误要能指导调用方动作。
                     if let Some(limit) = budget.max_wall_clock {
                         if self.consumption.elapsed >= limit {
+                            self.save_snapshot();
                             return Err(ApplicationError::WallClockExhausted {
                                 elapsed: self.consumption.elapsed,
                                 limit,
                             });
                         }
                     }
+                    self.save_snapshot();
                     return Err(ApplicationError::BudgetExhausted {
                         max_turns: budget.max_turns,
                     });
                 }
             }
-            if let RunState::Completed(answer) = self.step().await? {
-                return Ok(AgentOutcome {
-                    answer,
-                    turns_used: self.consumption.turns,
-                });
+            match self.step().await {
+                Ok(RunState::Completed(answer)) => {
+                    return Ok(AgentOutcome {
+                        answer,
+                        turns_used: self.consumption.turns,
+                    });
+                }
+                Ok(_) => {}
+                // 出错也存一次：任务没完成，下次从这里接。
+                Err(error) => {
+                    self.save_snapshot();
+                    return Err(error);
+                }
             }
         }
     }
@@ -370,6 +519,12 @@ impl AgentRunner {
     async fn ask_model(&mut self) -> Result<ModelReply, ApplicationError> {
         // 先克隆 Arc：否则请求借着 self 的字段，而它们紧接着就要被改写。
         let model = self.model.clone();
+        // 先探测一次裁剪：被裁轮次值得摘要且现有摘要没覆盖时，
+        // 先补摘要再正式裁——摘要是挂点，补完后下面的 compact 会带上它。
+        let (_, probe) = compact(&self.session, &self.context_budget);
+        if !probe.dropped.is_empty() && self.should_summarize(&probe.dropped) {
+            self.refresh_summary(&probe.dropped).await;
+        }
         // 裁剪是发给模型前的视图变换：请求里只放模型真正看到的东西。
         // 丢了历史就留一条证据，事后翻 JSONL 能对出"第 N 轮模型看到了什么"。
         let (history, report) = compact(&self.session, &self.context_budget);
@@ -386,7 +541,16 @@ impl AgentRunner {
             spec: &self.spec,
             tools: &self.visible_specs,
         };
-        let reply = model.complete(request).await?;
+        let reply = model.complete(request.clone()).await?;
+        // 空回复是模型端的瞬态故障（实测：偶发"计费了几十个输出 token，
+        // 却抽不出任何文本或调用"），不是任务的终点——重试一次同一请求，
+        // 仍为空才报错。重试的这一问还没被记为消耗轮，不计入预算。
+        let reply = if reply.turn.text.trim().is_empty() && reply.turn.calls.is_empty() {
+            eprintln!("警告：模型返回空回复，重试一次");
+            model.complete(request).await?
+        } else {
+            reply
+        };
         self.consumption.record_turn();
         self.record(AuditEvent::Thought {
             turn: self.session.rounds() + 1,
@@ -397,6 +561,80 @@ impl AgentRunner {
             return Err(ApplicationError::EmptyResponse);
         }
         Ok(reply)
+    }
+
+    /// 是否值得为这次裁剪生成/更新摘要。
+    ///
+    /// 三个闸门都过才生成：连续失败没有达到上限（持续失败时每轮重试
+    /// 只是白花模型调用，截断后本次运行退回占位说明）、被裁轮次达到
+    /// 策略阈值（小额裁剪不值得多花一次调用），且已有摘要没有覆盖
+    /// 全部被裁轮次（覆盖了就是白花钱）。
+    fn should_summarize(&self, dropped: &[u32]) -> bool {
+        if self.summary_failures >= SUMMARY_FAILURE_LIMIT {
+            return false;
+        }
+        let Some(policy) = self.context_budget.summarize else {
+            return false;
+        };
+        if dropped.len() < policy.min_dropped_to_summarize {
+            return false;
+        }
+        match self.session.summary() {
+            Some(summary) => !summary.covers_all(dropped),
+            None => true,
+        }
+    }
+
+    /// 生成并挂载摘要。摘要只是优化：失败打警告后继续用占位说明，
+    /// 绝不把错误抛给任务。
+    ///
+    /// 摘要调用计入 `consumption`（它是一次真实的模型调用，预算账要
+    /// 如实），并留 [`AuditEvent::SummaryGenerated`] 供事后对账。
+    async fn refresh_summary(&mut self, dropped: &[u32]) {
+        let turn = self.session.rounds() + 1;
+        // 借用 session 的同步部分先渲染成 owned 文本——`ContextSlice`
+        // 借着 session，不能跨过下面的 await。
+        let slices: Vec<ContextSlice<'_>> = self
+            .session
+            .slices()
+            .into_iter()
+            .filter(|slice| {
+                matches!(slice, ContextSlice::Round { number, .. } if dropped.contains(number))
+            })
+            .collect();
+        let transcript = render_slices(&slices);
+        let existing = self.session.summary().cloned();
+        let covers = (
+            dropped.first().copied().unwrap_or(1),
+            dropped.last().copied().unwrap_or(1),
+        );
+        let summarizer = Summarizer::new(self.model.clone());
+        match summarizer
+            .summarize(SummarizeInput {
+                dropped_transcript: transcript,
+                existing,
+                covers,
+            })
+            .await
+        {
+            Ok((summary, usage)) => {
+                self.session.set_summary(summary.clone());
+                self.consumption.record_turn();
+                self.record(AuditEvent::SummaryGenerated {
+                    turn,
+                    covers: summary.covers,
+                    usage,
+                });
+            }
+            Err(error) => {
+                self.summary_failures += 1;
+                eprintln!("警告：历史摘要生成失败（继续用占位说明）: {error}");
+                self.record(AuditEvent::SummaryFailed {
+                    turn,
+                    reason: error.to_string(),
+                });
+            }
+        }
     }
 
     /// 取本轮下一个待处理的调用。
@@ -460,12 +698,52 @@ impl AgentRunner {
             .ok_or(ApplicationError::NoPendingRound)?;
         self.session.commit_round(pending.turn, pending.outcomes)?;
         self.state = RunState::AwaitingModel;
+        // 历史增长的点：恢复从这里开始最干净（无半轮状态）。
+        self.save_snapshot();
         Ok(RunState::AwaitingModel)
     }
 
     /// 记一条证据，时间戳由时钟取。
     fn record(&self, event: AuditEvent) {
         self.evidence.record(self.clock.now(), event);
+    }
+
+    /// 把墙钟重测进 `consumption`。所有保存点都先调它：`step()` 内部的
+    /// 保存点在 `run()` 的循环计时之外，不重测的话快照里的已耗时停在
+    /// 上一轮循环顶部的旧值，恢复后墙钟预算被低估。
+    fn refresh_elapsed(&mut self) {
+        self.consumption.elapsed = self.elapsed_base + self.clock.elapsed_since(self.run_start);
+    }
+
+    /// 捕获当前状态的可序列化快照。
+    pub fn snapshot(&self) -> RunSnapshot {
+        RunSnapshot {
+            format_version: RUN_FORMAT,
+            session_id: self.session.id().clone(),
+            spec: self.spec.clone(),
+            session: self.session.snapshot(),
+            state: self.state.clone(),
+            consumption: self.consumption,
+            pending: self.pending.clone(),
+        }
+    }
+
+    /// 把快照存进依赖里给的存储，失败降级为 stderr 警告。
+    ///
+    /// 快照是"锦上添花"：任务本身是主线，不能让一次写盘失败
+    /// （磁盘满、目录被删）把跑了几十轮的任务带崩。
+    fn save_snapshot(&mut self) {
+        // 先克隆再刷新耗时：refresh_elapsed 要 &mut self，不能带着
+        // 对 session_store 的借用调它。
+        let Some(store) = self.session_store.clone() else {
+            return;
+        };
+        // 存之前重测一次墙钟：保存点可能落在 run() 循环计时之外。
+        self.refresh_elapsed();
+        let snapshot = self.snapshot();
+        if let Err(error) = store.save(&snapshot) {
+            eprintln!("警告：快照保存失败（任务继续）: {error}");
+        }
     }
 }
 
@@ -645,6 +923,7 @@ mod tests {
                 clock: Arc::new(crate::infrastructure::clock::SystemClock),
                 policy,
                 context_budget: ContextBudget::default(),
+                session_store: None,
             },
         );
         Harness {
@@ -893,6 +1172,7 @@ mod tests {
                 clock: Arc::new(crate::infrastructure::clock::SystemClock),
                 policy: PolicyEngine::new(),
                 context_budget: ContextBudget::default(),
+                session_store: None,
             },
         );
 
@@ -913,9 +1193,31 @@ mod tests {
     // ── 空回复要报错，不能当成成功 ─────────────────────────────────────
 
     #[tokio::test]
-    async fn empty_reply_is_an_error() {
+    async fn empty_reply_is_retried_once_and_recovers() {
+        // 第一次空回复是瞬态故障：重试同一请求应拿到后面的脚本位。
         let mut harness = harness(
-            vec![MockTurn::from_contents(Vec::<AssistantContent>::new())],
+            vec![
+                MockTurn::from_contents(Vec::<AssistantContent>::new()),
+                MockTurn::text("重试后想清楚了"),
+            ],
+            vec![read_file_spec()],
+        );
+
+        let outcome = harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(outcome.answer, "重试后想清楚了");
+        assert_eq!(harness.mock.request_count(), 2, "空回复触发了一次重试");
+        // 重试前的空回复不算消耗轮。
+        assert_eq!(outcome.turns_used, 1);
+    }
+
+    #[tokio::test]
+    async fn empty_reply_twice_is_an_error() {
+        let mut harness = harness(
+            vec![
+                MockTurn::from_contents(Vec::<AssistantContent>::new()),
+                MockTurn::from_contents(Vec::<AssistantContent>::new()),
+            ],
             vec![read_file_spec()],
         );
 
@@ -1296,7 +1598,9 @@ mod tests {
                 context_budget: ContextBudget {
                     max_rounds: 2,
                     keep_task: true,
+                    summarize: None,
                 },
+                session_store: None,
             },
         );
 
@@ -1340,6 +1644,211 @@ mod tests {
             })
             .collect();
         assert_eq!(compacted.len(), 1, "超预算的请求各留一条裁剪证据");
+    }
+
+    // ── P4-3：历史摘要 ──────────────────────────────────────────────────
+
+    /// 摘要测试的公共装配：3 轮工具调用 + 最终答案，预算只留 2 轮。
+    fn summary_test_runner(
+        mock: &MockCompletionModel,
+        context_budget: ContextBudget,
+    ) -> (AgentRunner, Arc<MemoryEvidenceSink>) {
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let runner = AgentRunner::new(
+            spec_with(),
+            SessionId::new("summary-session"),
+            "读三个文件",
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+                tools: registry_with(Arc::new(EchoInvoker), vec![read_file_spec()]),
+                approvals: Arc::new(CountingGate::default()),
+                evidence: evidence.clone(),
+                clock: Arc::new(crate::infrastructure::clock::SystemClock),
+                policy: PolicyEngine::new(),
+                context_budget,
+                session_store: None,
+            },
+        );
+        (runner, evidence)
+    }
+
+    #[tokio::test]
+    async fn summary_is_generated_once_and_replaces_the_placeholder() {
+        // 脚本：3 轮工具调用后历史 3 > 预算 2，第 4 问触发裁剪（丢第 1 轮）
+        // → 摘要调用① → r4 工具调用；第 5 问丢第 1-2 轮，现有摘要（第 1 轮）
+        // 没盖全 → 摘要调用②（增量合并）→ 最终答案。
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_1", "read_file", json!({"path": "r1.txt"})),
+            MockTurn::tool_call("call_2", "read_file", json!({"path": "r2.txt"})),
+            MockTurn::tool_call("call_3", "read_file", json!({"path": "r3.txt"})),
+            MockTurn::text("摘要：第 1 轮读了 r1"),
+            MockTurn::tool_call("call_4", "read_file", json!({"path": "r4.txt"})),
+            MockTurn::text("摘要：第 1-2 轮读了 r1 和 r2"),
+            MockTurn::text("四个文件都看完了"),
+        ]);
+        let (mut runner, evidence) = summary_test_runner(
+            &mock,
+            ContextBudget {
+                max_rounds: 2,
+                keep_task: true,
+                summarize: None,
+            }
+            .with_summarize(1),
+        );
+
+        runner.run(&Budget::new(20)).await.unwrap();
+
+        // 5 次真实请求 + 2 次摘要调用。
+        assert_eq!(mock.request_count(), 7, "每次超出覆盖范围的裁剪各补一次摘要");
+
+        // 摘要调用①：独立的单消息请求，只带被裁片段，不带任务与保留轮次。
+        let first_summary = serde_json::to_string(&history(&mock, 3)).unwrap();
+        assert!(
+            first_summary.contains("对话历史片段"),
+            "摘要请求应带摘要指令: {first_summary}"
+        );
+        assert!(
+            first_summary.contains("OBSERVATION_FOR_r1.txt"),
+            "摘要应看到第 1 轮的观察"
+        );
+        assert!(
+            !first_summary.contains("OBSERVATION_FOR_r2.txt"),
+            "第一次摘要不应包含未被裁掉的轮次: {first_summary}"
+        );
+
+        // 摘要调用②是增量的：旧摘要在提示里，新片段拼在后面。
+        let second_summary = serde_json::to_string(&history(&mock, 5)).unwrap();
+        assert!(second_summary.contains("此前已有摘要"), "应带上旧摘要做增量合并");
+        assert!(
+            second_summary.contains("OBSERVATION_FOR_r2.txt"),
+            "第二次摘要应包含新被裁的第 2 轮"
+        );
+
+        // 最后一问：摘要顶替了占位说明，被裁轮次的信息以摘要形式回到上下文。
+        let final_request = serde_json::to_string(&history(&mock, 6)).unwrap();
+        assert!(
+            final_request.contains("摘要：第 1-2 轮读了 r1 和 r2"),
+            "最终请求应带最新摘要: {final_request}"
+        );
+        assert!(
+            !final_request.contains("已省略"),
+            "摘要覆盖全部被裁轮次时不应再出现占位说明: {final_request}"
+        );
+
+        // 摘要挂到会话上（快照随之带走），并留了证据。
+        let summary = runner.session().summary().unwrap();
+        assert_eq!(summary.covers, (1, 2));
+        let summary_events: Vec<_> = evidence
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event.event, AuditEvent::SummaryGenerated { .. }))
+            .collect();
+        assert_eq!(summary_events.len(), 2, "每次摘要调用各留一条证据");
+    }
+
+    #[tokio::test]
+    async fn failed_summary_degrades_to_the_placeholder_and_the_task_survives() {
+        // 每次摘要尝试都拿到空文本（重试一次仍为空）→ 全部失败 →
+        // 每次都降级占位说明，任务照常跑完。
+        // 4 轮工具调用 + 2 次失败的摘要尝试（各含 1 次重试）+ 最终答案。
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_1", "read_file", json!({"path": "r1.txt"})),
+            MockTurn::tool_call("call_2", "read_file", json!({"path": "r2.txt"})),
+            MockTurn::tool_call("call_3", "read_file", json!({"path": "r3.txt"})),
+            MockTurn::text(""),
+            MockTurn::text(""),
+            MockTurn::tool_call("call_4", "read_file", json!({"path": "r4.txt"})),
+            MockTurn::text(""),
+            MockTurn::text(""),
+            MockTurn::text("降级后也跑完了"),
+        ]);
+        let (mut runner, _evidence) =
+            summary_test_runner(&mock, ContextBudget::default().with_summarize(1));
+        // 把轮数上限压到 2 才会触发裁剪；Default 的 max_rounds 是 16。
+        // 直接改字段：测试装配的便利优先于不可变性。
+        runner.context_budget.max_rounds = 2;
+
+        let outcome = runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(outcome.answer, "降级后也跑完了");
+        assert!(runner.session().summary().is_none(), "失败的摘要不应被挂载");
+        assert_eq!(mock.request_count(), 9);
+        let final_request = serde_json::to_string(&history(&mock, 8)).unwrap();
+        assert!(
+            final_request.contains("已省略"),
+            "降级后应退回占位说明: {final_request}"
+        );
+        assert!(!final_request.contains("摘要："), "{final_request}");
+    }
+
+    #[tokio::test]
+    async fn persistently_failing_summary_stops_retrying_after_the_limit() {
+        // 连续失败的摘要达到上限后不再重试：否则每次裁剪都白花两次
+        // 注定失败的调用。前两次摘要失败（各含 1 次重试），第三个
+        // 可摘要的裁剪点直接跳过摘要、退回占位说明。
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_1", "read_file", json!({"path": "r1.txt"})),
+            MockTurn::tool_call("call_2", "read_file", json!({"path": "r2.txt"})),
+            MockTurn::tool_call("call_3", "read_file", json!({"path": "r3.txt"})),
+            MockTurn::text(""),
+            MockTurn::text(""),
+            MockTurn::tool_call("call_4", "read_file", json!({"path": "r4.txt"})),
+            MockTurn::text(""),
+            MockTurn::text(""),
+            MockTurn::tool_call("call_5", "read_file", json!({"path": "r5.txt"})),
+            MockTurn::text("跑完了"),
+        ]);
+        let (mut runner, evidence) =
+            summary_test_runner(&mock, ContextBudget::default().with_summarize(1));
+        runner.context_budget.max_rounds = 2;
+
+        let outcome = runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(outcome.answer, "跑完了");
+        // 6 次真实请求 + 2 次摘要尝试（各含 1 次重试）= 10；没有上限
+        // 第三个裁剪点还会再花 2 次，共 12。
+        assert_eq!(mock.request_count(), 10);
+        // 失败的摘要也要留痕：事后翻 JSONL 能对上"这几轮为什么没有摘要"。
+        let failures: Vec<_> = evidence
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event.event, AuditEvent::SummaryFailed { .. }))
+            .collect();
+        assert_eq!(failures.len(), 2, "每次失败的摘要各留一条证据");
+    }
+
+    #[tokio::test]
+    async fn summarize_disabled_keeps_the_p3_behaviour() {
+        // 不开摘要：同样的裁剪场景，多出来的摘要调用一次都不该有。
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_1", "read_file", json!({"path": "r1.txt"})),
+            MockTurn::tool_call("call_2", "read_file", json!({"path": "r2.txt"})),
+            MockTurn::tool_call("call_3", "read_file", json!({"path": "r3.txt"})),
+            MockTurn::tool_call("call_4", "read_file", json!({"path": "r4.txt"})),
+            MockTurn::text("完成"),
+        ]);
+        let (mut runner, _evidence) = summary_test_runner(
+            &mock,
+            ContextBudget {
+                max_rounds: 2,
+                keep_task: true,
+                summarize: None,
+            },
+        );
+
+        runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(mock.request_count(), 5, "没有摘要调用");
+        assert!(runner.session().summary().is_none());
+        for index in 0..mock.request_count() {
+            let rendered = serde_json::to_string(&history(&mock, index)).unwrap();
+            assert!(
+                !rendered.contains("对话历史片段"),
+                "不开摘要就不该有摘要请求: {rendered}"
+            );
+        }
+        let final_request = serde_json::to_string(&history(&mock, 4)).unwrap();
+        assert!(final_request.contains("已省略"), "占位说明照旧: {final_request}");
     }
 
     // ── P3：整体超时与取消 ──────────────────────────────────────────────
@@ -1406,6 +1915,7 @@ mod tests {
                 clock: clock.clone(),
                 policy: PolicyEngine::new(),
                 context_budget: ContextBudget::default(),
+                session_store: None,
             },
         );
 
@@ -1462,6 +1972,7 @@ mod tests {
                 clock: Arc::new(crate::infrastructure::clock::SystemClock),
                 policy: PolicyEngine::new(),
                 context_budget: ContextBudget::default(),
+                session_store: None,
             },
         );
         handle_slot
@@ -1501,6 +2012,7 @@ mod tests {
                 clock,
                 policy: PolicyEngine::new(),
                 context_budget: ContextBudget::default(),
+                session_store: None,
             },
         );
 

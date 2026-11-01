@@ -145,18 +145,21 @@ fn unix_seconds(time: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-/// 计算某个会话的证据文件路径：`<root>/.qcodeharness/sessions/<session_id>.jsonl`。
-///
 /// 会话 ID 里可能带路径分隔符（理论上），先做一次净化，否则
 /// `../../etc/passwd` 这样的 ID 能把文件写到 workspace 外面去。
-pub fn session_path(root: &Path, session_id: &str) -> PathBuf {
-    let safe_id: String = session_id
+/// 证据文件与快照文件共用同一条规则，同一个 ID 不会落成两个名字。
+pub(crate) fn sanitize_session_id(session_id: &str) -> String {
+    session_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
-        .collect();
+        .collect()
+}
+
+/// 计算某个会话的证据文件路径：`<root>/.qcodeharness/sessions/<session_id>.jsonl`。
+pub fn session_path(root: &Path, session_id: &str) -> PathBuf {
     root.join(".qcodeharness")
         .join("sessions")
-        .join(format!("{safe_id}.jsonl"))
+        .join(format!("{}.jsonl", sanitize_session_id(session_id)))
 }
 
 #[cfg(test)]

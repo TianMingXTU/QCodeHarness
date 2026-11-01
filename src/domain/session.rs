@@ -11,7 +11,10 @@
 
 use std::borrow::Cow;
 
+use serde::{Deserialize, Serialize};
+
 use super::agent::AgentTurn;
+use super::context::Summary;
 use super::ids::SessionId;
 use super::tool::{ToolCall, ToolOutcome};
 
@@ -20,7 +23,9 @@ use super::tool::{ToolCall, ToolOutcome};
 /// `Agent` 与 `Observation` 必须成对出现，且 `Observation` 只能紧跟 `Agent`。
 /// 这个约束由 [`Session::commit_round`] 保证——枚举虽是 `pub` 的，但
 /// [`Session::turns`] 不提供插入入口，外部无法构造出半轮历史。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// 可序列化：快照要把完整历史存下来，恢复时逐条校验后重建。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Turn {
     /// 用户消息。第一条是任务描述。
     User(String),
@@ -44,6 +49,32 @@ pub enum SessionError {
         /// 实际收集到的观察数。
         observations: usize,
     },
+    /// 快照历史的布局非法。
+    ///
+    /// `commit_round` 在构造路径上排除了这些形态，所以快照里出现它们
+    /// 只能说明数据被改坏或来自不兼容的写入方——重建为显式错误，
+    /// 而不是一个自相矛盾的历史。
+    #[error("快照历史损坏：{reason}")]
+    Corrupt {
+        /// 哪里坏了、为什么。
+        reason: String,
+    },
+}
+
+/// 会话历史的可序列化快照：`Vec<Turn>` 的裸结构。
+///
+/// 为什么不让 `Session` 直接 derive `Deserialize`：反序列化得到的是
+/// 不可信的外部数据，直接塞进 `Session` 会绕过 `commit_round` 的配对
+/// 不变量——一条"有调用没观察"的半轮历史会让下一次模型请求直接 400。
+/// 快照先落在这个裸结构上，由 [`Session::from_snapshot`] 逐条校验后重建。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    /// 完整历史，按发生顺序。
+    pub turns: Vec<Turn>,
+    /// 已生成的历史摘要。老快照没有这个字段，`#[serde(default)]` 让它们
+    /// 照常反序列化为 `None`——新增可选字段不构成快照格式的不兼容变化。
+    #[serde(default)]
+    pub summary: Option<Summary>,
 }
 
 /// 会话历史的视图片段。
@@ -78,6 +109,10 @@ pub enum ContextSlice<'a> {
 pub struct Session {
     id: SessionId,
     turns: Vec<Turn>,
+    /// 已生成的历史摘要。摘要不是历史的一部分（不进 `turns`），
+    /// 而是历史的一种"压缩视图"：挂在会话上只为生成一次、随快照走，
+    /// 裁剪时按覆盖范围取用（见 `domain::context`）。
+    summary: Option<Summary>,
 }
 
 impl Session {
@@ -86,7 +121,21 @@ impl Session {
         Self {
             id,
             turns: vec![Turn::User(task.into())],
+            summary: None,
         }
+    }
+
+    /// 记录一段摘要，覆盖旧的。
+    ///
+    /// 调用方（运行循环）负责保证覆盖范围比现有摘要更广—— narrower 的
+    /// 摘要会让裁剪退回占位说明，不会错，只是白花了一次调用。
+    pub fn set_summary(&mut self, summary: Summary) {
+        self.summary = Some(summary);
+    }
+
+    /// 已挂的摘要。
+    pub fn summary(&self) -> Option<&Summary> {
+        self.summary.as_ref()
     }
 
     /// 会话 ID。
@@ -134,6 +183,112 @@ impl Session {
     /// 原始历史，按发生顺序排列。
     pub fn turns(&self) -> &[Turn] {
         &self.turns
+    }
+
+    /// 导出可序列化的历史快照。
+    pub fn snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            turns: self.turns.clone(),
+            summary: self.summary.clone(),
+        }
+    }
+
+    /// 从快照重建会话，重建时逐条校验配对不变量。
+    ///
+    /// 快照是不可信的外部数据：直接塞进 `Session` 会绕过 `commit_round`
+    /// 的不变量校验。这里按"构造路径能产生什么"来验收：
+    /// 用户消息开头、带调用的轮次必须紧跟等量的观察、最终答案轮不带观察、
+    /// 观察不能开头或连续出现。校验不过返回 [`SessionError`]，
+    /// 绝不构造出一个自相矛盾的历史。
+    pub fn from_snapshot(
+        id: SessionId,
+        snapshot: SessionSnapshot,
+    ) -> Result<Self, SessionError> {
+        let turns = snapshot.turns;
+        if !matches!(turns.first(), Some(Turn::User(_))) {
+            return Err(SessionError::Corrupt {
+                reason: "会话必须以用户消息开头".to_owned(),
+            });
+        }
+        let mut rounds = 0_u32;
+        let mut index = 0;
+        while index < turns.len() {
+            match &turns[index] {
+                // 用户消息只能出现在历史开头（任务交代）。构造路径产生不出
+                // 中部的用户消息，而裁剪只保留首条用户消息——放进来的话
+                // 那条消息会在下一次裁剪时被静默丢掉，上下文出现审计对不上
+                // 的缺口，所以在重建时拦下。
+                Turn::User(_) if index > 0 => {
+                    return Err(SessionError::Corrupt {
+                        reason: format!("第 {} 条历史是用户消息，但用户消息只能出现在开头", index + 1),
+                    });
+                }
+                Turn::User(_) => index += 1,
+                Turn::Agent(agent) => {
+                    rounds += 1;
+                    let calls = agent.calls.len();
+                    match turns.get(index + 1) {
+                        // 带调用的轮次：观察必须紧跟且数量一致。
+                        Some(Turn::Observation(outcomes)) if calls > 0 => {
+                            if outcomes.len() != calls {
+                                return Err(SessionError::Unpaired {
+                                    turn: rounds,
+                                    calls,
+                                    observations: outcomes.len(),
+                                });
+                            }
+                            index += 2;
+                        }
+                        // 最终答案轮不带观察。
+                        Some(Turn::Observation(_)) => {
+                            return Err(SessionError::Corrupt {
+                                reason: format!(
+                                    "第 {rounds} 轮没有工具调用，后面却跟着观察"
+                                ),
+                            });
+                        }
+                        // 带调用的轮次后面不是观察：历史无法回放。
+                        other if calls > 0 => {
+                            let follow = if other.is_some() {
+                                "但被下一条消息打断"
+                            } else {
+                                "但没有任何观察（历史在此截断）"
+                            };
+                            return Err(SessionError::Corrupt {
+                                reason: format!("第 {rounds} 轮有 {calls} 个调用，{follow}"),
+                            });
+                        }
+                        // 无调用的轮次后面没有观察：合法（最终答案轮）。
+                        _ => index += 1,
+                    }
+                }
+                // 能走到这个分支，说明观察前面不是带调用的 Agent——
+                // 即开头或紧跟另一个观察。
+                Turn::Observation(_) => {
+                    return Err(SessionError::Corrupt {
+                        reason: "观察只能紧跟在带工具调用的模型轮次之后".to_owned(),
+                    });
+                }
+            }
+        }
+        if let Some(summary) = &snapshot.summary {
+            // 轮次从 1 开始、范围必须正着写、文本不能为空：这三条破格说明
+            // 快照本身已损坏，与历史配对错误一样在重建时拦下——空摘要
+            // 会让 compact 在占位说明的位置发出一条空用户消息。
+            let (from, to) = summary.covers;
+            if from == 0 || from > to || to > rounds || summary.text.trim().is_empty() {
+                return Err(SessionError::Corrupt {
+                    reason: format!(
+                        "摘要覆盖范围 {from}-{to} 或文本无效（历史共 {rounds} 轮）"
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            id,
+            turns,
+            summary: snapshot.summary,
+        })
     }
 
     /// 按用户消息与轮次分组返回视图。
@@ -272,5 +427,148 @@ mod tests {
         assert_eq!(*thought, "想一下");
         assert_eq!(calls.len(), 1);
         assert_eq!(observations.len(), 1);
+    }
+
+    // ── P4：快照导出与校验重建 ──────────────────────────────────────────
+
+    /// 造一个带 n 轮合法历史的会话。
+    fn session_with_rounds(n: u32) -> Session {
+        let mut session = Session::new(SessionId::new("s1"), "任务");
+        for _ in 0..n {
+            session
+                .commit_round(
+                    turn_with(vec![call("read_file")]),
+                    vec![ToolOutcome::success("内容")],
+                )
+                .unwrap();
+        }
+        session
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_from_snapshot() {
+        let session = session_with_rounds(2);
+        let restored = Session::from_snapshot(SessionId::new("s1"), session.snapshot()).unwrap();
+
+        assert_eq!(restored.id(), session.id());
+        assert_eq!(restored.turns(), session.turns());
+        assert_eq!(restored.rounds(), 2);
+    }
+
+    #[test]
+    fn from_snapshot_rejects_history_not_starting_with_user() {
+        let snapshot = SessionSnapshot {
+            summary: None,
+            turns: vec![Turn::Agent(turn_with(vec![call("read_file")]))],
+        };
+        let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
+        assert!(error.to_string().contains("用户消息"), "{error}");
+    }
+
+    #[test]
+    fn from_snapshot_rejects_observation_count_mismatch() {
+        let snapshot = SessionSnapshot {
+            summary: None,
+            turns: vec![
+                Turn::User("任务".to_owned()),
+                Turn::Agent(turn_with(vec![call("a"), call("b")])),
+                // 两个调用只跟了一条观察。
+                Turn::Observation(vec![ToolOutcome::success("只有一条")]),
+            ],
+        };
+        let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
+        assert!(matches!(error, SessionError::Unpaired { calls: 2, observations: 1, .. }), "{error}");
+    }
+
+    #[test]
+    fn from_snapshot_rejects_agent_without_following_observation() {
+        let snapshot = SessionSnapshot {
+            summary: None,
+            turns: vec![
+                Turn::User("任务".to_owned()),
+                Turn::Agent(turn_with(vec![call("read_file")])),
+                // 观察缺席，直接是下一轮模型回复。
+                Turn::Agent(turn_with(vec![])),
+            ],
+        };
+        let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
+        assert!(error.to_string().contains("第 1 轮"), "{error}");
+    }
+
+    #[test]
+    fn from_snapshot_rejects_observation_after_final_answer() {
+        // 最终答案轮没有调用，观察挂在其后是构造路径产生不出的形态。
+        let snapshot = SessionSnapshot {
+            summary: None,
+            turns: vec![
+                Turn::User("任务".to_owned()),
+                Turn::Agent(AgentTurn {
+                    text: "结论".to_owned(),
+                    calls: Vec::new(),
+                }),
+                Turn::Observation(vec![ToolOutcome::success("多余")]),
+            ],
+        };
+        let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
+        assert!(error.to_string().contains("没有工具调用"), "{error}");
+    }
+
+    #[test]
+    fn from_snapshot_rejects_double_observation() {
+        // 第二条观察前面是观察而不是带调用的 Agent——构造路径产生不出。
+        let snapshot = SessionSnapshot {
+            summary: None,
+            turns: vec![
+                Turn::User("任务".to_owned()),
+                Turn::Agent(turn_with(vec![call("read_file")])),
+                Turn::Observation(vec![ToolOutcome::success("第一条")]),
+                Turn::Observation(vec![ToolOutcome::success("孤儿观察")]),
+            ],
+        };
+        let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
+        assert!(
+            error.to_string().contains("紧跟在带工具调用"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn summary_round_trips_through_the_snapshot() {
+        let mut session = session_with_rounds(3);
+        session.set_summary(Summary {
+            covers: (1, 2),
+            text: "前两轮读了文件".to_owned(),
+        });
+
+        let restored = Session::from_snapshot(SessionId::new("s1"), session.snapshot()).unwrap();
+
+        let summary = restored.summary().unwrap();
+        assert_eq!(summary.covers, (1, 2));
+        assert_eq!(summary.text, "前两轮读了文件");
+    }
+
+    #[test]
+    fn from_snapshot_rejects_an_invalid_summary_range() {
+        // 覆盖范围倒着写：能解析但不能是重建出来的状态。
+        let snapshot = SessionSnapshot {
+            summary: Some(Summary {
+                covers: (3, 1),
+                text: "坏摘要".to_owned(),
+            }),
+            turns: vec![Turn::User("任务".to_owned())],
+        };
+        let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
+        assert!(error.to_string().contains("覆盖范围"), "{error}");
+
+        // 覆盖范围超出历史轮数同理。
+        let snapshot = SessionSnapshot {
+            summary: Some(Summary {
+                covers: (1, 99),
+                text: "坏摘要".to_owned(),
+            }),
+            turns: vec![Turn::User("任务".to_owned())],
+        };
+        let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
+        assert!(error.to_string().contains("覆盖范围"), "{error}");
     }
 }
