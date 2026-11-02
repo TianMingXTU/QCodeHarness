@@ -25,6 +25,19 @@ const HARD_MAX_RESULTS: usize = 200;
 /// 递归遍历时要跳过的目录名。任意深度下命中都跳过。
 const SKIPPED_DIRS: [&str; 4] = [".git", "target", "node_modules", ".qcodeharness"];
 
+/// 凭据文件名：遍历时整个跳过，不当成普通文本读。
+///
+/// P8-1 把 `.env` / `.env.*` 列为受保护路径，`read_file` 直接拒。但搜索走
+/// 的是"按跳过名单遍历 + 读每行"这条路，`read_file` 的保护够不着它——
+/// `search_text({"pattern":"API_KEY"})` 会把 `.env` 里的凭据行连同行号
+/// 一起打印出来。同一份秘密换条路就能读到，保护就是半套。
+///
+/// 大小写不敏感：Windows 上 `.ENV` 与 `.env` 是同一个文件。
+fn is_credential_file(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    lowered == ".env" || lowered.starts_with(".env.")
+}
+
 /// 在 workspace 内递归搜索一段文本。
 pub struct SearchText {
     root: WorkspaceRoot,
@@ -41,7 +54,8 @@ impl SearchText {
         ToolSpec {
             name: SEARCH_TEXT.to_owned(),
             description: "在 workspace 内递归搜索一段文本（区分大小写的子串匹配），\
-                          输出 `相对路径:行号:该行内容`。跳过 .git、target、node_modules、.qcodeharness 目录。"
+                          输出 `相对路径:行号:该行内容`。跳过 .git、target、node_modules、.qcodeharness \
+                          目录与 .env / .env.* 凭据文件。"
                 .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -159,6 +173,10 @@ fn walk(dir: &Path, relative: &str, pattern: &str, cap: usize, result: &mut Walk
                 continue;
             }
             walk(&entry.path(), &child_rel, pattern, cap, result);
+        } else if is_credential_file(&name) {
+            // 凭据文件整份跳过：读进来的每一行都可能带着密钥，而这一行
+            // 会原样进提示词。搜索是"找代码"的工具，不是"读秘密"的工具。
+            continue;
         } else if let Ok(content) = std::fs::read_to_string(entry.path()) {
             scan_file(&content, &child_rel, pattern, cap, result);
         }
@@ -213,6 +231,44 @@ mod tests {
         fs::write(root.join("target/generated.rs"), "TODO fix\n").unwrap();
         fs::write(root.join(".git/config"), "TODO fix\n").unwrap();
         fs::write(root.join("README.md"), "没有匹配的内容\n").unwrap();
+    }
+
+    /// 凭据文件不能被全文搜索读到。
+    ///
+    /// P8-1 把 `.env` 列为受保护路径，`read_file` 直接拒。但 `search_text`
+    /// 走的是另一条路——它按跳过名单遍历，而名单里原本没有 `.env`，于是
+    /// `search_text({"pattern":"API_KEY"})` 能把 `.env` 里的凭据行连同行号
+    /// 一起打印出来。同一份秘密，换条路就能读到，那保护就是半套。
+    ///
+    /// 大小写同样要不敏感：Windows 上 `.ENV` 与 `.env` 是同一个文件。
+    #[tokio::test]
+    async fn search_never_reads_credential_files() {
+        let root = temp_workspace("env");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".env"), "API_KEY={{SECRET_0a71ea2c}}\n").unwrap();
+        fs::write(root.join(".ENV.local"), "DB_PASSWORD={{SECRET_d34bace8}}\n").unwrap();
+        fs::write(root.join("src/main.rs"), "const API_KEY: &str = \"\";\n").unwrap();
+        let tool = SearchText::new(WorkspaceRoot::new(&root));
+
+        let outcome = tool.invoke(&call(json!({"pattern": "KEY"}))).await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert!(
+            outcome.content.contains("src/main.rs:1"),
+            "workspace 内的正常文件仍要能搜到: {}",
+            outcome.content
+        );
+        assert!(
+            !outcome.content.contains("{{SECRET_0a71ea2c}}"),
+            ".env 里的凭据不能被搜出来: {}",
+            outcome.content
+        );
+        assert!(
+            !outcome.content.contains("{{SECRET_d34bace8}}"),
+            ".ENV.local 里的凭据不能被搜出来: {}",
+            outcome.content
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
