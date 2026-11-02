@@ -32,6 +32,7 @@ use qcode_harness::domain::ids::{SessionId, TaskId};
 use qcode_harness::domain::session::Turn;
 use qcode_harness::domain::task::TaskKind;
 use qcode_harness::domain::workspace::WorkspaceRoot;
+use qcode_harness::infrastructure::approval::ai_review::AiReviewGate;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
 use qcode_harness::infrastructure::clock::SystemClock;
@@ -45,6 +46,7 @@ use qcode_harness::infrastructure::policy;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::tool::all_tools;
 use qcode_harness::interface::cli::{self, ConsoleReporter};
+use qcode_harness::interface::instructions;
 
 /// `LLM_MAX_TURNS` 未设置时的默认最大轮数。
 const DEFAULT_MAX_TURNS: u32 = 20;
@@ -238,8 +240,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let registry = ToolRegistry::new(tool_entries);
 
+    // 审批闸门三选一，优先级从高到低：
+    //   --yes                恒放行（基准与脚本化场景）
+    //   --ai-review          模型先审，拿不准的退回交互式闸门
+    //   默认                 交互式闸门
+    // --yes 与 --ai-review 同时给出时走 --yes：用户已经声明"不用人管"，
+    // 再插一个模型审查只是白花一次调用。
     let approvals: Arc<dyn ApprovalGate> = if auto_approve {
         Arc::new(AutoApproveGate)
+    } else if args.ai_review {
+        // 审查员的退路必须是交互式闸门：模型说"拿不准"时得有人接。
+        // 与主循环共用同一个模型实例——审查就是一次普通的模型调用。
+        // clone 再 erase：同一个模型实例后面主循环还要用，erase() 会移走它。
+        Arc::new(AiReviewGate::new(
+            Box::new(RigChatGateway::new(model.clone().erase())),
+            Box::new(CliApprovalGate::new()),
+        ))
     } else {
         Arc::new(CliApprovalGate::new())
     };
@@ -312,6 +328,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     };
 
+    // 项目指令：workspace 根上的 QCODEHARNESS.md（次级位置
+    // .qcodeharness/instructions.md，P8-1 起模型读写都会被拒，所以放那里
+    // 的约定不会被一次失控的 write_file 抹掉）。两个位置都没有时花名册
+    // 就是内置档案，行为与没有这个特性时逐字相同。
+    let roster = match instructions::load_project_instructions(&workspace) {
+        Some(loaded) => {
+            for warning in &loaded.warnings {
+                eprintln!("警告：{warning}");
+            }
+            if loaded.truncated {
+                eprintln!("警告：{} 超过 8 KiB，已截断后注入", loaded.source.display());
+            }
+            println!(
+                "项目指令: {}（{} 字节）",
+                loaded.source.display(),
+                loaded.text.len()
+            );
+            AgentRoster::builtin().with_project_instructions(&loaded.text)
+        }
+        None => AgentRoster::builtin(),
+    };
+
     println!("任务: {task}");
     println!("类型: {} 模板", kind.name());
     println!("模型: {} @ {}", config.model, config.base_url);
@@ -326,6 +364,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     if auto_approve {
         println!("审批: 自动放行（QCH_AUTO_APPROVE 或 --yes）");
+    } else if args.ai_review {
+        // 说清退路：用户需要知道模型拿不准时仍然会来问他。
+        println!("审批: AI 审查优先，拿不准时退回人工询问");
     } else {
         println!("审批: 交互式（每次副作用工具执行前询问）");
     }
@@ -360,7 +401,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // 快照落盘随运行自动开启；--resume 可从任一步的会话恢复。
         session_store: Some(store.clone()),
     };
-    let mut orchestrator = Orchestrator::new(deps, budget, evidence_factory);
+    let mut orchestrator = Orchestrator::with_roster(deps, budget, evidence_factory, roster);
     let mut task = orchestrator.create_task(task_id, kind, &task);
 
     let outcome = match orchestrator.run(&mut task).await {

@@ -71,7 +71,33 @@ impl AgentRoster {
         }
         ToolRegistry::new(entries)
     }
+
+    /// 给每个角色的提示词追加项目指令。
+    ///
+    /// 注入点在构造花名册时，不在 runner 里：快照存的是 `AgentSpec`，
+    /// 恢复时直接用快照里的提示词。若等到 runner 才拼，中断后恢复的
+    /// 会话就丢了项目约定——而恢复往往正好发生在任务跑到一半、
+    /// 最需要项目约定的时候。
+    ///
+    /// 只动提示词，不动工具白名单：项目指令改变模型"想做什么"，
+    /// 不改变它"能做什么"。
+    pub fn with_project_instructions(mut self, instructions: &str) -> Self {
+        for profile in &mut self.profiles {
+            profile.system_prompt = format!(
+                "{}\n\n{}\n{instructions}",
+                profile.system_prompt, PROJECT_INSTRUCTIONS_HEADER
+            );
+        }
+        self
+    }
 }
+
+/// 项目指令段的标题。
+///
+/// 必须写清冲突时听谁的：项目约定（"提交信息用中文"、"别动生成代码"）
+/// 和内置规则冲突时，模型需要明确的优先级，否则它会两边各猜一半。
+const PROJECT_INSTRUCTIONS_HEADER: &str =
+    "──── 项目指令（项目自己的约定，与上述通用规则冲突时以项目为准）────";
 
 #[cfg(test)]
 mod tests {
@@ -110,6 +136,70 @@ mod tests {
         // 空花名册：查任何角色都是 None，编排器据此显式报错。
         let roster = AgentRoster::new(vec![]);
         assert!(roster.find(AgentRole::Coder).is_none());
+    }
+
+    // ── P8-4 项目指令注入 ─────────────────────────────────────────────
+
+    /// 四个角色的提示词都要带上项目指令。
+    ///
+    /// 漏一个角色就意味着那个角色按通用习惯干活——而编排器按步骤
+    /// 分派角色，漏掉的那个往往正是碰代码最多的那一步。
+    #[test]
+    fn project_instructions_reach_every_role() {
+        let roster = AgentRoster::builtin().with_project_instructions("提交信息用中文");
+
+        for role in [
+            AgentRole::Planner,
+            AgentRole::Coder,
+            AgentRole::Tester,
+            AgentRole::Reviewer,
+        ] {
+            let prompt = &roster.find(role).expect("应有档案").system_prompt;
+            assert!(
+                prompt.contains("提交信息用中文"),
+                "{role:?} 的提示词应含项目指令"
+            );
+            assert!(
+                prompt.contains(PROJECT_INSTRUCTIONS_HEADER),
+                "{role:?} 的提示词应有项目指令分隔标题"
+            );
+        }
+    }
+
+    /// 项目指令接在内置提示词之后，不是替换它。
+    ///
+    /// ReAct 工作方式与"不许越界"这些通用约束是底线，项目约定只该
+    /// 叠加不该覆盖——覆盖了就等于让一份 Markdown 关掉全部安全提示。
+    #[test]
+    fn project_instructions_are_appended_after_the_builtin_prompt() {
+        let base = AgentRoster::builtin()
+            .find(AgentRole::Coder)
+            .expect("应有档案")
+            .system_prompt
+            .clone();
+        let with = AgentRoster::builtin()
+            .with_project_instructions("别动生成代码")
+            .find(AgentRole::Coder)
+            .expect("应有档案")
+            .system_prompt
+            .clone();
+
+        assert!(with.starts_with(&base), "内置提示词必须原样保留在前");
+        assert!(with.ends_with("别动生成代码"), "项目指令应在末尾");
+        assert!(with.contains("ReAct"), "内置约束不能被顶掉");
+    }
+
+    /// 注入只改提示词，不动工具白名单。
+    ///
+    /// 项目指令改变模型"想做什么"，不改变它"能做什么"——后者是
+    /// 硬边界，不能因为一份 Markdown 就松。
+    #[test]
+    fn project_instructions_do_not_change_tool_whitelists() {
+        let before = AgentRoster::builtin();
+        let after = before.clone().with_project_instructions("随便写点什么");
+        for role in [AgentRole::Planner, AgentRole::Coder, AgentRole::Tester, AgentRole::Reviewer] {
+            assert_eq!(after.allowed_tools(role), before.allowed_tools(role));
+        }
     }
 
     #[test]

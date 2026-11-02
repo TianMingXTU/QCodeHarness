@@ -218,6 +218,7 @@ mod tests {
     use super::*;
     use crate::application::port::{ApprovalGate, EvidenceSink};
     use crate::application::tool_registry::ToolRegistry;
+    use crate::domain::agent::AgentRole;
     use crate::domain::policy::PolicyEngine;
     use crate::domain::workspace::WorkspaceRoot;
     use crate::infrastructure::approval::auto::AutoApproveGate;
@@ -525,5 +526,63 @@ mod tests {
         assert!(error.to_string().contains("planner"), "{error}");
         assert_eq!(task.state(), TaskState::Failed);
         assert_eq!(mock.requests().len(), 0, "装配失败不应触发模型调用");
+    }
+
+    // ── P8-4：项目指令真的到达模型 ─────────────────────────────────────
+
+    /// 端到端验证：注入的项目指令必须出现在模型收到的系统提示词里。
+    ///
+    /// 前面 roster 的测试只证明"字符串拼对了"，这条证明"拼对的字符串
+    /// 真的发出去了"——中间任何一环漏传（快照用了旧 spec、编排器没用
+    /// 注入了的花名册）都会在这里露出来。
+    #[tokio::test]
+    async fn project_instructions_reach_the_model() {
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::text("规划完了"),
+            MockTurn::text("改完了"),
+            MockTurn::text("测完了"),
+            MockTurn::text("审完了"),
+        ]);
+        let roster = AgentRoster::builtin().with_project_instructions("提交信息必须用中文");
+        let mut orchestrator =
+            Orchestrator::with_roster(deps(&mock), Budget::new(20), test_factory(), roster);
+        let mut task = orchestrator.create_task(TaskId::new("t8"), TaskKind::BugFix, "修好它");
+
+        orchestrator.run(&mut task).await.expect("四步都应跑完");
+
+        assert_eq!(mock.requests().len(), 4, "一步一次模型调用");
+        for index in 0..4 {
+            assert!(
+                system_prompt_of(&mock, index).contains("提交信息必须用中文"),
+                "第 {index} 步的系统提示词应含项目指令"
+            );
+        }
+    }
+
+    /// 没注入项目指令时，模型收到的就是内置档案那一份，一字不多。
+    ///
+    /// 这是 P8-4 的兼容性承诺：workspace 里没有 QCODEHARNESS.md 时，
+    /// 行为与加这个特性之前完全一致。
+    #[tokio::test]
+    async fn without_project_instructions_the_prompt_is_unchanged() {
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::text("规划完了"),
+            MockTurn::text("改完了"),
+            MockTurn::text("测完了"),
+            MockTurn::text("审完了"),
+        ]);
+        let roster = AgentRoster::builtin();
+        let expected = roster
+            .find(AgentRole::Planner)
+            .expect("应有档案")
+            .system_prompt
+            .clone();
+        let mut orchestrator =
+            Orchestrator::with_roster(deps(&mock), Budget::new(20), test_factory(), roster);
+        let mut task = orchestrator.create_task(TaskId::new("t9"), TaskKind::BugFix, "修好它");
+
+        orchestrator.run(&mut task).await.expect("应跑完");
+
+        assert_eq!(system_prompt_of(&mock, 0), expected);
     }
 }
