@@ -56,3 +56,53 @@ description = "shell 命令威力最大，每次都要人确认"
 # 但注意：这会把"以后新增的工具"也一并禁掉——模型每调一个新工具都会
 # 被拒，直到你把它显式加进配置。本示例不启用它：默认策略
 # （非只读要审批）已经是安全的兜底，deny 全禁适合 lockdown 场景。
+
+# ── 参数级作用域（P8-2）────────────────────────────────────────
+# scope 让一条规则只匹配"工具名 + 参数"都命中的调用，而不是整个工具。
+# 两个字段都可选，都不写等于没有作用域（退回只按工具名匹配）：
+#
+#   command_prefix  命令头，尾部 * 表示前缀匹配
+#   path_prefix     路径前缀，尾部 * 表示前缀匹配
+#
+# 例子：cargo test 免审，但 run_command 其他子命令仍要审批。
+
+[[rules]]
+tool = "run_command"
+verdict = "allow"
+description = "只读验证类命令免审"
+scope = { command_prefix = "cargo test *" }
+
+[[rules]]
+tool = "run_command"
+verdict = "require_approval"
+description = "其余 shell 命令一律审批"
+
+# 语义（与 Claude Code 的 Bash(cmd:*) 对齐）：
+#   "cargo test *" 匹配 "cargo test --nocapture"，也匹配 "cargo test"
+#   "cargo test *" 不匹配 "cargo testx"     —— * 只认到空格或结尾
+#   "cargo build"  不匹配 "cargo build --release"（没有 * 就是精确相等）
+#   "src/"         不匹配 "src/main.rs"      —— 要写 "src/*"
+#
+# * 不吞 shell 链接符：命令头之后一出现 && || ; | & 或换行，规则就不命中、
+# 退回审批。"cargo test *" 因此不放行 "cargo test && rm -rf /"。
+# 代价是 "cargo test 2>&1" 也要多问一次（单个 & 被算作链接符）——
+# 刻意偏向多问：漏拦是把整条命令链交出去。
+#
+# 尾部匹配只在结尾：不支持 "git * main" 这种中间通配。
+#
+# scope 只收紧规则，不放松任何东西：写在这里的 allow 仍然要过
+# 审批升级检查（见下）和受保护路径检查，三者是串联的。
+
+# 只放行受信来源的推送，禁止强推：
+#
+# [[rules]]
+# tool = "run_command"
+# verdict = "allow"
+# description = "只允许推送到 origin 的 main"
+# scope = { command_prefix = "git push origin main" }
+#
+# [[rules]]
+# tool = "run_command"
+# verdict = "deny"
+# description = "强推会改写远端历史，一律禁止"
+# scope = { command_prefix = "git push --force *" }
