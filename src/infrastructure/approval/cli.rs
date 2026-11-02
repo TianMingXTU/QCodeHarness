@@ -7,125 +7,290 @@
 //! 关闭（EOF），全都走否决分支。宁可让模型多撞几次墙，也不能在
 //! "没人看着"的时候把 destructive 工具放过去。
 
-use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
 use crate::application::port::{ApprovalGate, ApprovalRequest, BoxFuture, Decision};
+use crate::domain::policy::PolicyScope;
+
+/// 本会话内的一条信任记录。
+///
+/// P1 只按工具名记忆，粒度太粗：一句"允许 write_file"会连带放行之后所有
+/// write_file，包括写 `Cargo.toml` 的。P8-2 把信任拆成两档——参数完全
+/// 一致的精确信任，和参数文本命中某个前缀的模式信任。
+enum TrustEntry {
+    /// `a`：同工具且参数完全一致才放行。
+    Exact {
+        /// 工具名。
+        tool: String,
+        /// 被放行那次调用的参数原文。
+        arguments: serde_json::Value,
+    },
+    /// `p`：同工具且参数文本命中用户给出的前缀模式。
+    Prefix {
+        /// 工具名。
+        tool: String,
+        /// 用户给出的前缀模式，落在哪个字段取决于调用带的是 command 还是 path。
+        scope: PolicyScope,
+    },
+}
+
+impl TrustEntry {
+    /// 这条信任是否覆盖给定的调用。
+    fn covers(&self, call: &crate::domain::tool::ToolCall) -> bool {
+        match self {
+            TrustEntry::Exact { tool, arguments } => {
+                tool == &call.name && arguments == &call.arguments
+            }
+            TrustEntry::Prefix { tool, scope } => tool == &call.name && scope.matches(call),
+        }
+    }
+}
 
 /// 从标准输入读一行的人工审批闸门。
 ///
-/// 内部持有一份"本会话已批准的工具名"集合，供 `a` 选项使用。
-/// 放这里而不是放进领域层或应用层：它是"人这次坐在终端前"的会话状态，
-/// 属于交互基础设施，且它随闸门实例生灭——正好和一次 `cargo run` 同寿。
+/// 内部持有本会话的信任记录，供 `a` / `p` 选项使用。放这里而不是放进
+/// 领域层或应用层：它是"人这次坐在终端前"的会话状态，属于交互基础设施，
+/// 且它随闸门实例生灭——正好和一次 `cargo run` 同寿。
 pub struct CliApprovalGate {
-    /// 本会话内已被 `a` 放行的工具名。
+    /// 本会话内已被放行的调用，按授予顺序排列。
     ///
-    /// 用 `HashSet` 而不是 `Vec`：工具名数量少但会被反复查询，
-    /// 而且"已批准"是一个集合语义，用 Vec 会诱导出线性查找。
-    trusted: Mutex<HashSet<String>>,
+    /// 用 `Vec` 而不是集合：前缀信任之间不互斥，用户可能为同一个工具
+    /// 授多个前缀；查询是线性扫，长度等同于用户按过几次 `a`/`p`。
+    trusted: Mutex<Vec<TrustEntry>>,
 }
 
 impl CliApprovalGate {
     /// 构造一个空的交互式闸门。
     pub fn new() -> Self {
         Self {
-            trusted: Mutex::new(HashSet::new()),
+            trusted: Mutex::new(Vec::new()),
         }
     }
 
-    /// 从给定 reader 读一行答案，据此给出裁决。
+    /// 从给定 reader 读答案，据此给出裁决。
     ///
     /// 独立成函数是为了测试：测试不能抢进程的 stdin，
-    /// 但可以用 `&[u8]` 冒充一行输入来喂进去。
+    /// 但可以用 `&[u8]` 冒充几行输入来喂进去。
+    fn decide_from(&self, reader: &mut dyn BufRead, writer: &mut dyn Write, request: &ApprovalRequest) -> Decision {
+        // 带 reason 的请求是策略之上追加的复核（典型是越界写入升级）。
+        // 它的全部意义就在于"这一次必须有人过目"，所以会话信任整体失效：
+        // 不查信任、不接受 `a`/`p`。否则模型把同一条越界命令再发一遍，
+        // 就会被第一次授出的信任无声放行。
+        let trustable = request.reason.is_none();
+
+        if trustable {
+            if let Some(note) = self.trust_note(&request.call) {
+                let _ = writeln!(writer, "[审批] {} 已在会话内放行，自动通过", request.call.name);
+                let _ = writeln!(writer, "        （{note}）");
+                return Ok(());
+            }
+        }
+
+        // `p` 之后用户可能留空取消，此时要回到问题本身而不是直接否决，
+        // 所以这是一个循环而不是一次问答。
+        loop {
+            let _ = writeln!(writer);
+            let _ = writeln!(writer, "──── 审批请求 ────");
+            let _ = writeln!(writer, "工具:   {}", request.call.name);
+            let _ = writeln!(
+                writer,
+                "参数:   {}",
+                serde_json::to_string(&request.call.arguments).unwrap_or_else(|_| "{}".to_owned())
+            );
+            let _ = writeln!(
+                writer,
+                "风险:   {}",
+                risk_summary(&request.annotations)
+            );
+            if let Some(reason) = &request.reason {
+                let _ = writeln!(writer, "复核:   {reason}");
+            }
+            let _ = write!(writer, "批准执行？");
+            let _ = write!(writer, "[y] 允许  [n] 否决  ");
+            if trustable {
+                let _ = write!(
+                    writer,
+                    "[a] 本会话允许此精确调用  [p] 本会话按前缀允许  "
+                );
+            } else {
+                let _ = write!(writer, "（本次复核不适用会话信任）  ");
+            }
+            let _ = write!(writer, "[q] 中止运行: ");
+            let _ = writer.flush();
+
+            // 读不到行（EOF）时 line 为 Ok(0) 或 Err，两者都算否决。
+            let mut line = String::new();
+            let answer = match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => parse_answer(line.trim()),
+            };
+
+            match answer {
+                Some(Answer::Approve) => return Ok(()),
+                Some(Answer::Trust) if trustable => {
+                    self.trust_exact(&request.call);
+                    return Ok(());
+                }
+                Some(Answer::Prefix) if trustable => {
+                    match self.ask_prefix(reader, writer, &request.call) {
+                        Some(scope) => {
+                            self.trust_prefix(&request.call, scope);
+                            return Ok(());
+                        }
+                        // 空前缀或没有可匹配的参数：既不放行也不否决，重新问。
+                        None => continue,
+                    }
+                }
+                // 复核请求不接受信任类答复：提示一句，重新问，不放行也不否决。
+                Some(Answer::Trust) | Some(Answer::Prefix) => {
+                    let _ = writeln!(
+                        writer,
+                        "[审批] 本次是策略追加的复核，不能存入会话信任；请直接答 [y] 或 [n]。"
+                    );
+                    continue;
+                }
+                Some(Answer::Deny) => return Err(ask_reason(reader, writer)),
+                Some(Answer::Abort) => return Err("用户中止了本次运行".to_owned()),
+                // fail-closed：空行、无法识别、EOF 全部落到这里。
+                None => return Err("未给出有效答复，按策略视为否决".to_owned()),
+            }
+        }
+    }
+
+    /// 覆盖这个调用的信任记录的一行说明；没有则 `None`。
     ///
-    /// 返回值语义与 [`Decision`] 一致，但额外带上"是否记住这个工具"。
-    fn decide_from(
+    /// 返回说明而不是记录本身：锁守卫是临时值，借不出引用；而调用方
+    /// 要的只是"凭什么放行"那句话。
+    fn trust_note(&self, call: &crate::domain::tool::ToolCall) -> Option<String> {
+        let trusted = self
+            .trusted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        trusted
+            .iter()
+            .find(|entry| entry.covers(call))
+            .map(trust_description)
+    }
+
+    /// 记录一次精确信任。
+    fn trust_exact(&self, call: &crate::domain::tool::ToolCall) {
+        self.trusted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(TrustEntry::Exact {
+                tool: call.name.clone(),
+                arguments: call.arguments.clone(),
+            });
+    }
+
+    /// 记录一次前缀信任。
+    fn trust_prefix(&self, call: &crate::domain::tool::ToolCall, scope: PolicyScope) {
+        self.trusted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(TrustEntry::Prefix {
+                tool: call.name.clone(),
+                scope,
+            });
+    }
+
+    /// 追问要放行的前缀，返回它落在哪个作用域字段上。
+    ///
+    /// `None` 表示用户留空取消，或这个调用根本没有可匹配的参数——
+    /// 两者都该退回重新问，而不是记一条覆盖不全的信任。
+    fn ask_prefix(
         &self,
         reader: &mut dyn BufRead,
         writer: &mut dyn Write,
-        request: &ApprovalRequest,
-    ) -> (Decision, bool) {
-        // 已信任的工具不再打扰用户。
-        if self.is_trusted(&request.call.name) {
-            let _ = writeln!(writer, "[审批] {} 已在会话内放行，自动通过", request.call.name);
-            return (Ok(()), false);
+        call: &crate::domain::tool::ToolCall,
+    ) -> Option<PolicyScope> {
+        // 没有可匹配的参数时连问都不要问：问了也给不出能用的信任，
+        // 只会让用户在前缀输入框里白填一个字符串。
+        if matchable_argument(call).is_none() {
+            let _ = writeln!(
+                writer,
+                "[审批] 该工具没有命令或路径参数，无法按前缀放行；请改选 [a] 或 [y]。"
+            );
+            return None;
         }
 
         let _ = writeln!(writer);
-        let _ = writeln!(writer, "──── 审批请求 ────");
-        let _ = writeln!(writer, "工具:   {}", request.call.name);
         let _ = writeln!(
             writer,
-            "参数:   {}",
-            serde_json::to_string(&request.call.arguments).unwrap_or_else(|_| "{}".to_owned())
+            "本会话按前缀放行：之后参数文本以该前缀开头的同类调用都不再询问。"
         );
-        let _ = writeln!(
-            writer,
-            "风险:   {}",
-            risk_summary(&request.annotations)
-        );
-        let _ = write!(writer, "批准执行？[y] 允许  [n] 否决  [a] 本会话允许此工具  [q] 中止运行: ");
+        let _ = write!(writer, "前缀（回车取消）: ");
         let _ = writer.flush();
 
-        // 读不到行（EOF）时 line 为 Ok(0) 或 Err，两者都算否决。
         let mut line = String::new();
-        let read = reader.read_line(&mut line);
-        let answer = match read {
-            Ok(0) | Err(_) => None,
-            Ok(_) => parse_answer(line.trim()),
+        let input = match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => line.trim().to_owned(),
         };
-
-        match answer {
-            Some(Answer::Approve) => (Ok(()), false),
-            Some(Answer::Trust) => {
-                self.trust(&request.call.name);
-                (Ok(()), false)
-            }
-            Some(Answer::Deny) => {
-                let reason = ask_reason(reader, writer);
-                (Err(reason), false)
-            }
-            Some(Answer::Abort) => (
-                Err("用户中止了本次运行".to_owned()),
-                false,
-            ),
-            // fail-closed：空行、无法识别、EOF 全部落到这里。
-            None => (
-                Err("未给出有效答复，按策略视为否决".to_owned()),
-                false,
-            ),
+        if input.is_empty() {
+            return None;
         }
+        scope_for(call, &input)
     }
 
-    /// 该工具名是否已被 `a` 放行。
-    fn is_trusted(&self, tool: &str) -> bool {
-        self.trusted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(tool)
-    }
-
-    /// 把工具名加入本会话信任集合。
-    fn trust(&self, tool: &str) {
-        self.trusted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(tool.to_owned());
-    }
-
-    /// 测试用：当前已信任的工具名。
+    /// 测试用：当前信任记录的条数。
     #[cfg(test)]
-    fn trusted_tools(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .trusted
+    fn trusted_entries(&self) -> usize {
+        self.trusted
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .cloned()
-            .collect();
-        names.sort();
-        names
+            .len()
+    }
+}
+
+/// 这个调用的参数里，哪个字段能被前缀信任匹配上。
+///
+/// shell 是威力最大的工具，优先按命令头匹配；文件类工具没有 `command`，
+/// 落到 `path`。两者都没有（git_status、多数 MCP 工具）时返回 `None`，
+/// 调用方据此判定"这个工具没法按前缀放行"——空作用域会匹配一切，
+/// 拿它当信任用等于放行整个工具。
+fn matchable_argument(call: &crate::domain::tool::ToolCall) -> Option<&'static str> {
+    ["command", "path"]
+        .into_iter()
+        .find(|key| call.arguments.get(*key).and_then(serde_json::Value::as_str).is_some())
+}
+
+/// 把用户输入的前缀装进调用实际带的那个参数字段。
+///
+/// 末尾的 `*` 由这里补上：选了 `p` 就等于声明"这是前缀"，模式语言的
+/// 记法不该让使用者去记。用户已经写了 `*` 就不重复补。
+fn scope_for(call: &crate::domain::tool::ToolCall, input: &str) -> Option<PolicyScope> {
+    let pattern = if input.ends_with('*') {
+        input.to_owned()
+    } else {
+        format!("{input}*")
+    };
+    match matchable_argument(call) {
+        Some("command") => Some(PolicyScope {
+            command_prefix: Some(pattern),
+            ..Default::default()
+        }),
+        Some(_) => Some(PolicyScope {
+            path_prefix: Some(pattern),
+            ..Default::default()
+        }),
+        None => None,
+    }
+}
+
+/// 信任记录的一行摘要，打印在"自动通过"旁边。
+///
+/// 用户需要知道这次放行是凭哪条记忆——尤其是前缀信任，放行范围比
+/// 他看到的那一条调用宽。
+fn trust_description(entry: &TrustEntry) -> String {
+    match entry {
+        TrustEntry::Exact { .. } => "精确信任：参数完全一致".to_owned(),
+        TrustEntry::Prefix { scope, .. } => match (&scope.command_prefix, &scope.path_prefix) {
+            (Some(pattern), _) => format!("前缀信任：命令以 `{pattern}` 开头"),
+            (None, Some(pattern)) => format!("前缀信任：路径以 `{pattern}` 开头"),
+            (None, None) => "前缀信任".to_owned(),
+        },
     }
 }
 
@@ -141,21 +306,20 @@ impl ApprovalGate for CliApprovalGate {
             let stdin = std::io::stdin();
             let mut reader = stdin.lock();
             let mut writer = std::io::stdout();
-            // 第二个返回值是"是否要记住"，由 decide_from 内部直接处理，
-            // 这里只取裁决本身。
-            let (decision, _) = self.decide_from(&mut reader, &mut writer, request);
-            decision
+            self.decide_from(&mut reader, &mut writer, request)
         })
     }
 }
 
-/// 用户对一次审批的四种答复。
+/// 用户对一次审批的五种答复。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answer {
     /// `y`：仅放行这一次。
     Approve,
-    /// `a`：本会话内放行同名工具。
+    /// `a`：本会话内放行参数完全一致的同类调用。
     Trust,
+    /// `p`：本会话内按前缀放行同类调用。
+    Prefix,
     /// `n`：否决，并追问原因。
     Deny,
     /// `q`：中止整个运行。
@@ -170,6 +334,7 @@ fn parse_answer(line: &str) -> Option<Answer> {
     match line.trim().to_ascii_lowercase().as_str() {
         "y" => Some(Answer::Approve),
         "a" => Some(Answer::Trust),
+        "p" => Some(Answer::Prefix),
         "n" => Some(Answer::Deny),
         "q" => Some(Answer::Abort),
         _ => None,
@@ -226,23 +391,38 @@ mod tests {
     use std::io::Cursor;
 
     fn request(name: &str) -> ApprovalRequest {
+        request_with(name, json!({"path": "src/main.rs"}))
+    }
+
+    fn request_with(name: &str, arguments: serde_json::Value) -> ApprovalRequest {
         ApprovalRequest {
             turn: 1,
             call: ToolCall {
                 id: CallId::new("call_1"),
                 name: name.to_owned(),
-                arguments: json!({"path": "src/main.rs"}),
+                arguments,
             },
             annotations: ToolAnnotations::new(false, true, false, false),
+            reason: None,
         }
     }
+
+    /// 策略追加的复核请求（P8-3 的越界写入升级就是这一种）。
+    fn escalated_request(command: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            reason: Some(format!(
+                "策略已放行，但疑似越界写入：命令把输出重定向到 workspace 外的 `{command}`"
+            )),
+            ..request_with("run_command", json!({"command": command}))
+        }
+    }
+
 
     /// 用内存 reader/writer 跑一次审批，拿到裁决。
     fn decide(gate: &CliApprovalGate, input: &str, req: &ApprovalRequest) -> Decision {
         let mut reader = Cursor::new(input.as_bytes());
         let mut sink = Vec::new();
-        let (decision, _) = gate.decide_from(&mut reader, &mut sink, req);
-        decision
+        gate.decide_from(&mut reader, &mut sink, req)
     }
 
     #[test]
@@ -304,21 +484,100 @@ mod tests {
         assert!(reason.contains("中止"), "原因应说明是用户主动中止: {reason}");
     }
 
+    /// `a` 记住的是**这一次调用**，不是这个工具。
+    ///
+    /// P1 的 `a` 按工具名记忆，于是"允许 write_file"会连带放行之后所有
+    /// write_file——包括写 `Cargo.toml`、写 `.env` 的那些。参数不同，
+    /// 后果不同，信任的粒度必须跟后果对齐。
     #[test]
-    fn trust_remembers_the_tool_for_later_calls() {
+    fn trust_a_remembers_the_exact_call_not_the_tool() {
         let gate = CliApprovalGate::new();
         let req = request("write_file");
 
-        // 第一次回答 a：本会话放行。
+        // 第一次回答 a：本会话放行这一模一样的调用。
         assert!(decide(&gate, "a\n", &req).is_ok());
-        assert_eq!(gate.trusted_tools(), vec!["write_file".to_owned()]);
+        assert_eq!(gate.trusted_entries(), 1);
 
-        // 第二次同一个工具不再需要输入——reader 是空的（EOF），
+        // 参数完全一致的后续调用不再需要输入——reader 是空的（EOF），
         // 如果它没记住，就会因为读不到答案而否决。
-        assert!(decide(&gate, "", &req).is_ok(), "已信任的工具应自动放行");
+        assert!(decide(&gate, "", &req).is_ok(), "已信任的调用应自动放行");
 
-        // 换一个工具仍然要问。
-        assert!(decide(&gate, "", &request("delete_file")).is_err());
+        // 同一个工具、不同参数：仍然要问，且读不到输入时否决。
+        let other = request_with("write_file", json!({"path": "Cargo.toml", "content": "x"}));
+        assert!(
+            decide(&gate, "", &other).is_err(),
+            "参数不同的同工具调用不得被放行"
+        );
+    }
+
+    /// `p` 按用户给的前缀放行：命中前缀的后续调用自动通过，其余照问。
+    #[test]
+    fn trust_p_covers_calls_matching_the_prefix_only() {
+        let gate = CliApprovalGate::new();
+        let first = request_with("run_command", json!({"command": "cargo test --nocapture"}));
+
+        // p 之后输入前缀；p 分支自身不需要二次确认。
+        assert!(decide(&gate, "p\ncargo test\n", &first).is_ok());
+
+        // 同前缀的另一条命令自动通过。
+        let same_prefix = request_with("run_command", json!({"command": "cargo test --lib"}));
+        assert!(decide(&gate, "", &same_prefix).is_ok(), "前缀内的命令应自动放行");
+
+        // 裸命令也在前缀内：用户写 "cargo test" 时没带尾部空格。
+        let bare = request_with("run_command", json!({"command": "cargo test"}));
+        assert!(decide(&gate, "", &bare).is_ok(), "裸命令应算前缀命中");
+
+        // 前缀外的命令仍然要问。
+        let dangerous = request_with("run_command", json!({"command": "rm -rf /"}));
+        assert!(decide(&gate, "", &dangerous).is_err(), "前缀外的命令不得被放行");
+    }
+
+    /// `p` 对文件类工具放行的是路径前缀。
+    #[test]
+    fn trust_p_uses_the_path_argument_for_file_tools() {
+        let gate = CliApprovalGate::new();
+        assert!(decide(&gate, "p\nsrc/\n", &request("write_file")).is_ok());
+
+        let inside = request_with("write_file", json!({"path": "src/lib.rs", "content": "x"}));
+        assert!(decide(&gate, "", &inside).is_ok(), "路径前缀内的写入应自动放行");
+
+        let outside = request_with("write_file", json!({"path": "docs/a.md", "content": "x"}));
+        assert!(
+            decide(&gate, "", &outside).is_err(),
+            "路径前缀外的写入仍要审批"
+        );
+    }
+
+    /// `p` 之后留空：既不否决也不记信任，回到批准问题本身。
+    ///
+    /// 用户敲错键选了 `p` 却不能反悔，会被迫在前缀输入框里编一个字符串——
+    /// 那正是信任机制最不该有的用法。
+    #[test]
+    fn empty_prefix_answer_re_asks_without_trusting() {
+        let gate = CliApprovalGate::new();
+        let req = request("write_file");
+
+        // p → 空前缀 → 重新问 → 这次答 y。
+        assert!(decide(&gate, "p\n\ny\n", &req).is_ok());
+        assert_eq!(gate.trusted_entries(), 0, "空前缀不得写入信任");
+
+        // 既然没记信任，下一次照问。
+        assert!(decide(&gate, "", &req).is_err());
+    }
+
+    /// 没有 command 也没有 path 参数的工具（git_status、MCP 工具）无法按
+    /// 前缀放行：`p` 只能退回重新问，不能悄悄退化成"放行整个工具"。
+    #[test]
+    fn prefix_trust_is_unavailable_without_a_matchable_argument() {
+        let gate = CliApprovalGate::new();
+        let req = request_with("git_status", json!({}));
+
+        // p → 没有可匹配参数，直接退回重新问（不消费下一行）→ 答 y 放行这一次。
+        assert!(decide(&gate, "p\ny\n", &req).is_ok());
+        assert_eq!(gate.trusted_entries(), 0);
+
+        // 下一次照问。
+        assert!(decide(&gate, "", &req).is_err());
     }
 
     #[test]
@@ -328,7 +587,7 @@ mod tests {
 
         // 下一次仍需审批，且读不到输入时否决。
         assert!(decide(&gate, "", &request("write_file")).is_err());
-        assert!(gate.trusted_tools().is_empty(), "y 不应写入信任集合");
+        assert_eq!(gate.trusted_entries(), 0, "y 不应写入信任集合");
     }
 
     #[test]
@@ -352,6 +611,70 @@ mod tests {
         assert!(printed.contains("write_file"), "应打印工具名");
         assert!(printed.contains("src/main.rs"), "应打印参数");
         assert!(printed.contains("破坏性"), "应打印风险");
+        assert!(printed.contains("[p]"), "应说明前缀信任选项");
+    }
+
+    /// 前缀输入框要把后果说清楚：它放行的是一整类调用，不是这一次。
+    #[test]
+    fn prefix_prompt_explains_the_scope_of_the_grant() {
+        let gate = CliApprovalGate::new();
+        let mut reader = Cursor::new(b"p
+
+".as_slice());
+        let mut sink = Vec::new();
+
+        let _ = gate.decide_from(&mut reader, &mut sink, &request("run_command"));
+        let printed = String::from_utf8(sink).expect("输出是 UTF-8");
+
+        assert!(printed.contains("不再询问"), "应说明放行范围: {printed}");
+        assert!(printed.contains("回车取消"), "应说明可以取消: {printed}");
+    }
+
+    /// 带 reason 的复核请求对会话信任免疫：一次都不能被 `a`/`p` 消掉。
+    ///
+    /// 升级的全部意义是"越界写入每次都要人过目"。若信任对它有效，
+    /// 模型把同一条命令重发一遍就会被无声放行——升级白做。
+    #[test]
+    fn escalated_request_ignores_session_trust() {
+        let gate = CliApprovalGate::new();
+        let req = escalated_request(r"echo hi > C:\Windows\temp\x");
+
+        // 先授出一条前缀信任，让它确实在会话里生效。
+        let ordinary = request_with("run_command", json!({"command": "cargo test"}));
+        assert!(decide(&gate, "p\ncargo\n", &ordinary).is_ok());
+        assert_eq!(gate.trusted_entries(), 1);
+        // 信任确实有效：同前缀的普通调用不再询问。
+        let same_prefix = request_with("run_command", json!({"command": "cargo build"}));
+        assert!(decide(&gate, "", &same_prefix).is_ok());
+
+        // 复核请求照问，且 `a` 不被接受——它既不记信任也不放行。
+        assert!(decide(&gate, "a\n", &req).is_err(), "复核请求不得被 `a` 放行");
+        assert_eq!(gate.trusted_entries(), 1, "复核请求不得写入信任");
+
+        // `p` 同样不被接受。
+        assert!(decide(&gate, "p\ncargo\n", &req).is_err());
+        assert_eq!(gate.trusted_entries(), 1, "复核请求不得写入信任");
+
+        // 答 y 才放行，而且只放行这一次。
+        assert!(decide(&gate, "y\n", &req).is_ok());
+        assert!(decide(&gate, "", &req).is_err(), "复核请求每次都要问");
+    }
+
+    /// 复核请求的提示要说明为什么不给信任选项。
+    #[test]
+    fn escalated_prompt_shows_the_reason_and_hides_trust_options() {
+        let gate = CliApprovalGate::new();
+        let mut reader = Cursor::new(b"y\n".as_slice());
+        let mut sink = Vec::new();
+
+        let _ = gate.decide_from(&mut reader, &mut sink, &escalated_request(r"echo hi > C:\x"));
+        let printed = String::from_utf8(sink).expect("输出是 UTF-8");
+
+        assert!(printed.contains("复核"), "应标明这是复核: {printed}");
+        assert!(printed.contains(r"C:\x"), "应点名越界目标: {printed}");
+        assert!(!printed.contains("[a]"), "复核请求不应提供 [a]: {printed}");
+        assert!(!printed.contains("[p]"), "复核请求不应提供 [p]: {printed}");
+        assert!(printed.contains("不适用会话信任"), "应说明原因: {printed}");
     }
 
     #[test]

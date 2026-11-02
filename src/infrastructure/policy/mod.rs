@@ -48,6 +48,7 @@ pub fn parse(text: &str) -> Result<PolicyEngine, toml::de::Error> {
 /// 配置里用字符串表达裁决（`verdict = "deny"`），而领域里用枚举；
 /// 这层翻译同时承担了"字符串 → 枚举"的校验，非法值在这里就能报错。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PolicyConfig {
     /// 规则列表，按数组顺序匹配，第一条命中的生效。
     #[serde(default)]
@@ -56,6 +57,7 @@ struct PolicyConfig {
 
 /// TOML 侧的一条规则。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuleConfig {
     /// 匹配的工具名。缺省表示匹配所有工具。
     tool: Option<String>,
@@ -64,14 +66,41 @@ struct RuleConfig {
     /// 规则说明，进入证据和给模型的解释。
     #[serde(default)]
     description: String,
+    /// 参数级作用域。缺省表示不再卡参数，只按工具名匹配。
+    #[serde(default)]
+    scope: Option<ScopeConfig>,
+}
+
+/// TOML 侧的作用域。
+///
+/// `deny_unknown_fields` 是安全要求而不是洁癖：拼错一个字段若被静默
+/// 忽略，作用域就整个消失了——一条本意"只放行 cargo test"的规则会
+/// 悄悄扩大成"放行所有 run_command"。配置是手写的，拼错必须当场报错。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeConfig {
+    /// 命令头条件，尾部的 `*` 表示前缀匹配。
+    #[serde(default)]
+    command_prefix: Option<String>,
+    /// 路径前缀条件，尾部的 `*` 表示前缀匹配。
+    #[serde(default)]
+    path_prefix: Option<String>,
+}
+
+impl From<ScopeConfig> for PolicyScope {
+    fn from(config: ScopeConfig) -> Self {
+        PolicyScope {
+            command_prefix: config.command_prefix,
+            path_prefix: config.path_prefix,
+        }
+    }
 }
 
 impl From<RuleConfig> for PolicyRule {
     fn from(config: RuleConfig) -> Self {
         PolicyRule {
             tool: config.tool,
-            // P1 不支持参数级作用域，配置里也没有对应字段。
-            scope: None,
+            scope: config.scope.map(PolicyScope::from),
             verdict: PolicyVerdict::from_str(&config.verdict),
             description: config.description,
         }
@@ -90,14 +119,6 @@ impl PolicyVerdict {
             _ => Self::RequireApproval,
         }
     }
-}
-
-/// 让 `PolicyScope` 的预留字段不会因为"从未构造"而报警。
-///
-/// P2 加参数级作用域时会用上它；现在先让类型完整可序列化。
-#[allow(dead_code)]
-fn scope_placeholder() -> Option<PolicyScope> {
-    None
 }
 
 /// 策略配置的加载错误。
@@ -133,6 +154,14 @@ mod tests {
             id: CallId::new("c"),
             name: name.to_owned(),
             arguments: json!({}),
+        }
+    }
+
+    fn call_with(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: CallId::new("c"),
+            name: name.to_owned(),
+            arguments,
         }
     }
 
@@ -249,6 +278,125 @@ description = "手滑打错"
         );
     }
 
+    // ── P8-2 作用域（scope）───────────────────────────────────────────
+
+    /// `scope = { command_prefix = "cargo test *" }` 把一条针对
+    /// `run_command` 的放行收窄到 cargo test 一族。
+    #[test]
+    fn scope_with_command_prefix_narrows_the_rule() {
+        let engine = parse(
+            r#"
+[[rules]]
+tool = "run_command"
+verdict = "allow"
+description = "跑测试免审"
+scope = { command_prefix = "cargo test *" }
+"#,
+        )
+        .expect("解析");
+
+        let spec = spec(false);
+        assert_eq!(
+            engine
+                .evaluate(&call_with("run_command", json!({"command": "cargo test --nocapture"})), &spec)
+                .verdict,
+            PolicyVerdict::Allow
+        );
+        assert_eq!(
+            engine
+                .evaluate(&call_with("run_command", json!({"command": "rm -rf /"})), &spec)
+                .verdict,
+            PolicyVerdict::RequireApproval,
+            "作用域外的命令不得被放行"
+        );
+    }
+
+    /// `path_prefix` 同理，只对 `path` 参数生效。
+    #[test]
+    fn scope_with_path_prefix_narrows_the_rule() {
+        let engine = parse(
+            r#"
+[[rules]]
+tool = "write_file"
+verdict = "allow"
+description = "src/ 下的写入免审"
+scope = { path_prefix = "src/*" }
+"#,
+        )
+        .expect("解析");
+
+        let spec = spec(false);
+        assert_eq!(
+            engine
+                .evaluate(&call_with("write_file", json!({"path": "src/main.rs"})), &spec)
+                .verdict,
+            PolicyVerdict::Allow
+        );
+        assert_eq!(
+            engine
+                .evaluate(&call_with("write_file", json!({"path": "docs/x.md"})), &spec)
+                .verdict,
+            PolicyVerdict::RequireApproval
+        );
+    }
+
+    /// 空 `scope = {}` 等于没配作用域：规则仍只按工具名匹配。
+    #[test]
+    fn empty_scope_table_behaves_like_no_scope() {
+        let engine = parse(
+            r#"
+[[rules]]
+tool = "run_command"
+verdict = "allow"
+description = "空作用域"
+scope = {}
+"#,
+        )
+        .expect("解析");
+
+        assert_eq!(
+            engine
+                .evaluate(&call_with("run_command", json!({"command": "随便"})), &spec(false))
+                .verdict,
+            PolicyVerdict::Allow
+        );
+    }
+
+    /// 拼错作用域字段必须报错，不能被静默忽略。
+    ///
+    /// 这是 P8-2 新增的安全要求：`command_pretix` 若被当成"没有作用域"，
+    /// 一条本意"只放行 cargo test"的规则会悄悄扩大成"放行所有
+    /// run_command"。配置是手写的，拼错要当场炸出来。
+    #[test]
+    fn misspelled_scope_field_is_rejected() {
+        let result = parse(
+            r#"
+[[rules]]
+tool = "run_command"
+verdict = "allow"
+description = "手滑打错一个字母"
+scope = { command_pretix = "cargo test *" }
+"#,
+        );
+
+        assert!(result.is_err(), "拼错的作用域字段应报错");
+    }
+
+    /// 规则级的拼错同样要报错，理由同上。
+    #[test]
+    fn misspelled_rule_field_is_rejected() {
+        let result = parse(
+            r#"
+[[rules]]
+tool = "run_command"
+verdict = "allow"
+descriptoin = "少了一个 i"
+"#,
+        );
+
+        assert!(result.is_err(), "拼错的规则字段应报错");
+    }
+
     #[test]
     fn malformed_toml_reports_an_error() {
         let result = parse("[[rules]\nverdict = \"deny\"\n");
@@ -288,5 +436,23 @@ description = "忘了写 verdict"
 
         assert!(message.contains("policy.toml"), "错误应指明文件: {message}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 仓库里的示例配置必须能被当前解析器吃下。
+    ///
+    /// 这份文件是用户照着抄的模板，也是 README 引用的样例。它和解析器
+    /// 之间的漂移是静默的：示例里多了个字段、少了条规则，测试全绿、
+    /// 用户一抄就报错——所以拿它当解析器的回归测试跑。
+    #[test]
+    fn the_shipped_example_config_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.toml");
+
+        let engine = load(Some(&path)).expect("policy.example.toml 应能解析");
+
+        assert!(
+            engine.rules.len() >= 8,
+            "示例应覆盖八个内置工具，实际 {} 条",
+            engine.rules.len()
+        );
     }
 }
