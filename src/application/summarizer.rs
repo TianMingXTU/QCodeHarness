@@ -76,6 +76,11 @@ impl Summarizer {
             history: vec![ContextSlice::User(Cow::Owned(prompt))],
             spec: &spec,
             tools: &[],
+            // 摘要调用不参与前缀缓存：它每次的输入都是新裁出来的片段，
+            // 给它一个键只会让 provider 把互不相干的请求路由到同一台
+            // 机器，反而挤掉真正该命中的那条前缀。注意是 `None` 而不是
+            // 空字符串——后者在 wire 上仍是一个 `prompt_cache_key`。
+            cache_key: None,
         };
         let model = self.model.clone();
         let reply = model

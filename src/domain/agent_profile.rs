@@ -1,11 +1,13 @@
 //! 角色档案：一个 Agent 角色的系统提示词与工具白名单。
 //!
 //! P5 起不同角色看到不同的提示词、拿到不同的工具子集。工具约束必须是
-//! 双重的：① 提示词里说明不许做（降低概率）；② 工具子集里根本不给
-//! （硬边界）。只有 ① 没有 ② 的约束靠模型自觉，不构成边界。
+//! 双重的：① 提示词里说明不许做（降低概率）；② 调用层按白名单拒绝越权
+//! 调用（硬边界）。只有 ① 没有 ② 的约束靠模型自觉，不构成边界。
 //!
-//! 白名单用工具名（数据）而不是 `ToolSet`（运行时对象）：名字可以来自
-//! 配置、可以进测试、可以序列化；应用层按名字从 `ToolRegistry` 过滤。
+//! P9-3 起白名单不再被用于装配期过滤：模型每一步看到的都是全量注册表
+//! （前缀缓存要求工具定义跨步一致），白名单下沉为调用时校验——越权
+//! 调用拿到一条指明角色可用工具的拒绝观察，工具根本不会执行。这里的
+//! 数据因此就是边界的唯一真相来源，应用层（`AgentRunner`）按它逐条判断。
 
 use super::agent::AgentRole;
 
@@ -22,12 +24,23 @@ pub struct AgentProfile {
 
 /// 只读工具集：Planner 与 Reviewer 共用。任何会改动文件或执行命令的
 /// 工具都不在其中。
-const READ_ONLY_TOOLS: &[&str] = &["read_file", "list_dir", "search_text", "git_status", "git_diff"];
+///
+/// `read_files` 与 `read_file` 同权（同一条读取路径、同一套路径校验），
+/// 只是批量——把它挡在名单外会让受限角色明明有更省往返的读法却不能用，
+/// 而这不构成任何边界：读什么、读几个文件，权限上是一件事。
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "read_files",
+    "list_dir",
+    "search_text",
+    "git_status",
+    "git_diff",
+];
 
 impl AgentProfile {
     /// 四个内置档案。提示词都遵循 main.rs 的 ReAct 基调，并明确写出
     /// "不许做什么"——模型看到工具列表里有写工具就可能去用，提示词
-    /// 是第一道软约束（硬约束在工具子集的过滤上）。
+    /// 是第一道软约束（硬约束在调用层的白名单校验上）。
     pub fn builtin() -> Vec<AgentProfile> {
         let read_only_frame = "\
 你是一个运行在受控 workspace 中的只读分析角色，按照 ReAct 循环完成任务：
@@ -92,6 +105,7 @@ impl AgentProfile {
                 tools: Some(
                     [
                         "read_file",
+                        "read_files",
                         "list_dir",
                         "search_text",
                         "run_command",
@@ -165,6 +179,35 @@ mod tests {
         let planner = profiles.iter().find(|p| p.role == AgentRole::Planner).unwrap();
         let reviewer = profiles.iter().find(|p| p.role == AgentRole::Reviewer).unwrap();
         assert_eq!(planner.tools, reviewer.tools);
+    }
+
+    /// 批量读取工具要在只读名单里，且名单里不得混进任何写工具。
+    ///
+    /// P9-4 加了 `read_files`。它和 `read_file` 走同一条读取路径、同一套
+    /// 路径校验，权限上是同一件事——漏加它不削弱边界，但会让受限角色
+    /// 明明有更省往返的读法却用不上。断言的后一半守住的是反方向：
+    /// "批量"没有被当成"什么都能批量"的借口，写工具一个都不在。
+    #[test]
+    fn read_only_set_includes_the_batch_reader_and_no_write_tool() {
+        for role in [AgentRole::Planner, AgentRole::Reviewer] {
+            let tools = AgentProfile::builtin()
+                .into_iter()
+                .find(|profile| profile.role == role)
+                .expect("应有档案")
+                .tools
+                .expect("只读角色应有限定工具集");
+
+            assert!(
+                tools.iter().any(|name| name == "read_files"),
+                "{role:?} 应能批量读取: {tools:?}"
+            );
+            for forbidden in ["write_file", "edit_file", "run_command"] {
+                assert!(
+                    !tools.iter().any(|name| name == forbidden),
+                    "{role:?} 不应持有 {forbidden}: {tools:?}"
+                );
+            }
+        }
     }
 
     #[test]

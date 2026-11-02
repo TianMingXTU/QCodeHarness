@@ -197,8 +197,8 @@ impl CliApprovalGate {
 
     /// 追问要放行的前缀，返回它落在哪个作用域字段上。
     ///
-    /// `None` 表示用户留空取消，或这个调用根本没有可匹配的参数——
-    /// 两者都该退回重新问，而不是记一条覆盖不全的信任。
+    /// `None` 表示用户取消（留空且没有建议值可接受），或这个调用根本没有
+    /// 可匹配的参数——两者都该退回重新问，而不是记一条覆盖不全的信任。
     fn ask_prefix(
         &self,
         reader: &mut dyn BufRead,
@@ -215,22 +215,32 @@ impl CliApprovalGate {
             return None;
         }
 
+        // P9-5：先算一个候选建议。它只是预填的默认值——用户敲了别的就以
+        // 敲的为准，留空则接受它。给不出建议时行为与从前逐字相同。
+        let suggestion = suggested_prefix(call);
+        let accept_hint = match &suggestion {
+            Some(candidate) => format!("回车用 `{candidate}`，或输入别的"),
+            None => "回车取消".to_owned(),
+        };
+
         let _ = writeln!(writer);
         let _ = writeln!(
             writer,
             "本会话按前缀放行：之后参数文本以该前缀开头的同类调用都不再询问。"
         );
-        let _ = write!(writer, "前缀（回车取消）: ");
+        let _ = write!(writer, "前缀（{accept_hint}）: ");
         let _ = writer.flush();
 
         let mut line = String::new();
         let input = match reader.read_line(&mut line) {
+            // EOF 与读取错误照旧算取消，不接受建议：fail-closed 的边界
+            // 不该被一次"省打字"的便利撬开。
             Ok(0) | Err(_) => return None,
             Ok(_) => line.trim().to_owned(),
         };
-        if input.is_empty() {
-            return None;
-        }
+        // 留空且给得出建议值：接受建议。这是 P9-5 省下的那次打字。
+        // 没有建议值时 `?` 直接返回 None，走的仍是"回车取消"老路。
+        let input = if input.is_empty() { suggestion? } else { input };
         scope_for(call, &input)
     }
 
@@ -277,6 +287,46 @@ fn scope_for(call: &crate::domain::tool::ToolCall, input: &str) -> Option<Policy
         }),
         None => None,
     }
+}
+
+/// 从一次调用推断一个保守的前缀信任候选，供 `p` 预填（P9-5）。
+///
+/// `p` 的全部意义是少敲几次键盘，但候选绝不能比人愿意授的范围更宽，
+/// 所以"词数要够"是硬要求：`cargo` 这种裸程序名会让会话信任膨胀到该
+/// 程序的每一个子命令（包括 `cargo publish`），那不如不给建议。
+///
+/// - `command`：取前两个词。`cargo test --lib` → `cargo test`，覆盖
+///   `cargo test --doc` 一族，但不碰 `cargo build`、`cargo publish`。
+///   本次特有的参数不进候选——带上它，这条信任就永远匹配不上下一条调用。
+///   带包装前缀的命令（`sudo cargo test`）取到的是 `sudo cargo`：范围仍以
+///   那个程序为界，不会扩到 `sudo` 的别的子命令，但确实也涵盖
+///   `sudo cargo publish`。所以候选只是**起点**——它原样印在提示框里，
+///   按回车之前看得见自己授的范围，嫌宽就自己敲窄的。
+/// - `path`：取所在目录。`src/domain/policy.rs` → `src/domain/`。目录边界
+///   是天然的授权范围；不取"前两段路径"是因为前缀匹配不认词边界，
+///   `src/domain*` 会连 `src/domain.rs` 一起吞掉。
+///
+/// 三种情况一律不给建议：少于两个词的命令、根目录下的文件、带 shell
+/// 链接符的命令。第一种让命令头宽到整个程序；第二种连一个目录边界都没有；
+/// 第三种是因为信任只覆盖命令头（`prefix_matches` 明确不让 `*` 吞 `&&`
+/// 之后的部分），而人眼前那条调用是一条链——建议一个只覆盖前半截的前缀，
+/// 会让人以为整条链都被记住了。
+fn suggested_prefix(call: &crate::domain::tool::ToolCall) -> Option<String> {
+    if let Some(command) = call.arguments.get("command").and_then(serde_json::Value::as_str) {
+        if crate::domain::policy::chains_another_command(command) {
+            return None;
+        }
+        let mut words = command.split_whitespace();
+        let program = words.next()?;
+        let subcommand = words.next()?;
+        return Some(format!("{program} {subcommand}"));
+    }
+    let path = call.arguments.get("path").and_then(serde_json::Value::as_str)?;
+    let (directory, _) = path.rsplit_once('/')?;
+    if directory.is_empty() {
+        return None;
+    }
+    Some(format!("{directory}/"))
 }
 
 /// 信任记录的一行摘要，打印在"自动通过"旁边。
@@ -552,10 +602,15 @@ mod tests {
     ///
     /// 用户敲错键选了 `p` 却不能反悔，会被迫在前缀输入框里编一个字符串——
     /// 那正是信任机制最不该有的用法。
+    ///
+    /// 用根目录下的文件：它给不出候选建议，所以留空走的仍是"取消"这条
+    /// 老路。P9-5 之后留空的含义取决于有没有建议值——有建议时留空是
+    /// 接受它（见 `accepting_the_suggestion_with_enter_trusts_the_suggested_prefix`），
+    /// 那条路径上提示框已经把要授的范围原样印出来了。
     #[test]
     fn empty_prefix_answer_re_asks_without_trusting() {
         let gate = CliApprovalGate::new();
-        let req = request("write_file");
+        let req = request_with("write_file", json!({"path": "main.rs"}));
 
         // p → 空前缀 → 重新问 → 这次答 y。
         assert!(decide(&gate, "p\n\ny\n", &req).is_ok());
@@ -615,6 +670,9 @@ mod tests {
     }
 
     /// 前缀输入框要把后果说清楚：它放行的是一整类调用，不是这一次。
+    ///
+    /// 用裸命令（`ls`）：它给不出候选建议，所以"回车取消"这条老路仍在。
+    /// 有建议时的提示语由 `prefix_prompt_shows_the_suggested_candidate` 守着。
     #[test]
     fn prefix_prompt_explains_the_scope_of_the_grant() {
         let gate = CliApprovalGate::new();
@@ -623,7 +681,7 @@ mod tests {
 ".as_slice());
         let mut sink = Vec::new();
 
-        let _ = gate.decide_from(&mut reader, &mut sink, &request("run_command"));
+        let _ = gate.decide_from(&mut reader, &mut sink, &request_with("run_command", json!({"command": "ls"})));
         let printed = String::from_utf8(sink).expect("输出是 UTF-8");
 
         assert!(printed.contains("不再询问"), "应说明放行范围: {printed}");
@@ -681,5 +739,131 @@ mod tests {
     fn risk_summary_handles_a_clean_annotation() {
         let clean = ToolAnnotations::new(false, false, true, false);
         assert_eq!(risk_summary(&clean), "仅写操作，无已知风险标记");
+    }
+
+    // ── P9-5 前缀候选建议 ──────────────────────────────────────────────
+
+    fn call_with(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: CallId::new("call_1"),
+            name: name.to_owned(),
+            arguments,
+        }
+    }
+
+    /// 命令的候选取前两个词：够窄到不吞掉别的子命令，
+    /// 也够宽到把同一条命令的参数变体一次收编。
+    #[test]
+    fn suggested_prefix_takes_the_first_two_words_of_a_command() {
+        assert_eq!(
+            suggested_prefix(&call_with("run_command", json!({"command": "cargo test --lib foo"}))),
+            Some("cargo test".to_owned()),
+            "参数不该进候选：候选是给后续调用用的，带上这次特有的参数就永远匹配不上"
+        );
+        // 恰好两个词时候选就是整条命令：省下打字，范围一点没变。
+        assert_eq!(
+            suggested_prefix(&call_with("run_command", json!({"command": "cargo test"}))),
+            Some("cargo test".to_owned())
+        );
+    }
+
+    /// 裸程序名不给建议：一个词的命令头等于把整个程序交给会话信任，
+    /// `cargo` 会连 `cargo publish` 一起吞掉——那不如让用户自己敲。
+    #[test]
+    fn a_bare_program_name_gets_no_suggestion() {
+        assert_eq!(
+            suggested_prefix(&call_with("run_command", json!({"command": "ls"}))),
+            None
+        );
+    }
+
+    /// 路径的候选是所在目录：目录边界是天然的授权范围。
+    ///
+    /// 不取"前两段路径"是因为前缀匹配不认词边界，`src/domain*` 会连
+    /// `src/domain.rs` 一起吞掉；带上结尾的 `/` 才精确落在目录内。
+    #[test]
+    fn suggested_prefix_for_a_path_is_its_directory() {
+        assert_eq!(
+            suggested_prefix(&call_with("write_file", json!({"path": "src/domain/policy.rs"}))),
+            Some("src/domain/".to_owned())
+        );
+    }
+
+    /// 就在 workspace 根上的文件没有目录可授：给建议只会变成
+    /// "放行所有写入"，那是用户没说过的范围。
+    #[test]
+    fn a_path_at_the_workspace_root_gets_no_suggestion() {
+        assert_eq!(
+            suggested_prefix(&call_with("write_file", json!({"path": "main.rs"}))),
+            None
+        );
+    }
+
+    /// 带 shell 链接符的命令不给建议。
+    ///
+    /// 信任只覆盖命令头（`prefix_matches` 明确不让 `*` 吞 `&&` 之后的部分），
+    /// 而人眼前这条调用是一条链——建议一个只覆盖前半截的前缀，会让人以为
+    /// 整条链都被记住了，下次它照样要问。
+    #[test]
+    fn chained_commands_get_no_suggestion() {
+        assert_eq!(
+            suggested_prefix(&call_with("run_command", json!({"command": "cargo test && git push"}))),
+            None
+        );
+    }
+
+    /// 没有 command / path 参数的工具（git_status、多数 MCP 工具）
+    /// 没有可授的范围——与既有的"无法按前缀放行"是同一个结论。
+    #[test]
+    fn a_tool_without_matchable_arguments_gets_no_suggestion() {
+        assert_eq!(suggested_prefix(&call_with("git_status", json!({}))), None);
+    }
+
+    /// 建议值必须原样显示在输入框里。
+    ///
+    /// 人得看得见自己授的是什么范围，否则"回车"这个动作没有任何信息量——
+    /// 他以为批的是眼前这一条，实际放开的是一整类调用。
+    #[test]
+    fn prefix_prompt_shows_the_suggested_candidate() {
+        let gate = CliApprovalGate::new();
+        let mut reader = Cursor::new(b"p\n\n".as_slice());
+        let mut sink = Vec::new();
+        let req = request_with("run_command", json!({"command": "cargo test --lib"}));
+
+        let _ = gate.decide_from(&mut reader, &mut sink, &req);
+        let printed = String::from_utf8(sink).expect("输出是 UTF-8");
+
+        assert!(printed.contains("cargo test"), "应显示建议值: {printed}");
+    }
+
+    /// 选 `p` 后直接回车 = 接受建议值，不必手敲。
+    #[test]
+    fn accepting_the_suggestion_with_enter_trusts_the_suggested_prefix() {
+        let gate = CliApprovalGate::new();
+        let req = request_with("run_command", json!({"command": "cargo test --lib"}));
+
+        // "p" 之后紧跟一个空行：接受建议。
+        assert!(decide(&gate, "p\n\n", &req).is_ok());
+
+        // 建议范围生效：同命令头的另一条调用不再询问。
+        let same_head = request_with("run_command", json!({"command": "cargo test --doc"}));
+        assert!(decide(&gate, "", &same_head).is_ok(), "cargo test 一族应已被信任");
+        // 但换了子命令仍要问：建议值没有宽到把 cargo 整个吞掉。
+        let other = request_with("run_command", json!({"command": "cargo build"}));
+        assert!(decide(&gate, "", &other).is_err(), "cargo build 不在建议范围内");
+    }
+
+    /// 用户仍然可以敲自己的前缀：建议只是省一次打字，不是替人决定。
+    #[test]
+    fn typing_a_prefix_still_overrides_the_suggestion() {
+        let gate = CliApprovalGate::new();
+        let req = request_with("run_command", json!({"command": "cargo test --lib"}));
+
+        assert!(decide(&gate, "p\ncargo\n", &req).is_ok());
+
+        let under_cargo = request_with("run_command", json!({"command": "cargo build"}));
+        assert!(decide(&gate, "", &under_cargo).is_ok(), "用户敲的前缀优先");
+        let cargo_test = request_with("run_command", json!({"command": "cargo test"}));
+        assert!(decide(&gate, "", &cargo_test).is_ok());
     }
 }

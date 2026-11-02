@@ -35,6 +35,10 @@ pub fn all_tools(root: WorkspaceRoot) -> Vec<ToolEntry> {
             invoker: Arc::new(file::ReadFile::new(root.clone())),
         },
         ToolEntry {
+            spec: file::ReadFiles::spec(),
+            invoker: Arc::new(file::ReadFiles::new(root.clone())),
+        },
+        ToolEntry {
             spec: file::ListDir::spec(),
             invoker: Arc::new(file::ListDir::new(root.clone())),
         },
@@ -256,5 +260,29 @@ mod tests {
             refused.content
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `read_files` 必须登记进注册表，且紧挨着 `read_file`。
+    ///
+    /// 漏登记的表现是"模型看得见却调不动"——规格由同一个 `spec()` 产出，
+    /// 所以看得见；执行入口没注册，调用只会得到一条"未注册"的拒绝。
+    /// 挨着放是为了工具清单读起来连贯：两个读工具分居列表两端时，
+    /// 模型更难注意到批量入口的存在。
+    #[test]
+    fn read_files_is_registered_next_to_read_file() {
+        let names: Vec<String> = all_tools(WorkspaceRoot::new(std::env::temp_dir()))
+            .into_iter()
+            .map(|entry| entry.spec.name)
+            .collect();
+
+        let batch = names
+            .iter()
+            .position(|name| name == "read_files")
+            .expect("read_files 应登记进注册表");
+        let single = names
+            .iter()
+            .position(|name| name == "read_file")
+            .expect("read_file 应登记进注册表");
+        assert_eq!(batch, single + 1, "read_files 应紧挨 read_file: {names:?}");
     }
 }

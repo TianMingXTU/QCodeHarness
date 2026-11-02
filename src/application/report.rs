@@ -80,6 +80,16 @@ pub struct SessionSummary {
     pub approved: usize,
     /// 审批否决次数。
     pub denied: usize,
+    /// 等人点头一共花了多少毫秒。
+    ///
+    /// 取每条 `RequireApproval` 裁决到紧随其后的 `ApprovalDecided` 的
+    /// 时间差。P9-5 要减少的就是这段等待，所以它必须是个可测的数——
+    /// 只数审批次数看不出等待成本：两次秒点的 `y` 和两次人去泡咖啡的
+    /// `y` 在旧报表里一模一样。
+    ///
+    /// 只数"策略判了要审"的那几条：策略放行的调用压根不进闸门，把它
+    /// 后续的间隔算成"等人"会把工具执行时间记到人头上。
+    pub approval_wait_ms: u64,
     /// 策略裁决为 Allow 的次数。
     pub policy_allow: usize,
     /// 策略裁决为 RequireApproval 的次数。
@@ -90,6 +100,10 @@ pub struct SessionSummary {
     pub input_tokens: u64,
     /// 输出 token 合计。
     pub output_tokens: u64,
+    /// 从 provider 缓存读回的输入 token 合计。
+    pub cached_input_tokens: u64,
+    /// 写入 provider 缓存的输入 token 合计。
+    pub cache_creation_input_tokens: u64,
     /// 成本合计（美元）。任一次调用成本未知时为 `None`——
     /// 部分已知的合计是被低估的数字，比"未知"更危险。
     pub cost_usd: Option<f64>,
@@ -101,6 +115,32 @@ pub struct SessionSummary {
     pub started_at: Option<SystemTime>,
     /// 末事件时刻。
     pub ended_at: Option<SystemTime>,
+    /// 本次会话的首末事件间隔（毫秒）。空会话为 0。
+    ///
+    /// 用末事件减首事件而不是另设计时器：事件时间戳本来就在证据里，
+    /// 再起一个时钟只会多一处可能对不上的真相。它不含会话创建与
+    /// 证据文件打开的开销——那些发生在第一条事件之前。
+    pub wall_clock_ms: u64,
+    /// 每轮模型调用的耗时（毫秒），按调用顺序。空会话为空。
+    ///
+    /// 一轮的耗时取"本轮思考事件"与"上一轮思考事件"的时间差：模型
+    /// 调用是这两点之间发生的事，工具执行的结果落在下一轮思考之前，
+    /// 所以这个差值同时含 prefill 与 decode，也含这一轮触发的工具
+    /// 执行——它是"用户等待了一轮"的总时长，正是要优化的量。
+    pub turn_latencies_ms: Vec<u64>,
+    /// 缓存命中率：读回的 token 占输入 token 的比例。分母为 0 时为 `None`。
+    ///
+    /// 分母为 0 时报 `None` 而不是 `0.0`：两者含义相反——0.0 是
+    /// "有输入但一次都没命中"，`None` 是"压根没有输入 token 可算"
+    /// （provider 不报用量，或会话零调用）。把后者显示成 0% 会让
+    /// 用户以为缓存坏了，与"成本未知不填 0"是同一条诚实线。
+    pub cache_hit_ratio: Option<f64>,
+    /// 同一会话内被重复调用（同工具名 + 同一份参数）的工具名。
+    ///
+    /// 按名称去重后按首次出现排序。重复调用是轮次浪费最直接的信号：
+    /// 同一个文件读两遍，说明上一条观察没能让模型满意，或者它忘了
+    /// 自己已经读过——两者都指向提示词与工具描述可以改进的地方。
+    pub repeated_calls: Vec<String>,
 }
 
 /// 多个会话的汇总。
@@ -112,6 +152,26 @@ pub struct BenchmarkReport {
     pub total_input_tokens: u64,
     /// 全部会话的输出 token 合计。
     pub total_output_tokens: u64,
+    /// 全部会话从缓存读回的输入 token 合计。
+    pub total_cached_input_tokens: u64,
+    /// 全部会话的墙钟合计（毫秒）。
+    ///
+    /// 会话之间是串行跑的，所以这个合计就是"这一轮基准跑了多久"的
+    /// 下界——它不含 fixture 拷贝、判据命令与证据读回的开销。
+    pub total_wall_clock_ms: u64,
+    /// 全部会话的审批次数合计。
+    ///
+    /// 基准强制 `AutoApproveGate`（无人值守），所以这里在基准里恒为 0；
+    /// 真实使用中的审批次数要从 `--report` 看。两处的 `approvals`
+    /// 是同一个字段，只是基准里那个闸门不放人进来。
+    pub total_approvals: usize,
+    /// 全部会话的等人点头耗时合计（毫秒）。
+    ///
+    /// 与 [`Self::total_approvals`] 分开：次数回答"被打断几回"，
+    /// 这一列回答"被打断多久"。P9-5（默认基线免审 + `p` 前缀建议）
+    /// 要同时压这两个数，而压不下来的是时间——少问两次但每次都等五分钟，
+    /// 用户的体感没有任何改善。
+    pub total_approval_wait_ms: u64,
     /// 全部会话的成本合计。任一会话成本未知时为 `None`。
     pub total_cost_usd: Option<f64>,
     /// 成功会话数：会话以 `Thought` 事件收尾（ReAct 循环只有交付
@@ -127,6 +187,10 @@ impl BenchmarkReport {
         let sessions: Vec<SessionSummary> = logs.iter().map(|log| summarize(log)).collect();
         let mut total_input = 0u64;
         let mut total_output = 0u64;
+        let mut total_cached = 0u64;
+        let mut total_wall_clock = 0u64;
+        let mut total_approvals = 0usize;
+        let mut total_approval_wait = 0u64;
         // 没有任何成本数据（空清单或全部会话零调用）时是"未知"；
         // 每有一个已知成本就累加，遇到未知即整体转未知。
         let mut total_cost = None;
@@ -134,6 +198,10 @@ impl BenchmarkReport {
         for (log, summary) in logs.iter().zip(&sessions) {
             total_input += summary.input_tokens;
             total_output += summary.output_tokens;
+            total_cached += summary.cached_input_tokens;
+            total_wall_clock += summary.wall_clock_ms;
+            total_approvals += summary.approvals;
+            total_approval_wait += summary.approval_wait_ms;
             match summary.cost_usd {
                 Some(cost) => {
                     total_cost = Some(total_cost.unwrap_or(0.0) + cost);
@@ -150,6 +218,10 @@ impl BenchmarkReport {
             sessions,
             total_input_tokens: total_input,
             total_output_tokens: total_output,
+            total_cached_input_tokens: total_cached,
+            total_wall_clock_ms: total_wall_clock,
+            total_approvals,
+            total_approval_wait_ms: total_approval_wait,
             total_cost_usd: total_cost,
         }
     }
@@ -186,42 +258,113 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
         approvals: 0,
         approved: 0,
         denied: 0,
+        approval_wait_ms: 0,
         policy_allow: 0,
         policy_require_approval: 0,
         policy_deny: 0,
         input_tokens: 0,
         output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
         cost_usd: Some(0.0),
         summary_calls: 0,
         compactions: 0,
         started_at: log.started_at(),
         ended_at: log.ended_at(),
+        wall_clock_ms: wall_clock_of(log),
+        turn_latencies_ms: Vec::new(),
+        cache_hit_ratio: None,
+        repeated_calls: Vec::new(),
     };
 
-    for evidence in &log.events {
+    // 上一轮思考事件的时刻。用它算本轮延迟：模型调用发生在两个思考
+    // 事件之间，这个差值就是"用户等了一轮"的总时长。
+    let mut previous_thought_at: Option<u64> = None;
+    // 最近一条"要审批"裁决的时刻。等到紧随的 ApprovalDecided 时，
+    // 两者的差就是人花了多久点头——P9-5 要压的正是这段。
+    let mut pending_approval_at: Option<u64> = None;
+    // 已见过的调用（工具名 + 参数），用于识别重复。`Value` 的相等性是
+    // 结构化的：对象比内容不比键序。
+    let mut seen_calls: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut repeated: Vec<String> = Vec::new();
+
+    for (index, evidence) in log.events.iter().enumerate() {
         match &evidence.event {
             AuditEvent::Thought { usage, .. } => {
                 summary.model_calls += 1;
                 add_usage(&mut summary, usage);
+                let at = evidence.recorded_at_millis();
+                if let Some(previous) = previous_thought_at {
+                    summary
+                        .turn_latencies_ms
+                        .push(at.saturating_sub(previous));
+                }
+                previous_thought_at = Some(at);
             }
-            AuditEvent::ToolRequested { .. } => summary.tool_calls += 1,
+            AuditEvent::ToolRequested { call, .. } => {
+                summary.tool_calls += 1;
+                // 直接比 `Value` 而不是比序列化字符串：`serde_json` 开了
+                // `preserve_order`（rig-core 带的），同一份参数换个键序
+                // 序列化出来是两个不同的字符串，会把"模型重发了同一条
+                // 请求"漏判成两次不同调用。而 `Value` 的对象相等性是
+                // 结构化的，键序无关——正好是这里要的语义。
+                let key = (call.name.clone(), call.arguments.clone());
+                // 第一次见到某组参数：入表。之后再见到：同名则点名（只点
+                // 一次）。两个分支互斥，重复的参数不会反复入表。
+                if !seen_calls.contains(&key) {
+                    seen_calls.push(key);
+                } else if !repeated.contains(&call.name) {
+                    repeated.push(call.name.clone());
+                }
+            }
             AuditEvent::ToolObserved { outcome, .. } => match outcome.status {
                 crate::domain::tool::OutcomeStatus::Success => summary.succeeded += 1,
                 crate::domain::tool::OutcomeStatus::Failed => summary.failed += 1,
                 crate::domain::tool::OutcomeStatus::Refused => summary.refused += 1,
             },
-            AuditEvent::ApprovalDecided { allowed, .. } => {
+            AuditEvent::ApprovalDecided { allowed, turn, tool, .. } => {
                 summary.approvals += 1;
                 if *allowed {
                     summary.approved += 1;
                 } else {
                     summary.denied += 1;
                 }
+                // 等到了结论就把这段等待结算掉。
+                let asked_at = pending_approval_at.take().or_else(|| {
+                    // 越界写入升级的调用在这里没有锚点：策略记录的是原判
+                    // Allow（审计不该改写策略的原判），升级发生在裁决记录
+                    // 之后。它同样让人等了，漏掉会让 P9-5 的等审列对这条
+                    // 真实路径失真。从本次决定往前找最近一条同工具同轮次
+                    // 的 Allow 裁决，把它当作等待起点——那正是这条调用
+                    // 最早"需要人过目"的时刻。
+                    log.events[..index]
+                        .iter()
+                        .rev()
+                        .find_map(|prior| match &prior.event {
+                            AuditEvent::PolicyEvaluated {
+                                turn: prior_turn,
+                                tool: prior_tool,
+                                verdict: crate::domain::policy::PolicyVerdict::Allow,
+                                ..
+                            } if prior_turn == turn && prior_tool == tool => {
+                                Some(prior.recorded_at_millis())
+                            }
+                            _ => None,
+                        })
+                });
+                // 取不到锚点（日志被截断、或这条决定前面确实没有可追溯的
+                // 裁决）时不计——没有锚点的间隔是猜的，猜出来的数字比没有更糟。
+                if let Some(asked_at) = asked_at {
+                    summary.approval_wait_ms += evidence
+                        .recorded_at_millis()
+                        .saturating_sub(asked_at);
+                }
             }
             AuditEvent::PolicyEvaluated { verdict, .. } => match verdict {
                 crate::domain::policy::PolicyVerdict::Allow => summary.policy_allow += 1,
                 crate::domain::policy::PolicyVerdict::RequireApproval => {
                     summary.policy_require_approval += 1;
+                    pending_approval_at = Some(evidence.recorded_at_millis());
                 }
                 crate::domain::policy::PolicyVerdict::Deny => summary.policy_deny += 1,
             },
@@ -235,6 +378,14 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
             AuditEvent::StepStarted { .. } => {}
         }
     }
+    summary.repeated_calls = repeated;
+
+    // 缓存命中率：分子读回、分母输入。分母 0 时是 None 而不是 0.0——
+    // 0.0 的含义是"有输入但一次没命中"，与"没有输入可算"正好相反。
+    if summary.input_tokens > 0 {
+        summary.cache_hit_ratio =
+            Some(summary.cached_input_tokens as f64 / summary.input_tokens as f64);
+    }
 
     // 空会话没有任何成本数据："未知"而不是 0。
     if summary.model_calls == 0 && summary.summary_calls == 0 {
@@ -243,10 +394,26 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
     summary
 }
 
+/// 首末事件的间隔（毫秒）。
+///
+/// 空会话或只有一条事件时是 0：没有"间隔"可算，填 0 比填 None 好用——
+/// 调用方要做的是累加与比较，不需要为"一条事件的会话"单开一条分支。
+fn wall_clock_of(log: &SessionLog) -> u64 {
+    match (log.started_at(), log.ended_at()) {
+        (Some(start), Some(end)) => end
+            .duration_since(start)
+            .map(|span| span.as_millis() as u64)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// 累加一次调用的用量。成本未知时把整个会话的成本合计置为未知。
 fn add_usage(summary: &mut SessionSummary, usage: &crate::domain::evidence::TokenUsage) {
     summary.input_tokens += usage.input_tokens;
     summary.output_tokens += usage.output_tokens;
+    summary.cached_input_tokens += usage.cached_input_tokens;
+    summary.cache_creation_input_tokens += usage.cache_creation_input_tokens;
     match usage.cost_usd {
         Some(cost) => {
             if let Some(total) = summary.cost_usd.as_mut() {
@@ -263,6 +430,18 @@ pub(crate) fn cost_label(cost: Option<f64>) -> String {
     match cost {
         Some(value) => format!("${value:.4}"),
         None => "未知".to_owned(),
+    }
+}
+
+/// 缓存命中率的显示值：分母为 0 时写"—"而不是 0%。
+///
+/// 0% 的含义是"有输入 token，但一次都没命中缓存"，而 `None` 的含义是
+/// "没有输入 token 可算"（provider 不报用量，或会话零调用）。把后者
+/// 显示成 0% 会让人以为缓存坏了——与成本列"未知不填 0"是同一条线。
+pub(crate) fn hit_ratio_label(ratio: Option<f64>) -> String {
+    match ratio {
+        Some(value) => format!("{:.0}%", value * 100.0),
+        None => "—".to_owned(),
     }
 }
 
@@ -300,9 +479,15 @@ fn pad(text: &str, width: usize) -> String {
 }
 
 /// 渲染成人读的对齐表格。表头与"未知"两处 CJK 按显示宽度 2 参与对齐。
+///
+/// 墙钟、轮延迟与缓存命中率不进表：一行会话有 N 个轮延迟值，
+/// 表格装不下向量。它们随 `--json` 输出，表格给的是"一眼看完"的
+/// 标量——轮数、审批次数、等人时长、墙钟、缓存命中率、成本。
 pub fn render_text(report: &BenchmarkReport) -> String {
     // 列定义：表头固定，数据从摘要取。
-    let headers = ["会话", "事件", "模型", "工具成", "工具败", "工具拒", "审批放", "审批否", "输入tok", "输出tok", "成本"];
+    let headers = [
+        "会话", "事件", "模型", "工具成", "工具败", "工具拒", "审批", "等审ms", "输入tok", "缓存tok", "命中率", "墙钟ms", "成本",
+    ];
     let rows_of = |summary: &SessionSummary| -> Vec<String> {
         vec![
             summary.session_id.as_str().to_owned(),
@@ -311,10 +496,12 @@ pub fn render_text(report: &BenchmarkReport) -> String {
             summary.succeeded.to_string(),
             summary.failed.to_string(),
             summary.refused.to_string(),
-            summary.approved.to_string(),
-            summary.denied.to_string(),
+            summary.approvals.to_string(),
+            summary.approval_wait_ms.to_string(),
             summary.input_tokens.to_string(),
-            summary.output_tokens.to_string(),
+            summary.cached_input_tokens.to_string(),
+            hit_ratio_label(summary.cache_hit_ratio),
+            summary.wall_clock_ms.to_string(),
             cost_label(summary.cost_usd),
         ]
     };
@@ -364,10 +551,18 @@ pub fn render_text(report: &BenchmarkReport) -> String {
         report.sessions.iter().map(|s| s.succeeded).sum::<usize>().to_string(),
         report.sessions.iter().map(|s| s.failed).sum::<usize>().to_string(),
         report.sessions.iter().map(|s| s.refused).sum::<usize>().to_string(),
-        report.sessions.iter().map(|s| s.approved).sum::<usize>().to_string(),
-        report.sessions.iter().map(|s| s.denied).sum::<usize>().to_string(),
+        report.total_approvals.to_string(),
+        report.total_approval_wait_ms.to_string(),
         report.total_input_tokens.to_string(),
-        report.total_output_tokens.to_string(),
+        report.total_cached_input_tokens.to_string(),
+        // 合计行的命中率同样按"合计读回 / 合计输入"算，不是各行比率的平均：
+        // 平均会让一个小会话和一个大会话等权，而钱和时间是按 token 花的。
+        hit_ratio_label(if report.total_input_tokens > 0 {
+            Some(report.total_cached_input_tokens as f64 / report.total_input_tokens as f64)
+        } else {
+            None
+        }),
+        report.total_wall_clock_ms.to_string(),
         cost_label(report.total_cost_usd),
     ];
     out.push_str(&render_row(&total));
@@ -402,11 +597,13 @@ mod tests {
     }
 
     fn evidence(sequence: u64, event: AuditEvent) -> Evidence {
-        Evidence {
+        // 毫秒间隔：序列号本身就是毫秒偏移，合成数据因此带真实的
+        // 亚秒级时序，墙钟与每轮延迟的统计才有东西可算。
+        Evidence::new(
             sequence,
-            recorded_at: UNIX_EPOCH + Duration::from_secs(sequence),
+            UNIX_EPOCH + Duration::from_millis(sequence * 250),
             event,
-        }
+        )
     }
 
     /// 合成一个覆盖全部事件种类的会话，计数器手工可算。
@@ -420,7 +617,7 @@ mod tests {
                     AuditEvent::Thought {
                         turn: 1,
                         text: "先写".to_owned(),
-                        usage: TokenUsage { input_tokens: 100, output_tokens: 20, cost_usd: Some(0.25) },
+                        usage: TokenUsage { input_tokens: 100, output_tokens: 20, cached_input_tokens: 0, cache_creation_input_tokens: 0, cost_usd: Some(0.25) },
                     },
                 ),
                 evidence(
@@ -459,6 +656,8 @@ mod tests {
                         usage: TokenUsage {
                             input_tokens: 50,
                             output_tokens: 10,
+                            cached_input_tokens: 0,
+                            cache_creation_input_tokens: 0,
                             cost_usd: cost_of_second_thought,
                         },
                     },
@@ -499,6 +698,8 @@ mod tests {
                         usage: TokenUsage {
                             input_tokens: 200,
                             output_tokens: 40,
+                            cached_input_tokens: 0,
+                            cache_creation_input_tokens: 0,
                             cost_usd: Some(0.125),
                         },
                     },
@@ -569,7 +770,7 @@ mod tests {
             AuditEvent::Thought {
                 turn,
                 text: "最终答案".to_owned(),
-                usage: TokenUsage { input_tokens: 10, output_tokens: 5, cost_usd: cost },
+                usage: TokenUsage { input_tokens: 10, output_tokens: 5, cached_input_tokens: 0, cache_creation_input_tokens: 0, cost_usd: cost },
             },
         ));
         log
@@ -620,6 +821,378 @@ mod tests {
         assert_eq!((report.succeeded, report.failed), (0, 0));
     }
 
+    /// 缓存命中率的分母为 0 时是 `None`，不是 `0.0`。
+    ///
+    /// 两者的含义相反：`Some(0.0)` 是"有输入但一次都没命中"，
+    /// `None` 是"压根没有输入 token 可算"（provider 不报用量）。
+    /// 把后者显示成 0% 会让人以为缓存坏了。
+    #[test]
+    fn cache_hit_ratio_is_none_when_there_are_no_input_tokens() {
+        let summary = summarize(&SessionLog {
+            session_id: SessionId::new("no-usage"),
+            events: vec![evidence(
+                1,
+                AuditEvent::Thought {
+                    turn: 1,
+                    text: "想".to_owned(),
+                    // provider 不报用量：input/output 都是 0。
+                    usage: TokenUsage::default(),
+                },
+            )],
+            skipped_lines: 0,
+        });
+
+        assert_eq!(summary.cache_hit_ratio, None, "没有输入 token 时是未知而非 0%");
+        assert_eq!(hit_ratio_label(summary.cache_hit_ratio), "—");
+    }
+
+    /// 命中率 = 读回 / 输入，多轮累加后仍然按这个口径算。
+    #[test]
+    fn cache_hit_ratio_is_read_over_input() {
+        let mut log = synthetic_log(Some(0.25));
+        log.events.clear();
+        log.events = vec![
+            evidence(
+                1,
+                AuditEvent::Thought {
+                    turn: 1,
+                    text: "第一轮".to_owned(),
+                    usage: TokenUsage {
+                        input_tokens: 1_000,
+                        output_tokens: 10,
+                        cached_input_tokens: 0,
+                        cache_creation_input_tokens: 1_000,
+                        cost_usd: None,
+                    },
+                },
+            ),
+            evidence(
+                2,
+                AuditEvent::Thought {
+                    turn: 2,
+                    text: "第二轮".to_owned(),
+                    usage: TokenUsage {
+                        input_tokens: 1_000,
+                        output_tokens: 10,
+                        cached_input_tokens: 900,
+                        cache_creation_input_tokens: 0,
+                        cost_usd: None,
+                    },
+                },
+            ),
+        ];
+
+        let summary = summarize(&log);
+
+        // 900 / 2000 = 0.45。第一轮全量写入、第二轮几乎全量命中，
+        // 正是"缓存第一次贵、后面便宜"的形状。
+        assert_eq!(summary.cached_input_tokens, 900);
+        assert_eq!(summary.cache_creation_input_tokens, 1_000);
+        assert_eq!(summary.cache_hit_ratio, Some(0.45));
+    }
+
+    /// 墙钟 = 末事件 - 首事件；轮延迟按相邻思考事件的间隔算。
+    #[test]
+    fn wall_clock_and_turn_latencies_come_from_event_timestamps() {
+        let mut log = synthetic_log(Some(0.25));
+        // 合成数据的步进是 250ms：三轮思考 → 两个 250ms 间隔。
+        log.events.clear();
+        log.events = vec![
+            evidence(1, AuditEvent::StepStarted { turn: 1, role: AgentRole::Coder }),
+            evidence(
+                2,
+                AuditEvent::Thought {
+                    turn: 1,
+                    text: "一轮".to_owned(),
+                    usage: TokenUsage::default(),
+                },
+            ),
+            evidence(
+                3,
+                AuditEvent::Thought {
+                    turn: 2,
+                    text: "二轮".to_owned(),
+                    usage: TokenUsage::default(),
+                },
+            ),
+            evidence(
+                4,
+                AuditEvent::Thought {
+                    turn: 3,
+                    text: "三轮".to_owned(),
+                    usage: TokenUsage::default(),
+                },
+            ),
+        ];
+
+        let summary = summarize(&log);
+
+        assert_eq!(summary.wall_clock_ms, 750, "4 条事件、步进 250ms → 750ms");
+        assert_eq!(summary.turn_latencies_ms, vec![250, 250], "两段间隔");
+    }
+
+    /// 按 P9 之前的落盘格式造一条证据：没有 `format` 键，`recorded_at` 是整秒。
+    ///
+    /// 走 `serde_json::from_str` 而不是直接拼结构体：要验的正是"旧行读进来
+    /// 之后"统计对不对，绕开反序列化就验不到想要的那条路径。
+    fn legacy_evidence(sequence: u64, seconds: u64, event: AuditEvent) -> Evidence {
+        let line = serde_json::json!({
+            "sequence": sequence,
+            "recorded_at": seconds,
+            "event": serde_json::to_value(&event).expect("AuditEvent 序列化不应失败"),
+        });
+        serde_json::from_str::<Evidence>(&line.to_string()).expect("旧格式必须能反序列化")
+    }
+
+    /// 旧格式（秒级）证据的轮延迟与等审时间必须是真的毫秒。
+    ///
+    /// P9-1 提精度时，反序列化已经把秒换算成毫秒存进 `recorded_at` 了。
+    /// 统计若再按格式号乘一次 1000，旧文件的这两列就会放大一千倍——
+    /// 而墙钟不走同一条路（它直接读 `recorded_at`），于是两列互相矛盾：
+    /// 墙钟说 60 秒，轮延迟说 6000 万毫秒。这类错位只出现在旧文件上，
+    /// 新文件永远正确，所以必须有一条专门走旧格式的测试钉住它。
+    #[test]
+    fn legacy_format_latency_and_approval_wait_are_real_milliseconds() {
+        let log = SessionLog {
+            session_id: SessionId::new("session-legacy"),
+            skipped_lines: 0,
+            events: vec![
+                legacy_evidence(
+                    1,
+                    100,
+                    AuditEvent::Thought {
+                        turn: 1,
+                        text: "想".to_owned(),
+                        usage: TokenUsage::default(),
+                    },
+                ),
+                legacy_evidence(
+                    2,
+                    160,
+                    AuditEvent::Thought {
+                        turn: 2,
+                        text: "再想".to_owned(),
+                        usage: TokenUsage::default(),
+                    },
+                ),
+                legacy_evidence(
+                    3,
+                    200,
+                    AuditEvent::PolicyEvaluated {
+                        turn: 3,
+                        tool: "write_file".to_owned(),
+                        verdict: crate::domain::policy::PolicyVerdict::RequireApproval,
+                        rule_index: None,
+                        reason: "默认".to_owned(),
+                    },
+                ),
+                legacy_evidence(
+                    4,
+                    260,
+                    AuditEvent::ApprovalDecided {
+                        turn: 3,
+                        tool: "write_file".to_owned(),
+                        allowed: true,
+                        reason: None,
+                    },
+                ),
+            ],
+        };
+
+        let summary = summarize(&log);
+
+        assert_eq!(summary.wall_clock_ms, 160_000, "墙钟：100 → 260 秒");
+        assert_eq!(
+            summary.turn_latencies_ms,
+            vec![60_000],
+            "两轮间隔 60 秒，不是 6000 万毫秒"
+        );
+        assert_eq!(summary.approval_wait_ms, 60_000, "等审 60 秒");
+    }
+
+    /// 越界写入升级产生的审批也必须计入等审时间。
+    ///
+    /// 升级路径在证据里没有 `RequireApproval` 锚点：策略记录的是原判
+    /// Allow（这是刻意的——审计不该改写策略的原判），升级发生在裁决
+    /// 记录之后。等审统计若只认 `RequireApproval` 锚点，这类"策略放行
+    /// 但启发式拦下"的审批就永远显示 0ms，P9-5 的等审列对升级路径失真。
+    #[test]
+    fn escalated_approval_wait_is_counted_from_the_original_verdict() {
+        let log = SessionLog {
+            session_id: SessionId::new("session-esc"),
+            skipped_lines: 0,
+            events: vec![
+                evidence(
+                    1,
+                    AuditEvent::PolicyEvaluated {
+                        turn: 1,
+                        tool: "run_command".to_owned(),
+                        verdict: crate::domain::policy::PolicyVerdict::Allow,
+                        rule_index: None,
+                        reason: "默认基线".to_owned(),
+                    },
+                ),
+                // 同一轮紧接着的审批决定：升级路径上两者之间没有别的锚点。
+                evidence(
+                    2,
+                    AuditEvent::ApprovalDecided {
+                        turn: 1,
+                        tool: "run_command".to_owned(),
+                        allowed: true,
+                        reason: None,
+                    },
+                ),
+            ],
+        };
+
+        let summary = summarize(&log);
+
+        assert_eq!(summary.policy_allow, 1, "证据里仍是策略原判");
+        assert_eq!(summary.policy_require_approval, 0, "升级不增加 RequireApproval 计数");
+        assert_eq!(summary.approvals, 1);
+        assert_eq!(summary.approval_wait_ms, 250, "升级路径的等待必须计入");
+    }
+
+    /// 空会话没有时间数据：墙钟 0、无轮延迟、无命中率。
+    #[test]
+    fn empty_session_has_no_timing_data() {
+        let log = SessionLog {
+            session_id: SessionId::new("empty"),
+            events: vec![],
+            skipped_lines: 0,
+        };
+
+        let summary = summarize(&log);
+
+        assert_eq!(summary.wall_clock_ms, 0);
+        assert!(summary.turn_latencies_ms.is_empty());
+        assert_eq!(summary.cache_hit_ratio, None);
+        assert!(summary.repeated_calls.is_empty());
+    }
+
+    /// 同一个文件读两遍就是浪费：同工具 + 同参数的重复调用要被点名。
+    #[test]
+    fn repeated_calls_names_tools_called_twice_with_the_same_arguments() {
+        let mut log = synthetic_log(Some(0.25));
+        log.events.clear();
+        let read = |path: &str| ToolCall {
+            id: CallId::new("call_1"),
+            name: "read_file".to_owned(),
+            arguments: json!({"path": path}),
+        };
+        log.events = vec![
+            evidence(1, AuditEvent::ToolRequested { turn: 1, call: read("Cargo.toml") }),
+            evidence(1, AuditEvent::ToolRequested { turn: 1, call: read("src/lib.rs") }),
+            // 同一个文件再来一遍：重复。
+            evidence(2, AuditEvent::ToolRequested { turn: 2, call: read("Cargo.toml") }),
+            // 同名不同参：不是重复。
+            evidence(3, AuditEvent::ToolRequested { turn: 3, call: read("README.md") }),
+            evidence(4, AuditEvent::ToolRequested { turn: 4, call: read("README.md") }),
+        ];
+
+        let summary = summarize(&log);
+
+        assert_eq!(summary.tool_calls, 5);
+        // 只有 read_file 一个工具名被重复调用，且两组参数各重复一次；
+        // 去重后只列一次名字。
+        assert_eq!(summary.repeated_calls, vec!["read_file"]);
+    }
+
+    /// 键序不同但内容相同的参数算同一次调用。
+    ///
+    /// 不按 canonical 化比较的话，"模型重发了同一条请求"会因为键序
+    /// 抖动被漏判成两次不同调用——而它恰恰是最典型的浪费。
+    #[test]
+    fn repeated_calls_survives_argument_key_reordering() {
+        let log = SessionLog {
+            session_id: SessionId::new("keyorder"),
+            events: vec![
+                evidence(
+                    1,
+                    AuditEvent::ToolRequested {
+                        turn: 1,
+                        call: ToolCall {
+                            id: CallId::new("c1"),
+                            name: "read_file".to_owned(),
+                            arguments: json!({"path": "a.rs", "encoding": "utf8"}),
+                        },
+                    },
+                ),
+                evidence(
+                    2,
+                    AuditEvent::ToolRequested {
+                        turn: 2,
+                        call: ToolCall {
+                            id: CallId::new("c2"),
+                            name: "read_file".to_owned(),
+                            arguments: json!({"encoding": "utf8", "path": "a.rs"}),
+                        },
+                    },
+                ),
+            ],
+            skipped_lines: 0,
+        };
+
+        assert_eq!(summarize(&log).repeated_calls, vec!["read_file"]);
+    }
+
+    /// 报表的合计行要把新增的三个维度一起带上。
+    #[test]
+    fn report_totals_carry_the_throughput_dimensions() {
+        let mut log = synthetic_log(Some(0.25));
+        log.session_id = SessionId::new("a");
+        // 给会话补一条带缓存计数的收尾思考。
+        let last = log.events.len() as u64 + 1;
+        log.events.push(evidence(
+            last,
+            AuditEvent::Thought {
+                turn: 9,
+                text: "最终答案".to_owned(),
+                usage: TokenUsage {
+                    input_tokens: 400,
+                    output_tokens: 20,
+                    cached_input_tokens: 300,
+                    cache_creation_input_tokens: 100,
+                    cost_usd: Some(0.25),
+                },
+            },
+        ));
+
+        let report = BenchmarkReport::from_sessions(&[log]);
+
+        assert_eq!(report.total_cached_input_tokens, 300);
+        // 墙钟合计来自各会话 wall_clock_ms 之和（这里只有一个会话）。
+        assert_eq!(report.total_wall_clock_ms, report.sessions[0].wall_clock_ms);
+        assert_eq!(report.total_approvals, 1, "审批次数进合计");
+    }
+
+    /// 命中率列：有输入 token 但一次没命中时是 0%，没有输入 token 时是"—"。
+    #[test]
+    fn text_rendering_shows_hit_ratio_and_wall_clock() {
+        let log = synthetic_log(Some(0.25));
+        let report = BenchmarkReport::from_sessions(&[log]);
+        let text = render_text(&report);
+
+        assert!(text.contains("命中率"), "{text}");
+        assert!(text.contains("墙钟ms"), "{text}");
+        // 合成数据有 350 个输入 token、一次都没命中：0% 而不是"—"。
+        // 这两者的区别正是本列要守住的诚实线。
+        assert!(text.contains("0%"), "有输入但没命中应显示 0%: {text}");
+
+        // 没有用量数据的会话才显示"—"（连 SummaryGenerated 一起清零：
+        // 摘要调用也记用量，漏掉它分母就不是 0）。
+        let mut bare = synthetic_log(Some(0.25));
+        for evidence in &mut bare.events {
+            match &mut evidence.event {
+                AuditEvent::Thought { usage, .. }
+                | AuditEvent::SummaryGenerated { usage, .. } => *usage = TokenUsage::default(),
+                _ => {}
+            }
+        }
+        let text = render_text(&BenchmarkReport::from_sessions(&[bare]));
+        assert!(text.contains("—"), "没有输入 token 应显示破折号: {text}");
+    }
+
     #[test]
     fn json_rendering_round_trips() {
         let mut log = synthetic_log(Some(0.25));
@@ -629,6 +1202,102 @@ mod tests {
         let text = render_json(&report).expect("序列化");
         let back: BenchmarkReport = serde_json::from_str(&text).expect("反序列化");
         assert_eq!(back, report);
+    }
+
+    // ── P9-5 审批等待 ─────────────────────────────────────────────────
+
+    /// 等人时长 = "判了要审"到"闸门给结论"的间隔。
+    ///
+    /// 合成数据里事件 3（RequireApproval）在 750ms、事件 5
+    /// （ApprovalDecided）在 1250ms，所以是 500ms。
+    #[test]
+    fn approval_wait_spans_the_verdict_and_the_decision() {
+        let summary = summarize(&synthetic_log(Some(0.5)));
+
+        assert_eq!(summary.approval_wait_ms, 500);
+    }
+
+    /// 策略放行的调用不计等待：它压根不进闸门。
+    ///
+    /// 把 Allow 之后到下一个事件的间隔算成"等人"，会把工具执行时间
+    /// 记到人头上——报表于是显示"人等了两秒"，而人根本没被问过。
+    #[test]
+    fn a_policy_allowed_call_contributes_no_wait() {
+        let log = SessionLog {
+            session_id: SessionId::new("session-allow-only"),
+            events: vec![
+                evidence(
+                    1,
+                    AuditEvent::PolicyEvaluated {
+                        turn: 1,
+                        tool: "read_file".to_owned(),
+                        verdict: crate::domain::policy::PolicyVerdict::Allow,
+                        rule_index: Some(0),
+                        reason: "只读".to_owned(),
+                    },
+                ),
+                evidence(2, AuditEvent::ToolRequested { turn: 1, call: call("read_file") }),
+                evidence(
+                    3,
+                    AuditEvent::ToolObserved {
+                        turn: 1,
+                        call: call("read_file"),
+                        outcome: ToolOutcome::success("内容"),
+                    },
+                ),
+            ],
+            skipped_lines: 0,
+        };
+
+        assert_eq!(summarize(&log).approval_wait_ms, 0);
+    }
+
+    /// 多次审批的等待要累加，不是只算最后一次。
+    #[test]
+    fn approval_wait_accumulates_across_calls() {
+        let mut log = synthetic_log(Some(0.5));
+        // 在第二条思考之后补一轮"要审 → 结论"：事件 13 在 3250ms、
+        // 事件 14 在 3500ms，与原有的 500ms 合计 750ms。
+        log.events.push(evidence(
+            13,
+            AuditEvent::PolicyEvaluated {
+                turn: 3,
+                tool: "write_file".to_owned(),
+                verdict: crate::domain::policy::PolicyVerdict::RequireApproval,
+                rule_index: None,
+                reason: "默认".to_owned(),
+            },
+        ));
+        log.events.push(evidence(
+            14,
+            AuditEvent::ApprovalDecided {
+                turn: 3,
+                tool: "write_file".to_owned(),
+                allowed: false,
+                reason: Some("不让写".to_owned()),
+            },
+        ));
+
+        assert_eq!(summarize(&log).approval_wait_ms, 750);
+    }
+
+    /// 报表把等人时长单列一列，并给出跨会话合计。
+    ///
+    /// P9-5 的验收就落在这列上：默认基线少问几次、`p` 少敲几个字，
+    /// 最终都该表现为它变小。没有它，"等待成本降了"只是句无法核对的话。
+    #[test]
+    fn report_shows_approval_wait_beside_the_approval_count() {
+        let report = BenchmarkReport::from_sessions(&[
+            synthetic_log(Some(0.25)),
+            synthetic_log(Some(0.25)),
+        ]);
+
+        assert_eq!(report.total_approvals, 2);
+        assert_eq!(report.total_approval_wait_ms, 1000);
+
+        let text = render_text(&report);
+        assert!(text.contains("等审ms"), "表头应单列等人时长: {text}");
+        assert!(text.contains("1000"), "合计行应给出等人时长: {text}");
     }
 
     #[test]

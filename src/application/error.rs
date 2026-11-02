@@ -41,8 +41,8 @@ pub enum ApplicationError {
     },
 
     /// 墙钟超时。与轮数耗尽分开报：两者的对策不同——前者调大时限
-    /// 或拆小任务，后者调大 LLM_MAX_TURNS。编排模式下每个步骤的
-    /// 会话各自计时，这里报的是该步会话的耗时。
+    /// 或拆小任务，后者调大 LLM_MAX_TURNS。P9-3 起一个任务一个会话，
+    /// 编排模式下这里报的是整个任务的耗时。
     #[error("耗时 {elapsed:?} 超过上限 {limit:?}，任务终止；请调大 QCH_MAX_WALL_CLOCK 或拆小任务")]
     WallClockExhausted {
         /// 实际耗时。
@@ -92,16 +92,19 @@ pub enum ApplicationError {
 
     /// 编排中某一步失败。原错误的对策指引在 `message` 里，
     /// 外层再标明是哪一步，调用方才知道断在流程的哪个位置。
-    /// 已完成步骤的会话 ID 一并带出：失败时刻就能按 ID 翻证据
-    /// 或 `--resume`，不必再 `--list-sessions` 里找。
+    /// 会话 ID 与已完成步数一并带出：失败时刻就能按 ID 翻证据或
+    /// `--resume`，不必再 `--list-sessions` 里找。
     #[error("{message}")]
     StepFailed {
         /// 失败的步骤（1-based，给人看）。
         step: usize,
         /// 失败原因，含原错误信息。
         message: String,
-        /// 本次运行中已完成步骤的会话 ID（失败的那步不在其中）。
-        step_sessions: Vec<SessionId>,
+        /// 本次任务的会话 ID。P9-3 起一个任务只有一个会话，证据文件与
+        /// 快照都按它命名——失败的那一步也在同一个文件里。
+        session_id: SessionId,
+        /// 本次运行中已完成的步骤数（失败的那步不算）。
+        steps_completed: usize,
     },
 
     /// 证据文件初始化失败。与快照错误同理：没有证据的运行不可复盘，

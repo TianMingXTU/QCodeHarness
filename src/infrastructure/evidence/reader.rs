@@ -170,96 +170,88 @@ mod tests {
             arguments: json_args(),
         };
         vec![
-            Evidence {
-                sequence: 1,
-                recorded_at: at(100),
-                event: AuditEvent::StepStarted {
+            Evidence::new(
+                1,
+                at(100),
+                AuditEvent::StepStarted {
                     turn: 1,
                     role: AgentRole::Reviewer,
                 },
-            },
-            Evidence {
-                sequence: 2,
-                recorded_at: at(101),
-                event: AuditEvent::Thought {
+            ),
+            Evidence::new(
+                2,
+                at(101),
+                AuditEvent::Thought {
                     turn: 1,
                     text: "先读代码".to_owned(),
-                    usage: TokenUsage {
-                        input_tokens: 120,
-                        output_tokens: 30,
-                        cost_usd: Some(0.5),
-                    },
+                    usage: TokenUsage::default(),
                 },
-            },
-            Evidence {
-                sequence: 3,
-                recorded_at: at(102),
-                event: AuditEvent::ToolRequested {
+            ),
+            Evidence::new(
+                3,
+                at(102),
+                AuditEvent::ToolRequested {
                     turn: 1,
                     call: call("read_file"),
                 },
-            },
-            Evidence {
-                sequence: 4,
-                recorded_at: at(103),
-                event: AuditEvent::ToolObserved {
+            ),
+            Evidence::new(
+                4,
+                at(103),
+                AuditEvent::ToolObserved {
                     turn: 1,
                     call: call("read_file"),
                     outcome: ToolOutcome::refused("路径越界"),
                 },
-            },
-            Evidence {
-                sequence: 5,
-                recorded_at: at(104),
-                event: AuditEvent::ApprovalDecided {
+            ),
+            Evidence::new(
+                5,
+                at(104),
+                AuditEvent::ApprovalDecided {
                     turn: 2,
                     tool: "write_file".to_owned(),
                     allowed: false,
                     reason: Some("不像该改的".to_owned()),
                 },
-            },
-            Evidence {
-                sequence: 6,
-                recorded_at: at(105),
-                event: AuditEvent::PolicyEvaluated {
+            ),
+            Evidence::new(
+                6,
+                at(105),
+                AuditEvent::PolicyEvaluated {
                     turn: 2,
                     tool: "write_file".to_owned(),
                     verdict: PolicyVerdict::RequireApproval,
                     rule_index: None,
                     reason: "非只读走默认".to_owned(),
                 },
-            },
-            Evidence {
-                sequence: 7,
-                recorded_at: at(106),
-                event: AuditEvent::ContextCompacted {
+            ),
+            Evidence::new(
+                7,
+                at(106),
+                AuditEvent::ContextCompacted {
                     turn: 3,
                     rounds_before: 20,
                     rounds_after: 16,
                     dropped: vec![1, 2, 3, 4],
                 },
-            },
-            Evidence {
-                sequence: 8,
-                recorded_at: at(107),
-                event: AuditEvent::SummaryGenerated {
+            ),
+            Evidence::new(
+                8,
+                at(107),
+                AuditEvent::SummaryGenerated {
                     turn: 3,
                     covers: (1, 4),
-                    usage: TokenUsage {
-                        input_tokens: 500,
-                        output_tokens: 80,
-                        cost_usd: None,
-                    },
+                    usage: TokenUsage::default(),
                 },
-            },
-            Evidence {
-                sequence: 9,
-                recorded_at: at(108),
-                event: AuditEvent::SummaryFailed {
+            ),
+            Evidence::new(
+                9,
+                at(108),
+                AuditEvent::SummaryFailed {
                     turn: 4,
                     reason: "模型超时".to_owned(),
                 },
-            },
+            ),
         ]
     }
 
@@ -288,6 +280,124 @@ mod tests {
         assert_eq!(log.events, events);
         assert_eq!(log.started_at(), Some(UNIX_EPOCH + Duration::from_secs(100)));
         assert_eq!(log.ended_at(), Some(UNIX_EPOCH + Duration::from_secs(108)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 手写一条 P9 之前的证据行：没有 `format` 键，`recorded_at` 是整秒。
+    ///
+    /// 这是 P9-1 最容易踩的坑：把时间戳精度从秒提到毫秒时，如果不在
+    /// 行里留标记，reader 就只能猜。猜错的代价是**所有历史证据的耗时
+    /// 统计变成垃圾**——100 秒被读成 100 毫秒，一分钟的会话算成亚毫秒。
+    /// 所以旧文件必须仍然读得出正确的时刻，一条不漏。
+    #[test]
+    fn legacy_second_precision_lines_still_read_correctly() {
+        let dir = temp_dir("legacy-seconds");
+        let path = dir.join("session-legacy.jsonl");
+        // 照 P9 之前的落盘格式手写：sequence / recorded_at（秒）/ event。
+        let lines = vec![
+            serde_json::json!({
+                "sequence": 1,
+                "recorded_at": 100u64,
+                "event": {"StepStarted": {"turn": 1, "role": "Planner"}},
+            })
+            .to_string(),
+            serde_json::json!({
+                "sequence": 2,
+                "recorded_at": 160u64,
+                "event": {"Thought": {"turn": 1, "text": "想", "usage": {
+                    "input_tokens": 10, "output_tokens": 5,
+                    "cached_input_tokens": 0, "cache_creation_input_tokens": 0,
+                    "cost_usd": null
+                }}},
+            })
+            .to_string(),
+        ];
+        write_lines(&path, &lines);
+
+        let log = read_session(&path).unwrap().expect("旧格式必须能读");
+
+        assert_eq!(log.events.len(), 2, "旧格式一行不漏");
+        assert_eq!(log.skipped_lines, 0);
+        assert_eq!(
+            log.started_at(),
+            Some(UNIX_EPOCH + Duration::from_secs(100)),
+            "秒级时间戳必须按秒解释"
+        );
+        assert_eq!(
+            log.ended_at(),
+            Some(UNIX_EPOCH + Duration::from_secs(160)),
+            "末条同样是秒"
+        );
+        // 60 秒的间隔不能因为精度变更被算成 60 毫秒。
+        let span = log
+            .ended_at()
+            .unwrap()
+            .duration_since(log.started_at().unwrap())
+            .unwrap();
+        assert_eq!(span, Duration::from_secs(60), "旧文件的墙钟必须还是 60 秒");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 新格式（毫秒）必须读出亚秒级的真实间隔。
+    #[test]
+    fn millisecond_lines_give_sub_second_resolution() {
+        let dir = temp_dir("millis");
+        let path = dir.join("session-millis.jsonl");
+        // 同一秒内的两条事件：秒级精度下间隔是 0，毫秒级下是 250ms。
+        let base = 1_700_000_000_000u64;
+        let lines = vec![
+            serde_json::json!({
+                "sequence": 1, "format": 2, "recorded_at": base,
+                "event": {"StepStarted": {"turn": 1, "role": "Coder"}},
+            })
+            .to_string(),
+            serde_json::json!({
+                "sequence": 2, "format": 2, "recorded_at": base + 250,
+                "event": {"Thought": {"turn": 1, "text": "想", "usage": {
+                    "input_tokens": 1, "output_tokens": 1,
+                    "cached_input_tokens": 0, "cache_creation_input_tokens": 0,
+                    "cost_usd": null
+                }}},
+            })
+            .to_string(),
+        ];
+        write_lines(&path, &lines);
+
+        let log = read_session(&path).unwrap().expect("新格式必须能读");
+
+        assert_eq!(log.events.len(), 2);
+        let span = log
+            .ended_at()
+            .unwrap()
+            .duration_since(log.started_at().unwrap())
+            .unwrap();
+        assert_eq!(span, Duration::from_millis(250), "毫秒精度要能分辨亚秒间隔");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 不认识的格式号：跳过该行并计数，不猜。
+    ///
+    /// 猜的代价是让耗时统计悄悄变成垃圾；跳过至少能被 `skipped_lines`
+    /// 和"整文件都读不动就报错"发现。与"末行截断跳过而非报错"是同一条
+    /// 降级哲学。
+    #[test]
+    fn unknown_format_marker_is_skipped_and_counted() {
+        let dir = temp_dir("unknown-format");
+        let path = dir.join("session-future.jsonl");
+        let lines = vec![
+            serde_json::json!({
+                "sequence": 1, "format": 99, "recorded_at": 1u64,
+                "event": {"StepStarted": {"turn": 1, "role": "Coder"}},
+            })
+            .to_string(),
+            evidence_line(&every_variant()[1]),
+        ];
+        write_lines(&path, &lines);
+
+        let log = read_session(&path).unwrap().expect("有一条能读就不报错");
+
+        assert_eq!(log.events.len(), 1, "格式号不认识的那行被跳过");
+        assert_eq!(log.skipped_lines, 1, "跳过的行要计数");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -355,14 +465,14 @@ mod tests {
         let path = dir.join("session-5.jsonl");
         let events = every_variant();
         let mut lines: Vec<String> = events[..3].iter().map(evidence_line).collect();
-        lines.push(evidence_line(&Evidence {
-            sequence: 1,
-            recorded_at: UNIX_EPOCH,
-            event: AuditEvent::SummaryFailed {
+        lines.push(evidence_line(&Evidence::new(
+            1,
+            UNIX_EPOCH,
+            AuditEvent::SummaryFailed {
                 turn: 1,
                 reason: "重开后序号归 1".to_owned(),
             },
-        }));
+        )));
         write_lines(&path, &lines);
 
         let log = read_session(&path).unwrap().unwrap();

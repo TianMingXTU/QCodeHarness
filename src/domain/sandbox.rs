@@ -63,6 +63,14 @@ impl Default for SandboxPolicy {
 /// 真正的边界在 P7 的进程沙箱与后续的 OS 级隔离；这里的价值是把
 /// 最常见的直白写法从"无声放行"变成"有人过目"。
 ///
+/// **任何指向 workspace 外的参数都算嫌疑，不限写入型动词。** P9-5 的
+/// 默认基线放行 `cargo test *` / `git diff *` 一族之后，这条检查从
+/// "补漏"升格为"主防线"：`git diff --output=C:\x` 既没有写入型动词
+/// 也没有 `>`，只按动词判就整个漏掉，而它确实把 workspace 的内容写到
+/// 了外面（`--output` 是 git 自己的写文件选项）。动词门槛原本是为
+/// `rd /s /q build` 这类带开关的命令降噪，而 [`escapes_workspace`]
+/// 已经不把 `/q` 当路径——降噪交给它就够了，门槛留着只会漏。
+///
 /// 网络类操作（`git push`、`curl`）不在范围内：外传数据的形态太多，
 /// 硬列只会制造噪音，让用户对真正的越界写入提示脱敏。
 pub fn write_escape_suspect(command: &str) -> Option<String> {
@@ -74,15 +82,17 @@ pub fn write_escape_suspect(command: &str) -> Option<String> {
         }
     }
 
-    if let Some(verb) = write_verb(&command) {
-        if let Some(target) = escaping_argument(&command) {
-            return Some(format!("命令用 `{verb}` 操作 workspace 外的 `{target}`"));
-        }
+    if let Some(target) = escaping_argument(&command) {
+        // 有写入型动词时理由说清"它在动什么"，没有时只说"提到了外面"——
+        // 后者同样是升级的充分理由，见下面的说明。
+        return Some(match write_verb(&command) {
+            Some(verb) => format!("命令用 `{verb}` 操作 workspace 外的 `{target}`"),
+            None => format!("命令提到 workspace 外的 `{target}`"),
+        });
     }
 
     None
 }
-
 /// 写入型命令的动词。命中其中任意一个，后面的参数才按"写目标"审视。
 ///
 /// 只收命令名本身，不收开关：`/s`、`-Recurse` 只是修饰，判断越界看的是
@@ -126,8 +136,22 @@ fn redirect_target(command: &str) -> Option<&str> {
 }
 
 /// 第一个越出 workspace 的参数。
+///
+/// `--flag=value` 形态要连值一起看：`--output=C:\x` 整个词不是绝对路径
+/// （开头是 `-`），只比整个词会把最常用的开关写法整个漏掉。
 fn escaping_argument(command: &str) -> Option<&str> {
-    split_tokens(command).find(|token| escapes_workspace(token))
+    split_tokens(command).find(|token| points_outside(token))
+}
+
+/// 这个词本身、或它 `=` 后面的值，是否指向 workspace 之外。
+fn points_outside(token: &str) -> bool {
+    if escapes_workspace(token) {
+        return true;
+    }
+    match token.split_once('=') {
+        Some((_, value)) => escapes_workspace(value),
+        None => false,
+    }
 }
 
 /// 按空白与常见分隔符切词。
@@ -224,6 +248,14 @@ mod tests {
             r"echo hi >> ..\out.txt",
             // UNC 共享路径。
             r"copy src \\server\share\x",
+            // 不带写入型动词、也不带 `>` 的越界：P9-5 的默认基线放行了
+            // `git diff *` 一族，`--output` 是 git 自己的写文件选项，
+            // 只按动词和重定向判就整个漏掉——而它确实把 workspace 的
+            // 内容写到了外面。本机实测 `git diff --output=D:\x` 会落盘。
+            r"git diff --output=C:\Windows\temp\x",
+            // 开关与值之间不写空格是常见写法，值跟在 `=` 后面。
+            r"cargo build --target-dir=D:/cache",
+            r"git diff --output D:\Windows\temp\x",
         ];
         for command in suspects {
             assert!(

@@ -172,6 +172,11 @@ impl ApprovalGate for AiReviewGate {
                 ))],
                 spec: &spec,
                 tools: &[],
+                // 审查调用的输入每次都是"这一次待审调用"，彼此不共享前缀，
+                // 给它键没有意义——`None` 让 provider 自行路由。不能拿空
+                // 字符串顶替：那在 wire 上仍是一个 `prompt_cache_key`，
+                // 所有审查请求会共用一个固定的空键。
+                cache_key: None,
             };
 
             // 任何一步失败都退回给人：超时、网关报错、空回复、解析不出来。

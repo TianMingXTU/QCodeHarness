@@ -7,12 +7,15 @@
 //! 生产和测试走的是同一条代码路径。
 
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rig::completion::{
     AssistantContent, AssistantMessage, CompletionRequest, CompletionResponse, Message,
     ToolAnnotations as RigToolAnnotations, ToolDefinition, Usage,
 };
+use rig::completion::options::{CacheRetention, GenerationOptions, OnUnsupported};
 use rig::driver::DynModel;
 use rig::message::{CallId as RigCallId, ToolCall as RigToolCall, ToolFunction, ToolName, ToolResult, ToolResultContent};
 use rig::operation::Completion;
@@ -38,6 +41,17 @@ pub struct RigChatGateway {
     /// 单次调用的时限。reqwest 默认没有总超时：连接挂死时请求永远
     /// 不返回，整个任务卡在"等模型回复"。
     call_timeout: Duration,
+    /// 是否已就"provider 不支持某些生成选项"警告过一次。
+    ///
+    /// `OnUnsupported::Ignore` 的降级是静默的——rig 只发一条
+    /// `tracing::warn!`，默认不装 subscriber 就什么也看不见。用户会
+    /// 以为缓存在生效，而实际上一个字段都没发出去。所以在第一次调用
+    /// 前用 `check()` 主动查一次并明说。
+    ///
+    /// 只警告一次：一次运行有几十轮，每轮刷屏只会让人学会忽略它。
+    /// 用 `AtomicBool` 而不是 `Mutex<bool>`：`complete` 拿的是 `&self`，
+    /// 而这个标记不需要和任何东西一起加锁。
+    warned_unsupported: Arc<AtomicBool>,
 }
 
 impl RigChatGateway {
@@ -46,12 +60,48 @@ impl RigChatGateway {
         Self {
             model,
             call_timeout: DEFAULT_MODEL_TIMEOUT,
+            warned_unsupported: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// 自定义单次调用时限（测试与特殊网络环境用）。
     pub fn with_timeout(model: DynModel<Completion>, call_timeout: Duration) -> Self {
-        Self { model, call_timeout }
+        Self {
+            model,
+            call_timeout,
+            warned_unsupported: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// 第一次调用前查一遍 provider 支不支持我们设的生成选项。
+    ///
+    /// `check()` 是本地预检（不请求服务端），把 wire 与模型目录能判定
+    /// 的拒绝项一次收齐。`OnUnsupported::Ignore` 下真实调用会静默丢掉
+    /// 这些字段，所以必须在这里替用户问出来。
+    ///
+    /// 只在第一次调用：`check()` 每次都要本地编码一遍请求，几十轮下来
+    /// 不是零成本，而结论不会变（同一会话的 provider 与模型不变）。
+    fn warn_once_about_unsupported(&self, request: &CompletionRequest) {
+        if self.warned_unsupported.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        // `Invalid` 不是"某个选项不被支持"而是"这个请求压根建不起来"，
+        // 真正的调用会带着同样的错误失败，这里不用重复说一遍。
+        if let Err(rig::completion::CheckError::Unsupported(refused)) = self.model.check(request) {
+            let details = refused
+                .iter()
+                .map(|item| format!("{}（{}）", item.option, item.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            eprintln!(
+                "警告：provider {} 不支持以下生成选项，本次运行已忽略它们: {details}",
+                refused
+                    .first()
+                    .map(|item| item.provider.as_str())
+                    .unwrap_or("未知")
+            );
+            eprintln!("      提示缓存与并行工具调用可能没有生效，提速幅度会小于预期。");
+        }
     }
 }
 
@@ -60,12 +110,26 @@ impl ModelGateway for RigChatGateway {
         &'a self,
         request: ModelRequest<'a>,
     ) -> BoxFuture<'a, Result<ModelReply, ApplicationError>> {
+        // 请求在这里就拼好（而不是进 async 块再拼）：预检要读它的字段，
+        // 而 async 块里不能再借 self。拼装是纯函数，没有 IO，
+        // 提前做不改变任何时序。
+        let built = build_request(
+            &request.history,
+            request.spec,
+            request.tools,
+            request.cache_key,
+        );
+        let request = match built {
+            Ok(request) => request,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        // 第一次调用前问一遍 provider 收不收我们设的选项。
+        self.warn_once_about_unsupported(&request);
         // DynModel::call 内部克隆 Arc，返回 'static future，
         // 所以先取出模型再 move 进装箱的 future，不借用 self。
         let model = self.model.clone();
         let call_timeout = self.call_timeout;
         Box::pin(async move {
-            let request = build_request(&request.history, request.spec, request.tools)?;
             // 双层 ?：外层是调用时限（ModelTimeout），内层是 provider 错误（Model）。
             let response = with_call_timeout(model.call(request), call_timeout).await??;
             Ok(ModelReply {
@@ -96,10 +160,13 @@ where
 ///
 /// 工具规格从 `ModelRequest.tools` 来（P2 起注册表是唯一清单），
 /// 不再从 `AgentSpec` 取。
+///
+/// `cache_key` 是会话 ID，见 [`ModelRequest::cache_key`]。
 fn build_request(
     history: &[ContextSlice<'_>],
     spec: &AgentSpec,
     tools: &[ToolSpec],
+    cache_key: Option<&str>,
 ) -> Result<CompletionRequest, ApplicationError> {
     let mut messages = slices_to_messages(history);
     // Session::new 总会把用户任务放进历史，所以这里必然取得到。
@@ -110,7 +177,51 @@ fn build_request(
     Ok(CompletionRequest::new(prompt)
         .messages(messages)
         .preamble(spec.system_prompt.clone())
-        .tools(tools.iter().map(ToolDefinition::from)))
+        .tools(tools.iter().map(ToolDefinition::from))
+        .options(generation_options(cache_key)))
+}
+
+/// 一次请求的生成选项：缓存保留期、路由键、并行工具调用、降级策略。
+///
+/// **不设 `cache_points`，这不是遗漏。** rig-core 0.45 的
+/// `CompletionRequest.cache_points` 只有 Anthropic Messages 编码器会读
+/// （`providers/anthropic/completion.rs` 按位置倒序取点、超额丢弃）；
+/// 我们走的 OpenAI 兼容 Chat Completions 编码器
+/// （`providers/openai/wire/chat.rs`）通篇不碰这个字段——`grep -rn
+/// cache_points src/providers/openai/` 零匹配。给它赋值只会让读代码的
+/// 人以为配了缓存断点，而 wire 上一个字节都不会多发。真正在 Chat
+/// 路由上生效的是下面三个选项，它们由 `providers/openai/options.rs`
+/// 映射成 body 顶层的 `prompt_cache_retention` / `prompt_cache_key` /
+/// `parallel_tool_calls`。
+///
+/// 保留期取 `Short`：任务中途有人长时间不回复审批时缓存可能过期，
+/// 长保留要多花钱，而 `Budget::max_wall_clock` 本来就是兜底。
+/// `Short` 在传统路径映射为 `prompt_cache_retention: "in_memory"`，
+/// 在走 `prompt_cache_options` 的模型上则不发字段（默认保留约 30 分钟）。
+///
+/// `parallel_tool_calls(true)` 是显式设置而不是依赖 provider 默认值：
+/// 一次回复里给多个调用能省掉整轮往返，而"默认开还是默认关"各 provider
+/// 说法不一，不该让吞吐取决于对端的默认配置。
+///
+/// `on_unsupported(Ignore)`：不是所有 provider 都认这些字段。选 `Error`
+/// 会让整个 agent 在只支持部分选项的 provider 上直接不可用——那比没有
+/// 缓存严重得多。代价是降级静默，所以网关在第一次调用前用 `check()`
+/// 主动查一遍并把结果告诉用户（见 [`RigChatGateway::warn_once_about_unsupported`]）。
+///
+/// `None` 的 `cache_key` 是"这个请求压根不参与前缀缓存"（摘要、AI 审查
+/// 这类一次性调用），此时**不发这个字段**。不能拿空字符串顶替：rig 只把
+/// `None` 映射成 `Mapping::Nothing`，`Some("")` 会映射成
+/// `Mapping::Send({"prompt_cache_key": ""})`（见 rig-core 的
+/// `providers/openai/options.rs`），于是所有一次性请求共用一个固定的空键。
+fn generation_options(cache_key: Option<&str>) -> GenerationOptions {
+    let options = GenerationOptions::new()
+        .cache(CacheRetention::Short)
+        .parallel_tool_calls(true)
+        .on_unsupported(OnUnsupported::Ignore);
+    match cache_key {
+        Some(key) => options.cache_key(key),
+        None => options,
+    }
 }
 
 /// 把历史片段翻译成 rig 的消息序列。
@@ -215,6 +326,12 @@ impl From<&Usage> for TokenUsage {
         Self {
             input_tokens: usage.input_tokens.unwrap_or(0),
             output_tokens: usage.output_tokens.unwrap_or(0),
+            // 缓存命中与写入的 token 必须单独平移，不能并进 input_tokens：
+            // 并进去就看不出缓存有没有生效，而"缓存命中率"是 P9 判断
+            // 提速有没有到手的唯一直接证据。provider 不报告时是 0 而不是
+            // None——"没有缓存"与"没查到"在这里同义，都不影响合计。
+            cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
+            cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
             // rig 的诚实策略照搬：无法定价时是 None，报表显示"未知"，
             // 绝不折算成 0。
             cost_usd: usage.cost.map(|cost| cost.total),
@@ -349,11 +466,42 @@ mod tests {
             TokenUsage {
                 input_tokens: 11,
                 output_tokens: 7,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
                 cost_usd: Some(0.75),
             }
         );
         // provider 未报告成本 → None（报表显示"未知"，绝不折算成 0）。
         assert_eq!(TokenUsage::from(&Usage::default()).cost_usd, None);
+    }
+
+    /// 缓存计数器必须原样平移，不能并进 input_tokens。
+    ///
+    /// 并进去的后果不是精度损失，是**缓存有没有生效直接看不出来**——
+    /// 而命中率是 P9 判断"省下的 prefill 时间有没有到手"的唯一直接证据。
+    /// rig 的契约：`cached + cache_creation <= input`，即 input 已含这三类，
+    /// 所以命中率的分母用 input、分子用 cached 是自洽的。
+    #[test]
+    fn usage_translates_cache_counters_separately() {
+        let mut usage = Usage::default();
+        usage.input_tokens = Some(10_000);
+        usage.output_tokens = Some(200);
+        usage.cached_input_tokens = Some(7_500);
+        usage.cache_creation_input_tokens = Some(1_200);
+
+        let translated = TokenUsage::from(&usage);
+
+        assert_eq!(translated.cached_input_tokens, 7_500);
+        assert_eq!(translated.cache_creation_input_tokens, 1_200);
+        assert_eq!(
+            translated.input_tokens, 10_000,
+            "input 是 provider 报的原值，不减掉缓存部分"
+        );
+        // provider 不报告缓存计数时是 0：没有缓存与没查到在这里同义，
+        // 都不该让合计变成 None。
+        let bare = TokenUsage::from(&Usage::default());
+        assert_eq!(bare.cached_input_tokens, 0);
+        assert_eq!(bare.cache_creation_input_tokens, 0);
     }
 
     #[tokio::test]
@@ -369,7 +517,7 @@ mod tests {
     #[test]
     fn request_puts_system_prompt_first() {
         let session = Session::new(SessionId::new("s1"), "任务");
-        let request = build_request(&session.slices(), &spec_with(), &[read_file_spec()])
+        let request = build_request(&session.slices(), &spec_with(), &[read_file_spec()], Some("s1"))
             .unwrap();
 
         assert_eq!(request.system_instructions(), Some("系统提示"));
@@ -377,5 +525,98 @@ mod tests {
         assert_eq!(request.tools.len(), 1);
         // 最后一条是 prompt，即用户任务。
         assert!(matches!(&*request.chat_history[1], Message::User { .. }));
+    }
+
+    /// 请求必须带上缓存保留期、路由键与并行工具调用开关。
+    ///
+    /// 这三项是 OpenAI 兼容 Chat 路由上**真正会发出**的缓存相关字段
+    /// （映射成 body 顶层的 `prompt_cache_retention` /
+    /// `prompt_cache_key` / `parallel_tool_calls`）。断言它们存在，
+    /// 是为了将来有人"顺手清理未使用的 options"时测试会拦下来。
+    #[test]
+    fn request_carries_the_cache_and_parallel_options() {
+        let session = Session::new(SessionId::new("session-42"), "任务");
+        let request = build_request(
+            &session.slices(),
+            &spec_with(),
+            &[read_file_spec()],
+            Some("session-42"),
+        )
+        .unwrap();
+
+        let options = &request.options;
+        assert_eq!(options.cache, Some(CacheRetention::Short), "保留期取短档");
+        assert_eq!(
+            options.cache_key.as_deref(),
+            Some("session-42"),
+            "路由键用会话 ID，跨轮次必须稳定"
+        );
+        assert_eq!(
+            options.parallel_tool_calls,
+            Some(true),
+            "并行工具调用显式开启，不依赖 provider 默认值"
+        );
+        assert_eq!(
+            options.on_unsupported,
+            Some(OnUnsupported::Ignore),
+            "provider 不支持时降级而不是让 agent 不可用"
+        );
+    }
+
+    /// 路由键跟着会话走：换一个会话就是另一个键。
+    ///
+    /// 这条守住的是"键必须稳定"的另一半——它还得**随会话变化**。
+    /// 所有会话共用一个键会让 provider 把互不相干的前缀混在一起，
+    /// 命中率与安全性双双落空。
+    #[test]
+    fn cache_key_follows_the_session() {
+        let session = Session::new(SessionId::new("s1"), "任务");
+        let first = build_request(&session.slices(), &spec_with(), &[], Some("session-a")).unwrap();
+        let second = build_request(&session.slices(), &spec_with(), &[], Some("session-b")).unwrap();
+
+        assert_eq!(first.options.cache_key.as_deref(), Some("session-a"));
+        assert_eq!(second.options.cache_key.as_deref(), Some("session-b"));
+    }
+
+    /// 一次性调用（摘要、AI 审查）不带路由键：不设这个字段，
+    /// 而不是设成一个空字符串。
+    ///
+    /// rig-core 0.45 只把 `None` 映射成 `Mapping::Nothing`；
+    /// `Some("")` 照样映射成 `Mapping::Send({"prompt_cache_key": ""})`
+    /// （见 `providers/openai/options.rs` 的 `prompt_cache_key`）。
+    /// 用空字符串表达"不带键"时，所有摘要与审查请求就共用一个固定的
+    /// 空键——注释说它们不参与前缀缓存，wire 上却句句都带着同一个键。
+    #[test]
+    fn a_one_off_call_sends_no_cache_key_at_all() {
+        let session = Session::new(SessionId::new("s1"), "任务");
+        let request = build_request(&session.slices(), &spec_with(), &[], None).unwrap();
+
+        assert_eq!(
+            request.options.cache_key, None,
+            "不带键就是不设这个字段，空字符串会在 wire 上变成 prompt_cache_key: \"\""
+        );
+        // 只少这一个字段：保留期与并行开关与主循环一致，
+        // 否则"一次性调用"会被做成"降级请求"。
+        assert_eq!(request.options.cache, Some(CacheRetention::Short));
+        assert_eq!(request.options.parallel_tool_calls, Some(true));
+    }
+
+    /// 不设 `cache_points`，这是查证过的决定而不是遗漏。
+    ///
+    /// rig-core 0.45 里只有 Anthropic Messages 编码器读这个字段；
+    /// 我们走的 OpenAI 兼容 Chat 编码器通篇不碰它
+    /// （`grep -rn cache_points src/providers/openai/` 零匹配）。
+    /// 给它赋值只会让读代码的人以为配了缓存断点，而 wire 上一个字节
+    /// 都不会多发——所以这里断言它就是空的，把决定钉在测试里。
+    #[test]
+    fn request_leaves_cache_points_empty_because_the_chat_wire_ignores_them() {
+        let session = Session::new(SessionId::new("s1"), "任务");
+        let request = build_request(&session.slices(), &spec_with(), &[], Some("s1")).unwrap();
+
+        assert!(
+            request.cache_points.is_empty(),
+            "Chat 路由不读 cache_points，设了也是装饰: {:?}",
+            request.cache_points
+        );
     }
 }

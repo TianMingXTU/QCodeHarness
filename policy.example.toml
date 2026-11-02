@@ -5,6 +5,10 @@
 #
 # 规则按数组顺序匹配，第一条命中的生效；都不命中走默认策略
 # （只读工具放行、非只读工具要求审批）。想让某条 deny 优先，把它写在前面。
+#
+# ⚠ 用了这个文件，内置默认基线就整体失效（不与它合并）——下面那条
+# "cargo test 免审"因此必须留在这里。不设 QCH_POLICY 时基线自动生效，
+# 放着文件正是为了能改它。
 
 [[rules]]
 tool = "read_file"
@@ -61,7 +65,7 @@ description = "修改文件内容，每次都要人确认"
 [[rules]]
 tool = "run_command"
 verdict = "allow"
-description = "只读验证类命令免审"
+description = "只读验证类命令免审（与内置默认基线一致，删了它这里就不再免审）"
 scope = { command_prefix = "cargo test *" }
 
 [[rules]]

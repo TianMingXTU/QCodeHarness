@@ -1,10 +1,14 @@
-//! 角色花名册：按角色查档案、按档案裁剪工具集。
+//! 角色花名册：按角色查档案、按档案给出工具白名单。
 //!
 //! 编排器按步骤的角色来这里取档案（提示词 + 工具白名单），恢复入口
-//! 用同一条裁剪路径——工具子集是硬边界，任何把注册表交到模型面前的
-//! 路径都必须过这道滤网，不能只在编排一条路上生效。
+//! 用同一份档案——角色边界是硬边界，任何把工具交到模型面前或手里的
+//! 路径都必须认这道名单，不能只在编排一条路上生效。
+//!
+//! P9-3 起白名单的执行点从"装配时过滤注册表"移到"调用时校验"：
+//! 模型看到的工具定义对所有步骤统一（否则每一步的工具数组都不同，
+//! 前缀缓存一步都命不中），而 runner 在每条执行入口上按这份名单裁决。
+//! 边界没有消失，只是从"看不见"变成"调不动"。
 
-use crate::application::tool_registry::{ToolEntry, ToolRegistry};
 use crate::domain::agent::AgentRole;
 use crate::domain::agent_profile::AgentProfile;
 
@@ -38,38 +42,12 @@ impl AgentRoster {
     ///
     /// 角色没有档案时也返回 `None`，但调用方应先经 [`Self::find`]
     /// 排除这种情况——`None` 的语义是"不限"，不是"没有"。
+    ///
+    /// 这是 P9-3 之后角色边界的唯一真相来源：runner 拿着它在调用层
+    /// 校验每一次工具调用（见 `application::agent_run`）。
     pub fn allowed_tools(&self, role: AgentRole) -> Option<&[String]> {
         self.find(role)
             .and_then(|profile| profile.tools.as_deref())
-    }
-
-    /// 把整张注册表裁剪成该角色可见的工具集（白名单的硬边界）。
-    ///
-    /// 顺序跟随档案配置，重复项只装一次。档案配了但注册表没有的
-    /// 工具名打警告后忽略——档案是配置，注册表是实现，配置超前于实现
-    /// （比如某台机器没装某个 MCP Server）不该让整个任务崩，但也不该
-    /// 静默到没人发现装配缩水了。
-    ///
-    /// 角色没有档案时返回全量注册表（`None` = 不限的语义）；
-    /// 常规编排路径在调用前已用 [`Self::find`]-把缺档案变成显式错误。
-    pub fn filter_registry(&self, role: AgentRole, registry: &ToolRegistry) -> ToolRegistry {
-        let Some(allowed) = self.allowed_tools(role) else {
-            return registry.clone();
-        };
-        let mut entries: Vec<ToolEntry> = Vec::with_capacity(allowed.len());
-        for name in allowed {
-            if entries.iter().any(|entry| entry.spec.name == *name) {
-                continue;
-            }
-            match registry.find(name) {
-                Some(entry) => entries.push(entry.clone()),
-                None => eprintln!(
-                    "警告：角色 {} 的档案配置了未注册的工具 `{name}`，已忽略",
-                    role.name()
-                ),
-            }
-        }
-        ToolRegistry::new(entries)
     }
 
     /// 给每个角色的提示词追加项目指令。
@@ -129,6 +107,44 @@ mod tests {
         assert!(!reviewer_tools.iter().any(|name| name == "run_command"));
         // 编码者不限工具。
         assert_eq!(roster.allowed_tools(AgentRole::Coder), None);
+    }
+
+    /// 白名单里的每个名字都必须是真实注册的工具。
+    ///
+    /// P9-3 起白名单由 runner 在调用层按名字校验，拼错的名字不会像以前
+    /// 那样在装配时打一条警告——它会静默地让该角色永远调不到那个工具。
+    /// 所以这条断言从"白名单数据"一侧守住边界：档案写错了要让测试红，
+    /// 而不是让用户以为评审者"本来就不能用 search_text"。
+    #[test]
+    fn every_whitelisted_tool_name_is_a_real_tool() {
+        let registry = crate::application::tool_registry::ToolRegistry::new(
+            crate::infrastructure::tool::all_tools(crate::domain::workspace::WorkspaceRoot::new(
+                std::env::temp_dir(),
+            )),
+        );
+        let registered: Vec<String> = registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        let roster = AgentRoster::builtin();
+
+        for role in [
+            AgentRole::Planner,
+            AgentRole::Coder,
+            AgentRole::Tester,
+            AgentRole::Reviewer,
+        ] {
+            let Some(allowed) = roster.allowed_tools(role) else {
+                continue;
+            };
+            for name in allowed {
+                assert!(
+                    registered.iter().any(|real| real == name),
+                    "{role:?} 的白名单配了未注册的工具 `{name}`；已注册: {registered:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -200,31 +216,5 @@ mod tests {
         for role in [AgentRole::Planner, AgentRole::Coder, AgentRole::Tester, AgentRole::Reviewer] {
             assert_eq!(after.allowed_tools(role), before.allowed_tools(role));
         }
-    }
-
-    #[test]
-    fn filter_registry_cuts_the_full_registry_down_to_the_whitelist() {
-        // 恢复路径复用这条裁剪：白名单角色拿到的注册表必须真的没有
-        // 写工具，而不是只在编排路径上过滤。
-        let registry = crate::application::tool_registry::ToolRegistry::new(
-            crate::infrastructure::tool::all_tools(crate::domain::workspace::WorkspaceRoot::new(
-                std::env::temp_dir(),
-            )),
-        );
-        let roster = AgentRoster::builtin();
-
-        let reviewer_view = roster.filter_registry(AgentRole::Reviewer, &registry);
-        let specs = reviewer_view.specs();
-        let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
-        assert_eq!(names.len(), 5);
-        assert!(names.iter().all(|name| {
-            !matches!(*name, "write_file" | "edit_file" | "run_command")
-        }));
-
-        // 不限工具的角色拿全量。
-        assert_eq!(
-            roster.filter_registry(AgentRole::Coder, &registry).specs().len(),
-            registry.specs().len()
-        );
     }
 }

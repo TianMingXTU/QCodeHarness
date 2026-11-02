@@ -130,7 +130,7 @@ pub fn compact<'a>(
     }
 
     let dropped = round_numbers[..drop_count].to_vec();
-    let mut kept: Vec<ContextSlice<'a>> = Vec::with_capacity(budget.max_rounds + 2);
+    let mut kept: Vec<ContextSlice<'a>> = Vec::with_capacity(budget.max_rounds + 4);
     // 任务消息是历史的第一条用户消息。先它、后占位说明/摘要、再保留的轮次，
     // 顺序与"人先交代任务、再补一句摘要、然后是近期工作"一致。
     if budget.keep_task {
@@ -139,10 +139,23 @@ pub fn compact<'a>(
         }
     }
     kept.push(ContextSlice::User(Cow::Owned(omitted_text(session, &dropped))));
-    kept.extend(slices.iter().filter_map(|slice| match slice {
-        ContextSlice::Round { number, .. } if !dropped.contains(number) => Some(slice.clone()),
-        _ => None,
-    }));
+    for (index, slice) in slices.iter().enumerate() {
+        match slice {
+            // 任务消息已在最前面钉住（或按 keep_task 主动裁掉），原样再放
+            // 一遍只会让模型把同一件事看两遍。
+            ContextSlice::User(_) if index == 0 => {}
+            // 其余用户消息是步骤边界（P9-3 单会话编排）：它们是"现在在
+            // 第几步"的唯一来源，不是历史轮次。裁掉它模型就不知道自己
+            // 进行到哪了——而裁剪恰恰发生在步数最多的长任务上，正是最
+            // 需要这一步信息的时候。按原位置保留，不跳到前面：把第 3 步
+            // 的交代挪到第 1 步的观察之前，等于给模型一份假时间线。
+            ContextSlice::User(_) => kept.push(slice.clone()),
+            ContextSlice::Round { number, .. } if !dropped.contains(number) => {
+                kept.push(slice.clone())
+            }
+            ContextSlice::Round { .. } => {}
+        }
+    }
 
     let rounds_after = rounds_before - drop_count;
     (
@@ -305,6 +318,80 @@ mod tests {
         assert_eq!(slices.len(), 2, "只剩任务 + 占位说明");
         assert!(slices.iter().all(|slice| matches!(slice, ContextSlice::User(_))));
         assert_eq!(report.dropped, vec![1, 2]);
+    }
+
+    // ── P9-3：步骤边界的用户消息不占轮次预算 ────────────────────────
+
+    /// 造一个跨三步的单会话历史：每步两轮，步骤之间夹一条用户消息。
+    fn session_with_steps(rounds_per_step: u32) -> Session {
+        let mut session = Session::new(SessionId::new("s1"), "任务");
+        for step in 1..=3u32 {
+            if step > 1 {
+                session.push_user(format!("[第 {step}/3 步] 第 {step} 步的交代"));
+            }
+            for _ in 0..rounds_per_step {
+                session
+                    .commit_round(
+                        AgentTurn {
+                            text: format!("第 {step} 步的思考"),
+                            calls: vec![ToolCall {
+                                id: CallId::new(format!("call_{step}")),
+                                name: "read_file".to_owned(),
+                                arguments: json!({"path": "a.txt"}),
+                            }],
+                        },
+                        vec![ToolOutcome::success(format!("第 {step} 步的观察"))],
+                    )
+                    .unwrap();
+            }
+        }
+        session
+    }
+
+    #[test]
+    fn step_boundaries_survive_compaction_in_their_original_order() {
+        let session = session_with_steps(2);
+        // 只保留两轮：第 1、2、3 步各两轮里只有最后两轮活下来，
+        // 但三条步骤交代一条都不能丢。
+        let (slices, report) = compact(&session, &budget(2));
+
+        assert_eq!(report.dropped, vec![1, 2, 3, 4], "裁掉前四轮");
+        let texts: Vec<String> = slices
+            .iter()
+            .filter_map(|slice| match slice {
+                ContextSlice::User(text) => Some(text.as_ref().to_owned()),
+                ContextSlice::Round { .. } => None,
+            })
+            .collect();
+        assert_eq!(texts[0], "任务", "任务交代钉在最前");
+        assert!(texts[1].contains("已省略第 1-4 轮"), "第二位是占位说明: {texts:?}");
+        // 第 1 步没有独立交代——任务消息就是第 1 步的交代。
+        for step in 2..=3 {
+            assert!(
+                texts.contains(&format!("[第 {step}/3 步] 第 {step} 步的交代")),
+                "第 {step} 步的交代必须保留: {texts:?}"
+            );
+        }
+        // 顺序不能乱：第 3 步的交代必须排在第 3 步的观察之前。
+        let boundary = slices
+            .iter()
+            .position(|slice| matches!(slice, ContextSlice::User(text) if text.as_ref() == "[第 3/3 步] 第 3 步的交代"))
+            .expect("应有第 3 步的交代");
+        let last_round = slices
+            .iter()
+            .rposition(|slice| matches!(slice, ContextSlice::Round { number: 6, .. }))
+            .expect("第 6 轮应保留");
+        assert!(boundary < last_round, "步骤交代必须排在本步工作之前");
+    }
+
+    #[test]
+    fn step_boundaries_do_not_count_against_the_round_budget() {
+        let session = session_with_steps(3);
+        // 预算正好等于总轮数：一条都不该裁，步骤交代也原样在位。
+        let (slices, report) = compact(&session, &budget(9));
+
+        assert!(report.dropped.is_empty(), "九轮全在预算内: {report:?}");
+        assert_eq!(slices.len(), 9 + 3, "九轮 + 任务 + 第 2/3 步的两条交代");
     }
 
     #[test]

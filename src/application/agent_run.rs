@@ -16,6 +16,7 @@ use crate::application::port::{
     ApprovalGate, ApprovalRequest, Clock, EvidenceSink, ModelGateway, ModelReply,
     ModelRequest,
 };
+use crate::application::agent_roster::AgentRoster;
 use crate::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
 use crate::application::summarizer::{render_slices, SummarizeInput, Summarizer};
 use crate::application::tool_registry::ToolRegistry;
@@ -126,6 +127,13 @@ pub struct AgentDependencies {
     /// 它是领域类型而不是端口 trait——它无 IO、无外部依赖，
     /// 直接持有比再开一个端口更简单。
     pub policy: PolicyEngine,
+    /// 角色花名册：按 `spec.role` 查出这个角色能调哪些工具。
+    ///
+    /// P9-3 起工具定义对所有步骤统一（模型看到的永远是全量注册表），
+    /// 角色边界从"模型看不见"下沉到"调不动"——花名册就是那道边界的
+    /// 唯一真相来源，runner 自己来查，不靠调用方预先过滤。放在依赖里
+    /// 而不是构造参数里：`resume()` 同样要按快照里的角色重算一遍。
+    pub roster: AgentRoster,
     /// 上下文预算：发给模型前按它裁剪历史。
     pub context_budget: ContextBudget,
     /// 快照存储。`None` 表示不做自动保存（单测、不需要恢复的场景）。
@@ -151,6 +159,14 @@ pub struct AgentRunner {
     /// 它是领域类型而不是端口 trait——它无 IO、无外部依赖，
     /// 直接持有比再开一个端口更简单。
     policy: PolicyEngine,
+    /// 角色花名册：角色边界的真相来源（见 [`AgentDependencies::roster`]）。
+    roster: AgentRoster,
+    /// 当前角色可调用的工具名；`None` 表示不限。
+    ///
+    /// 换角色时重算（构造、恢复、`begin_step` 各一次），之后每条调用
+    /// 都查它。缓存而不是每次现查：`AgentRoster::allowed_tools` 要遍历
+    /// 档案，而它在每条工具调用上都会被问到。
+    allowed_tools: Option<Vec<String>>,
     /// 上下文预算：发给模型前按它裁剪历史。
     ///
     /// 裁剪只改"发给模型时怎么看"，不改 `session` 本身——
@@ -197,13 +213,14 @@ impl AgentRunner {
             evidence,
             clock,
             policy,
+            roster,
             context_budget,
             session_store,
         } = deps;
         let visible_specs = tools.specs();
         let session = Session::new(session_id, task);
         let run_start = clock.now();
-        Self {
+        let mut runner = Self {
             model,
             tools,
             visible_specs,
@@ -211,6 +228,8 @@ impl AgentRunner {
             evidence,
             clock,
             policy,
+            roster,
+            allowed_tools: None,
             context_budget,
             session_store,
             cancel: CancelHandle::default(),
@@ -222,7 +241,9 @@ impl AgentRunner {
             run_start,
             elapsed_base: Duration::ZERO,
             summary_failures: 0,
-        }
+        };
+        runner.refresh_role_boundary();
+        runner
     }
 
     /// 从快照恢复一个 runner，接着往下跑。
@@ -286,6 +307,7 @@ impl AgentRunner {
             evidence,
             clock,
             policy,
+            roster,
             context_budget,
             session_store,
         } = deps;
@@ -301,6 +323,8 @@ impl AgentRunner {
             evidence,
             clock,
             policy,
+            roster,
+            allowed_tools: None,
             context_budget,
             session_store,
             spec: snapshot.spec,
@@ -313,6 +337,7 @@ impl AgentRunner {
             elapsed_base,
             summary_failures: 0,
         };
+        runner.refresh_role_boundary();
         runner.save_snapshot();
         Ok(runner)
     }
@@ -331,6 +356,103 @@ impl AgentRunner {
     /// `run()` 都会在下一轮问模型之前停下。
     pub fn cancel_handle(&self) -> CancelHandle {
         self.cancel.clone()
+    }
+
+    /// 进入下一步：换角色、交代步骤、把上一步的结论落进历史。
+    ///
+    /// P9-3 单会话编排的接缝。一个任务只开一个会话，步骤之间不再另起
+    /// runner——历史、轮数、墙钟与缓存路由键全部延续，下一步的模型因此
+    /// 看得见上一步读过的文件和得出的结论，不必把同样的文件再读一遍。
+    ///
+    /// 只在 [`RunState::Completed`] 之后调用：那意味着上一步正常收尾。
+    /// 半轮状态（有未配平的调用）下换步骤会丢掉 pending，历史从此错位。
+    ///
+    /// # Errors
+    ///
+    /// 把上一步的最终答案提交进历史时若配平被破坏，返回
+    /// [`ApplicationError::Session`]。正常流程不可能——无调用轮次的观察
+    /// 必然是空的；真出现说明会话状态已被破坏，带着错历史继续问模型
+    /// 只会把错误放大。
+    pub fn begin_step(
+        &mut self,
+        spec: AgentSpec,
+        prompt: String,
+    ) -> Result<(), ApplicationError> {
+        // 上一步的最终答案必须先落进历史。`step()` 的 Completed 分支
+        // 刻意不提交轮次（最终答案没有观察可配），而单会话编排的全部
+        // 价值就在于下一步看得见上一步的结论——不提交的话，第二步的
+        // 模型只能看到第二步自己的东西，"跨步骤不重读"无从谈起。
+        if let RunState::Completed(answer) = &self.state {
+            let answer = answer.clone();
+            self.session
+                .commit_round(AgentTurn { text: answer, calls: Vec::new() }, Vec::new())?;
+        }
+        self.session.push_user(prompt);
+        self.spec = spec;
+        self.refresh_role_boundary();
+        self.state = RunState::AwaitingModel;
+        self.pending = None;
+        // 立刻存一次：快照若还停在 Completed，恢复的人会以为任务已经
+        // 结束，而实际上还有步骤没跑。
+        self.save_snapshot();
+        Ok(())
+    }
+
+    /// 按当前 `spec.role` 重算角色可调用的工具名。
+    ///
+    /// 查不到档案时是 `None`（不限）：编排路径已在调用
+    /// [`AgentRoster::find`] 时把"缺档案"变成显式错误，走到这里说明
+    /// 角色一定有档案，`None` 只可能是档案本身没配白名单。
+    fn refresh_role_boundary(&mut self) {
+        self.allowed_tools = self
+            .roster
+            .allowed_tools(self.spec.role)
+            .map(<[String]>::to_vec);
+    }
+
+    /// 这条调用是否越过当前角色的工具白名单。
+    ///
+    /// 返回 `Some(拒绝说明)` 表示越权。与注册表查找、策略裁决、审批闸门
+    /// 相互独立：注册表管"这个工具存不存在"，策略管"该不该审"，闸门管
+    /// "人点不点头"，这道管"这个角色配不配提这个调用"。少任何一道都有
+    /// 一条真实的越权路径能通到底。
+    ///
+    /// 拒绝说明必须点破"这是权限问题不是审批问题"：模型最常见的反应是
+    /// 换个参数重试同一次调用，或者跑去请求审批——两条路都是死路，
+    /// 说清边界它才会改用这个角色真能用的工具。
+    fn role_refusal(&self, call: &ToolCall) -> Option<String> {
+        let allowed = self.allowed_tools.as_ref()?;
+        if allowed.iter().any(|name| name == &call.name) {
+            return None;
+        }
+        Some(format!(
+            "角色 `{}` 无权调用工具 `{}`（该角色可用: {}）。这是角色权限边界，\
+             不是审批问题——请改用该角色可用的工具，或把这件事留给后续步骤的角色。",
+            self.spec.role.name(),
+            call.name,
+            allowed.join(", "),
+        ))
+    }
+
+    /// 角色边界检查，越权就记一条拒绝观察并推进。
+    ///
+    /// 返回 `Ok(None)` 表示没越权，调用方照常往下走。
+    ///
+    /// 检查逻辑只有这一份，调用点有两处（`Evaluating` 与 `Dispatching`）：
+    /// 状态机的形状决定的——恢复可以从 `Dispatching` 直接进入，那条路
+    /// 上 `Evaluating` 的检查被整段跳过。只在 `Evaluating` 查一次的后果
+    /// 是：一个停在 `Dispatching(write_file)` 的受限角色快照，恢复后
+    /// 就能把写工具放行。
+    async fn refuse_out_of_role(
+        &mut self,
+        call: &ToolCall,
+    ) -> Result<Option<RunState>, ApplicationError> {
+        let Some(reason) = self.role_refusal(call) else {
+            return Ok(None);
+        };
+        self.record_and_advance(call.clone(), ToolOutcome::refused(reason))
+            .await
+            .map(Some)
     }
 
     /// 推进一步。调用方决定何时停——这是超时/取消/恢复的挂点。
@@ -372,6 +494,14 @@ impl AgentRunner {
 
             RunState::Evaluating(calls) => {
                 let call = self.next_call(&calls)?.clone();
+                // 角色边界先于一切：未注册检查、策略裁决、人工审批管的都是
+                // "这个调用能不能发生"，这里管"这个角色配不配提它"。放在
+                // 最前面，越权调用连策略和闸门都不值得惊动——为人省下
+                // 一次注定被拒的审批，也让审计里不会出现一条误导性的
+                // "策略已放行"。
+                if let Some(state) = self.refuse_out_of_role(&call).await? {
+                    return Ok(state);
+                }
                 // 未注册的工具不进审批也不执行，直接拒绝。
                 let Some(entry) = self.tools.find(&call.name) else {
                     let outcome = ToolOutcome::refused(unregistered_tool_message(
@@ -455,6 +585,11 @@ impl AgentRunner {
 
             RunState::Dispatching(calls) => {
                 let call = self.next_call(&calls)?.clone();
+                // 恢复可能从 Dispatching 直接进入（快照停在半轮执行），
+                // 那时 Evaluating 的检查被跳过——所以这里必须再查一次。
+                if let Some(state) = self.refuse_out_of_role(&call).await? {
+                    return Ok(state);
+                }
                 let outcome = self.tools.invoke(&call).await;
                 self.record_and_advance(call, outcome).await
             }
@@ -548,6 +683,9 @@ impl AgentRunner {
             history,
             spec: &self.spec,
             tools: &self.visible_specs,
+            // 会话 ID 作路由键：同一会话的每一轮都必须是同一个键，
+            // 否则 provider 把它们路由到不同机器，前缀缓存一次都读不回来。
+            cache_key: Some(self.session.id().as_str()),
         };
         let reply = model.complete(request.clone()).await?;
         // 空回复是模型端的瞬态故障（实测：偶发"计费了几十个输出 token，
@@ -839,7 +977,7 @@ mod tests {
     use crate::domain::tool::{OutcomeStatus, ToolAnnotations};
     use crate::infrastructure::evidence::memory::MemoryEvidenceSink;
     use crate::infrastructure::model::rig_chat::RigChatGateway;
-    use rig::message::{AssistantContent, UserContent};
+    use rig::message::{AssistantContent, ToolName, UserContent};
     use rig::test_utils::{MockCompletionModel, MockTurn};
     use serde_json::json;
 
@@ -980,6 +1118,7 @@ mod tests {
                 evidence: evidence.clone(),
                 clock: Arc::new(crate::infrastructure::clock::SystemClock),
                 policy,
+                roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
             },
@@ -999,6 +1138,18 @@ mod tests {
             .iter()
             .map(|message| (**message).clone())
             .collect()
+    }
+
+    /// 拼一个助手工具调用块，供"一轮多个调用"的测试用。
+    ///
+    /// `MockTurn::tool_call` 一次只能塞一个调用；多个调用要走
+    /// `from_contents`，那就得自己拼 `AssistantContent`。
+    fn call_content(id: &str, name: &str, arguments: serde_json::Value) -> AssistantContent {
+        AssistantContent::tool_call(
+            id,
+            ToolName::new(name).expect("测试里的工具名应合法"),
+            arguments,
+        )
     }
 
     // ── 用例 1：能连续调用工具 ──────────────────────────────────────────
@@ -1203,6 +1354,104 @@ mod tests {
         );
     }
 
+    // ── 一轮多个调用（P9-4 parallel_tool_calls）────────────────────────
+
+    /// 一次回复里带多个工具调用时，全部都要执行并各回一条观察。
+    ///
+    /// P9-4 起请求显式带 `parallel_tool_calls(true)`（见
+    /// `infrastructure::model::rig_chat::generation_options`），模型于是会
+    /// 在一轮里给多个调用。这里守住三件事：一条不漏、顺序不乱、各配各的
+    /// 观察——错位配对会让模型把 A 的结果当成 B 的，后面整个任务都建在
+    /// 错配上，而表面上一切正常。
+    #[tokio::test]
+    async fn multiple_calls_in_one_reply_are_all_observed_in_order() {
+        let mut harness = harness(
+            vec![
+                MockTurn::from_contents([
+                    call_content("call_1", "read_file", json!({"path": "Cargo.toml"})),
+                    call_content(
+                        "call_2",
+                        "write_file",
+                        json!({"path": "out.txt", "content": "x"}),
+                    ),
+                    call_content("call_3", "read_file", json!({"path": "b.txt"})),
+                ]),
+                MockTurn::text("三个都处理完了"),
+            ],
+            vec![read_file_spec(), write_file_spec()],
+        );
+
+        let outcome = harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert!(outcome.answer.contains("三个都处理完了"));
+        // 三条调用只花一次模型往返：轮数不随调用数上涨，这是 P9-4 要的账。
+        assert_eq!(outcome.turns_used, 2);
+        assert_eq!(harness.mock.request_count(), 2);
+
+        let requested: Vec<String> = harness
+            .evidence
+            .events()
+            .iter()
+            .filter_map(|event| match &event.event {
+                AuditEvent::ToolRequested { call, .. } => Some(call.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            requested,
+            vec!["read_file", "write_file", "read_file"],
+            "三条调用都要留下请求记录，且顺序与回复一致"
+        );
+
+        let observed: Vec<String> = harness
+            .evidence
+            .events()
+            .iter()
+            .filter_map(|event| match &event.event {
+                AuditEvent::ToolObserved { call, .. } => Some(call.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            observed, requested,
+            "每条调用都要配到自己的观察，不能错位"
+        );
+
+        // 审批只问写工具：两个只读调用照常跳过闸门。
+        assert_eq!(harness.approvals.requested_tools(), vec!["write_file"]);
+    }
+
+    /// 一轮多个调用时，历史里仍是"一条助手消息 + 一组 tool 结果"。
+    ///
+    /// OpenAI 兼容端点要求同一轮的所有 tool 结果跟在同一条助手消息之后；
+    /// 拆成多组会让请求直接 400。这条守住的是翻译层的配对形状。
+    #[tokio::test]
+    async fn one_reply_with_many_calls_produces_one_paired_history_block() {
+        let mut harness = harness(
+            vec![
+                MockTurn::from_contents([
+                    call_content("call_1", "read_file", json!({"path": "Cargo.toml"})),
+                    call_content("call_2", "read_file", json!({"path": "b.txt"})),
+                ]),
+                MockTurn::text("两行都读完了"),
+            ],
+            vec![read_file_spec()],
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        let messages = history(&harness.mock, 1);
+        assert_eq!(messages.len(), 4, "系统 + 任务 + 助手 + 一组观察");
+        let Message::Assistant(assistant) = &messages[2] else {
+            panic!("第三条应当是助手消息，实际是 {:?}", messages[2]);
+        };
+        assert_eq!(assistant.tool_calls().count(), 2, "助手消息应含两次调用");
+        let Message::User { content } = &messages[3] else {
+            panic!("第四条应当是 tool 结果，实际是 {:?}", messages[3]);
+        };
+        assert_eq!(content.len(), 2, "两条结果应在同一组里");
+    }
+
     // ── 审批否决不是崩溃 ───────────────────────────────────────────────
 
     #[tokio::test]
@@ -1229,6 +1478,7 @@ mod tests {
                 evidence: Arc::new(MemoryEvidenceSink::new()),
                 clock: Arc::new(crate::infrastructure::clock::SystemClock),
                 policy: PolicyEngine::new(),
+                roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
             },
@@ -1523,6 +1773,39 @@ mod tests {
         // P2 验收点：新加的最危险工具 run_command（open_world）没有在
         // 策略引擎里登记任何规则，默认策略按注解自动把它送进闸门——
         // "加高危工具不需要改策略引擎"正是 P1 接缝设计的验收点。
+        //
+        // 命令刻意避开 P9-5 默认基线放行的那几条（cargo test / build、
+        // git status / diff）：验收点是"基线之外的命令仍要人点头"，
+        // 拿 `cargo test` 当例子会让它测不到任何东西。
+        let run_command_spec = ToolSpec {
+            name: "run_command".to_owned(),
+            description: "跑命令".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(false, true, false, true),
+        };
+        let mut harness = harness(
+            vec![
+                MockTurn::tool_call("call_1", "run_command", json!({"command": "rm -rf target"})),
+                MockTurn::text("跑完了"),
+            ],
+            vec![read_file_spec(), run_command_spec],
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(
+            harness.approvals.requested_tools(),
+            vec!["run_command"],
+            "默认策略下 run_command 必须过审批闸门"
+        );
+    }
+
+    /// 默认基线放行的命令确实不问人——这是 P9-5 省下的那次点击。
+    ///
+    /// 与上一条配对：一条守住"高危仍要审"，这一条守住"无害的别再审"。
+    /// 只测前者的话，将来有人把基线删了，测试全绿而等待成本悄悄回去。
+    #[tokio::test]
+    async fn baseline_commands_skip_the_approval_gate() {
         let run_command_spec = ToolSpec {
             name: "run_command".to_owned(),
             description: "跑命令".to_owned(),
@@ -1539,10 +1822,9 @@ mod tests {
 
         harness.runner.run(&Budget::new(20)).await.unwrap();
 
-        assert_eq!(
-            harness.approvals.requested_tools(),
-            vec!["run_command"],
-            "默认策略下 run_command 必须过审批闸门"
+        assert!(
+            harness.approvals.requested_tools().is_empty(),
+            "cargo test 在默认基线里，不该再问人"
         );
     }
 
@@ -1685,6 +1967,51 @@ mod tests {
         );
     }
 
+    /// 默认策略（P9-5 的内置基线）放行 `git diff *` 一族，但这条命令
+    /// 用 git 自己的 `--output` 选项把 workspace 的内容写到外面。
+    ///
+    /// 它既没有写入型动词也没有 `>`，按 P8-3 原来的两个判据整个漏掉；
+    /// 而基线又刚刚把它放行，两道防线同时失守。本机实测
+    /// `git diff --output=D:\x` 会真的落盘，所以这不是理论风险。
+    #[tokio::test]
+    async fn default_baseline_still_gates_a_diff_that_writes_outside() {
+        let run_command_spec = ToolSpec {
+            name: "run_command".to_owned(),
+            description: "跑命令".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(false, true, false, true),
+        };
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call(
+                    "call_1",
+                    "run_command",
+                    json!({"command": r"git diff --output=C:\Windows\temp\x"}),
+                ),
+                MockTurn::text("跑完了"),
+            ],
+            vec![run_command_spec],
+            PolicyEngine::new(),
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(
+            harness.approvals.requested_tools(),
+            vec!["run_command"],
+            "基线放行的命令族也不能把内容写到 workspace 外而无人过目"
+        );
+        let reason = harness
+            .approvals
+            .first_request()
+            .reason
+            .expect("升级请求必须带 reason");
+        assert!(
+            reason.contains(r"C:\Windows\temp\x"),
+            "理由应点名越界目标: {reason}"
+        );
+    }
+
     /// 审计里记的仍是策略的原判（Allow），不是升级后的裁决。
     ///
     /// 策略没改，改的是"这次调用要不要人过目"。两件事混在一条
@@ -1766,6 +2093,7 @@ mod tests {
                 evidence: evidence.clone(),
                 clock: Arc::new(crate::infrastructure::clock::SystemClock),
                 policy,
+                roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
             },
@@ -1845,6 +2173,7 @@ mod tests {
                 evidence: evidence.clone(),
                 clock: Arc::new(crate::infrastructure::clock::SystemClock),
                 policy: PolicyEngine::new(),
+                roster: AgentRoster::builtin(),
                 context_budget: ContextBudget {
                     max_rounds: 2,
                     keep_task: true,
@@ -1915,6 +2244,7 @@ mod tests {
                 evidence: evidence.clone(),
                 clock: Arc::new(crate::infrastructure::clock::SystemClock),
                 policy: PolicyEngine::new(),
+                roster: AgentRoster::builtin(),
                 context_budget,
                 session_store: None,
             },
@@ -2164,6 +2494,7 @@ mod tests {
                 evidence: Arc::new(MemoryEvidenceSink::new()),
                 clock: clock.clone(),
                 policy: PolicyEngine::new(),
+                roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
             },
@@ -2221,6 +2552,7 @@ mod tests {
                 evidence: Arc::new(MemoryEvidenceSink::new()),
                 clock: Arc::new(crate::infrastructure::clock::SystemClock),
                 policy: PolicyEngine::new(),
+                roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
             },
@@ -2261,11 +2593,11 @@ mod tests {
                 evidence: Arc::new(MemoryEvidenceSink::new()),
                 clock,
                 policy: PolicyEngine::new(),
+                roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
             },
         );
-
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
 
         assert_eq!(outcome.answer, "读完了");

@@ -12,6 +12,7 @@ use std::time::Duration;
 use qcode_harness::application::agent_run::{
     AgentDependencies, AgentRunner, PendingRound, RunState,
 };
+use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::port::{ApprovalGate, ApprovalRequest, BoxFuture, Decision, ToolInvoker};
 use qcode_harness::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
@@ -22,11 +23,13 @@ use qcode_harness::domain::ids::{CallId, SessionId};
 use qcode_harness::domain::policy::{PolicyEngine, PolicyRule, PolicyVerdict};
 use qcode_harness::domain::session::{Session, Turn};
 use qcode_harness::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
+use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::clock::SystemClock;
 use qcode_harness::infrastructure::evidence::memory::MemoryEvidenceSink;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
+use qcode_harness::infrastructure::tool::all_tools;
 
 use rig::test_utils::{MockCompletionModel, MockTurn};
 use serde_json::json;
@@ -76,6 +79,7 @@ fn deps_with(
         evidence: Arc::new(MemoryEvidenceSink::new()),
         clock: Arc::new(SystemClock),
         policy,
+        roster: AgentRoster::builtin(),
         context_budget: Default::default(),
         session_store,
     }
@@ -285,10 +289,82 @@ async fn half_dispatched_snapshot_executes_only_the_remaining_call() {
     assert_eq!(outcomes[0].content, "a 的内容");
 }
 
+/// 恢复路径也必须过角色边界。
+///
+/// P9-3 把角色白名单从"装配时过滤注册表"移到"调用时校验"，注册表因此
+/// 对每个角色都是全量的。这条测试守的是那次迁移唯一真实的坑：快照可以
+/// 直接停在 `Dispatching`，恢复后 `Evaluating` 的检查被整段跳过。如果
+/// 只在 `Evaluating` 查一次，一个停在 `Dispatching(write_file)` 的受限
+/// 角色快照就能把写工具放行——白名单名义上还在，实际上少了一半入口。
+#[tokio::test]
+async fn dispatching_snapshot_of_a_restricted_role_still_refuses_the_write() {
+    let workspace = std::env::temp_dir().join(format!("qch-resume-role-{}", std::process::id()));
+    fs::create_dir_all(&workspace).expect("建临时工作区");
+    let target = workspace.join("keep.txt");
+    fs::write(&target, "原文").expect("写初始内容");
+
+    let write_call = ToolCall {
+        id: CallId::new("call_w"),
+        name: "write_file".to_owned(),
+        arguments: json!({"path": "keep.txt", "content": "被改"}),
+    };
+    let reviewer = AgentSpec {
+        role: AgentRole::Reviewer,
+        system_prompt: "恢复测试：评审者".to_owned(),
+    };
+    let snapshot = RunSnapshot {
+        format_version: RUN_FORMAT,
+        session_id: SessionId::new("resume-role"),
+        spec: reviewer,
+        session: Session::new(SessionId::new("resume-role"), "越权写入").snapshot(),
+        state: RunState::Dispatching(vec![write_call.clone()]),
+        consumption: Consumption {
+            turns: 1,
+            elapsed: Duration::from_millis(10),
+        },
+        pending: Some(PendingRound {
+            turn: AgentTurn {
+                text: "把结论写进文件".to_owned(),
+                calls: vec![write_call],
+            },
+            outcomes: Vec::new(),
+        }),
+    };
+
+    // 真实工具、全量注册表——与 P9-3 之后生产路径给 runner 的一致。
+    let registry = ToolRegistry::new(all_tools(WorkspaceRoot::new(workspace.clone())));
+    let mock = MockCompletionModel::from_turns(vec![MockTurn::text("改用文字给出结论")]);
+    let mut runner = AgentRunner::resume(
+        snapshot,
+        deps_with(&mock, registry, Arc::new(AutoApproveGate), PolicyEngine::new(), None),
+    )
+    .unwrap();
+    let outcome = runner.run(&Budget::new(5)).await.unwrap();
+
+    assert_eq!(outcome.answer, "改用文字给出结论");
+    // 文件一个字节都没动：恢复路径上的角色边界与正常调用链是同一条。
+    assert_eq!(
+        fs::read_to_string(&target).expect("读回文件"),
+        "原文",
+        "恢复后停在 Dispatching 的越权调用必须被拒"
+    );
+    // 拒绝观察如实回给模型，指明是角色权限问题。
+    let turns = runner.session().snapshot().turns;
+    let Some(Turn::Observation(outcomes)) = turns.last() else {
+        panic!("最后一轮应是观察，实际 {:?}", turns.last());
+    };
+    assert_eq!(outcomes.len(), 1);
+    assert!(
+        outcomes[0].content.contains("角色 `reviewer` 无权调用工具 `write_file`"),
+        "{}",
+        outcomes[0].content
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 #[tokio::test]
 async fn normal_stop_with_pending_is_rejected_on_resume() {
-    // 反向配平：停在正常点（等模型）却带着待配平轮次——恢复后 step()
-    // 会先去配一轮幽灵观察，必须在入口拦下。
     let snapshot = RunSnapshot {
         format_version: RUN_FORMAT,
         session_id: SessionId::new("resume-ghost"),

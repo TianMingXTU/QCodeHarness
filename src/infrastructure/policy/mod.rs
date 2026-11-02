@@ -11,8 +11,14 @@ use crate::domain::policy::{PolicyEngine, PolicyRule, PolicyScope, PolicyVerdict
 
 /// 加载策略配置。
 ///
-/// 路径为 `None` 时返回内置默认策略（空规则表，走注解判断）；
-/// 为 `Some` 时读取并解析该文件。
+/// 路径为 `None` 时返回内置默认策略（P9-5 起带一份基线，见
+/// [`crate::domain::policy::PolicyEngine::new`]）；为 `Some` 时读取并解析
+/// 该文件。
+///
+/// **显式配置整体取代基线，不与它合并。** 写了配置文件就意味着"规则我
+/// 自己定"，此时基线里的 `cargo test *` 之类不再自动生效——想让某条命令
+/// 免审，就把它写进自己的配置（`policy.example.toml` 已经这么做了）。
+/// 空文件因此比不给文件更严：那是"我声明了没有任何规则"。
 ///
 /// # Errors
 ///
@@ -178,7 +184,24 @@ mod tests {
     fn no_path_means_default_policy() {
         let engine = load(None).expect("无路径应返回默认策略");
 
-        assert!(engine.rules.is_empty());
+        // P9-5 起默认策略带一份内置基线（cargo test/build、git status/diff
+        // 免审）。断言它非空而不是空：空规则表意味着"cargo test 每次都要
+        // 人按 y"，那正是 P9-5 要消掉的等待。
+        assert!(!engine.rules.is_empty(), "默认策略应带内置基线");
+        assert_eq!(
+            engine
+                .evaluate(&call_with("run_command", json!({"command": "cargo test"})), &spec(false))
+                .verdict,
+            PolicyVerdict::Allow,
+            "cargo test 应免审"
+        );
+        assert_eq!(
+            engine
+                .evaluate(&call_with("run_command", json!({"command": "git push"})), &spec(false))
+                .verdict,
+            PolicyVerdict::RequireApproval,
+            "基线之外的命令仍要审批"
+        );
         assert_eq!(
             engine.evaluate(&call("write_file"), &spec(false)).verdict,
             PolicyVerdict::RequireApproval

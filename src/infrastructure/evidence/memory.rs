@@ -43,11 +43,7 @@ impl EvidenceSink for MemoryEvidenceSink {
     fn record(&self, at: Timestamp, event: AuditEvent) {
         let mut events = self.lock();
         let sequence = events.len() as u64 + 1;
-        events.push(Evidence {
-            sequence,
-            recorded_at: at,
-            event,
-        });
+        events.push(Evidence::new(sequence, at, event));
     }
 }
 

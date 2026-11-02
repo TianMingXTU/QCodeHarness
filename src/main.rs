@@ -69,8 +69,9 @@ struct LlmConfig {
     policy_path: Option<PathBuf>,
     /// 是否跳过人工审批。`--yes` 或 `QCH_AUTO_APPROVE=1` 时为真。
     auto_approve: bool,
-    /// 墙钟上限（秒）。编排模式下每步的会话各自计时（单步上限）；
-    /// `--resume` 时是本次恢复运行的上限。未设置时不限时。
+    /// 墙钟上限（秒）。P9-3 起一个任务一个会话，编排模式下它就是
+    /// 整个任务的上限；`--resume` 时是本次恢复运行的上限。
+    /// 未设置时不限时。
     max_wall_clock: Option<Duration>,
     /// 被裁历史累积到多少轮才生成一次 LLM 摘要。未设置时不做摘要
     /// （裁剪退回占位说明，P3 行为）。
@@ -83,7 +84,7 @@ impl LlmConfig {
     /// 必需变量：`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`；
     /// 可选变量：`LLM_MAX_TURNS`（默认 20）、`QCH_POLICY`（策略配置路径）、
     /// `QCH_AUTO_APPROVE`（设为 `1` 时跳过人工审批）、
-    /// `QCH_MAX_WALL_CLOCK`（墙钟上限，秒；编排模式下为单步上限）。
+    /// `QCH_MAX_WALL_CLOCK`（墙钟上限，秒；编排模式下为整个任务的上限）。
     ///
     /// # Errors
     ///
@@ -190,6 +191,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             approvals: Arc::new(AutoApproveGate),
             clock: Arc::new(SystemClock),
             policy,
+            roster: AgentRoster::builtin(),
             context_budget,
             evidence: Arc::new(MemoryEvidenceSink::new()),
             // 基准会话不留快照：恢复它们只会把任务跑回当前工作区，
@@ -294,17 +296,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // 白名单是硬边界，编排与恢复两条路径共用一条滤网（AgentRoster）。
         // 不裁的话，中断的只读步骤恢复后会带着全量注册表上场，
         // 提示词说"你没有写能力"，模型手里却握着 write_file。
-        let role_tools =
-            AgentRoster::builtin().filter_registry(snapshot.spec.role, &registry);
+        // 工具给全量：P9-3 起模型看到的工具定义对所有步骤统一（前缀缓存
+        // 才命得中），角色边界由 runner 按花名册在调用层校验——恢复路径
+        // 与编排路径走的是同一道校验，不因入口不同而松动。
         let runner = match AgentRunner::resume(
             snapshot,
             AgentDependencies {
                 model: Arc::new(RigChatGateway::new(model.erase())),
-                tools: role_tools,
+                tools: registry,
                 approvals,
                 evidence,
                 clock,
                 policy,
+                roster: AgentRoster::builtin(),
                 context_budget,
                 session_store: Some(store.clone()),
             },
@@ -394,11 +398,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         approvals,
         clock,
         policy,
+        roster: roster.clone(),
         context_budget,
-        // 编排器每步用工厂另造证据汇，这个占位不会被步骤用到；
-        // deps 的形状要求它有值。
+        // 编排器为任务另造证据汇（一个任务一份 JSONL），这个占位不会被
+        // 步骤用到；deps 的形状要求它有值。
         evidence: Arc::new(MemoryEvidenceSink::new()),
-        // 快照落盘随运行自动开启；--resume 可从任一步的会话恢复。
+        // 快照落盘随运行自动开启；--resume 可从任一会话恢复。
         session_store: Some(store.clone()),
     };
     let mut orchestrator = Orchestrator::with_roster(deps, budget, evidence_factory, roster);
@@ -408,19 +413,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!("{error}");
-            // 失败时刻把已完成步骤的会话 ID 给出来：证据文件按会话 ID
-            // 命名，用户拿到 ID 就能翻证据或 --resume，不用再翻目录。
-            if let ApplicationError::StepFailed { step_sessions, .. } = &error {
-                if !step_sessions.is_empty() {
-                    eprintln!(
-                        "已完成步骤的会话: {}",
-                        step_sessions
-                            .iter()
-                            .map(|id| id.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
+            // 失败时刻把会话 ID 给出来：证据文件按会话 ID 命名，用户拿到
+            // ID 就能翻证据或 --resume，不用再翻目录。
+            if let ApplicationError::StepFailed { session_id, .. } = &error {
+                eprintln!("会话 {session_id} 的证据已写入 .qcodeharness/sessions/");
             }
             std::process::exit(1);
         }
@@ -429,16 +425,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("\n──── 最终答案 ────\n{}", outcome.answer);
     let (done, total) = task.progress();
     println!(
-        "\n（任务 {} · {}/{} 步 · 步骤会话: {}）",
+        "\n（任务 {} · {}/{} 步 · 会话: {}）",
         task.id(),
         done,
         total,
-        outcome
-            .step_sessions
-            .iter()
-            .map(|id| id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        outcome.session_id.as_str()
     );
     Ok(())
 }

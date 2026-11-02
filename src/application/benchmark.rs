@@ -23,7 +23,7 @@ use crate::application::agent_run::AgentDependencies;
 use crate::application::error::ApplicationError;
 use crate::application::orchestrator::{EvidenceFactory, Orchestrator};
 use crate::application::port::EvidenceSink;
-use crate::application::report::{cost_label, summarize};
+use crate::application::report::{cost_label, hit_ratio_label, summarize};
 use crate::application::tool_registry::ToolRegistry;
 use crate::domain::benchmark::{BenchmarkResult, BenchmarkTask, CriteriaObservation};
 use crate::domain::budget::Budget;
@@ -75,16 +75,22 @@ pub async fn run_benchmark(
                 failures: vec![failure],
                 steps_completed: 0,
                 turns_used: 0,
+                wall_clock_ms: 0,
+                approvals: 0,
+                cache_hit_ratio: None,
                 cost_usd: None,
             },
         };
         let verdict = if result.passed { "✓ 通过" } else { "✗ 未通过" };
         println!(
-            "{} {}：{} 步 / {} 轮 / 成本 {}",
+            "{} {}：{} 步 / {} 轮 / 墙钟 {} / 审批 {} 次 / 缓存 {} / 成本 {}",
             verdict,
             result.task_id,
             result.steps_completed,
             result.turns_used,
+            wall_clock_label(result.wall_clock_ms),
+            result.approvals,
+            hit_ratio_label(result.cache_hit_ratio),
             cost_label(result.cost_usd),
         );
         for reason in &result.failures {
@@ -93,6 +99,15 @@ pub async fn run_benchmark(
         results.push(result);
     }
     Ok(results)
+}
+
+/// 墙钟的显示值：秒级可读，亚秒保留一位小数。
+///
+/// 毫秒数对人没有意义（"跑了 12345"），而基准里一个任务的量级是
+/// 几十秒到几分钟——按秒显示再带一位小数，既能一眼比大小，
+/// 又不会把 200ms 的差异抹成 0。
+pub(crate) fn wall_clock_label(millis: u64) -> String {
+    format!("{:.1}s", millis as f64 / 1000.0)
 }
 
 /// 跑一个任务并打分。`Err` 只覆盖"任务根本没法跑"的装配级失败
@@ -121,15 +136,24 @@ async fn run_one(
     let mut orchestrated =
         orchestrator.create_task(TaskId::new(format!("bench-{}", task.id)), task.kind, &task.description);
 
-    let (answer, steps_completed, sessions, mut failures) = match orchestrator.run(&mut orchestrated).await {
-        Ok(outcome) => (outcome.answer, outcome.steps_completed, outcome.step_sessions, Vec::new()),
-        Err(ApplicationError::StepFailed { step_sessions, message, .. }) => {
-            (String::new(), step_sessions.len(), step_sessions, vec![message])
-        }
-        Err(error) => (String::new(), 0, Vec::new(), vec![error.to_string()]),
-    };
+    let (answer, steps_completed, session_id, mut failures) =
+        match orchestrator.run(&mut orchestrated).await {
+            Ok(outcome) => (
+                outcome.answer,
+                outcome.steps_completed,
+                Some(outcome.session_id),
+                Vec::new(),
+            ),
+            Err(ApplicationError::StepFailed {
+                session_id,
+                steps_completed,
+                message,
+                ..
+            }) => (String::new(), steps_completed, Some(session_id), vec![message]),
+            Err(error) => (String::new(), 0, None, vec![error.to_string()]),
+        };
 
-    if sessions.is_empty() {
+    let Some(session_id) = session_id else {
         // 一个会话都没跑起来：任务没有动手过程，判据无从谈起。
         let _ = fs::remove_dir_all(&repo);
         return Ok(BenchmarkResult {
@@ -139,9 +163,12 @@ async fn run_one(
             failures,
             steps_completed,
             turns_used: 0,
+            wall_clock_ms: 0,
+            approvals: 0,
+            cache_hit_ratio: None,
             cost_usd: None,
         });
-    }
+    };
 
     // 编排中断时判据不再有意义：任务没走完，测试通过与否都证明不了
     // 问题被解决，不再烧一次最多五分钟的测试命令。
@@ -155,14 +182,18 @@ async fn run_one(
         failures.extend(task.criteria.evaluate(observation));
     }
 
-    let (turns_used, cost_usd) = usage_of(workspace, &sessions).await;
+    let (turns_used, cost_usd, wall_clock_ms, approvals, cache_hit_ratio) =
+        usage_of(workspace, &session_id).await;
     let result = BenchmarkResult {
         task_id: task.id.clone(),
-        session_id: sessions.first().cloned(),
+        session_id: Some(session_id),
         passed: failures.is_empty(),
         failures,
         steps_completed,
         turns_used,
+        wall_clock_ms,
+        approvals,
+        cache_hit_ratio,
         cost_usd,
     };
     // 结果已定，临时仓库尽力清理：失败诊断看结果里的输出末尾与证据。
@@ -216,37 +247,52 @@ fn tail(stdout: &str, stderr: &str) -> String {
     text
 }
 
-/// 汇总一次任务各步会话的轮数与成本。轮数 = 各步思考事件数之和
-/// （每轮模型调用记一次）；成本合并沿用报表的口径——任一步未知
-/// 则整体未知，被低估的合计比"未知"更危险。
-async fn usage_of(workspace: &Path, sessions: &[SessionId]) -> (u32, Option<f64>) {
+/// 汇总一个任务会话的轮数、墙钟、审批次数、缓存命中率与成本。
+///
+/// 轮数 = 会话里思考事件的条数（每轮模型调用记一次）；墙钟 = 首末事件
+/// 的间隔——它不含 fixture 拷贝与判据命令的时间，那两段不是"等模型"。
+///
+/// P9-3 起一个任务只有一个会话，所以这里读一份证据就够。早先是逐步
+/// 会话累加，还要防着同一个 ID 在列表里出现两次被重复累计。
+///
+/// 成本按报表的口径——未知就是未知，被低估的合计比"未知"更危险。
+/// 命中率按合计算（合计读回 / 合计输入），不是各步比率的平均：平均会
+/// 让一个短步骤和一个长步骤等权。
+async fn usage_of(
+    workspace: &Path,
+    session: &SessionId,
+) -> (u32, Option<f64>, u64, usize, Option<f64>) {
+    let path = session_path(workspace, session.as_str());
     let mut turns = 0u32;
-    let mut cost = Some(0.0);
-    for session in sessions {
-        let path = session_path(workspace, session.as_str());
-        match read_session(&path) {
-            Ok(Some(log)) => {
-                let summary = summarize(&log);
-                turns += summary.model_calls as u32;
-                match summary.cost_usd {
-                    Some(value) => {
-                        if let Some(total) = cost.as_mut() {
-                            *total += value;
-                        }
-                    }
-                    None => cost = None,
-                }
-            }
-            // 没有可读证据（空文件）或读不出来：成本按未知处理，
-            // 轮数按 0 计——缺数据不能伪造数据。
-            Ok(None) => cost = None,
-            Err(error) => {
-                eprintln!("警告：证据 {} 读不出来，成本按未知处理: {error}", path.display());
-                cost = None;
-            }
+    let mut cost = None;
+    let mut wall_clock = 0u64;
+    let mut approvals = 0usize;
+    let mut input_tokens = 0u64;
+    let mut cached_tokens = 0u64;
+    match read_session(&path) {
+        Ok(Some(log)) => {
+            let summary = summarize(&log);
+            turns = summary.model_calls as u32;
+            wall_clock = summary.wall_clock_ms;
+            approvals = summary.approvals;
+            input_tokens = summary.input_tokens;
+            cached_tokens = summary.cached_input_tokens;
+            cost = summary.cost_usd;
+        }
+        // 没有可读证据（空文件）或读不出来：成本按未知处理，轮数按 0 计
+        // ——缺数据不能伪造数据。
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("警告：证据 {} 读不出来，成本按未知处理: {error}", path.display());
         }
     }
-    (turns, cost)
+    // 分母为 0 时是 None：没有输入 token 可算，不是"0% 命中"。
+    let hit_ratio = if input_tokens > 0 {
+        Some(cached_tokens as f64 / input_tokens as f64)
+    } else {
+        None
+    };
+    (turns, cost, wall_clock, approvals, hit_ratio)
 }
 
 /// 把任务的 fixture 仓库复制到临时目录，返回拷贝根。
@@ -325,6 +371,7 @@ fn walk(root: &Path, dir: &Path, files: &mut HashMap<String, Vec<u8>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::agent_roster::AgentRoster;
     use crate::application::port::ApprovalGate;
     use crate::infrastructure::approval::auto::AutoApproveGate;
     use crate::infrastructure::clock::SystemClock;
@@ -344,6 +391,7 @@ mod tests {
             evidence: Arc::new(MemoryEvidenceSink::new()) as Arc<dyn EvidenceSink>,
             clock: Arc::new(SystemClock),
             policy: PolicyEngine::new(),
+            roster: AgentRoster::builtin(),
             context_budget: Default::default(),
             session_store: None,
         }
@@ -441,9 +489,13 @@ mod tests {
             failed.failures
         );
         assert_eq!(failed.steps_completed, 0);
-        // 第 1 步就中断：没有"已完成步骤"，中断步骤自己的会话 ID
-        // 不随 StepFailed 带出（编排器的既有语义）——None 而不是编一个。
-        assert!(failed.session_id.is_none());
+        // P9-3 起一个任务只有一个会话，会话在第一步之前就开好了：即使
+        // 第 1 步当场失败，它的两次空回复也已经在证据文件里。所以失败
+        // 也带得出会话 ID——那正是要去翻的证据。
+        assert!(
+            failed.session_id.is_some(),
+            "第 1 步失败也应带出会话 ID，否则用户没有证据可翻"
+        );
         let passed = &results[1];
         assert_eq!(passed.task_id, "b-passes");
         assert!(passed.passed, "后续任务不该被前一个的失败拖累: {:?}", passed.failures);

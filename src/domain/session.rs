@@ -133,6 +133,18 @@ impl Session {
         self.summary = Some(summary);
     }
 
+    /// 追加一条用户消息。
+    ///
+    /// P9-3 单会话编排用：步骤边界就是一条用户消息（"现在进行第 N 步"），
+    /// 它必须和任务交代一样进历史、进快照——下一步的模型要靠它知道
+    /// 自己进行到哪了，裁剪时也要能把它认出来。
+    ///
+    /// 独立于 [`Self::commit_round`]：步骤交代不是一轮模型回复，
+    /// 没有观察可配，硬塞进 commit_round 只会造出一个空壳轮次。
+    pub fn push_user(&mut self, message: impl Into<String>) {
+        self.turns.push(Turn::User(message.into()));
+    }
+
     /// 已挂的摘要。
     pub fn summary(&self) -> Option<&Summary> {
         self.summary.as_ref()
@@ -200,6 +212,10 @@ impl Session {
     /// 用户消息开头、带调用的轮次必须紧跟等量的观察、最终答案轮不带观察、
     /// 观察不能开头或连续出现。校验不过返回 [`SessionError`]，
     /// 绝不构造出一个自相矛盾的历史。
+    ///
+    /// 用户消息允许出现在历史中部：P9-3 起步骤边界就是一条用户消息，
+    /// [`Session::push_user`] 产生得出来。但**第一条**仍必须是用户消息——
+    /// 那是任务交代，没有它的历史无法回答"这个会话在干什么"。
     pub fn from_snapshot(
         id: SessionId,
         snapshot: SessionSnapshot,
@@ -214,15 +230,10 @@ impl Session {
         let mut index = 0;
         while index < turns.len() {
             match &turns[index] {
-                // 用户消息只能出现在历史开头（任务交代）。构造路径产生不出
-                // 中部的用户消息，而裁剪只保留首条用户消息——放进来的话
-                // 那条消息会在下一次裁剪时被静默丢掉，上下文出现审计对不上
-                // 的缺口，所以在重建时拦下。
-                Turn::User(_) if index > 0 => {
-                    return Err(SessionError::Corrupt {
-                        reason: format!("第 {} 条历史是用户消息，但用户消息只能出现在开头", index + 1),
-                    });
-                }
+                // 中部用户消息是步骤边界（P9-3），构造路径产生得出来。
+                // 早先这里一律拒绝，那时"每步一个会话"让中部用户消息不可
+                // 能出现；拒绝的理由（裁剪会静默丢掉它）也已经不成立——
+                // 见 `domain::context::compact`，步骤交代现在被完整保留。
                 Turn::User(_) => index += 1,
                 Turn::Agent(agent) => {
                     rounds += 1;
@@ -427,6 +438,81 @@ mod tests {
         assert_eq!(*thought, "想一下");
         assert_eq!(calls.len(), 1);
         assert_eq!(observations.len(), 1);
+    }
+
+    // ── P9-3：步骤边界的用户消息 ─────────────────────────────────────
+
+    #[test]
+    fn push_user_appends_a_step_boundary_message() {
+        let mut session = Session::new(SessionId::new("s1"), "任务");
+        session
+            .commit_round(
+                AgentTurn {
+                    text: "根因在解析层".to_owned(),
+                    calls: Vec::new(),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+
+        session.push_user("[第 2/3 步] 按上面的根因动手改");
+
+        assert_eq!(session.rounds(), 1, "步骤交代不算一轮");
+        assert_eq!(
+            session.turns(),
+            &[
+                Turn::User("任务".to_owned()),
+                Turn::Agent(AgentTurn {
+                    text: "根因在解析层".to_owned(),
+                    calls: Vec::new(),
+                }),
+                Turn::User("[第 2/3 步] 按上面的根因动手改".to_owned()),
+            ]
+        );
+        // 视图里它是独立的一条用户消息，紧跟在那轮之后。
+        let slices = session.slices();
+        assert_eq!(slices.len(), 3);
+        assert!(matches!(&slices[2], ContextSlice::User(text) if text.as_ref() == "[第 2/3 步] 按上面的根因动手改"));
+    }
+
+    #[test]
+    fn from_snapshot_accepts_user_messages_at_step_boundaries() {
+        // 单会话编排的历史：任务交代 → 几步工作 → 步骤交代 → 更多工作。
+        // 重建必须原样接受，否则一个跨步的快照永远恢复不了。
+        let snapshot = SessionSnapshot {
+            summary: None,
+            turns: vec![
+                Turn::User("任务".to_owned()),
+                Turn::Agent(turn_with(vec![call("read_file")])),
+                Turn::Observation(vec![ToolOutcome::success("内容")]),
+                Turn::User("[第 2/3 步] 接着改".to_owned()),
+                Turn::Agent(turn_with(vec![call("write_file")])),
+                Turn::Observation(vec![ToolOutcome::success("写好了")]),
+            ],
+        };
+
+        let restored = Session::from_snapshot(SessionId::new("s1"), snapshot).expect("应能重建");
+
+        assert_eq!(restored.rounds(), 2);
+        assert_eq!(restored.turns().len(), 6);
+    }
+
+    #[test]
+    fn from_snapshot_still_requires_a_leading_user_message() {
+        // 放宽的只是"中部可以有用户消息"，不是"可以没有任务交代"。
+        let snapshot = SessionSnapshot {
+            summary: None,
+            turns: vec![Turn::User("[第 2/3 步] 接着改".to_owned())],
+        };
+        // 这一条其实是合法的（第一条就是用户消息）——真正非法的是下面这种。
+        assert!(Session::from_snapshot(SessionId::new("s1"), snapshot).is_ok());
+
+        let snapshot = SessionSnapshot {
+            summary: None,
+            turns: vec![Turn::Agent(turn_with(vec![call("read_file")]))],
+        };
+        let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
+        assert!(error.to_string().contains("用户消息"), "{error}");
     }
 
     // ── P4：快照导出与校验重建 ──────────────────────────────────────────

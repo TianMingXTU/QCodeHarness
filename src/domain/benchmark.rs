@@ -75,9 +75,12 @@ impl SuccessCriteria {
 pub struct BenchmarkResult {
     /// 任务标识。
     pub task_id: String,
-    /// 该任务第一个**完成**步骤的会话 ID（证据文件的入口）。任务
-    /// 没有完成任何步骤时为 `None`——第一步就中断时，中断步骤自己的
-    /// 会话 ID 不随编排错误带出，没有 ID 可填。
+    /// 该任务第一次**完成**步骤的会话 ID（证据文件的入口）。
+    ///
+    /// P9-3 起一个任务只有一个会话，且会话在第一步之前就开好——
+    /// 所以只要任务真的跑起来过，哪怕是第一步就失败，这里也有 ID
+    /// （失败步骤的观察在同一份证据里，可恢复可复盘）。只有任务还没
+    /// 开跑就出错（fixture 拷贝、装载之类）时为 `None`。
     pub session_id: Option<SessionId>,
     /// 是否通过全部判据。
     pub passed: bool,
@@ -85,9 +88,25 @@ pub struct BenchmarkResult {
     pub failures: Vec<String>,
     /// 完成的步骤数。
     pub steps_completed: usize,
-    /// 全部步骤消耗的模型调用轮数（各步会话的思考事件数之和）。
+    /// 全部步骤消耗的模型调用轮数（这个任务唯一会话里的思考事件数）。
     pub turns_used: u32,
-    /// 成本合计（美元）。任一步成本未知时为 `None`。
+    /// 本次任务的墙钟（毫秒）。
+    ///
+    /// 取该会话的首末事件间隔：证据里本来就有每条事件的
+    /// 时间戳，再起一个计时器只会多一处可能对不上的真相。它不含
+    /// fixture 拷贝与判据命令的时间——那两段不是"等模型"。
+    pub wall_clock_ms: u64,
+    /// 审批次数合计（这个任务唯一会话里的 `ApprovalDecided` 事件数）。
+    ///
+    /// 基准强制 `AutoApproveGate`（无人值守），所以这里恒为 0。
+    /// **真实使用中的审批次数要从 `--report` 看**，不要拿这个 0 得出
+    /// "人工等待不是问题"的结论——它衡量的是另一条路径。
+    pub approvals: usize,
+    /// 缓存命中率：读回的输入 token 占全部输入 token 的比例。
+    /// 没有任何输入 token 时为 `None`（含义是"没数据"，不是"0% 命中"）。
+    pub cache_hit_ratio: Option<f64>,
+    /// 成本合计（美元）。任一次调用成本未知时为 `None`——被低估的合计
+    /// 比"未知"更危险。
     pub cost_usd: Option<f64>,
 }
 
@@ -173,6 +192,9 @@ mod tests {
             failures: vec!["测试命令 `cargo test` 未通过（非 0 退出）".to_owned()],
             steps_completed: 2,
             turns_used: 9,
+            wall_clock_ms: 12_500,
+            approvals: 0,
+            cache_hit_ratio: Some(0.42),
             cost_usd: None,
         };
         let text = serde_json::to_string(&result).unwrap();

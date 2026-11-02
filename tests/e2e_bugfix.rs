@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use qcode_harness::application::agent_run::{AgentDependencies, AgentRunner};
+use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::tool_registry::ToolRegistry;
 use qcode_harness::domain::agent::{AgentRole, AgentSpec};
 use qcode_harness::domain::budget::Budget;
@@ -122,6 +123,7 @@ async fn fixes_a_failing_test_in_an_isolated_repo() {
             evidence: Arc::new(MemoryEvidenceSink::new()),
             clock: Arc::new(SystemClock),
             policy: PolicyEngine::new(),
+            roster: AgentRoster::builtin(),
             context_budget: Default::default(),
             session_store: None,
         },

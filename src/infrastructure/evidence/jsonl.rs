@@ -14,7 +14,7 @@ use std::time::SystemTime;
 use serde::Serialize;
 
 use crate::application::port::{EvidenceSink, Timestamp};
-use crate::domain::evidence::AuditEvent;
+use crate::domain::evidence::{AuditEvent, EVIDENCE_FORMAT_MILLIS};
 
 /// 落在磁盘上的证据汇。
 ///
@@ -46,6 +46,10 @@ pub struct JsonlEvidenceSink {
 #[derive(Debug, Serialize)]
 struct Record<'a> {
     sequence: u64,
+    /// 磁盘格式号。reader 按它解释 `recorded_at` 的单位，缺省按秒
+    /// （兼容 P9 之前的证据文件）。写死常量而不是从别处取：这一行
+    /// 是磁盘契约，契约里的字面量不该被间接改动。
+    format: u32,
     recorded_at: u64,
     event: &'a AuditEvent,
 }
@@ -115,7 +119,8 @@ impl EvidenceSink for JsonlEvidenceSink {
         let sequence = self.next_sequence.load(Ordering::Relaxed);
         let record = Record {
             sequence,
-            recorded_at: unix_seconds(at),
+            format: EVIDENCE_FORMAT_MILLIS,
+            recorded_at: unix_millis(at),
             event: &event,
         };
         match self.write(&record) {
@@ -135,13 +140,18 @@ impl EvidenceSink for JsonlEvidenceSink {
     }
 }
 
-/// `SystemTime` 转秒级 Unix 时间戳。
+/// `SystemTime` 转毫秒 Unix 时间戳。
 ///
 /// 早于 UNIX_EPOCH 的时间戳按 0 处理——本项目的运行时刻不可能早于 1970 年，
 /// 而为此引入有符号类型只会让反序列化多一种要处理的情况。
-fn unix_seconds(time: SystemTime) -> u64 {
+///
+/// 毫秒而不是秒：P9-1 要统计"每轮模型调用花了多久"，一次快的调用只有
+/// 几百毫秒，秒级精度下它们全被记成 0，延迟分布画不出来。
+/// 精度必须和 `format` 一起给（见 [`EVIDENCE_FORMAT_MILLIS`]）——
+/// 不留标记就改精度，会让所有历史证据的耗时统计变成垃圾。
+fn unix_millis(time: SystemTime) -> u64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
 
