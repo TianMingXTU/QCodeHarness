@@ -71,9 +71,10 @@ pub(crate) fn parse_args<A: DeserializeOwned>(arguments: &Value) -> Result<A, St
     serde_json::from_value(arguments.clone()).map_err(|error| format!("参数解析失败: {error}"))
 }
 
-/// 解析 workspace 内的相对路径，越界时直接给出拒绝观察。
+/// 解析 workspace 内的相对路径，越界或受保护时直接给出拒绝观察。
 ///
-/// 所有碰文件的工具共用这条校验路径，保证"越界即拒绝"只有一种实现。
+/// 所有碰文件的工具共用这条校验路径，保证"越界即拒绝、受保护即拒绝"
+/// 只有一种实现。
 pub(crate) fn resolve_in(root: &WorkspaceRoot, raw: &str) -> Result<WorkspacePath, ToolOutcome> {
-    WorkspacePath::resolve(root, raw).map_err(|escape| ToolOutcome::refused(escape.to_string()))
+    WorkspacePath::resolve(root, raw).map_err(|rejected| ToolOutcome::refused(rejected.to_string()))
 }

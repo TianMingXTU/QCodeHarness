@@ -25,15 +25,55 @@ impl WorkspaceRoot {
     }
 }
 
-/// 路径越界错误：模型给出的相对路径试图逃出 workspace。
+/// workspace 路径被拒绝的原因。
 ///
-/// 按 `tools.rs` 原有实现，越界路径统一归为"拒绝访问"，不再细分原因——
-/// 错误说明会作为观察结果回传给模型，细分别的型号对模型没有意义。
+/// 分成两个变体不是给模型看两种措辞，而是让调用方与测试能区分"路径算错了"
+/// 和"这条路本来就不许走"：越界换个写法可能就合法，受保护路径则不会——
+/// 把后者说成前者，会引导模型反复重写路径去撞同一堵墙。
 #[derive(Debug, thiserror::Error)]
-#[error("拒绝访问 `{raw}`：只允许 workspace 内的相对路径")]
-pub struct PathEscape {
-    /// 模型给出的原始路径文本，原样回显便于模型自行纠正。
-    pub raw: String,
+pub enum PathRejected {
+    /// 路径试图逃出 workspace：绝对路径、`..`、根目录或盘符前缀。
+    #[error("拒绝访问 `{raw}`：只允许 workspace 内的相对路径")]
+    Escape {
+        /// 模型给出的原始路径文本，原样回显便于模型自行纠正。
+        raw: String,
+    },
+    /// 路径落在受保护区域内，agent 不可读写，也不因策略放行而解禁。
+    #[error("拒绝访问 `{raw}`：受保护路径，agent 不可读写")]
+    Protected {
+        /// 模型给出的原始路径文本。
+        raw: String,
+    },
+}
+
+/// 判断一条 workspace 相对路径是否落在受保护区域内。
+///
+/// `.git` 是版本库元数据（改它就是改历史），`.qcodeharness` 是本工具自己的
+/// 会话与快照（改它就是改审计证据），`.env*` 按约定放本地凭据。三者被 agent
+/// 碰到都意味着运行状态被污染或凭据外泄，因此读和写一并拒绝。
+///
+/// 只看首组件：`sub/.git` 是子项目自己的仓库，不在保护范围——保护的是
+/// workspace 根上那几个 agent 不该碰的位置，不是所有同名目录。
+///
+/// `.` 要跳过：`./.git/config` 与 `.git/config` 指向同一处，不能因为多了
+/// 一层当前目录前缀就绕过保护。
+///
+/// 大小写不敏感：Windows 与 macOS 的文件系统默认如此，`.GIT/config` 与
+/// `.git/config` 是同一处。若按字节精确比较，把路径改写成大写就能读到
+/// `.env`、改写 `.git/config`——而"这两个位置 agent 碰不得"正是这里唯一
+/// 要守的东西。比较前统一转小写（ASCII 小写化不改变字节长度，分配一次）。
+fn is_protected(raw: &str) -> bool {
+    let first = Path::new(raw)
+        .components()
+        .find(|component| !matches!(component, Component::CurDir));
+    match first {
+        Some(Component::Normal(name)) => {
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            matches!(name.as_str(), ".git" | ".qcodeharness" | ".env")
+                || name.starts_with(".env.")
+        }
+        _ => false,
+    }
 }
 
 /// workspace 内的一条已验证路径。
@@ -48,10 +88,16 @@ impl WorkspacePath {
     ///
     /// 这是 M1 的词法校验，不解析符号链接；完整的沙箱隔离是后续里程碑的工作。
     ///
+    /// 受保护路径（见 [`is_protected`]）在这里一并拒绝，而不是留给策略层：
+    /// 策略是给使用者调配的调剂，而"agent 不能改版本库元数据和审计证据"
+    /// 是不该被任何配置放宽的底线。
+    ///
     /// # Errors
     ///
-    /// 路径为绝对路径、或含 `..` / 根 / 前缀等越界成分时返回 [`PathEscape`]。
-    pub fn resolve(root: &WorkspaceRoot, raw: &str) -> Result<Self, PathEscape> {
+    /// 路径为绝对路径、或含 `..` / 根 / 前缀等越界成分时返回
+    /// [`PathRejected::Escape`]；路径落在受保护区域时返回
+    /// [`PathRejected::Protected`]。
+    pub fn resolve(root: &WorkspaceRoot, raw: &str) -> Result<Self, PathRejected> {
         let relative = Path::new(raw);
         let escapes = relative.is_absolute()
             || relative.components().any(|component| {
@@ -61,7 +107,10 @@ impl WorkspacePath {
                 )
             });
         if escapes {
-            return Err(PathEscape { raw: raw.to_owned() });
+            return Err(PathRejected::Escape { raw: raw.to_owned() });
+        }
+        if is_protected(raw) {
+            return Err(PathRejected::Protected { raw: raw.to_owned() });
         }
         Ok(Self(root.0.join(relative)))
     }
@@ -104,5 +153,90 @@ mod tests {
     fn allows_current_dir_component() {
         let resolved = WorkspacePath::resolve(&workspace(), "./README.md").unwrap();
         assert_eq!(resolved.as_path(), workspace().as_path().join("./README.md"));
+    }
+
+    // ── P8-1 受保护路径 ────────────────────────────────────────────────
+
+    /// 受保护路径的真值表：`.git`、`.qcodeharness`、`.env*` 一律拒，
+    /// 名字相似但不是它们的（`.gitignore`、`.github`、`environments/`）一律放。
+    /// 大小写变形不能绕过保护。
+    ///
+    /// Windows 与 macOS 的文件系统默认大小写不敏感：`.GIT/config` 与
+    /// `.git/config` 指向同一处。`is_protected` 若只做精确比较，模型把
+    /// 路径改写成大写就能读到 `.env`、改写 `.git/config`——而 P8-1 的全部
+    /// 意义就是"这两个位置 agent 碰不得"。用户验收时正是从这里被攻破的。
+    #[test]
+    fn protected_paths_are_matched_case_insensitively() {
+        for rejected in [
+            ".GIT/config",
+            ".Git/config",
+            ".ENV",
+            ".Env.local",
+            ".QCODEHARNESS/sessions/x.jsonl",
+            "./.GIT/config",
+        ] {
+            assert!(
+                WorkspacePath::resolve(&workspace(), rejected).is_err(),
+                "`{rejected}` 是受保护路径的大小写变形，应被拒绝"
+            );
+        }
+        // 反向：只是名字长得像的仍然放行。
+        for allowed in [".gitignore", ".GITHUB/workflows/ci.yml", ".ENVRC.d/keep.js"] {
+            assert!(
+                WorkspacePath::resolve(&workspace(), allowed).is_ok(),
+                "`{allowed}` 不该被误杀"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_paths_are_rejected_and_lookalikes_are_not() {
+        for rejected in [
+            ".git/config",
+            ".git",
+            "./.git/config",
+            ".qcodeharness/sessions/x.jsonl",
+            ".env",
+            ".env.local",
+        ] {
+            assert!(
+                WorkspacePath::resolve(&workspace(), rejected).is_err(),
+                "`{rejected}` 应被拒绝"
+            );
+        }
+        for allowed in [
+            ".gitignore",
+            ".github/workflows/ci.yml",
+            // 首组件是 environments 而不是 .env：凭据文件放进普通目录不该被误杀。
+            "environments/prod.txt",
+            // .envrc.d 以 .env 开头但不是 .env 或 .env.*，放行。
+            ".envrc.d/keep.txt",
+            "src/main.rs",
+        ] {
+            assert!(
+                WorkspacePath::resolve(&workspace(), allowed).is_ok(),
+                "`{allowed}` 不应被误杀"
+            );
+        }
+    }
+
+    /// 受保护与越界必须是两种拒绝：模型看到的信息不同，它能采取的行动也不同。
+    ///
+    /// 越界是"路径算错了"，换个写法可能就对了；受保护是"这条路本来就不许走"，
+    /// 引导它重写只会换来一轮无用的重试。
+    #[test]
+    fn protected_path_reports_a_reason_distinct_from_escape() {
+        let protected = WorkspacePath::resolve(&workspace(), ".git/config").unwrap_err();
+        assert!(
+            matches!(protected, PathRejected::Protected { .. }),
+            "`.git/config` 应按受保护拒绝，实际: {protected}"
+        );
+        assert!(protected.to_string().contains("受保护"), "{protected}");
+
+        let escaped = WorkspacePath::resolve(&workspace(), "../outside.txt").unwrap_err();
+        assert!(
+            matches!(escaped, PathRejected::Escape { .. }),
+            "越界仍是越界，实际: {escaped}"
+        );
     }
 }

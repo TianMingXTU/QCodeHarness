@@ -481,6 +481,83 @@ mod tests {
         assert_eq!(refused.status, OutcomeStatus::Refused);
     }
 
+    /// 受保护路径测试专用的临时目录。
+    ///
+    /// 不复用 `temp_dir_with` 的共享目录：那些测试并行跑，末尾会
+    /// `remove_dir_all` 整个目录，把这边刚建好的 `.git` 一起删掉。
+    fn protected_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("qch-protected-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    // ── P8-1 受保护路径（工具层）──────────────────────────────────────
+
+    /// `write_file(".git/config")` 必须在策略之前就被拒绝。
+    ///
+    /// 这条测试刻意不碰策略引擎：保护是 workspace 路径解析的固有行为，
+    /// 任何"放行写入"的配置都不该让它失效。工具层的拒绝观察就是契约——
+    /// 模型看到的是 refused，不是"审批一下就能写"。
+    #[tokio::test]
+    async fn write_file_refuses_protected_paths_without_consulting_policy() {
+        let dir = protected_dir("write");
+        // 造一个真的 .git/config：拒绝必须发生在文件系统之前，
+        // 不能让"文件不存在"成为一种假通过。
+        std::fs::create_dir_all(dir.join(".git")).expect("建 .git");
+        std::fs::write(dir.join(".git/config"), "[core]\n").expect("写 .git/config");
+        let tools = WriteFile::new(WorkspaceRoot::new(&dir));
+
+        for path in [".git/config", "./.git/config", ".env", ".qcodeharness/sessions/x.jsonl"] {
+            let outcome = tools
+                .invoke(&call(WRITE_FILE, json!({"path": path, "content": "恶意覆盖"})))
+                .await;
+            assert_eq!(outcome.status, OutcomeStatus::Refused, "`{path}`: {}", outcome.content);
+            assert!(outcome.content.contains("受保护"), "`{path}`: {}", outcome.content);
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/config")).unwrap(),
+            "[core]\n",
+            "受保护文件必须保持原样"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读与写同权：agent 也不能通过 `read_file` 摸 `.git` 和 `.env`。
+    #[tokio::test]
+    async fn read_file_refuses_protected_paths() {
+        let dir = protected_dir("read");
+        std::fs::create_dir_all(dir.join(".git")).expect("建 .git");
+        std::fs::write(dir.join(".git/config"), "[core]\n").expect("写 .git/config");
+        std::fs::write(dir.join(".env"), "TOKEN=secret\n").expect("写 .env");
+        let tools = ReadFile::new(WorkspaceRoot::new(&dir));
+
+        for path in [".git/config", ".env"] {
+            let outcome = tools.invoke(&call(READ_FILE, json!({"path": path}))).await;
+            assert_eq!(outcome.status, OutcomeStatus::Refused, "`{path}`: {}", outcome.content);
+            assert!(!outcome.content.contains("secret"), "凭据不得出现在观察里: {}", outcome.content);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `list_dir(".qcodeharness")` 同样拒绝：目录列表会泄露会话文件名，
+    /// 那是审计证据的索引，不该进模型的上下文。
+    #[tokio::test]
+    async fn list_dir_refuses_protected_directories() {
+        let dir = protected_dir("list");
+        std::fs::create_dir_all(dir.join(".qcodeharness/sessions")).expect("建目录");
+        let tools = ListDir::new(WorkspaceRoot::new(&dir));
+
+        let outcome = tools
+            .invoke(&call(LIST_DIR, json!({"path": ".qcodeharness"})))
+            .await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
+        assert!(outcome.content.contains("受保护"), "{}", outcome.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// WorkspacePath 校验通过时 resolve_in 返回路径本身。
     #[test]
     fn resolve_in_returns_validated_path() {
