@@ -3,3 +3,5 @@
 .env
 # 运行时证据（.qcodeharness/sessions/*.jsonl），每次运行都会产生
 .qcodeharness/
+# 用户实测用的临时仓库（不删是因为 git_status 泄露问题的现场保留）
+.quser-test/

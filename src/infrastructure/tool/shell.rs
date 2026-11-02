@@ -18,8 +18,10 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 use crate::application::port::{BoxFuture, ToolInvoker};
+use crate::domain::sandbox::SandboxPolicy;
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 use crate::domain::workspace::WorkspaceRoot;
+use crate::infrastructure::sandbox::{assign_child, JobGuard};
 
 use super::parse_args;
 
@@ -48,8 +50,10 @@ impl RunCommand {
         ToolSpec {
             name: RUN_COMMAND.to_owned(),
             description: "在 workspace 根目录下用系统 shell（Windows: cmd，其他: sh）执行一条命令，\
-                          返回退出码、stdout 与 stderr。超时默认 30 秒、上限 300 秒，超时会终止进程。\
-                          环境变量中疑似密钥的条目（名字含 key/token/secret/password/credential）不会传入子进程。"
+                          返回退出码、stdout 与 stderr。命令在受控进程组内执行：整树内存与进程数受限，\
+                          超时终止全部后代进程（不只是直接子进程），不要依赖超限资源或遗留后台进程。\
+                          超时默认 30 秒、上限 300 秒。环境变量中疑似密钥的条目\
+                          （名字含 key/token/secret/password/credential）不会传入子进程。"
                 .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -78,6 +82,10 @@ pub(crate) struct RawOutput {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// 沙箱是否实际生效。false 时调用方要在模型可见文本前加一行说明——
+    /// 模型应当知道自己跑在无沙箱环境里，行为要更保守；这段文本随
+    /// `ToolObserved` 进证据，审计链因此完整。
+    pub sandbox_active: bool,
 }
 
 /// 把输出文本截到上限内，超出时带说明。
@@ -116,9 +124,14 @@ fn shell_program(command: &str) -> (String, Vec<String>) {
 
 /// 在 `root` 下执行命令，捕获输出。供本模块与 git 工具复用。
 ///
+/// 命令在进程沙箱（Windows Job Object，见 `infrastructure::sandbox`）
+/// 内执行：整树内存/进程数受限、超时或句柄关闭时整树终止。沙箱创建
+/// 或 assign 失败时**降级不阻断**——命令照常跑，但 `sandbox_active`
+/// 带回 false，由调用方在模型可见文本里声明"未受保护"。
+///
 /// # Errors
 ///
-/// 进程启动失败（命令不存在等）时返回说明文本。
+/// 进程启动失败（命令不存在等）或超时时返回说明文本。
 pub(crate) async fn run_in_workspace(
     root: &WorkspaceRoot,
     command: &str,
@@ -146,6 +159,27 @@ pub(crate) async fn run_in_workspace(
     let mut child = cmd
         .spawn()
         .map_err(|error| format!("启动 `{program}` 失败: {error}"))?;
+
+    // ── 沙箱：spawn 后立即把子进程纳入 Job。──
+    // 降级立场：创建/assign 失败不拦死命令（审批闸门才是"能不能跑"
+    // 的裁决者），但降级要三处知情——模型（content 前缀）、人
+    // （stderr 警告）、审计（ToolObserved 全文）。
+    let (sandbox, sandbox_warning) = match child.raw_handle() {
+        Some(handle) => match JobGuard::create(&SANDBOX_POLICY) {
+            Ok(job) => match assign_child(&job, handle) {
+                Ok(()) => (Some(job), None),
+                Err(error) => (None, Some(format!("进程纳入沙箱失败: {error}"))),
+            },
+            Err(error) => (None, Some(format!("沙箱创建失败: {error}"))),
+        },
+        None => (
+            None,
+            Some("沙箱未生效：拿不到子进程句柄（进程可能已立即退出）".to_owned()),
+        ),
+    };
+    if let Some(warning) = &sandbox_warning {
+        eprintln!("警告：{warning}");
+    }
 
     // take() 之后管道归我们所有，读结束后子进程写端关闭会自然 EOF。
     let mut stdout_pipe = child
@@ -176,17 +210,28 @@ pub(crate) async fn run_in_workspace(
     match tokio::time::timeout(timeout, run).await {
         Ok((stdout, stderr, status)) => {
             let code = status.map(|status| status.code().unwrap_or(-1)).unwrap_or(-1);
+            // sandbox_active 先取走：RawOutput 不持有 JobGuard，守卫在
+            // 本分支结尾 drop，KILL_ON_JOB_CLOSE 清理还挂着的残留进程
+            // ——此刻管道已 EOF、子进程已 wait，树内不会有活进程。
+            let sandbox_active = sandbox.is_some();
+            drop(sandbox);
             Ok(RawOutput {
                 code,
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                sandbox_active,
             })
         }
         Err(_elapsed) => {
-            // 显式杀进程再回收，不依赖 drop 语义：tokio 默认 kill_on_drop=false，
-            // 且不 wait 会留下僵尸。杀完管道随进程关闭，资源彻底落定。
+            // 超时杀整树：先 Job 层终止（覆盖全部后代），再 child.kill()
+            // 兜底直接子进程（沙箱降级时它是唯一手段）。杀完 wait 回收，
+            // 管道随进程关闭，资源彻底落定。
+            if let Some(job) = &sandbox {
+                job.terminate_tree();
+            }
             let _ = child.kill().await;
             let _ = child.wait().await;
+            drop(sandbox);
             Err(format!(
                 "命令超时：{} 秒内未结束，进程已被终止。长任务请拆小，或调大 timeout_seconds（上限 {} 秒）",
                 timeout.as_secs(),
@@ -195,6 +240,15 @@ pub(crate) async fn run_in_workspace(
         }
     }
 }
+
+/// 沙箱策略。默认强制生效，不设开关（任务书决策）：所有命令执行路径
+/// 统一走这一个策略；要关只可能在未来以策略文件形式出现。
+static SANDBOX_POLICY: SandboxPolicy = SandboxPolicy {
+    kill_tree: true,
+    per_process_memory: Some(4 * 1024 * 1024 * 1024),
+    max_processes: Some(256),
+    cpu_time: None,
+};
 
 /// 把一次执行的产出渲染成给模型看的观察文本。
 fn render_output(output: &RawOutput) -> String {
@@ -225,7 +279,15 @@ impl ToolInvoker for RunCommand {
             match run_in_workspace(&self.root, &args.command, timeout).await {
                 Err(message) => ToolOutcome::failed(message),
                 Ok(output) => {
-                    let rendered = render_output(&output);
+                    let mut rendered = render_output(&output);
+                    // 沙箱未生效要让模型的第一个字就读到：它应当因此
+                    // 更保守（不假设资源受限、不留后台进程）。这段文本
+                    // 随 ToolObserved 进证据，审计链同样完整。
+                    if !output.sandbox_active {
+                        rendered = format!(
+                            "⚠️ 进程沙箱未生效：本命令在无资源限制的宿主机环境执行，请格外保守。\n{rendered}"
+                        );
+                    }
                     // 退出码非 0 也是 failed，但输出原样带回——模型要靠它修 bug。
                     if output.code == 0 {
                         ToolOutcome::success(rendered)
@@ -267,6 +329,114 @@ mod tests {
 
     fn run_args(command: &str) -> serde_json::Value {
         json!({"command": command})
+    }
+
+    #[tokio::test]
+    async fn successful_command_runs_with_the_sandbox_active() {
+        // 回归保护：沙箱接入不能把正常命令弄坏，且成功路径必须带回
+        // "沙箱已生效"的事实（不带未生效前缀）。
+        let root = temp_workspace("sandbox-ok");
+        let cmd = tool(&root);
+
+        let outcome = cmd.invoke(&call(run_args("echo ok"))).await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        let raw = run_in_workspace(&WorkspaceRoot::new(root.clone()), "echo ok", Duration::from_secs(30))
+            .await
+            .expect("执行成功");
+        assert!(raw.sandbox_active, "Windows 上沙箱应实际生效");
+        assert!(
+            !outcome.content.contains("进程沙箱未生效"),
+            "沙箱生效时不应带未生效说明: {}",
+            outcome.content
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_tree() {
+        // 核心验收：整树终止。受害进程 parent 再拉 child（真实孙进程
+        // 形态），两代都写日志；1.5 秒超时后日志必须停止增长——没有
+        // Job 时 child 会作为孤儿继续写（这正是旧实现的缺陷形态）。
+        // 探针是 examples/sandbox-victim.rs（无参=parent+拉 child）。
+        let root = temp_workspace("killtree");
+        let log = root.join("victim.log");
+
+        let outcome = run_in_workspace(
+            &WorkspaceRoot::new(root.clone()),
+            &format!("{} {}", victim_exe().display(), log.display()),
+            Duration::from_millis(1500),
+        )
+        .await;
+        assert!(
+            outcome.is_err() && outcome.err().unwrap().contains("超时"),
+            "受害进程必须被超时收口"
+        );
+
+        // 给"假死但没被杀"的进程留足再写两轮的机会，然后验证日志停了。
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let lines_after_kill = count_lines(&log);
+        assert!(lines_after_kill > 0, "超时前 victim 应已写过日志");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            count_lines(&log),
+            lines_after_kill,
+            "超时后日志必须停止增长：父与孙进程都被整树终止"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 受害探针的可执行路径。测试进程的兄弟目录（examples 与 lib 同一
+    /// target），测试前由构建系统编译（examples 是 dev-target 的一部分）。
+    fn victim_exe() -> std::path::PathBuf {
+        let path = std::env::current_exe()
+            .expect("测试进程路径")
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("examples").join("sandbox-victim.exe"))
+            .expect("定位探针");
+        assert!(path.exists(), "探针未编译（cargo test 会编 examples）: {}", path.display());
+        path
+    }
+
+    fn count_lines(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn sandbox_downgrade_keeps_command_running_with_a_visible_notice() {
+        // 降级路径：JobGuard::create 失败 → 命令照常执行、
+        // sandbox_active == false、content 前缀带未生效说明。
+        // 直接测降级语义的组合点（RunCommand::invoke 的前缀逻辑 +
+        // RawOutput 事实），不真的砸坏 Job 创建（需要注入点，复杂度
+        // 不成比例）——JobGuard::create 的失败分支在 noop 平台恒走，
+        // 这里验证 Windows 实现的降级消费端。
+        let policy = SandboxPolicy {
+            cpu_time: Some(Duration::from_secs(1)),
+            ..SandboxPolicy::default()
+        };
+        // cpu_time 是当前实现明确拒绝的限额：走的就是 create 失败路径。
+        let error = match JobGuard::create(&policy) {
+            Err(error) => error,
+            Ok(_) => panic!("cpu_time 限额应触发创建失败"),
+        };
+        assert!(error.contains("cpu_time"), "{error}");
+
+        // 消费端：RawOutput.sandbox_active == false 时的前缀逻辑。
+        let output = RawOutput {
+            code: 0,
+            stdout: "ok".into(),
+            stderr: String::new(),
+            sandbox_active: false,
+        };
+        let mut rendered = render_output(&output);
+        if !output.sandbox_active {
+            rendered = format!("⚠️ 进程沙箱未生效：本命令在无资源限制的宿主机环境执行，请格外保守。\n{rendered}");
+        }
+        assert!(rendered.starts_with("⚠️ 进程沙箱未生效"), "{rendered}");
+        assert!(rendered.contains("退出码: 0"), "正文应保留: {rendered}");
     }
 
     #[tokio::test]

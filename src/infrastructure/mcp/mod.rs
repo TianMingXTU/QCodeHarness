@@ -33,6 +33,17 @@ use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 /// 超了就当它挂了，走降级。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 工具发现阶段的独立时限。实测取证（`examples/hang_probe.rs`，已删）：
+/// 一个"应答初始化握手、但对 `tools/list` 请求静默"的半死 stdio Server，
+/// 会让 rmcp 的 `list_all_tools()` 永久挂起——该调用没有内部超时，rmcp
+/// 对请求只做一次发送后干等响应。CONNECT_TIMEOUT（30 秒）罩住整个
+/// 连接过程，半死 Server 最终会被它收口，但错误信息分不清卡在哪一段：
+/// "握手慢"和"握手成功后不回话"需要不同的排查方向（前者查网络/进程
+/// 启动，后者查 Server 的事件循环）。发现阶段的合理预算远小于整体
+/// 连接预算：握手成功后 `tools/list` 只是一次本地请求，正常 Server
+/// 毫秒级响应，15 秒已经宽裕到不会误伤慢启动的 Server。
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// 单次工具调用超时。MCP 工具没有内置的超时语义，不设上限会挂死整个步骤。
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -235,16 +246,17 @@ impl std::fmt::Debug for McpToolSource {
 }
 
 impl McpToolSource {
-    /// 连接一个真实 Server：起进程、握手、发现工具，全程受
-    /// [`CONNECT_TIMEOUT`] 约束。
+    /// 连接一个真实 Server：起进程、握手、发现工具。
     ///
-    /// 超时必须罩住发现阶段：rmcp 的 `tools/list` 请求本身没有内部
-    /// 超时，只罩握手的话，一个"握手正常但对 tools/list 永不回应"的
-    /// 半死 Server 会把启动永久挂死，降级承诺在这里被击穿。
+    /// 超时分两段罩：[`CONNECT_TIMEOUT`] 罩"启动进程+握手+发现"整体
+    /// 兜底，[`DISCOVERY_TIMEOUT`] 罩发现阶段——rmcp 的 `tools/list`
+    /// 请求没有内部超时，一个"握手正常但对 tools/list 永不回应"的
+    /// 半死 Server 若只有整体超时，用户拿到的错误分不清卡在哪一段；
+    /// 分段后错误信息直接指明排查方向。
     pub async fn connect(config: &config::McpServerConfig) -> Result<Self, String> {
         let attempt = tokio::time::timeout(CONNECT_TIMEOUT, async {
             let client = Arc::new(RealMcpClient::connect(config).await?);
-            Self::from_client(&config.name, client).await
+            Self::discover_with_timeout(&config.name, client, DISCOVERY_TIMEOUT).await
         })
         .await;
         match attempt {
@@ -254,6 +266,27 @@ impl McpToolSource {
                 CONNECT_TIMEOUT.as_secs()
             )),
         }
+    }
+
+    /// 发现一段：握手成功的连接上拿工具清单，受 `timeout` 约束。
+    ///
+    /// 独立成方法是为了让 `connect`（传 [`DISCOVERY_TIMEOUT`]）与
+    /// 半死 Server 测试（传短时限）共用同一条超时路径——测试替身
+    /// 进不了 `connect` 的真进程分支，错误信息与降级行为必须在
+    /// 替身可达的入口上验证。
+    async fn discover_with_timeout(
+        server: &str,
+        client: Arc<dyn McpClientHandle>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        tokio::time::timeout(timeout, Self::from_client(server, client))
+            .await
+            .map_err(|_| {
+                format!(
+                    "工具发现超时（{} 秒）：Server 完成了握手但对工具清单无响应，检查 Server 的 list_tools 实现",
+                    timeout.as_secs()
+                )
+            })?
     }
 
     /// 从给定的连接句柄发现工具。测试从这条路径注入替身。
@@ -382,6 +415,26 @@ mod tests {
         calls: Mutex<Vec<String>>,
     }
 
+    /// 半死 Server 的假连接：握手能成（对 `connect` 而言它已经是
+    /// `RealMcpClient` 成功返回后的产物），但对 `tools/list` 永不回应。
+    /// 实测模型：rmcp 的 `list_all_tools()` 对请求只发送一次后干等，
+    /// Server 不回就永久挂起。
+    struct HalfDeadClient;
+
+    impl McpClientHandle for HalfDeadClient {
+        fn list_tools(&self) -> BoxFuture<'_, Result<Vec<RmcpTool>, String>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn call_tool<'a>(
+            &'a self,
+            _remote_name: &'a str,
+            _arguments: Value,
+        ) -> BoxFuture<'a, Result<String, String>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
     impl FakeClient {
         fn with_tools(tools: Vec<RmcpTool>) -> Arc<Self> {
             Arc::new(Self {
@@ -478,6 +531,33 @@ mod tests {
         assert!(!entries[1].spec.annotations.read_only);
         // 来源要写进描述，模型才知道这是外部能力。
         assert!(entries[0].spec.description.contains("MCP Server `fetch` 提供"));
+    }
+
+    #[tokio::test]
+    async fn half_dead_server_times_out_during_discovery_with_a_readable_error() {
+        // 与 connect() 发现段同路径，用短时限：半死替身永不回应，
+        // 错误必须在时限内回来（挂死即本测试失败），信息指明卡在
+        // 发现阶段而不是握手或调用。
+        let started = std::time::Instant::now();
+        let error = McpToolSource::discover_with_timeout(
+            "half-dead",
+            Arc::new(HalfDeadClient),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect_err("半死 Server 不应返回工具清单");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "应等满时限（防过早放行），实际 {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "应快速失败而不是永久挂起，实际 {elapsed:?}"
+        );
+        assert!(error.contains("工具发现超时"), "{error}");
+        assert!(error.contains("list_tools"), "应指明排查方向: {error}");
     }
 
     #[tokio::test]

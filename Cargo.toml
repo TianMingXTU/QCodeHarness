@@ -30,6 +30,14 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "ti
 # `cargo tree -i rustls` 为空是 P5-2 的验收项之一。
 rmcp = { version = "3.8.0", default-features = false, features = ["client", "transport-child-process", "transport-async-rw"] }
 
+# Windows Job Object：进程树的资源限制与整树终止（P7 沙箱）。
+# 只挑 Win32 的三个子 feature（句柄基础 + Job Objects + 进程/线程），
+# 不碰任何网络/TLS feature；windows crate 不引 rustls，
+# `cargo tree -i rustls` 为空仍是验收项。只在 Windows 目标下生效，
+# 非 Windows 平台不拉这个依赖（cfg 分发见 infrastructure/sandbox）。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 [dev-dependencies]
 # 测试需要 rig 的 test-utils 提供 MockCompletionModel，
 # 用假的模型响应驱动 AgentRunner，避免真实网络调用。
