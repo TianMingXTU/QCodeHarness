@@ -25,6 +25,8 @@ use crate::domain::context::{compact, ContextBudget};
 use crate::domain::evidence::AuditEvent;
 use crate::domain::ids::SessionId;
 use crate::domain::policy::{PolicyDecision, PolicyEngine, PolicyVerdict};
+use crate::domain::sandbox::write_escape_suspect;
+use serde_json::Value;
 use crate::domain::session::{ContextSlice, Session};
 use crate::domain::tool::{ToolCall, ToolOutcome, ToolSpec};
 
@@ -391,6 +393,11 @@ impl AgentRunner {
                     reason: decision.reason.clone(),
                 });
 
+                // P8-3：策略说放行，但命令看着像把写操作伸到 workspace 外时，
+                // 升级成要审批。审计里记的仍是策略的原判——策略没改，改的是
+                // 这次调用要不要人过目，两件事不能混在一条事件里。
+                let (decision, escalation) = escalate_out_of_workspace_write(decision, &call);
+
                 match decision.verdict {
                     // 放行：不过闸门，直接进执行。
                     PolicyVerdict::Allow => {
@@ -404,6 +411,7 @@ impl AgentRunner {
                             turn: self.session.rounds() + 1,
                             call,
                             annotations: spec.annotations,
+                            reason: escalation,
                         };
                         self.state = RunState::AwaitingApproval(request.clone());
                         // 最重要的保存点：等人审批时人可能走开、进程可能被杀，
@@ -783,6 +791,43 @@ fn denied_by_policy_message(name: &str, decision: &PolicyDecision) -> String {
     }
 }
 
+/// 策略放行但调用疑似越界写入时，把裁决升级为要求审批。
+///
+/// 返回升级后的裁决，以及要写进 [`ApprovalRequest::reason`] 的理由；
+/// 没有升级时理由为 `None`。
+///
+/// 补的是策略的一个真实缺口：策略按"工具名 + 参数文本"放行 `run_command`
+/// 之后，命令内容就不受任何约束了——模型敲 `echo x > C:\Windows\temp\y`，
+/// 策略看到的是"run_command，已放行"。这道检查让这种调用至少有人过目。
+///
+/// 只升级 `Allow`：本来就要审的（`RequireApproval`）不必再贴一遍理由，
+/// 被拒的（`Deny`）连闸门都到不了。`rule_index` 置回 `None`——放行它的
+/// 规则并没有改主意，改主意的是这次调用本身。
+fn escalate_out_of_workspace_write(
+    decision: PolicyDecision,
+    call: &ToolCall,
+) -> (PolicyDecision, Option<String>) {
+    if decision.verdict != PolicyVerdict::Allow {
+        return (decision, None);
+    }
+    // 只有带 command 参数的调用（即 run_command）走得进这个启发式，
+    // 其他工具没有命令文本可看。
+    let Some(command) = call.arguments.get("command").and_then(Value::as_str) else {
+        return (decision, None);
+    };
+    let Some(suspect) = write_escape_suspect(command) else {
+        return (decision, None);
+    };
+    (
+        PolicyDecision {
+            verdict: PolicyVerdict::RequireApproval,
+            reason: format!("策略已放行，但疑似越界写入：{suspect}"),
+            rule_index: None,
+        },
+        Some(suspect),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,10 +897,12 @@ mod tests {
         }
     }
 
-    /// 数一数闸门被问了多少次、问的是哪个工具。
+    /// 数一数闸门被问了多少次、问的是什么。
     #[derive(Default)]
     struct CountingGate {
         requested: std::sync::Mutex<Vec<String>>,
+        /// 收到的完整请求，按顺序。P8-3 的升级测试要断言 `reason`。
+        seen: std::sync::Mutex<Vec<ApprovalRequest>>,
     }
 
     impl ApprovalGate for CountingGate {
@@ -865,6 +912,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(request.call.name.clone());
+                self.seen.lock().unwrap().push(request.clone());
                 Ok(())
             })
         }
@@ -873,6 +921,16 @@ mod tests {
     impl CountingGate {
         fn requested_tools(&self) -> Vec<String> {
             self.requested.lock().unwrap().clone()
+        }
+
+        /// 第一次收到的请求；没被问过就 panic。
+        fn first_request(&self) -> ApprovalRequest {
+            self.seen
+                .lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .expect("闸门应被问过")
         }
     }
 
@@ -1361,6 +1419,7 @@ mod tests {
                 arguments: json!({}),
             },
             annotations: write_file_spec().annotations,
+            reason: None,
         };
 
         assert_eq!(gate.request(&request).await, Err("不允许".to_owned()));
@@ -1377,6 +1436,7 @@ mod tests {
                 arguments: json!({}),
             },
             annotations: write_file_spec().annotations,
+            reason: None,
         };
 
         assert_eq!(gate.request(&request).await, Ok(()));
@@ -1551,6 +1611,196 @@ mod tests {
             .filter(|e| matches!(e.event, AuditEvent::PolicyEvaluated { .. }))
             .collect();
         assert_eq!(evaluated.len(), 1, "每次策略裁决都该留证");
+    }
+
+    // ── P8-3：越界写入升级 ─────────────────────────────────────────────
+
+    /// 策略放行了 `run_command`，但命令把输出写到 workspace 外时，
+    /// 必须升级成要审批。
+    ///
+    /// 这是 P8-3 的核心承诺：策略按"工具名 + 参数文本"放行之后，
+    /// 命令内容就不受任何约束了，补的正是这个缺口。
+    #[tokio::test]
+    async fn allow_rule_still_gates_an_out_of_workspace_write() {
+        let policy = policy_with("run_command", PolicyVerdict::Allow, "shell 免审");
+        let run_command_spec = ToolSpec {
+            name: "run_command".to_owned(),
+            description: "跑命令".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(false, true, false, true),
+        };
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call(
+                    "call_1",
+                    "run_command",
+                    json!({"command": r"echo hi > C:\Windows\temp\x"}),
+                ),
+                MockTurn::text("跑完了"),
+            ],
+            vec![run_command_spec],
+            policy,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(
+            harness.approvals.requested_tools(),
+            vec!["run_command"],
+            "越界写入必须被升级为要审批"
+        );
+        // 升级理由要递到闸门：用户得知道为什么要他看这一眼。
+        let request = harness.approvals.first_request();
+        let reason = request.reason.expect("升级请求必须带 reason");
+        assert!(reason.contains(r"C:\Windows\temp\x"), "理由应点名目标: {reason}");
+    }
+
+    /// 同样的 Allow 规则下，落在 workspace 内的命令不被升级。
+    ///
+    /// 没有这一条，"升级"就会退化成"所有 run_command 都要审"——
+    /// 用户被无谓地打扰几次之后就会一律放行，升级也就白做了。
+    #[tokio::test]
+    async fn allow_rule_does_not_gate_an_in_workspace_command() {
+        let policy = policy_with("run_command", PolicyVerdict::Allow, "shell 免审");
+        let run_command_spec = ToolSpec {
+            name: "run_command".to_owned(),
+            description: "跑命令".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(false, true, false, true),
+        };
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call("call_1", "run_command", json!({"command": "cargo test"})),
+                MockTurn::text("跑完了"),
+            ],
+            vec![run_command_spec],
+            policy,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert!(
+            harness.approvals.requested_tools().is_empty(),
+            "workspace 内的命令不该被升级"
+        );
+    }
+
+    /// 审计里记的仍是策略的原判（Allow），不是升级后的裁决。
+    ///
+    /// 策略没改，改的是"这次调用要不要人过目"。两件事混在一条
+    /// `PolicyEvaluated` 里，事后就分不清是配置放宽了还是启发式报警了。
+    #[tokio::test]
+    async fn escalated_call_still_records_the_original_policy_verdict() {
+        let policy = policy_with("run_command", PolicyVerdict::Allow, "shell 免审");
+        let run_command_spec = ToolSpec {
+            name: "run_command".to_owned(),
+            description: "跑命令".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(false, true, false, true),
+        };
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call(
+                    "call_1",
+                    "run_command",
+                    json!({"command": r"del ..\outside"}),
+                ),
+                MockTurn::text("跑完了"),
+            ],
+            vec![run_command_spec],
+            policy,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        let evaluated: Vec<_> = harness
+            .evidence
+            .events()
+            .into_iter()
+            .filter_map(|e| match e.event {
+                AuditEvent::PolicyEvaluated { verdict, .. } => Some(verdict),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(evaluated, vec![PolicyVerdict::Allow], "证据应记策略原判");
+    }
+
+    // ── P8-1：受保护路径经真实工具层的端到端验证 ─────────────────────
+
+    /// 策略放行 `write_file` 也写不进 `.git/config`。
+    ///
+    /// 单独一条工具层测试只能证明"工具自己会拒"；这一条把策略引擎、runner
+    /// 与真实文件工具串起来，证明保护是**结构性的**——不管配置怎么写，
+    /// 调用都到不了文件系统。这是 P8-1"保护不留给配置去放宽"那句话的
+    /// 直接对应物。
+    #[tokio::test]
+    async fn allow_policy_cannot_write_into_a_protected_path() {
+        // 造一个真的 .git/config：拒绝必须发生在文件系统之前，
+        // 不能让"文件不存在"成为一种假通过。
+        let dir = std::env::temp_dir().join(format!("qch-e2e-protected-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).expect("建 .git");
+        std::fs::write(dir.join(".git/config"), "[core]\n").expect("写 .git/config");
+
+        let policy = policy_with("write_file", PolicyVerdict::Allow, "写入一律免审");
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call(
+                "call_1",
+                "write_file",
+                json!({"path": ".git/config", "content": "恶意覆盖"}),
+            ),
+            MockTurn::text("写完了"),
+        ]);
+        let approvals = Arc::new(CountingGate::default());
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mut runner = AgentRunner::new(
+            spec_with(),
+            SessionId::new("test-session"),
+            "改一下 git 配置",
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+                tools: ToolRegistry::new(crate::infrastructure::tool::all_tools(
+                    crate::domain::workspace::WorkspaceRoot::new(&dir),
+                )),
+                approvals: approvals.clone(),
+                evidence: evidence.clone(),
+                clock: Arc::new(crate::infrastructure::clock::SystemClock),
+                policy,
+                context_budget: ContextBudget::default(),
+                session_store: None,
+            },
+        );
+
+        // 断言全在证据、文件内容与闸门上；答案本身与保护无关，
+        // 但 run() 必须正常收尾（没被保护拒绝带崩）才算通过。
+        let _outcome = runner.run(&Budget::new(20)).await.unwrap();
+
+        // 模型看到的是一条拒绝观察，不是成功——它必须知道自己被拦了，
+        // 否则它会基于"已写入"继续往下推理。
+        let observed: Vec<String> = evidence
+            .events()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                AuditEvent::ToolObserved { outcome, .. } => Some(outcome.content),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            observed.iter().any(|text| text.contains("受保护")),
+            "模型应看到受保护拒绝: {observed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/config")).unwrap(),
+            "[core]\n",
+            "受保护文件必须保持原样"
+        );
+        // 免审策略下闸门本来就不会被问；这里断言的是"没有退化成要审批"——
+        // 保护是拒绝，不是升级。
+        assert!(
+            approvals.requested_tools().is_empty(),
+            "受保护路径应直接拒绝，不该绕道审批"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── P3：上下文预算与历史裁剪 ────────────────────────────────────────

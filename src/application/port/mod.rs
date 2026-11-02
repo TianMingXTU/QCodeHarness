@@ -89,6 +89,17 @@ pub struct ApprovalRequest {
     pub call: ToolCall,
     /// 被调工具的风险注解，审批方据此决策。
     pub annotations: ToolAnnotations,
+    /// 策略之上追加的复核理由。
+    ///
+    /// `None` 是常规审批：策略说"要审"，闸门按自己的规则决定。
+    /// `Some` 是升级复核——典型情形是策略放行、但调用被判定为疑似越界
+    /// 写入（见 `domain::sandbox::write_escape_suspect`）。这种请求
+    /// **每一次都要见到人**：会话信任（"同类调用不必再问"）对它无效，
+    /// 否则升级就白做了。
+    ///
+    /// `#[serde(default)]` 让 P8 之前落盘的老快照仍能反序列化。
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// 审批结论：`Ok(())` 放行；`Err(reason)` 否决，原因会作为拒绝观察回填给模型。
