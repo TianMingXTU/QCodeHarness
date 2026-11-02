@@ -49,14 +49,10 @@ impl JobGuard {
         let handle = unsafe { CreateJobObjectW(None, None) }
             .map_err(|error| format!("创建 Job Object 失败: {error}"))?;
 
-        if let Err(error) = Self::apply_limits(&handle, policy) {
-            return Err(error);
-        }
-
-        // Owned 接管句柄：从这里起无论哪条路径退出都会 CloseHandle。
-        Ok(Self {
-            job: unsafe { Owned::new(handle) },
-        })
+        // 必须先接管句柄：设置限额失败也要 CloseHandle。
+        let job = unsafe { Owned::new(handle) };
+        Self::apply_limits(&job, policy)?;
+        Ok(Self { job })
     }
 
     /// 把策略翻译成 Job 限额。限额调用失败在这里就地转成说明文本：
@@ -112,13 +108,8 @@ impl JobGuard {
     ///
     /// # 已知的理论竞态
     ///
-    /// spawn 与 assign 之间，子进程可能已经拉起孙进程——孙进程不在
-    /// Job 里，整树终止杀不到它。窗口在微秒级（子进程此刻还在加载
-    /// 可执行文件，`cmd` 解释命令远慢于此），且收窄它需要
-    /// CREATE_SUSPENDED + NtResumeThread 一族未文档化调用，复杂度与
-    /// 收益不成比例。这是有意的取舍：Job Object 的树模型对"正常
-    /// 子进程先于 assign 造出孙进程"之外的全部形态（超时杀树、
-    /// fork 炸弹、内存失控）仍然完备。
+    /// spawn 与 assign 之间拉起的后代可能未进入 Job。窗口长度受系统
+    /// 调度影响，没有固定上界；P7 接受该竞态，不引入挂起启动机制。
     pub fn assign(&self, process_handle: HANDLE) -> Result<(), String> {
         unsafe { AssignProcessToJobObject(*self.job, process_handle) }
             .map_err(|error| format!("进程纳入 Job 失败: {error}"))
@@ -141,7 +132,10 @@ impl JobGuard {
 /// # Errors
 ///
 /// 句柄不可用或 assign 失败时返回说明文本。
-pub fn assign_child(job: &JobGuard, raw_handle: *mut std::ffi::c_void) -> Result<(), String> {
+pub fn assign_child(job: &JobGuard, child: &tokio::process::Child) -> Result<(), String> {
+    let raw_handle = child
+        .raw_handle()
+        .ok_or_else(|| "子进程句柄不可用（进程可能已退出）".to_owned())?;
     if raw_handle.is_null() {
         return Err("子进程句柄不可用（进程可能已退出）".into());
     }

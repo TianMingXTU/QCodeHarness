@@ -37,12 +37,14 @@ const MAX_OUTPUT_CHARS: usize = 8000;
 /// 在 workspace 根下执行一条 shell 命令。
 pub struct RunCommand {
     root: WorkspaceRoot,
+    // 生产入口固定使用默认策略；测试可在实例内注入失败策略，不改全局状态。
+    policy: SandboxPolicy,
 }
 
 impl RunCommand {
     /// 以 `root` 为命令的工作目录构造。
     pub fn new(root: WorkspaceRoot) -> Self {
-        Self { root }
+        Self { root, policy: SandboxPolicy::default() }
     }
 
     /// 工具规格。
@@ -137,6 +139,15 @@ pub(crate) async fn run_in_workspace(
     command: &str,
     timeout: Duration,
 ) -> Result<RawOutput, String> {
+    run_with_policy(root, command, timeout, &SandboxPolicy::default()).await
+}
+
+async fn run_with_policy(
+    root: &WorkspaceRoot,
+    command: &str,
+    timeout: Duration,
+    policy: &SandboxPolicy,
+) -> Result<RawOutput, String> {
     let (program, args) = shell_program(command);
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
@@ -164,18 +175,12 @@ pub(crate) async fn run_in_workspace(
     // 降级立场：创建/assign 失败不拦死命令（审批闸门才是"能不能跑"
     // 的裁决者），但降级要三处知情——模型（content 前缀）、人
     // （stderr 警告）、审计（ToolObserved 全文）。
-    let (sandbox, sandbox_warning) = match child.raw_handle() {
-        Some(handle) => match JobGuard::create(&SANDBOX_POLICY) {
-            Ok(job) => match assign_child(&job, handle) {
-                Ok(()) => (Some(job), None),
-                Err(error) => (None, Some(format!("进程纳入沙箱失败: {error}"))),
-            },
-            Err(error) => (None, Some(format!("沙箱创建失败: {error}"))),
+    let (sandbox, sandbox_warning) = match JobGuard::create(policy) {
+        Ok(job) => match assign_child(&job, &child) {
+            Ok(()) => (Some(job), None),
+            Err(error) => (None, Some(format!("进程纳入沙箱失败: {error}"))),
         },
-        None => (
-            None,
-            Some("沙箱未生效：拿不到子进程句柄（进程可能已立即退出）".to_owned()),
-        ),
+        Err(error) => (None, Some(format!("沙箱创建失败: {error}"))),
     };
     if let Some(warning) = &sandbox_warning {
         eprintln!("警告：{warning}");
@@ -241,15 +246,6 @@ pub(crate) async fn run_in_workspace(
     }
 }
 
-/// 沙箱策略。默认强制生效，不设开关（任务书决策）：所有命令执行路径
-/// 统一走这一个策略；要关只可能在未来以策略文件形式出现。
-static SANDBOX_POLICY: SandboxPolicy = SandboxPolicy {
-    kill_tree: true,
-    per_process_memory: Some(4 * 1024 * 1024 * 1024),
-    max_processes: Some(256),
-    cpu_time: None,
-};
-
 /// 把一次执行的产出渲染成给模型看的观察文本。
 fn render_output(output: &RawOutput) -> String {
     let mut text = format!("退出码: {}\n", output.code);
@@ -276,7 +272,7 @@ impl ToolInvoker for RunCommand {
                     .clamp(1, HARD_MAX_TIMEOUT_SECS),
             );
 
-            match run_in_workspace(&self.root, &args.command, timeout).await {
+            match run_with_policy(&self.root, &args.command, timeout, &self.policy).await {
                 Err(message) => ToolOutcome::failed(message),
                 Ok(output) => {
                     let mut rendered = render_output(&output);
@@ -284,9 +280,7 @@ impl ToolInvoker for RunCommand {
                     // 更保守（不假设资源受限、不留后台进程）。这段文本
                     // 随 ToolObserved 进证据，审计链同样完整。
                     if !output.sandbox_active {
-                        rendered = format!(
-                            "⚠️ 进程沙箱未生效：本命令在无资源限制的宿主机环境执行，请格外保守。\n{rendered}"
-                        );
+                        rendered = format!("{}\n{rendered}", super::git::SANDBOX_DOWNGRADE_NOTICE);
                     }
                     // 退出码非 0 也是 failed，但输出原样带回——模型要靠它修 bug。
                     if output.code == 0 {
@@ -405,38 +399,26 @@ mod tests {
             .unwrap_or(0)
     }
 
-    #[test]
-    fn sandbox_downgrade_keeps_command_running_with_a_visible_notice() {
-        // 降级路径：JobGuard::create 失败 → 命令照常执行、
-        // sandbox_active == false、content 前缀带未生效说明。
-        // 直接测降级语义的组合点（RunCommand::invoke 的前缀逻辑 +
-        // RawOutput 事实），不真的砸坏 Job 创建（需要注入点，复杂度
-        // 不成比例）——JobGuard::create 的失败分支在 noop 平台恒走，
-        // 这里验证 Windows 实现的降级消费端。
-        let policy = SandboxPolicy {
-            cpu_time: Some(Duration::from_secs(1)),
-            ..SandboxPolicy::default()
-        };
-        // cpu_time 是当前实现明确拒绝的限额：走的就是 create 失败路径。
-        let error = match JobGuard::create(&policy) {
-            Err(error) => error,
-            Ok(_) => panic!("cpu_time 限额应触发创建失败"),
-        };
-        assert!(error.contains("cpu_time"), "{error}");
+    #[tokio::test]
+    async fn sandbox_downgrade_keeps_command_running_with_a_visible_notice() {
+        let root = temp_workspace("sandbox-downgrade");
+        let mut cmd = tool(&root);
+        // CPU 限额明确未实现，稳定触发创建失败，不依赖宿主机权限或资源耗尽。
+        cmd.policy.cpu_time = Some(Duration::from_secs(1));
+        let outcome = cmd.invoke(&call(run_args(
+            "echo downgrade_ok > ran.txt && echo downgrade_ok",
+        ))).await;
 
-        // 消费端：RawOutput.sandbox_active == false 时的前缀逻辑。
-        let output = RawOutput {
-            code: 0,
-            stdout: "ok".into(),
-            stderr: String::new(),
-            sandbox_active: false,
-        };
-        let mut rendered = render_output(&output);
-        if !output.sandbox_active {
-            rendered = format!("⚠️ 进程沙箱未生效：本命令在无资源限制的宿主机环境执行，请格外保守。\n{rendered}");
-        }
-        assert!(rendered.starts_with("⚠️ 进程沙箱未生效"), "{rendered}");
-        assert!(rendered.contains("退出码: 0"), "正文应保留: {rendered}");
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert!(outcome.content.starts_with("⚠️ 进程沙箱未生效"), "{}", outcome.content);
+        assert!(outcome.content.contains("退出码: 0"), "{}", outcome.content);
+        assert_eq!(std::fs::read_to_string(root.join("ran.txt")).unwrap().trim(), "downgrade_ok");
+
+        let raw = run_with_policy(&cmd.root, "echo ok", Duration::from_secs(30), &cmd.policy)
+            .await.expect("降级后命令仍应执行");
+        assert!(!raw.sandbox_active);
+        assert_eq!(raw.code, 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

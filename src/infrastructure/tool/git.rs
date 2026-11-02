@@ -43,7 +43,9 @@ impl GitStatus {
         ToolSpec {
             name: GIT_STATUS.to_owned(),
             description: "查看 workspace 内 git 仓库的工作区状态（git status --porcelain），\
-                          空输出表示工作区干净。只读操作。".to_owned(),
+                          空输出表示工作区干净。只读操作。workspace 不是 git 仓库根时返回说明，\
+                          不会去读父目录的仓库。"
+                .to_owned(),
             parameters: json!({"type": "object", "properties": {}}),
             annotations: ToolAnnotations::new(true, false, true, false),
         }
@@ -51,6 +53,9 @@ impl GitStatus {
 
     /// 执行 git status。独立出来供测试与内部复用。
     async fn run(&self) -> ToolOutcome {
+        if let Some(notice) = not_a_repo_notice(&self.root) {
+            return ToolOutcome::failed(notice);
+        }
         match run_in_workspace(&self.root, "git status --porcelain=v1", GIT_TIMEOUT).await {
             Err(message) => git_failure(message),
             Ok(output) => {
@@ -62,10 +67,15 @@ impl GitStatus {
                     ));
                 }
                 let stdout = output.stdout.trim_end();
-                if stdout.is_empty() {
-                    ToolOutcome::success("（工作区干净，没有未提交的改动）")
+                let body = if stdout.is_empty() {
+                    "（工作区干净，没有未提交的改动）".to_owned()
                 } else {
-                    ToolOutcome::success(stdout)
+                    stdout.to_owned()
+                };
+                if output.sandbox_active {
+                    ToolOutcome::success(body)
+                } else {
+                    ToolOutcome::success(with_sandbox_notice(body))
                 }
             }
         }
@@ -94,7 +104,8 @@ impl GitDiff {
         ToolSpec {
             name: GIT_DIFF.to_owned(),
             description: "查看 workspace 内 git 仓库的未暂存差异（git diff）；\
-                          staged 为 true 时查看已暂存的差异（git diff --staged）。输出最多约 4000 字符。只读操作。"
+                          staged 为 true 时查看已暂存的差异（git diff --staged）。输出最多约 4000 字符。只读操作。\
+                          workspace 不是 git 仓库根时返回说明，不会去读父目录的仓库。"
                 .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -108,6 +119,9 @@ impl GitDiff {
 
     /// 执行 git diff。独立出来供测试与内部复用。
     async fn run(&self, staged: bool) -> ToolOutcome {
+        if let Some(notice) = not_a_repo_notice(&self.root) {
+            return ToolOutcome::failed(notice);
+        }
         let command = if staged {
             "git diff --staged"
         } else {
@@ -124,10 +138,15 @@ impl GitDiff {
                     ));
                 }
                 let stdout = output.stdout.trim_end().to_owned();
-                if stdout.is_empty() {
-                    ToolOutcome::success("（没有差异）")
+                let body = if stdout.is_empty() {
+                    "（没有差异）".to_owned()
                 } else {
-                    ToolOutcome::success(clamp_output(stdout, DIFF_MAX_CHARS))
+                    clamp_output(stdout, DIFF_MAX_CHARS)
+                };
+                if output.sandbox_active {
+                    ToolOutcome::success(body)
+                } else {
+                    ToolOutcome::success(with_sandbox_notice(body))
                 }
             }
         }
@@ -152,8 +171,43 @@ impl ToolInvoker for GitDiff {
     }
 }
 
-/// 把执行层的失败翻译成面向模型的失败观察。
+/// workspace 不是 git 仓库根时，返回给模型的说明；是仓库根则返回 `None`。
 ///
+/// git 在找不到 `.git` 的目录里会**沿父目录一路向上爬**，直到撞见一个仓库
+/// 才肯报告。于是 workspace 里的 `git status` 会输出父仓库的状态，模型
+/// 据此以为自己看到的是 workspace 的改动——本项目的 workspace 常常是
+/// 父目录下的临时副本（基准评测的 fixture 副本、用户实测仓库都中过招），
+/// 这个泄露会直接把 agent 带偏去改不相干的文件。
+///
+/// 判定用 `.git` 的存在性而非 `git rev-parse --show-toplevel`：前者一次
+/// stat 就够，且不受 workspace 路径写法（相对/绝对/大小写/尾斜杠）影响；
+/// 后者要把两条路径规范化后才能比，而"要不要比"本身还是要先确认 `.git`。
+/// `.git` 是文件（worktree、submodule）也算仓库根——它们各自有独立的
+/// 工作区，git 报的就是本目录的状态，不会向上爬。
+fn not_a_repo_notice(root: &WorkspaceRoot) -> Option<String> {
+    if root.as_path().join(".git").exists() {
+        return None;
+    }
+    Some(format!(
+        "workspace（{}）不是 git 仓库根：目录下没有 .git。\
+         本工具不会去读父目录的仓库——那只会看到与 workspace 无关的状态。\
+         如需版本状态，请先在 workspace 内执行 git init。",
+        root.as_path().display()
+    ))
+}
+
+/// 沙箱未生效时给观察加的前缀。与 `run_command` 用同一份文本：模型
+/// 在不同工具里看到的降级说明必须一致，否则它会以为是另一回事。
+pub(crate) fn with_sandbox_notice(body: String) -> String {
+    format!("{SANDBOX_DOWNGRADE_NOTICE}\n{body}")
+}
+
+/// 降级说明的正文。抽取成常量是让 `run_command` 与 git 工具共用：
+/// "三处知情"承诺里的模型可见一环，两条命令路径都得兑现。
+pub(crate) const SANDBOX_DOWNGRADE_NOTICE: &str =
+    "⚠️ 进程沙箱未生效：本命令在无资源限制的宿主机环境执行，请格外保守。";
+
+/// 把执行层的失败翻译成面向模型的失败观察。///
 /// 启动失败（git 不在 PATH）和 git 自身报错（不是仓库等）在这里归并：
 /// 模型只需要知道"git 没跑成、为什么"，不需要区分进程层还是 git 层。
 fn git_failure(message: String) -> ToolOutcome {
@@ -217,26 +271,88 @@ mod tests {
         }
     }
 
-    /// git 不可用时给出失败观察，而不是 panic——这条不依赖 git 存在。
+    /// workspace 里没有 `.git` 时必须明确说"不是仓库根"。
+    ///
+    /// 这条不依赖 git 在 PATH，也不该依赖：判定本身只看文件系统，git
+    /// 根本不会被执行——"不执行"正是修复的一部分（旧行为会执行 git，
+    /// 然后 git 沿父目录爬到一个不相干的仓库里去）。
     #[tokio::test]
-    async fn handles_missing_git_gracefully_when_git_absent() {
-        // 用一个必然不是 git 仓库的目录：即使 git 在 PATH，status 也会非 0。
-        let dir = std::env::temp_dir().join(format!("qch-git-norepo-{}", std::process::id()));
+    async fn workspace_without_git_dir_is_reported_as_not_a_repo() {
+        let dir = std::env::temp_dir().join(format!("qch-git-nogitdir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时目录");
 
-        let tool = GitStatus::new(WorkspaceRoot::new(&dir));
-        let outcome = tool.run().await;
+        let outcome = GitStatus::new(WorkspaceRoot::new(&dir)).run().await;
 
-        // git 在 PATH：退出码 128（not a repository）；不在：启动失败。
-        // 两种都必须是 failed 且带说明，绝不能 panic。
         assert_eq!(outcome.status, OutcomeStatus::Failed, "{}", outcome.content);
         assert!(
-            outcome.content.contains("git"),
-            "失败说明应点名 git: {}",
+            outcome.content.contains("不是 git 仓库根"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains(".git"),
+            "说明应点名缺失的 .git: {}",
             outcome.content
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 仓库子目录里的 git 工具不得泄露父仓库状态。
+    ///
+    /// 这是实测中把 agent 带偏的那个 bug 的回归测试：workspace 是仓库的
+    /// 子目录时，旧实现让 git 沿父目录爬，模型看到的是父仓库的改动，
+    /// 于是据此修改了跟 workspace 无关的文件。
+    #[tokio::test]
+    #[ignore = "需要 git 在 PATH 中"]
+    async fn subdirectory_of_a_repo_does_not_leak_the_parent_status() {
+        let repo = temp_repo("subdir");
+        // 仓库根的未提交改动：泄露发生时它一定会出现在观察里。
+        std::fs::write(repo.join("parent-only.txt"), "父仓库的改动\n").unwrap();
+        let nested = repo.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let outcome = GitStatus::new(WorkspaceRoot::new(&nested)).run().await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Failed, "{}", outcome.content);
+        assert!(
+            outcome.content.contains("不是 git 仓库根"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            !outcome.content.contains("parent-only.txt"),
+            "不得泄露父仓库状态: {}",
+            outcome.content
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// diff 同样不得泄露父仓库：父仓库的差异对 workspace 里的模型是噪音。
+    #[tokio::test]
+    #[ignore = "需要 git 在 PATH 中"]
+    async fn subdirectory_of_a_repo_does_not_leak_the_parent_diff() {
+        let repo = temp_repo("subdir-diff");
+        std::fs::write(repo.join("base.txt"), "基线\n").unwrap();
+        commit_all(&repo);
+        std::fs::write(repo.join("base.txt"), "父仓库的改动\n").unwrap();
+        let nested = repo.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let outcome = GitDiff::new(WorkspaceRoot::new(&nested)).run(false).await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Failed, "{}", outcome.content);
+        assert!(
+            outcome.content.contains("不是 git 仓库根"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            !outcome.content.contains("父仓库的改动"),
+            "不得泄露父仓库差异: {}",
+            outcome.content
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[tokio::test]
