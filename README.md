@@ -160,7 +160,7 @@ flowchart TD
 系统处理真实代码仓库和可执行命令，必须明确以下约束：
 
 - 模型与 Agent 不直接获得无限制宿主机访问权：agent 经 **run_command / git_status / git_diff / 基准判据**发起的子进程都运行在**进程沙箱**内（Windows Job Object）——整树内存上限（单进程 4 GiB）、进程数上限（256）、超时或结束时**终止整个进程树**（含孙进程；`cmd /C "start /b ..."` 拉起的后代不再失控）。沙箱默认强制生效、不可关闭；创建或纳入失败时命令降级执行，但模型会在工具结果开头看到"进程沙箱未生效"的提示（该文本随 `ToolObserved` 进入审计证据），非 Windows 平台一律降级（Linux 版沙箱是后续工作）。**范围外**：MCP Server 子进程由 `QCH_MCP_CONFIG` 里的用户命令直接拉起，不经过沙箱——它不受上述限额与整树终止约束，环境也不脱敏（见下方已知边界）。
-- **受保护路径，agent 读写都被拒**（P8-1）：`.git`、`.qcodeharness`、以及根下的 `.env` / `.env.*`。这几个前缀命中的路径，`read_file` / `write_file` / `edit_file` / `list_dir` 直接在**路径解析**阶段拒绝，**不看策略配置**——策略能把一条规则放宽到 `allow`，但放不宽这一层。这样设计是因为"保护不留给自己去申请的许可"：历史、会话快照与凭据一旦被 agent 读到或改写，破坏是不可逆的，而任何"配置项忘了写"都会让它裸奔。`.gitignore`、`.github` 这类同样以 `.git` 开头的名字不受影响（只精确匹配 `.git`）。**大小写不敏感**：Windows 与 macOS 的文件系统默认如此，`.GIT/config` 与 `.git/config` 是同一处，所以 `.ENV`、`.Git/` 同样被拒。
+- **受保护路径，agent 读写都被拒**（P8-1）：`.git`、`.qcodeharness`、以及根下的 `.env` / `.env.*`。这几个前缀命中的路径，`read_file` / `write_file` / `edit_file` / `list_dir` 直接在**路径解析**阶段拒绝，**不看策略配置**——策略能把一条规则放宽到 `allow`，但放不宽这一层。这样设计是因为"保护不留给自己去申请的许可"：历史、会话快照与凭据一旦被 agent 读到或改写，破坏是不可逆的，而任何"配置项忘了写"都会让它裸奔。`.gitignore`、`.github` 这类同样以 `.git` 开头的名字不受影响（只精确匹配 `.git`）。判定按**文件系统的实际语义**归一化，三种变形都堵：**大小写**不敏感（Windows 与 macOS 默认如此，`.ENV`、`.Git/` 与 `.env`、`.git/` 是同一处）；**尾随空格和点**先剥掉再比（NTFS 本就会剥，`.env ` 落在磁盘上就是 `.env`——不归一化，把路径写成 `.env ` 就能读到凭据，而审批界面上显示的还是 `.env `）；**符号链接 / junction** 解析后再查一遍（在 workspace 里 `mklink /J jgit .git`，词法上 `jgit/config` 完全合法，落盘却打在真实的 `.git/config` 上）。
 - **越界写入必审**（P8-3）：策略判 `allow` 的命令，若看起来在 workspace 之外写东西——`del`/`rd`/`rmdir`/`move`/`ren`/`copy`/`rm`/`mv`/`cp`/`mkdir`/`Remove-Item` 这类动词配上盘符绝对路径、UNC 路径或含 `..` 的参数，或 `>` / `>>` 重定向到外部——会被**追加升级为 `require_approval`**，理由是升级的触发点。这类请求**不吃会话信任**——`a` / `p` 存下的信任对它们无效，每次都要重新问。
 - 文件操作限制在指定 Workspace 内，防范路径越界。
 - Shell、MCP 和外部连接遵循最小权限原则；高风险操作必须审批。
@@ -181,6 +181,7 @@ P8 新增机制的已知边界（同样影响"能不能上真实仓库"的判断
 - **deny 规则的条件无法求值时按拒绝处理。** 参数名不叫 `path`/`command` 时（MCP 工具、`git_diff`、未来新工具），作用域条件无从求值；`deny` 遇到这种情形直接拒绝而不是落回默认策略，否则一条"禁止碰 secrets/"会因为参数名不同而静默失效、翻成放行。`allow` 侧仍要求条件成立。
 - **越界写入检查是启发式，不是沙箱**。它按动词表 + 绝对路径/`..` 识别，看不懂 `Get-Content a | Set-Content ..\b` 这种管道写法，也认不出经过变量间接拼出的路径。它把"看起来越界"的调用升级成"必须问人"，是**兜底**而不是**隔离**——真正的隔离仍然要靠进程沙箱与受保护路径。同理，`&&` 之后的代码不在它的视野内（那正是上一条要拦的）。
 - **受保护路径只覆盖 workspace 内的相对路径**。`WorkspacePath` 先拒越界再查保护，所以 `../../.git/config` 命中的是越界拒绝而不是保护拒绝（都是拒，理由不同）。workspace 之外的路径由越界检查负责，与保护名单无关。同理，`run_command` 与 `git_*` 不经过 `WorkspacePath`——`type .env`、`git show HEAD:.env` 这类读法不在保护范围内，靠的是策略与审批。
+- **链接解析只在文件类工具这一侧**。junction / 符号链接的复查放在 infrastructure 层（`resolve_in`）：领域层不许碰文件系统，`canonicalize` 只能在那里调。因此这条防线对 `run_command`、`git_*` 和 MCP 工具无效——它们本就不经过 `WorkspacePath`（见上一条）。反过来，解析失败（目标不存在、盘符不对）时不追加拒绝，否则新建文件会被挡住。
 - **`search_text` 也读不到凭据文件**：它按跳过名单遍历，`.env`/`.env.*` 整份跳过（大小写不敏感）。这条是用户验收时补的——`read_file` 拒了 `.env`，但搜索能把凭据行连同行号打印出来，同一份秘密换条路就能读到。
 - **`path_prefix` 只作用于路径参数**（`path`），`command_prefix` 只作用于 `command` 参数；工具用了别的参数名时该条件不成立——拼写错误的字段名在加载时报错，拼写错误的**参数名**不会（deny 会 fail-closed，allow 会退化成不命中）。
 - **项目指令（P8-4）是一条被低估的 prompt 注入面**，而且是五条机制里唯一"全部载荷都是不可信文本"的一条。根位置 `QCODEHARNESS.md` **不在**受保护名单里，agent 自己能写：只要诱导 Coder 把一段藏指令的文本写进那个文件，一次性注入就固化成"此后每次运行、每个角色都生效"的系统提示词，而注入段的标题还声明它优先于通用规则。启动时只打印路径与字节数，不展示内容、不要求确认。次级位置 `.qcodeharness/instructions.md` 模型改不动（P8-1），但根位置改得动——这是有意的取舍（使用者要能随时编辑它），代价由使用者承担。缓解：发现注入后删掉根文件；但已存快照里的提示词不会因此更新，`--resume` 的会话仍按旧提示词跑，唯一的净化方式是丢弃会话重跑。
@@ -350,10 +351,14 @@ tool = "read_file"
 verdict = "require_approval"
 description = "读敏感目录要人工确认"
 
+# 只放行 src/ 下的写入：scope 把 allow 收窄到路径前缀，别处的 write_file
+# 落到兜底 deny。注意 scope 不写就等于没有范围限制——整条规则的描述若说
+# "src/ 下"而规则里没有 scope，说的是谎。
 [[rules]]
 tool = "write_file"
 verdict = "allow"
 description = "src/ 下的写入在信任范围内，免审"
+scope = { path_prefix = "src/*" }
 
 # 通配规则（不写 tool 字段匹配所有工具）放在最后兜底
 [[rules]]
@@ -383,7 +388,7 @@ description = "其余 shell 命令一律审批"
 | `command_prefix` | `command` | 命令头，尾部 `*` 为前缀匹配 |
 | `path_prefix` | `path` | 路径前缀，尾部 `*` 为前缀匹配 |
 
-`"cargo test *"` 匹配 `cargo test --nocapture` 也匹配 `cargo test`，但**不**匹配 `cargo testx`（`*` 只认到空格或结尾，与 Claude Code 的 `Bash(cmd:*)` 一致）；没有 `*` 就是精确相等，所以 `"src/"` 不匹配 `src/main.rs`，要写 `"src/*"`。只支持尾部通配，不支持 `git * main` 这种中间匹配。两个字段都不写等于没有作用域。
+`"cargo test *"` 匹配 `cargo test --nocapture` 也匹配 `cargo test`，但**不**匹配 `cargo testx`（`*` 之前那段必须原样出现，语义与 Claude Code 的 `Bash(cmd:*)` 一致）；没有 `*` 就是精确相等，所以 `"src/"` 不匹配 `src/main.rs`，要写 `"src/*"`。只支持尾部通配，不支持 `git * main` 这种中间匹配。两个字段都不写等于没有作用域。
 
 **`*` 不吞 shell 链接符**：命令头之后一出现 `&&` `||` `;` `|` `&` 或换行，规则就不命中、退回审批——`cargo test *` 因此不放行 `cargo test && rm -rf /`。代价是 `cargo test 2>&1` 也要多问一次（单个 `&` 算链接符），这是刻意偏向"多问"的取舍。
 

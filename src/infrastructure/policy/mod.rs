@@ -455,4 +455,29 @@ description = "忘了写 verdict"
             engine.rules.len()
         );
     }
+
+    /// 示例里那条带 scope 的 allow 必须真的排在前、兜底 require_approval 排在后。
+    ///
+    /// 用户验收时审计指出：README 有一段 `write_file` 的示例写着"src/ 下的
+    /// 写入免审"却**没有 scope**——描述承诺了范围，规则却没给，用户照抄会
+    /// 得到"所有 write_file 都免审"。文档与规则之间的这种漂移是静默的：
+    /// 测试全绿、抄过去就出事。这里顺带钉住"allow 在前、require_approval
+    /// 兜底在后"的顺序，顺序反了 cargo test 反而要审批。
+    #[test]
+    fn the_scoped_allow_rule_comes_before_the_catch_all() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.toml");
+
+        let engine = load(Some(&path)).expect("policy.example.toml 应能解析");
+        let spec = spec(false);
+
+        let cargo_test = engine.evaluate(&call_with("run_command", json!({"command": "cargo test"})), &spec);
+        let other = engine.evaluate(&call_with("run_command", json!({"command": "git status"})), &spec);
+
+        assert_eq!(cargo_test.verdict, PolicyVerdict::Allow, "cargo test 应免审");
+        assert_eq!(
+            other.verdict,
+            PolicyVerdict::RequireApproval,
+            "其余 shell 命令应落到兜底审批"
+        );
+    }
 }

@@ -46,6 +46,18 @@ pub enum PathRejected {
     },
 }
 
+/// 判断单个路径组件的名字是否命中受保护名单。
+///
+/// 末尾的空格和点要先剥掉：NTFS 等文件系统就是这么做的，`.env ` 与
+/// `.env` 落在磁盘上是同一个文件。不先归一化，模型把路径写成 `.env `
+/// 就能读到凭据文件、覆盖 `.env`，而审批界面上显示的仍是 `.env `——
+/// 人很难认出那就是 `.env`。这不是假想的攻击面，是 Windows 路径解析的
+/// 既定行为。
+fn is_protected_name(name: &str) -> bool {
+    let name = name.trim_end_matches([' ', '.']).to_ascii_lowercase();
+    matches!(name.as_str(), ".git" | ".qcodeharness" | ".env") || name.starts_with(".env.")
+}
+
 /// 判断一条 workspace 相对路径是否落在受保护区域内。
 ///
 /// `.git` 是版本库元数据（改它就是改历史），`.qcodeharness` 是本工具自己的
@@ -62,16 +74,15 @@ pub enum PathRejected {
 /// `.git/config` 是同一处。若按字节精确比较，把路径改写成大写就能读到
 /// `.env`、改写 `.git/config`——而"这两个位置 agent 碰不得"正是这里唯一
 /// 要守的东西。比较前统一转小写（ASCII 小写化不改变字节长度，分配一次）。
-fn is_protected(raw: &str) -> bool {
-    let first = Path::new(raw)
+///
+/// 单独公开而不是藏在 `resolve` 里：infrastructure 层解析完符号链接后，
+/// 要拿物理路径再问一次这个问题（见 `tool::resolve_in`）。
+pub fn is_protected_path(path: &Path) -> bool {
+    let first = path
         .components()
         .find(|component| !matches!(component, Component::CurDir));
     match first {
-        Some(Component::Normal(name)) => {
-            let name = name.to_string_lossy().to_ascii_lowercase();
-            matches!(name.as_str(), ".git" | ".qcodeharness" | ".env")
-                || name.starts_with(".env.")
-        }
+        Some(Component::Normal(name)) => is_protected_name(&name.to_string_lossy()),
         _ => false,
     }
 }
@@ -109,7 +120,7 @@ impl WorkspacePath {
         if escapes {
             return Err(PathRejected::Escape { raw: raw.to_owned() });
         }
-        if is_protected(raw) {
+        if is_protected_path(relative) {
             return Err(PathRejected::Protected { raw: raw.to_owned() });
         }
         Ok(Self(root.0.join(relative)))
@@ -216,6 +227,29 @@ mod tests {
             assert!(
                 WorkspacePath::resolve(&workspace(), allowed).is_ok(),
                 "`{allowed}` 不应被误杀"
+            );
+        }
+    }
+
+    /// 尾随空格和点不能绕过保护。
+    ///
+    /// NTFS 会剥掉路径组件末尾的空格和点，`.env ` 与 `.env` 落在磁盘上是
+    /// 同一个文件。用户验收时审计拿这条打穿了 P8-1：`read_file(".env ")`
+    /// 成功返回凭据内容，`write_file(".env ", ...)` 成功覆盖了真实的 `.env`。
+    /// 审批界面上显示的路径是 `".env "`，人几乎不可能认出它就是 `.env`。
+    #[test]
+    fn protected_names_survive_trailing_spaces_and_dots() {
+        for rejected in [".env ", ".ENV  ", ".env .", ".env.", ".env..", ".git ", ".GIT ."] {
+            assert!(
+                WorkspacePath::resolve(&workspace(), rejected).is_err(),
+                "`{rejected}` 归一化后命中受保护名单，应被拒绝"
+            );
+        }
+        // 反向：尾巴上没有空格/点的，以及剥完之后仍然不像的，都要放行。
+        for allowed in [".envx", ".envrc", ".envrc.d/keep.txt", "notes .txt", "src/main.rs"] {
+            assert!(
+                WorkspacePath::resolve(&workspace(), allowed).is_ok(),
+                "`{allowed}` 不该被误杀"
             );
         }
     }

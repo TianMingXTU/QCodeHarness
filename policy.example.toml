@@ -41,21 +41,8 @@ tool = "edit_file"
 verdict = "require_approval"
 description = "修改文件内容，每次都要人确认"
 
-[[rules]]
-tool = "run_command"
-verdict = "require_approval"
-description = "shell 命令威力最大，每次都要人确认"
-
-# ── 兜底说明（不要照抄）────────────────────────────────────────
-# 可以再加一条不带 tool 字段的通配规则，把没列到的工具全部拒绝：
-#
-#   [[rules]]
-#   verdict = "deny"
-#   description = "未列入白名单的工具一律禁止"
-#
-# 但注意：这会把"以后新增的工具"也一并禁掉——模型每调一个新工具都会
-# 被拒，直到你把它显式加进配置。本示例不启用它：默认策略
-# （非只读要审批）已经是安全的兜底，deny 全禁适合 lockdown 场景。
+# run_command 的规则在下面的"参数级作用域"一节：cargo test 一族免审，
+# 其余一律审批。写在这里会被那条宽规则挡住，见该节的顺序说明。
 
 # ── 参数级作用域（P8-2）────────────────────────────────────────
 # scope 让一条规则只匹配"工具名 + 参数"都命中的调用，而不是整个工具。
@@ -65,6 +52,11 @@ description = "shell 命令威力最大，每次都要人确认"
 #   path_prefix     路径前缀，尾部 * 表示前缀匹配
 #
 # 例子：cargo test 免审，但 run_command 其他子命令仍要审批。
+#
+# ⚠ 这条必须写在下面那条"run_command 一律审批"的前面。规则按数组顺序
+# 匹配、第一条命中的生效：宽规则在前，后面补的窄 allow 永远撞不上它，
+# 用户照抄会得到"cargo test 还是每次都要审"。想收窄某个子命令，
+# 就把窄规则提前。
 
 [[rules]]
 tool = "run_command"
@@ -77,9 +69,20 @@ tool = "run_command"
 verdict = "require_approval"
 description = "其余 shell 命令一律审批"
 
+# ── 兜底说明（不要照抄）────────────────────────────────────────
+# 可以再加一条不带 tool 字段的通配规则，把没列到的工具全部拒绝：
+#
+#   [[rules]]
+#   verdict = "deny"
+#   description = "未列入白名单的工具一律禁止"
+#
+# 但注意：这会把"以后新增的工具"也一并禁掉——模型每调一个新工具都会
+# 被拒，直到你把它显式加进配置。本示例不启用它：默认策略
+# （非只读要审批）已经是安全的兜底，deny 全禁适合 lockdown 场景。
+
 # 语义（与 Claude Code 的 Bash(cmd:*) 对齐）：
 #   "cargo test *" 匹配 "cargo test --nocapture"，也匹配 "cargo test"
-#   "cargo test *" 不匹配 "cargo testx"     —— * 只认到空格或结尾
+#   "cargo test *" 不匹配 "cargo testx"     —— * 之前那段必须原样出现
 #   "cargo build"  不匹配 "cargo build --release"（没有 * 就是精确相等）
 #   "src/"         不匹配 "src/main.rs"      —— 要写 "src/*"
 #
