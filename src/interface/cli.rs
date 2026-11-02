@@ -16,13 +16,14 @@ const OBSERVE_PREVIEW_CHARS: usize = 400;
 
 /// 用法说明，参数缺失时打印。
 pub const USAGE: &str = "\
-用法: cargo run -- [--yes] [--kind <模板>] \"任务描述\"
+用法: cargo run -- [--yes] [--ai-review] [--kind <模板>] \"任务描述\"
       cargo run -- --list-sessions
       cargo run -- [--yes] --resume <会话ID>
       cargo run -- --report [--report-dir <目录>] [--json]
       cargo run -- --benchmark
 示例: cargo run -- \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
       cargo run -- --yes \"非交互场景下跑同一个任务\"
+      cargo run -- --ai-review \"让模型先审一遍，拿不准的再问人\"
       cargo run -- --list-sessions
       cargo run -- --resume <会话ID>
       cargo run -- --report
@@ -37,6 +38,9 @@ pub struct CliArgs {
     pub task: Option<String>,
     /// 跳过人工审批，所有工具自动放行。
     pub auto_approve: bool,
+    /// 启用 AI 审批审查员：模型先判 approve/deny/human，只有它
+    /// 拿不准时才退回交互式闸门问人。
+    pub ai_review: bool,
     /// 要恢复的会话 ID（`--resume <id>`）。
     pub resume: Option<String>,
     /// 只列出可恢复的会话（`--list-sessions`），然后退出。
@@ -67,6 +71,7 @@ pub fn parse_args() -> Option<CliArgs> {
 /// 不接 `clap`——个位数开关不值得引一个依赖。
 pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut auto_approve = false;
+    let mut ai_review = false;
     let mut resume = None;
     let mut list_sessions = false;
     let mut kind = None;
@@ -80,6 +85,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--yes" => auto_approve = true,
+            "--ai-review" => ai_review = true,
             "--list-sessions" => list_sessions = true,
             "--report" => report = true,
             "--json" => json = true,
@@ -147,6 +153,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     Some(CliArgs {
         task,
         auto_approve,
+        ai_review,
         resume,
         list_sessions,
         kind,
@@ -294,6 +301,30 @@ mod tests {
         assert_eq!(args.task.as_deref(), Some("检查这段代码"));
         assert!(args.auto_approve);
         assert_eq!(args.kind.as_deref(), Some("review"));
+    }
+
+    /// `--ai-review` 与 `--yes` 各自独立，也能同时给出。
+    ///
+    /// 同时给出时 main.rs 走 `--yes`（用户已声明不用人管，再插一次模型
+    /// 审查只是白花调用）——解析层不替用户做这个决定，只把两个意图都
+    /// 如实带下去。
+    #[test]
+    fn ai_review_flag_stands_alone_and_combines_with_yes() {
+        let alone = parse_from(argv(&["--ai-review", "跑一下测试"])).unwrap();
+        assert!(alone.ai_review);
+        assert!(!alone.auto_approve);
+        assert_eq!(alone.task.as_deref(), Some("跑一下测试"));
+
+        let both = parse_from(argv(&["--ai-review", "--yes", "跑一下测试"])).unwrap();
+        assert!(both.ai_review);
+        assert!(both.auto_approve);
+    }
+
+    /// 默认不开 AI 审查：交互式闸门仍是生产默认。
+    #[test]
+    fn ai_review_is_off_by_default() {
+        let args = parse_from(argv(&["跑一下测试"])).unwrap();
+        assert!(!args.ai_review);
     }
 
     #[test]
