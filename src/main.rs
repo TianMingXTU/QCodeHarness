@@ -19,12 +19,13 @@ use qcode_harness::application::agent_run::{
     new_session_id, AgentDependencies, AgentRunner, RunState,
 };
 use qcode_harness::application::agent_roster::AgentRoster;
-use qcode_harness::application::benchmark::run_benchmark;
+use qcode_harness::application::benchmark::{run_benchmark, run_long_benchmark};
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{ApprovalGate, EvidenceSink};
 use qcode_harness::application::report::{render_json, render_text, BenchmarkReport};
-use qcode_harness::application::snapshot::{RunSnapshot, SessionStore};
+use qcode_harness::application::snapshot::{RunSnapshot, SessionStore, TaskStore};
+use qcode_harness::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
 use qcode_harness::application::tool_registry::ToolRegistry;
 use qcode_harness::domain::budget::Budget;
 use qcode_harness::domain::context::ContextBudget;
@@ -44,7 +45,9 @@ use qcode_harness::infrastructure::mcp::config::McpConfig;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 use qcode_harness::infrastructure::policy;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
+use qcode_harness::infrastructure::task_store::JsonTaskStore;
 use qcode_harness::infrastructure::tool::all_tools;
+use qcode_harness::infrastructure::worktree::RootedWorktreeScanner;
 use qcode_harness::interface::cli::{self, ConsoleReporter};
 use qcode_harness::interface::instructions;
 
@@ -183,7 +186,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ── 基准模式：跑 benchmarks/ 下的任务集并打分。放在全局工具装配
     // 之前——运行器为每个任务重建以 fixture 拷贝为根的注册表，全局
     // 注册表与 MCP 连接在这里用不上。──
-    if args.benchmark {
+    if args.benchmark || args.benchmark_long {
         // 基准无人值守：交互式审批会把整场运行挂住，强制自动放行。
         let deps = AgentDependencies {
             model: Arc::new(RigChatGateway::new(model.erase())),
@@ -194,8 +197,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             roster: AgentRoster::builtin(),
             context_budget,
             evidence: Arc::new(MemoryEvidenceSink::new()),
-            // 基准会话不留快照：恢复它们只会把任务跑回当前工作区，
+            // 短任务基准不留快照：恢复它们只会把任务跑回当前工作区，
             // 而不是当时的 fixture 拷贝。证据照常落盘，--report 统计得到。
+            // 长任务基准的运行器会在每段装配自己的快照存储（恢复是
+            // 它流程的一部分），这里的 None 只是装配模板的占位。
             session_store: None,
         };
         let mut budget = Budget::new(config.max_turns);
@@ -205,6 +210,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let benchmarks_root = workspace.join("benchmarks");
         println!("基准任务集: {}", benchmarks_root.display());
         println!("模型: {} @ {}", config.model, config.base_url);
+        if args.benchmark_long {
+            let results =
+                run_long_benchmark(&deps, &budget, &benchmarks_root, &workspace).await?;
+            let passed = results.iter().filter(|result| result.passed).count();
+            println!("\n通过 {passed}/{} 个长任务", results.len());
+            if passed < results.len() {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         let results = run_benchmark(&deps, &budget, &benchmarks_root, &workspace).await?;
         let passed = results.iter().filter(|result| result.passed).count();
         println!("\n通过 {passed}/{} 个任务", results.len());
@@ -323,6 +338,87 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    // ── 任务级恢复：从步骤边界接着走，前面的步骤不重做。──
+    if let Some(id_text) = args.resume_task {
+        let task_id = TaskId::new(id_text);
+        let task_store = JsonTaskStore::new(&workspace);
+        let Some(snapshot) = task_store
+            .load(&task_id)
+            .map_err(|error| format!("读取任务快照失败: {error}"))?
+        else {
+            eprintln!(
+                "没有找到任务 {} 的快照；任务 ID 在运行失败时打印过",
+                task_id.as_str()
+            );
+            std::process::exit(1);
+        };
+        println!(
+            "恢复任务 {}（已完成 {}/{} 步）",
+            task_id.as_str(),
+            snapshot.task.current_index(),
+            snapshot.task.steps().len(),
+        );
+        // 工作区检查由编排器在恢复前做（快照里存着"当时的样子"）。
+        // CLI 这边先把差异打出来，让人看得见到底改了什么——
+        // 编排器默认拒绝恢复，用户看完可以加 --force-worktree 放行。
+        //
+        // 快照里没有清单时不比对：空清单 vs 当前清单，每个文件都是
+        // "新增"，全量误报。"这一道检查没有跑"由编排器统一出声，
+        // CLI 只负责把查到的差异打印出来，两处各报一遍是噪音。
+        let scanner = RootedWorktreeScanner::new(&workspace);
+        if let Some(ResumeCheck::WorktreeChanged { changes }) = (!snapshot.worktree.is_empty())
+            .then(|| task_resume::check_worktree(&snapshot.worktree, &scanner))
+        {
+            let described: Vec<String> = changes.iter().map(|change| change.describe()).collect();
+            eprintln!(
+                "工作区在任务中断后被改动过：\n{}",
+                described
+                    .iter()
+                    .map(|text| format!("  - {text}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        let evidence_factory = evidence_factory_for(&workspace, config.max_turns);
+        let deps = AgentDependencies {
+            model: Arc::new(RigChatGateway::new(model.erase())),
+            tools: registry,
+            approvals,
+            clock,
+            policy,
+            roster: AgentRoster::builtin(),
+            context_budget,
+            evidence: Arc::new(MemoryEvidenceSink::new()),
+            session_store: Some(store.clone()),
+        };
+        let mut orchestrator =
+            Orchestrator::new(deps, budget, evidence_factory).with_task_store(Arc::new(task_store));
+        // 工作区被改动时默认拒绝恢复。用户确认过就加 --force-worktree。
+        let policy = if args.force_worktree {
+            WorktreeChangePolicy::Confirmed
+        } else {
+            WorktreeChangePolicy::Refuse
+        };
+        orchestrator = orchestrator
+            .with_worktree_scanner(Arc::new(RootedWorktreeScanner::new(&workspace)))
+            .with_worktree_policy(policy);
+        let outcome = match orchestrator.resume(snapshot).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+        println!("\n──── 最终答案 ────\n{}", outcome.answer);
+        println!(
+            "\n（任务 {} · 本次完成 {} 步 · 会话: {}）",
+            task_id.as_str(),
+            outcome.steps_completed,
+            outcome.session_id.as_str()
+        );
+        return Ok(());
+    }
+
     let task = args.task.expect("parse_args 保证：非 list/resume 模式必有任务描述");
 
     // --kind 选模板；不传默认 bug-fix（最常见）。
@@ -377,17 +473,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 每步一份证据：独立的 JSONL 文件（与会话 ID 同名）+ 一个新的控制台
     // 播报器（轮次号每步从头计，复用旧播报器会丢步骤 2-4 的分隔线）。
-    let evidence_factory: EvidenceFactory = {
-        let workspace = workspace.clone();
-        Arc::new(move |session_id: &SessionId| {
-            let path = session_path(&workspace, session_id.as_str());
-            let jsonl = JsonlEvidenceSink::open(&path)?;
-            Ok(Arc::new(FanoutEvidenceSink::new(vec![
-                Arc::new(jsonl),
-                Arc::new(ConsoleReporter::new(config.max_turns)) as Arc<dyn EvidenceSink>,
-            ])) as Arc<dyn EvidenceSink>)
-        })
-    };
+    let evidence_factory = evidence_factory_for(&workspace, config.max_turns);
 
     // 任务 ID 复用会话 ID 的生成策略：唯一、可读，证据/快照同名可互查。
     let task_id = TaskId::new(new_session_id(&*clock).as_str());
@@ -406,18 +492,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // 快照落盘随运行自动开启；--resume 可从任一会话恢复。
         session_store: Some(store.clone()),
     };
-    let mut orchestrator = Orchestrator::with_roster(deps, budget, evidence_factory, roster);
-    let mut task = orchestrator.create_task(task_id, kind, &task);
+    let mut orchestrator = Orchestrator::with_roster(deps, budget, evidence_factory, roster)
+        .with_task_store(Arc::new(JsonTaskStore::new(&workspace)))
+        .with_worktree_scanner(Arc::new(RootedWorktreeScanner::new(&workspace)));
+    let mut task = orchestrator.create_task(task_id.clone(), kind, &task);
 
     let outcome = match orchestrator.run(&mut task).await {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!("{error}");
-            // 失败时刻把会话 ID 给出来：证据文件按会话 ID 命名，用户拿到
-            // ID 就能翻证据或 --resume，不用再翻目录。
+            // 失败时刻把会话 ID 与任务 ID 给出来：证据文件按会话 ID 命名，
+            // 任务快照按任务 ID 命名。拿到 ID 就能翻证据或 --resume-task，
+            // 不用再翻目录。
             if let ApplicationError::StepFailed { session_id, .. } = &error {
                 eprintln!("会话 {session_id} 的证据已写入 .qcodeharness/sessions/");
             }
+            eprintln!(
+                "任务 {} 的快照已写入 .qcodeharness/tasks/；用 --resume-task {} 接着跑",
+                task_id.as_str(),
+                task_id.as_str()
+            );
             std::process::exit(1);
         }
     };
@@ -512,6 +606,23 @@ fn fanout_evidence(
         Arc::new(jsonl),
         reporter as Arc<dyn EvidenceSink>,
     ])))
+}
+
+/// 每任务的证据汇工厂：一个任务一份 JSONL + 一个控制台播报器。
+///
+/// 独立成函数是因为新任务与任务级恢复两条入口都要用它——恢复路径上
+/// 证据要**追加**到同一个文件（复盘时一个 ID 看到全貌），所以工厂
+/// 每次都按会话 ID 打开同一个路径。
+fn evidence_factory_for(workspace: &Path, max_turns: u32) -> EvidenceFactory {
+    let workspace = workspace.to_path_buf();
+    Arc::new(move |session_id: &SessionId| {
+        let path = session_path(&workspace, session_id.as_str());
+        let jsonl = JsonlEvidenceSink::open(&path)?;
+        Ok(Arc::new(FanoutEvidenceSink::new(vec![
+            Arc::new(jsonl),
+            Arc::new(ConsoleReporter::new(max_turns)) as Arc<dyn EvidenceSink>,
+        ])) as Arc<dyn EvidenceSink>)
+    })
 }
 
 /// 跑到底并汇报结果。新任务与恢复两条入口共用的尾巴。

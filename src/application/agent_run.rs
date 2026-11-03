@@ -29,11 +29,22 @@ use crate::domain::policy::{PolicyDecision, PolicyEngine, PolicyVerdict};
 use crate::domain::sandbox::write_escape_suspect;
 use serde_json::Value;
 use crate::domain::session::{ContextSlice, Session};
-use crate::domain::tool::{ToolCall, ToolOutcome, ToolSpec};
+use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 
 /// 摘要连续失败的上限。给两次机会（瞬态故障实测存在），之后本次运行
 /// 不再重试：持续失败的摘要调用每轮都白花一次模型调用。
 const SUMMARY_FAILURE_LIMIT: u32 = 2;
+
+/// 重新询问审批时的统一说法。
+///
+/// 措辞要点破"之前问过、那次没答复"：人被重新问一次时，最自然的反应
+/// 是"怎么又问我"，而不是"上次那个还没答复"。不点破这一层，人可能
+/// 以为程序出了故障，或者——更糟——顺手按了 y。
+pub const APPROVAL_REASK_REASON: &str =
+    "这个审批请求之前就问过，那时没答复；恢复后需要你重新决定一次。";
+
+/// 重放提示里给出的原因。
+pub const REPLAY_REASON: &str = "中断发生在这次调用执行期间，副作用可能已经发生，结果未知";
 
 /// 运行状态机。
 ///
@@ -189,6 +200,18 @@ pub struct AgentRunner {
     /// 连续摘要失败次数。达到上限后本次运行不再重试摘要：
     /// 持续失败的摘要调用每轮都白花一次模型调用，截断它。
     summary_failures: u32,
+    /// 恢复时的重放提示：中断时正在执行的那一次调用。
+    ///
+    /// `Some` 表示这个调用在中断前已发起、可能已经产生副作用，而结果
+    /// 未知。恢复时**不自动重跑**——重跑一次就是把同一次副作用做两遍；
+    /// 也不装作没发生过——把这件事告诉模型，由它决定要不要再来一次
+    /// （见 [`AgentRunner::replay_interrupted_call`]）。
+    replay_pending: Option<ToolCall>,
+    /// 恢复时的重新审批标记：这次审批之前问过、没答复。
+    ///
+    /// 恢复后要**再问一次**闸门，绝不凭快照放行（见
+    /// [`AgentRunner::apply_resume_semantics`]）。
+    reask_approval: bool,
 }
 
 impl AgentRunner {
@@ -241,6 +264,8 @@ impl AgentRunner {
             run_start,
             elapsed_base: Duration::ZERO,
             summary_failures: 0,
+            replay_pending: None,
+            reask_approval: false,
         };
         runner.refresh_role_boundary();
         runner
@@ -299,6 +324,26 @@ impl AgentRunner {
                 .into());
             }
         }
+        // 观察数就是"这一轮已经跑完几条调用"。它不能超过调用数（观察比
+        // 调用还多是自相矛盾），而在"正在执行"的状态里它必须更少——
+        // 全部配平意味着这一轮已经结束，那该停在"等模型回复"而不是
+        // "执行中"。这两种形态构造路径产生不出来，在入口就拦下。
+        if let Some(pending) = &snapshot.pending {
+            if pending.outcomes.len() > pending.turn.calls.len() {
+                return Err(StoreError::Corrupt(
+                    "快照的观察数超过了调用数".to_owned(),
+                )
+                .into());
+            }
+            if matches!(snapshot.state, RunState::Dispatching(_))
+                && pending.outcomes.len() == pending.turn.calls.len()
+            {
+                return Err(StoreError::Corrupt(
+                    "快照停在执行中，但这一轮的调用已经全部配平".to_owned(),
+                )
+                .into());
+            }
+        }
         let session = Session::from_snapshot(snapshot.session_id.clone(), snapshot.session)?;
         let AgentDependencies {
             model,
@@ -336,10 +381,54 @@ impl AgentRunner {
             run_start: clock_now,
             elapsed_base,
             summary_failures: 0,
+            replay_pending: None,
+            reask_approval: false,
         };
         runner.refresh_role_boundary();
+        // 半轮状态各有各的恢复语义，翻译成"接下来该怎么走"。
+        runner.apply_resume_semantics();
         runner.save_snapshot();
         Ok(runner)
+    }
+
+    /// 恢复语义：把快照里的半轮状态翻译成"接下来该怎么走"。
+    ///
+    /// 三种半轮状态，三种语义：
+    ///
+    /// - **`Evaluating`**：调用还没执行，策略也还没裁决。恢复后照常走
+    ///   评估流程——裁决用**当前**的 [`PolicyEngine`] 重算。快照里其实
+    ///   没有存裁决结果（裁决只落在审计事件里），所以"策略可能变了"
+    ///   是天然成立的：恢复时看到的是今天的策略，不是中断那天的。
+    /// - **`AwaitingApproval`**：上一次已经问过人，人没答复。恢复后把
+    ///   状态退回评估态，让当前策略重新裁决；若仍要审批，就**再问一次**
+    ///   （带 `resumed` 标记），绝不凭快照放行。
+    /// - **`Dispatching`**：调用已发起、可能已经产生副作用，结果未知。
+    ///   恢复后**不自动重跑**，而是把重放提示交给模型，由它决定要不要
+    ///   再跑一次。
+    ///
+    /// 退回评估态而不是就地续跑，是为了让三种半轮状态共用同一条"先裁决、
+    /// 再决定要不要问人"的路径——恢复语义只有一处实现，不会出现"从
+    /// `AwaitingApproval` 恢复走的是另一套规矩"的分支。
+    fn apply_resume_semantics(&mut self) {
+        let Some(pending) = self.pending.clone() else {
+            return;
+        };
+        match self.state.clone() {
+            RunState::AwaitingApproval(_) => {
+                self.state = RunState::Evaluating(pending.turn.calls.clone());
+                self.reask_approval = true;
+            }
+            RunState::Dispatching(_) => {
+                self.state = RunState::Evaluating(pending.turn.calls.clone());
+                // 在途的那一条 = 已配平的条数（观察数就是"跑完几条"）。
+                self.replay_pending = pending
+                    .turn
+                    .calls
+                    .get(pending.outcomes.len())
+                    .cloned();
+            }
+            _ => {}
+        }
     }
 
     /// 会话 ID。
@@ -378,6 +467,22 @@ impl AgentRunner {
         spec: AgentSpec,
         prompt: String,
     ) -> Result<(), ApplicationError> {
+        // 恢复路径：runner 停在这一步的**半轮**上（评估中 / 等人审批 /
+        // 正在执行），而这一步的交代已经在历史末尾。这种情况下"进入
+        // 下一步"其实是"继续这一步"——把状态机重置成"等模型回复"会把
+        // pending 那一轮整个丢掉，中断时的执行现场（可能已经发生的
+        // 副作用、还没答复的审批）就此消失，恢复语义也就无从谈起。
+        let resuming_same_step = matches!(
+            self.state,
+            RunState::Evaluating(_) | RunState::AwaitingApproval(_) | RunState::Dispatching(_)
+        ) && self.session.ends_with_user_message(&prompt);
+        if resuming_same_step {
+            // 只换角色与白名单：这一步的现场（状态机位置与 pending）原样保留。
+            self.spec = spec;
+            self.refresh_role_boundary();
+            self.save_snapshot();
+            return Ok(());
+        }
         // 上一步的最终答案必须先落进历史。`step()` 的 Completed 分支
         // 刻意不提交轮次（最终答案没有观察可配），而单会话编排的全部
         // 价值就在于下一步看得见上一步的结论——不提交的话，第二步的
@@ -387,7 +492,16 @@ impl AgentRunner {
             self.session
                 .commit_round(AgentTurn { text: answer, calls: Vec::new() }, Vec::new())?;
         }
-        self.session.push_user(prompt);
+        // 恢复路径上这一步的交代**已经在历史里**了：中断就发生在这一步
+        // 当中，交接是快照的一部分。再推一遍就成了同一句交代出现两次，
+        // 模型看到两条一模一样的指令，"会话开了几步"也会因此算错。
+        //
+        // 只看历史末尾不够：预算耗尽时末条是观察（那一轮已提交），交代
+        // 在更早的位置。查全历史——这条 prompt 由 step_prompt 唯一生成，
+        // 全历史只该有一条。
+        if !self.session.has_user_message(&prompt) {
+            self.session.push_user(prompt);
+        }
         self.spec = spec;
         self.refresh_role_boundary();
         self.state = RunState::AwaitingModel;
@@ -396,6 +510,32 @@ impl AgentRunner {
         // 结束，而实际上还有步骤没跑。
         self.save_snapshot();
         Ok(())
+    }
+
+    /// 追加一条用户消息到会话历史。
+    ///
+    /// P10 任务级恢复用：把已完成步骤的结论交回给模型，让恢复后的
+    /// 下一步看得见前面几步查出了什么（见 `application::task_resume`）。
+    ///
+    /// 与 [`Self::begin_step`] 的分工：`begin_step` 换角色、交代步骤、
+    /// 并把上一步的最终答案提交成一轮；这条只推一条消息，不动状态机。
+    /// 恢复路径上 runner 是从快照里重建的，上一步的答案已经在历史里
+    /// （它随会话快照一起存着），不需要再提交一次。
+    ///
+    /// 不存快照：这条消息本身就会随下一次保存点一起落盘，而恢复刚
+    /// 发生时立刻存一份会把"刚恢复"与"刚交接"两个状态混在一个文件里，
+    /// 反而更难看出恢复到了哪。
+    pub fn push_user_message(&mut self, message: impl Into<String>) {
+        self.session.push_user(message);
+    }
+
+    /// 把一条用户消息插到当前步骤交代之前。
+    ///
+    /// 结论交接用：结论是对前几步的总结，落在"现在做第几步"这条交代
+    /// 之前才是对的顺序——放后面就成了倒着说。
+    pub fn insert_user_message_before_step(&mut self, message: impl Into<String>) {
+        let position = self.session.step_prompt_position();
+        self.session.insert_user_at(position, message);
     }
 
     /// 按当前 `spec.role` 重算角色可调用的工具名。
@@ -443,16 +583,139 @@ impl AgentRunner {
     /// 上 `Evaluating` 的检查被整段跳过。只在 `Evaluating` 查一次的后果
     /// 是：一个停在 `Dispatching(write_file)` 的受限角色快照，恢复后
     /// 就能把写工具放行。
+    ///
+    /// `in_flight` 表示这次调用正是中断时正在执行的那一条。越权时要多
+    /// 说一句"它可能已经执行过"：角色边界管的是**现在**能不能调这个
+    /// 工具，而那次调用可能在中断前就已经跑掉了——只说"不许调"会让
+    /// 模型以为它压根没跑过，于是照原样再提一次。
     async fn refuse_out_of_role(
         &mut self,
         call: &ToolCall,
+        in_flight: bool,
     ) -> Result<Option<RunState>, ApplicationError> {
         let Some(reason) = self.role_refusal(call) else {
             return Ok(None);
         };
+        let reason = if in_flight {
+            format!(
+                "{reason}（另注：这次调用在中断前已经发起，可能已经执行过；\
+                 上面这条拒绝只说明现在不能执行它。）"
+            )
+        } else {
+            reason
+        };
         self.record_and_advance(call.clone(), ToolOutcome::refused(reason))
             .await
             .map(Some)
+    }
+
+    /// 这次调用是不是"中断时正在执行"的那一条。
+    ///
+    /// 是的话，它可能已经产生了副作用——恢复时不自动重跑，而是把决定权
+    /// 交回模型（见 [`AgentRunner::replay_interrupted_call`]）。
+    fn is_in_flight(&self, call: &ToolCall) -> bool {
+        self.replay_pending
+            .as_ref()
+            .is_some_and(|pending| pending.id == call.id)
+    }
+
+    /// 造一份审批请求并停在闸门前。
+    ///
+    /// `resumed` 标出"这是恢复后的重新询问"：闸门据此不让会话信任免掉
+    /// 这一问，人据此知道上一次问过、没答复。
+    fn park_at_approval(
+        &mut self,
+        call: ToolCall,
+        annotations: ToolAnnotations,
+        reason: Option<String>,
+        resumed: bool,
+    ) -> RunState {
+        let request = ApprovalRequest {
+            turn: self.session.rounds() + 1,
+            call,
+            annotations,
+            reason,
+            resumed,
+        };
+        if resumed {
+            // 恢复路径上那一次"问过"发生在上一个进程里，当前证据文件里
+            // 没有它——补一条，否则事后翻 JSONL 会以为人从头到尾只被问过
+            // 一次。
+            self.record(AuditEvent::ApprovalReasked {
+                turn: request.turn,
+                tool: request.call.name.clone(),
+                reason: APPROVAL_REASK_REASON.to_owned(),
+            });
+        }
+        self.state = RunState::AwaitingApproval(request.clone());
+        // 最重要的保存点：等人审批时人可能走开、进程可能被杀，
+        // 快照必须先落盘，恢复后才能把同一个请求重新递给闸门。
+        self.save_snapshot();
+        RunState::AwaitingApproval(request)
+    }
+
+    /// 恢复时处理"中断时正在执行"的那一次调用。
+    ///
+    /// **不执行它。** 中断发生在调用发起之后、观察记下之前——它可能已经
+    /// 产生了副作用（文件已写、命令已跑），而我们不知道结果。重跑一次
+    /// 就是把同一次副作用做两遍；不重跑又不能装作没发生过。于是：
+    ///
+    /// 1. 留一条 [`AuditEvent::ToolCallReplayed`] 证据；
+    /// 2. 给模型回一条观察，说明"这个调用之前跑过、结果是什么、要不要
+    ///    再跑由你决定"；
+    /// 3. 这一轮照常配平，模型下一轮就能看到这条提示并自己决定。
+    async fn replay_interrupted_call(
+        &mut self,
+        call: ToolCall,
+    ) -> Result<RunState, ApplicationError> {
+        let turn = self.session.rounds() + 1;
+        let previous = self.previous_outcome_of(&call);
+        self.record(AuditEvent::ToolCallReplayed {
+            turn,
+            tool: call.name.clone(),
+            reason: REPLAY_REASON.to_owned(),
+            previous_outcome: previous.clone(),
+        });
+        // 只对这一次调用生效：重放提示说过就作废。
+        self.replay_pending = None;
+        let content = replay_notice(&call, previous.as_ref());
+        self.record_and_advance(call, ToolOutcome::refused(content)).await
+    }
+
+    /// 这个调用在本次会话里之前跑过没有；跑过就把那次的结果找出来。
+    ///
+    /// 判据是"工具名与参数完全一致"：同一路径的同一写入、同一参数的
+    /// 同一命令。参数不同就不是同一件事——拿别的结果当"上次的结果"，
+    /// 会把模型引向错误的结论（它会以为文件已经是新内容了）。
+    ///
+    /// 先看本轮已完成的调用（它们还没进历史，但确实跑过），再看历史里
+    /// 更早的轮次。
+    fn previous_outcome_of(&self, call: &ToolCall) -> Option<ToolOutcome> {
+        if let Some(pending) = &self.pending {
+            let index = pending.turn.calls.iter().position(|earlier| {
+                earlier.name == call.name && earlier.arguments == call.arguments
+            });
+            if let Some(outcome) = index.and_then(|index| pending.outcomes.get(index)) {
+                return Some(outcome.clone());
+            }
+        }
+        let mut turns = self.session.turns().iter();
+        while let Some(turn) = turns.next() {
+            let crate::domain::session::Turn::Agent(agent) = turn else {
+                continue;
+            };
+            // 观察紧跟在带调用的那一轮之后（`commit_round` 保证配对）。
+            let Some(crate::domain::session::Turn::Observation(outcomes)) = turns.next() else {
+                continue;
+            };
+            let index = agent.calls.iter().position(|earlier| {
+                earlier.name == call.name && earlier.arguments == call.arguments
+            });
+            if let Some(outcome) = index.and_then(|index| outcomes.get(index)) {
+                return Some(outcome.clone());
+            }
+        }
+        None
     }
 
     /// 推进一步。调用方决定何时停——这是超时/取消/恢复的挂点。
@@ -494,13 +757,25 @@ impl AgentRunner {
 
             RunState::Evaluating(calls) => {
                 let call = self.next_call(&calls)?.clone();
+                // 这次调用是不是中断时正在执行的那一条。
+                let in_flight = self.is_in_flight(&call);
                 // 角色边界先于一切：未注册检查、策略裁决、人工审批管的都是
                 // "这个调用能不能发生"，这里管"这个角色配不配提它"。放在
                 // 最前面，越权调用连策略和闸门都不值得惊动——为人省下
                 // 一次注定被拒的审批，也让审计里不会出现一条误导性的
                 // "策略已放行"。
-                if let Some(state) = self.refuse_out_of_role(&call).await? {
+                if let Some(state) = self.refuse_out_of_role(&call, in_flight).await? {
+                    // 越权调用就此终结：重放提示对它不再适用。
+                    if in_flight {
+                        self.replay_pending = None;
+                    }
                     return Ok(state);
+                }
+                // 恢复路径：这次调用在中断前已发起，可能已经产生副作用。
+                // 不自动重跑——把"跑过没有、结果是什么"告诉模型，由它决定
+                // 要不要再来一次。
+                if in_flight {
+                    return self.replay_interrupted_call(call).await;
                 }
                 // 未注册的工具不进审批也不执行，直接拒绝。
                 let Some(entry) = self.tools.find(&call.name) else {
@@ -528,27 +803,12 @@ impl AgentRunner {
                 // 这次调用要不要人过目，两件事不能混在一条事件里。
                 let (decision, escalation) = escalate_out_of_workspace_write(decision, &call);
 
+                // 恢复时的"重新审批"标记只作用于这一次调用：裁决完就清掉。
+                // 它必须在这里取走而不是留在字段里——否则策略放行时它会
+                // 一直挂着，蹭到下一次审批上去。
+                let reask = std::mem::replace(&mut self.reask_approval, false);
+
                 match decision.verdict {
-                    // 放行：不过闸门，直接进执行。
-                    PolicyVerdict::Allow => {
-                        self.state = RunState::Dispatching(calls.clone());
-                        Ok(RunState::Dispatching(calls))
-                    }
-                    // 要审批：停在闸门前，策略理由一并带上，
-                    // 让人（或未来的自动闸门）知道是哪条规则要他点头。
-                    PolicyVerdict::RequireApproval => {
-                        let request = ApprovalRequest {
-                            turn: self.session.rounds() + 1,
-                            call,
-                            annotations: spec.annotations,
-                            reason: escalation,
-                        };
-                        self.state = RunState::AwaitingApproval(request.clone());
-                        // 最重要的保存点：等人审批时人可能走开、进程可能被杀，
-                        // 快照必须先落盘，恢复后才能把同一个请求重新递给闸门。
-                        self.save_snapshot();
-                        Ok(RunState::AwaitingApproval(request))
-                    }
                     // 拒绝：连闸门都不问，直接给模型一条拒绝观察。
                     // 内容里带上命中规则的理由，模型才知道该换哪条路。
                     PolicyVerdict::Deny => {
@@ -557,6 +817,25 @@ impl AgentRunner {
                             &decision,
                         ));
                         self.record_and_advance(call, outcome).await
+                    }
+                    // 要审批：停在闸门前，策略理由一并带上，
+                    // 让人（或未来的自动闸门）知道是哪条规则要他点头。
+                    PolicyVerdict::RequireApproval => {
+                        Ok(self.park_at_approval(call, spec.annotations, escalation, reask))
+                    }
+                    // 放行：不过闸门，直接进执行。
+                    PolicyVerdict::Allow => {
+                        // 恢复路径上的例外：这个请求在中断前已经被判为
+                        // "需要人过目"。策略后来放宽了，也不能替人把这个
+                        // 判断抹掉——人要再点一次，否则"人没答复"会被
+                        // 悄悄读成"人点过了"。
+                        if reask {
+                            return Ok(
+                                self.park_at_approval(call, spec.annotations, escalation, true)
+                            );
+                        }
+                        self.state = RunState::Dispatching(calls.clone());
+                        Ok(RunState::Dispatching(calls))
                     }
                 }
             }
@@ -585,11 +864,29 @@ impl AgentRunner {
 
             RunState::Dispatching(calls) => {
                 let call = self.next_call(&calls)?.clone();
+                let in_flight = self.is_in_flight(&call);
                 // 恢复可能从 Dispatching 直接进入（快照停在半轮执行），
                 // 那时 Evaluating 的检查被跳过——所以这里必须再查一次。
-                if let Some(state) = self.refuse_out_of_role(&call).await? {
+                if let Some(state) = self.refuse_out_of_role(&call, in_flight).await? {
+                    if in_flight {
+                        self.replay_pending = None;
+                    }
                     return Ok(state);
                 }
+                // 在途的调用同样不自动重跑（见 `replay_interrupted_call`）。
+                if in_flight {
+                    return self.replay_interrupted_call(call).await;
+                }
+                // **执行前落盘**：这是"副作用可能已经发生"这个事实唯一
+                // 能被记录下来的时刻——调用一旦发起，进程就可能死在它
+                // 里面，那时磁盘上必须还留着"这一次正要执行"的痕迹，
+                // 否则恢复时无从知道该不该重跑。
+                //
+                // 状态机在 `step()` 开头被换成了 `AwaitingModel`，所以这里
+                // 要显式写回 `Dispatching`：落盘的状态必须是真实的位置，
+                // 否则快照说"在等模型"，恢复就会当成什么都没发生。
+                self.state = RunState::Dispatching(calls.clone());
+                self.save_snapshot();
                 let outcome = self.tools.invoke(&call).await;
                 self.record_and_advance(call, outcome).await
             }
@@ -678,6 +975,13 @@ impl AgentRunner {
                 rounds_after: report.rounds_after,
                 dropped: report.dropped,
             });
+            // token 账单独记一条：轮数是手段，token 才是花掉的钱。
+            self.record(AuditEvent::ContextBudgeted {
+                turn: self.session.rounds() + 1,
+                tokens_before: report.tokens_before as u64,
+                tokens_after: report.tokens_after as u64,
+                dropped_tokens: report.dropped_tokens as u64,
+            });
         }
         let request = ModelRequest {
             history,
@@ -731,6 +1035,23 @@ impl AgentRunner {
         }
     }
 
+    /// 被裁轮次涉及的步骤号（1-based，升序去重）。
+    ///
+    /// 轮次号到步号的映射是**结构性的**：会话历史里每条非交接的用户
+    /// 消息就是一步的交代，数一遍用户消息就知道每轮属于第几步。
+    fn steps_of(&self, dropped: &[u32]) -> Vec<u32> {
+        let per_round = self.session.round_steps();
+        let mut steps: Vec<u32> = dropped
+            .iter()
+            .filter_map(|number| {
+                // 轮次从 1 开始，数组下标从 0 开始。
+                per_round.get((*number as usize).saturating_sub(1)).copied()
+            })
+            .collect();
+        steps.dedup();
+        steps
+    }
+
     /// 生成并挂载摘要。摘要只是优化：失败打警告后继续用占位说明，
     /// 绝不把错误抛给任务。
     ///
@@ -754,12 +1075,18 @@ impl AgentRunner {
             dropped.first().copied().unwrap_or(1),
             dropped.last().copied().unwrap_or(1),
         );
+        // 摘要覆盖哪几步由代码算：历史里每条非交接的用户消息就是一步的
+        // 交代，数一遍就知道每轮属于第几步。模型可能漏写、可能写错编号，
+        // 而"这份摘要讲的是哪几步"必须准确——下一步的模型要靠它对上
+        // 自己的进度。
+        let steps = self.steps_of(dropped);
         let summarizer = Summarizer::new(self.model.clone());
         match summarizer
             .summarize(SummarizeInput {
                 dropped_transcript: transcript,
                 existing,
                 covers,
+                steps,
             })
             .await
         {
@@ -927,6 +1254,25 @@ fn denied_by_policy_message(name: &str, decision: &PolicyDecision) -> String {
         ),
         None => format!("工具 `{name}` 被默认策略拒绝：{}", decision.reason),
     }
+}
+
+/// 恢复时给模型的重放提示。
+///
+/// 措辞要回答模型真正会问的三个问题：这个调用跑过没有、结果是什么、
+/// 现在该怎么办。少答一个它就会自己猜——而它猜的方向通常是"再跑一遍"，
+/// 那正是我们要避免的重复副作用。
+fn replay_notice(call: &ToolCall, previous: Option<&ToolOutcome>) -> String {
+    let known = match previous {
+        Some(outcome) => format!("同一调用此前执行过的结果是：{}。", outcome.content),
+        None => "这次执行的结果未知（中断就发生在它执行期间）。".to_owned(),
+    };
+    format!(
+        "【中断恢复】工具 `{}` 在中断前已经发起执行，可能已经产生了副作用，\
+         因此**没有自动再跑一次**。{known}\
+         要不要再执行一次由你判断：需要就重新发起同一个调用，\
+         不需要就用现有信息继续。",
+        call.name
+    )
 }
 
 /// 策略放行但调用疑似越界写入时，把裁决升级为要求审批。
@@ -1670,6 +2016,7 @@ mod tests {
             },
             annotations: write_file_spec().annotations,
             reason: None,
+            resumed: false,
         };
 
         assert_eq!(gate.request(&request).await, Err("不允许".to_owned()));
@@ -1687,6 +2034,7 @@ mod tests {
             },
             annotations: write_file_spec().annotations,
             reason: None,
+            resumed: false,
         };
 
         assert_eq!(gate.request(&request).await, Ok(()));
@@ -2175,7 +2523,8 @@ mod tests {
                 policy: PolicyEngine::new(),
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget {
-                    max_rounds: 2,
+                    max_tokens: Some(1),
+                    min_recent_rounds: 2,
                     keep_task: true,
                     summarize: None,
                 },
@@ -2269,7 +2618,8 @@ mod tests {
         let (mut runner, evidence) = summary_test_runner(
             &mock,
             ContextBudget {
-                max_rounds: 2,
+                max_tokens: Some(1),
+                min_recent_rounds: 2,
                 keep_task: true,
                 summarize: None,
             }
@@ -2344,9 +2694,9 @@ mod tests {
         ]);
         let (mut runner, _evidence) =
             summary_test_runner(&mock, ContextBudget::default().with_summarize(1));
-        // 把轮数上限压到 2 才会触发裁剪；Default 的 max_rounds 是 16。
+        // 把 token 上限压到 1 才会触发裁剪；Default 是 16000。
         // 直接改字段：测试装配的便利优先于不可变性。
-        runner.context_budget.max_rounds = 2;
+        runner.context_budget.max_tokens = Some(1);
 
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
 
@@ -2380,7 +2730,7 @@ mod tests {
         ]);
         let (mut runner, evidence) =
             summary_test_runner(&mock, ContextBudget::default().with_summarize(1));
-        runner.context_budget.max_rounds = 2;
+        runner.context_budget.max_tokens = Some(1);
 
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
 
@@ -2410,7 +2760,8 @@ mod tests {
         let (mut runner, _evidence) = summary_test_runner(
             &mock,
             ContextBudget {
-                max_rounds: 2,
+                max_tokens: Some(1),
+                min_recent_rounds: 2,
                 keep_task: true,
                 summarize: None,
             },
@@ -2602,5 +2953,447 @@ mod tests {
 
         assert_eq!(outcome.answer, "读完了");
         assert_eq!(outcome.turns_used, 2);
+    }
+
+    // ── P10-2：有界恢复 ────────────────────────────────────────────────
+    //
+    // 恢复的三种半轮状态，三种语义：
+    //
+    // - `Evaluating`：还没执行 → 用**当前**策略重新裁决；
+    // - `AwaitingApproval`：问过人但没答复 → **再问一次**，人要再点一次；
+    // - `Dispatching`：正在执行 → 副作用可能已经发生，**不自动重跑**，
+    //   把决定权交回模型。
+
+    /// 一个待执行的写调用。
+    fn write_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: CallId::new(id),
+            name: "write_file".to_owned(),
+            arguments: json!({"path": "out.txt", "content": "x"}),
+        }
+    }
+
+    /// 恢复测试用的依赖装配。
+    fn resume_deps(
+        mock: &MockCompletionModel,
+        invoker: Arc<dyn ToolInvoker>,
+        evidence: Arc<MemoryEvidenceSink>,
+        approvals: Arc<CountingGate>,
+        policy: PolicyEngine,
+    ) -> AgentDependencies {
+        AgentDependencies {
+            model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+            tools: registry_with(invoker, vec![read_file_spec(), write_file_spec()]),
+            approvals,
+            evidence,
+            clock: Arc::new(crate::infrastructure::clock::SystemClock),
+            policy,
+            roster: AgentRoster::builtin(),
+            context_budget: ContextBudget::default(),
+            session_store: None,
+        }
+    }
+
+    /// 停在"正在执行工具"这一刻的快照。
+    ///
+    /// 中断就发生在调用发起之后、观察记下之前——副作用可能已经出去，
+    /// 而我们不知道结果。这是最危险的那种中断。
+    fn dispatching_snapshot(call: ToolCall) -> RunSnapshot {
+        let turn = AgentTurn {
+            text: "写一下".to_owned(),
+            calls: vec![call.clone()],
+        };
+        RunSnapshot {
+            format_version: RUN_FORMAT,
+            session_id: SessionId::new("resume-session"),
+            spec: spec_with(),
+            session: Session::new(SessionId::new("resume-session"), "任务").snapshot(),
+            state: RunState::Dispatching(vec![call.clone()]),
+            consumption: Consumption {
+                turns: 1,
+                elapsed: Duration::from_secs(1),
+            },
+            pending: Some(PendingRound {
+                turn,
+                outcomes: Vec::new(),
+            }),
+        }
+    }
+
+    /// 停在"评估调用、还没裁决"这一刻的快照。
+    fn evaluating_snapshot(call: ToolCall) -> RunSnapshot {
+        let turn = AgentTurn {
+            text: "写一下".to_owned(),
+            calls: vec![call.clone()],
+        };
+        RunSnapshot {
+            format_version: RUN_FORMAT,
+            session_id: SessionId::new("resume-session"),
+            spec: spec_with(),
+            session: Session::new(SessionId::new("resume-session"), "任务").snapshot(),
+            state: RunState::Evaluating(vec![call.clone()]),
+            consumption: Consumption {
+                turns: 1,
+                elapsed: Duration::from_secs(1),
+            },
+            pending: Some(PendingRound {
+                turn,
+                outcomes: Vec::new(),
+            }),
+        }
+    }
+
+    /// 停在"等人审批"这一刻的快照。
+    ///
+    /// 这正是"上一次问过、人没答复"的状态：进程停在闸门前，人没有
+    /// 回答就被中断了。
+    fn awaiting_approval_snapshot(call: ToolCall) -> RunSnapshot {
+        let turn = AgentTurn {
+            text: "写一下".to_owned(),
+            calls: vec![call.clone()],
+        };
+        let request = ApprovalRequest {
+            turn: 1,
+            call: call.clone(),
+            annotations: write_file_spec().annotations,
+            reason: None,
+            resumed: false,
+        };
+        RunSnapshot {
+            format_version: RUN_FORMAT,
+            session_id: SessionId::new("resume-session"),
+            spec: spec_with(),
+            session: Session::new(SessionId::new("resume-session"), "任务").snapshot(),
+            state: RunState::AwaitingApproval(request),
+            consumption: Consumption {
+                turns: 1,
+                elapsed: Duration::from_secs(1),
+            },
+            pending: Some(PendingRound {
+                turn,
+                outcomes: Vec::new(),
+            }),
+        }
+    }
+
+    /// 请求历史里最后一条工具结果的内容。
+    fn last_tool_result_text(mock: &MockCompletionModel, index: usize) -> String {
+        let messages = history(mock, index);
+        let Message::User { content } = messages.last().unwrap() else {
+            panic!("观察结果应当是 user 消息");
+        };
+        let Some(UserContent::ToolResult(result)) = content.first() else {
+            panic!("应当是 tool 结果内容");
+        };
+        result.content[0].as_text().unwrap().to_owned()
+    }
+
+    /// 恢复时，中断时正在执行的那个调用**不自动重跑**。
+    ///
+    /// 切片 2 最要紧的一条：副作用可能已经发生，重跑一次就是把同一次
+    /// 副作用做两遍。恢复必须把决定权交回模型，而不是替模型决定。
+    #[tokio::test]
+    async fn resuming_from_dispatching_does_not_rerun_the_interrupted_call() {
+        let call = write_call("call_1");
+        let invoker = Arc::new(RecordingInvoker::default());
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mock = MockCompletionModel::from_turns(vec![MockTurn::text("我不重跑了")]);
+        let mut runner = AgentRunner::resume(
+            dispatching_snapshot(call.clone()),
+            resume_deps(
+                &mock,
+                invoker.clone(),
+                evidence.clone(),
+                Arc::new(CountingGate::default()),
+                PolicyEngine::new(),
+            ),
+        )
+        .expect("快照应可恢复");
+
+        let state = runner.step().await.unwrap();
+
+        assert!(
+            matches!(state, RunState::AwaitingModel),
+            "重放提示之后应回到等模型回复，实际 {state:?}"
+        );
+        assert!(
+            invoker.calls.lock().unwrap().is_empty(),
+            "中断时正在执行的调用不得被自动重跑"
+        );
+        // 证据里要有一条"可能已执行"的记录：事后翻 JSONL 才知道这里
+        // 差点发生过一次重复副作用。
+        let replays: Vec<_> = evidence
+            .events()
+            .into_iter()
+            .filter(|entry| matches!(entry.event, AuditEvent::ToolCallReplayed { .. }))
+            .collect();
+        assert_eq!(replays.len(), 1, "应留下一条重放证据");
+    }
+
+    /// 模型看得见"这个调用之前跑过、要不要再跑由你决定"。
+    ///
+    /// 提示要给出"跑过没有"的事实：结果未知也要说清楚，不能让模型
+    /// 以为调用没跑过、于是照原样再来一遍。
+    #[tokio::test]
+    async fn the_model_is_told_the_interrupted_call_may_already_have_run() {
+        let call = write_call("call_1");
+        let invoker = Arc::new(RecordingInvoker::default());
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mock = MockCompletionModel::from_turns(vec![MockTurn::text("我不重跑了")]);
+        let mut runner = AgentRunner::resume(
+            dispatching_snapshot(call),
+            resume_deps(
+                &mock,
+                invoker,
+                evidence,
+                Arc::new(CountingGate::default()),
+                PolicyEngine::new(),
+            ),
+        )
+        .unwrap();
+
+        runner.step().await.unwrap(); // 重放提示
+        runner.step().await.unwrap(); // 问模型
+
+        let text = last_tool_result_text(&mock, 0);
+        assert!(text.contains("中断恢复"), "模型应看见重放提示: {text}");
+        assert!(text.contains("write_file"), "提示应点名工具: {text}");
+        assert!(
+            text.contains("没有自动再跑"),
+            "提示应说明没有自动重跑: {text}"
+        );
+        assert!(
+            text.contains("结果未知"),
+            "提示应说明结果未知: {text}"
+        );
+        assert!(
+            text.contains("由你判断"),
+            "提示应把决定权交回模型: {text}"
+        );
+    }
+
+    /// 恢复时，审批要**再问一次**，不能凭快照放行。
+    ///
+    /// 人被问过但没答复，那就不算同意——这是安全要求，不是体验问题。
+    #[tokio::test]
+    async fn resuming_from_awaiting_approval_asks_the_gate_again() {
+        let call = write_call("call_1");
+        let approvals = Arc::new(CountingGate::default());
+        let invoker = Arc::new(RecordingInvoker::default());
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mock = MockCompletionModel::from_turns(vec![MockTurn::text("写完了")]);
+        let mut runner = AgentRunner::resume(
+            awaiting_approval_snapshot(call),
+            resume_deps(
+                &mock,
+                invoker.clone(),
+                evidence.clone(),
+                approvals.clone(),
+                PolicyEngine::new(),
+            ),
+        )
+        .unwrap();
+
+        // 第一步：按当前策略重新裁决，停在审批前。
+        let state = runner.step().await.unwrap();
+        assert!(
+            matches!(state, RunState::AwaitingApproval(_)),
+            "恢复后仍应停在审批前，实际 {state:?}"
+        );
+        assert!(
+            invoker.calls.lock().unwrap().is_empty(),
+            "没点头之前不该执行"
+        );
+        assert!(
+            approvals.requested_tools().is_empty(),
+            "裁决这一步还不该问闸门"
+        );
+
+        // 第二步：问闸门——人被问了一次（快照里那次在上一个进程里）。
+        runner.step().await.unwrap();
+        assert_eq!(approvals.requested_tools(), vec!["write_file"]);
+        // 请求要标出"这是重新问"：人需要知道上一次问过、没答复。
+        assert!(
+            approvals.first_request().resumed,
+            "重新询问必须带 resumed 标记"
+        );
+        // 证据里也要留一条：上一个进程里那次"问过"不在当前证据文件里。
+        let reasks: Vec<_> = evidence
+            .events()
+            .into_iter()
+            .filter(|entry| matches!(entry.event, AuditEvent::ApprovalReasked { .. }))
+            .collect();
+        assert_eq!(reasks.len(), 1, "重新询问要留一条证据");
+    }
+
+    /// 恢复时用**当前**的策略引擎重新裁决，而不是快照里的旧结论。
+    ///
+    /// 快照里其实没存裁决结果（裁决只在审计事件里），所以"策略变了"
+    /// 是天然成立的：恢复时看到的是今天的策略。策略改成拒绝之后，
+    /// 那个调用必须被拒——哪怕中断时它是放行的。
+    #[tokio::test]
+    async fn resuming_from_evaluating_uses_the_current_policy() {
+        let call = write_call("call_1");
+        let approvals = Arc::new(CountingGate::default());
+        let invoker = Arc::new(RecordingInvoker::default());
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mock = MockCompletionModel::from_turns(vec![MockTurn::text("那就不写了")]);
+        let mut runner = AgentRunner::resume(
+            evaluating_snapshot(call),
+            resume_deps(
+                &mock,
+                invoker.clone(),
+                evidence,
+                approvals.clone(),
+                policy_with("write_file", PolicyVerdict::Deny, "恢复时的策略：禁止写文件"),
+            ),
+        )
+        .unwrap();
+
+        runner.step().await.unwrap(); // 裁决：拒绝
+        runner.step().await.unwrap(); // 问模型
+
+        assert!(
+            invoker.calls.lock().unwrap().is_empty(),
+            "被当前策略拒绝的调用不得执行"
+        );
+        assert!(
+            approvals.requested_tools().is_empty(),
+            "被拒绝的调用不该惊动闸门"
+        );
+        // 模型看到的是一条拒绝观察，理由来自**当前**策略。
+        let text = last_tool_result_text(&mock, 0);
+        assert!(text.contains("恢复时的策略"), "拒绝理由应来自当前策略: {text}");
+    }
+
+    /// 停在审批前时，当前策略改成拒绝 → 直接拒，不问闸门。
+    ///
+    /// 策略重算不是走过场：今天的策略说不行，今天就不行。
+    #[tokio::test]
+    async fn resuming_from_awaiting_approval_uses_the_current_policy_too() {
+        let call = write_call("call_1");
+        let approvals = Arc::new(CountingGate::default());
+        let invoker = Arc::new(RecordingInvoker::default());
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mock = MockCompletionModel::from_turns(vec![MockTurn::text("那就不写了")]);
+        let mut runner = AgentRunner::resume(
+            awaiting_approval_snapshot(call),
+            resume_deps(
+                &mock,
+                invoker.clone(),
+                evidence,
+                approvals.clone(),
+                policy_with("write_file", PolicyVerdict::Deny, "恢复时的策略：禁止写文件"),
+            ),
+        )
+        .unwrap();
+
+        runner.step().await.unwrap();
+
+        assert!(
+            approvals.requested_tools().is_empty(),
+            "当前策略拒绝时不该再问闸门"
+        );
+        assert!(
+            invoker.calls.lock().unwrap().is_empty(),
+            "被当前策略拒绝的调用不得执行"
+        );
+    }
+
+    /// 当前策略放行时，恢复仍然要**再问一次**。
+    ///
+    /// 这个请求在中断前已经被判为"需要人过目"。策略后来放宽了，也不能
+    /// 替人把这个判断抹掉——否则"人没答复"会被悄悄读成"人点过了"。
+    #[tokio::test]
+    async fn a_relaxed_policy_does_not_cancel_the_re_ask() {
+        let call = write_call("call_1");
+        let approvals = Arc::new(CountingGate::default());
+        let invoker = Arc::new(RecordingInvoker::default());
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mock = MockCompletionModel::from_turns(vec![MockTurn::text("写完了")]);
+        let mut runner = AgentRunner::resume(
+            awaiting_approval_snapshot(call),
+            resume_deps(
+                &mock,
+                invoker.clone(),
+                evidence,
+                approvals.clone(),
+                policy_with("write_file", PolicyVerdict::Allow, "恢复时的策略：写文件免审"),
+            ),
+        )
+        .unwrap();
+
+        let state = runner.step().await.unwrap();
+
+        assert!(
+            matches!(state, RunState::AwaitingApproval(_)),
+            "策略放宽也不该跳过重新询问，实际 {state:?}"
+        );
+        runner.step().await.unwrap();
+        assert_eq!(
+            approvals.requested_tools(),
+            vec!["write_file"],
+            "闸门必须被问一次"
+        );
+        assert!(approvals.first_request().resumed);
+    }
+
+    /// 恢复后累计轮数**不重置**：预算接着算。
+    ///
+    /// 快照里的 `consumption` 是恢复的账本起点。若恢复时把它清零，
+    /// 一个长任务就能靠"中断-恢复"无限续命——轮数预算就成了摆设。
+    #[tokio::test]
+    async fn cumulative_turns_survive_a_resume() {
+        // 第一次运行：2 轮工具调用，正好用光 2 轮的预算。
+        let first_mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
+            MockTurn::tool_call("call_2", "read_file", json!({"path": "b"})),
+        ]);
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mut first = AgentRunner::new(
+            spec_with(),
+            SessionId::new("resume-session"),
+            "任务",
+            resume_deps(
+                &first_mock,
+                Arc::new(RecordingInvoker::default()),
+                evidence.clone(),
+                Arc::new(CountingGate::default()),
+                PolicyEngine::new(),
+            ),
+        );
+        let error = first.run(&Budget::new(2)).await.unwrap_err();
+        assert!(matches!(error, ApplicationError::BudgetExhausted { .. }));
+        let snapshot = first.snapshot();
+        assert_eq!(snapshot.consumption.turns, 2, "账本记着已用两轮");
+
+        // 恢复：总预算 3 轮，已经用掉 2 轮，只剩 1 轮。
+        let second_mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_3", "read_file", json!({"path": "c"})),
+            MockTurn::text("第二轮才轮到的收尾"),
+        ]);
+        let mut resumed = AgentRunner::resume(
+            snapshot,
+            resume_deps(
+                &second_mock,
+                Arc::new(RecordingInvoker::default()),
+                evidence,
+                Arc::new(CountingGate::default()),
+                PolicyEngine::new(),
+            ),
+        )
+        .unwrap();
+        let error = resumed.run(&Budget::new(3)).await.unwrap_err();
+
+        assert!(
+            matches!(error, ApplicationError::BudgetExhausted { .. }),
+            "恢复后的预算应当接着算，实际 {error}"
+        );
+        assert_eq!(
+            second_mock.request_count(),
+            1,
+            "只剩一轮可用：清零的话这里能跑两轮"
+        );
+        assert_eq!(resumed.snapshot().consumption.turns, 3);
     }
 }

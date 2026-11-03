@@ -19,16 +19,21 @@ pub const USAGE: &str = "\
 用法: cargo run -- [--yes] [--ai-review] [--kind <模板>] \"任务描述\"
       cargo run -- --list-sessions
       cargo run -- [--yes] --resume <会话ID>
+      cargo run -- [--yes] [--force-worktree] --resume-task <任务ID>
       cargo run -- --report [--report-dir <目录>] [--json]
       cargo run -- --benchmark
+      cargo run -- --benchmark-long
 示例: cargo run -- \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
       cargo run -- --yes \"非交互场景下跑同一个任务\"
       cargo run -- --ai-review \"让模型先审一遍，拿不准的再问人\"
       cargo run -- --list-sessions
       cargo run -- --resume <会话ID>
+      cargo run -- --resume-task <任务ID>
+      cargo run -- --force-worktree --resume-task <任务ID>
       cargo run -- --report
       cargo run -- --report --json
-      cargo run -- --benchmark";
+      cargo run -- --benchmark
+      cargo run -- --benchmark-long";
 
 /// 解析出的命令行参数。
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +48,19 @@ pub struct CliArgs {
     pub ai_review: bool,
     /// 要恢复的会话 ID（`--resume <id>`）。
     pub resume: Option<String>,
+    /// 要恢复的任务 ID（`--resume-task <id>`）。
+    ///
+    /// 与 `--resume` 的分工：`--resume` 恢复的是**一个 runner**
+    /// （"这个会话停在哪"），从半轮接着跑；`--resume-task` 恢复的是
+    /// **一个任务**（"这个任务做到哪"），从步骤边界接着走，前面的步骤
+    /// 不重做。
+    pub resume_task: Option<String>,
+    /// 恢复任务时，即使工作区被改动过也继续（`--force-worktree`）。
+    ///
+    /// 工作区被改动默认是**拒绝恢复**：改动可能与任务无关，也可能正是
+    /// 上一个 agent 留下的半成品，只有人看得懂区别。这个开关是人的
+    /// 决定——用过它就等于说"我知道，继续"。
+    pub force_worktree: bool,
     /// 只列出可恢复的会话（`--list-sessions`），然后退出。
     pub list_sessions: bool,
     /// 任务模板名（`--kind <name>`），交给任务编排（P4-2）解析。
@@ -57,6 +75,9 @@ pub struct CliArgs {
     pub json: bool,
     /// 跑 `benchmarks/` 下的基准任务集并打分（`--benchmark`）。
     pub benchmark: bool,
+    /// 跑长任务基准集（`--benchmark-long`）：两段式跑法——先故意耗尽
+    /// 预算制造中断，再从任务快照恢复着跑完。
+    pub benchmark_long: bool,
 }
 
 /// 解析命令行参数。
@@ -73,12 +94,15 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut auto_approve = false;
     let mut ai_review = false;
     let mut resume = None;
+    let mut resume_task = None;
+    let mut force_worktree = false;
     let mut list_sessions = false;
     let mut kind = None;
     let mut report = false;
     let mut report_dir = None;
     let mut json = false;
     let mut benchmark = false;
+    let mut benchmark_long = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut iter = argv.into_iter();
@@ -90,6 +114,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--report" => report = true,
             "--json" => json = true,
             "--benchmark" => benchmark = true,
+            "--benchmark-long" => benchmark_long = true,
             "--report-dir" => match iter.next() {
                 Some(dir) => report_dir = Some(dir),
                 None => {
@@ -101,6 +126,14 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
                 Some(id) => resume = Some(id),
                 None => {
                     eprintln!("--resume 需要一个会话 ID：--resume <id>");
+                    return None;
+                }
+            },
+            "--force-worktree" => force_worktree = true,
+            "--resume-task" => match iter.next() {
+                Some(id) => resume_task = Some(id),
+                None => {
+                    eprintln!("--resume-task 需要一个任务 ID：--resume-task <id>");
                     return None;
                 }
             },
@@ -122,14 +155,24 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let task = positional.into_iter().next();
     // 报表与基准都是不接任务描述的独立模式：带着描述跑只会让人以为
     // 描述也生效了，直接拒掉。
-    if task.is_some() && (report || benchmark) {
-        eprintln!("--report / --benchmark 不接受任务描述");
+    if task.is_some() && (report || benchmark || benchmark_long) {
+        eprintln!("--report / --benchmark / --benchmark-long 不接受任务描述");
         return None;
     }
     // 恢复模式沿用快照里的原任务：再塞一条用户消息会破坏
     // "助手轮次后面紧跟观察"的配对，也说不清哪条才是真任务。
     if task.is_some() && resume.is_some() {
         eprintln!("--resume 会沿用快照里的原任务，不能再另外指定任务描述");
+        return None;
+    }
+    if task.is_some() && resume_task.is_some() {
+        eprintln!("--resume-task 会沿用快照里的原任务，不能再另外指定任务描述");
+        return None;
+    }
+    // 会话级与任务级恢复不能同时给：它们恢复的是两样不同的东西，
+    // 同时给的话只有一边会生效，而用户不会知道自己给的那条被吃了。
+    if resume.is_some() && resume_task.is_some() {
+        eprintln!("--resume 与 --resume-task 不能同时使用：一个恢复会话，一个恢复任务");
         return None;
     }
     // 搭错车的开关要当场指出来，静默忽略等于悄悄吃掉用户的意图。
@@ -145,8 +188,22 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         eprintln!("--benchmark 不能与 --resume 搭配");
         return None;
     }
-    if task.is_none() && resume.is_none() && !list_sessions && !report && !benchmark {
-        eprintln!("缺少任务描述；恢复请用 --resume <id>，查看请用 --report，基准请用 --benchmark\n\n{USAGE}");
+    if benchmark && resume_task.is_some() {
+        eprintln!("--benchmark 不能与 --resume-task 搭配");
+        return None;
+    }
+    // 两种基准互斥：跑法不同（长任务先故意耗尽再恢复），同时给的话
+    // 只有跑得快的那种会被注意到。
+    if benchmark && benchmark_long {
+        eprintln!("--benchmark 与 --benchmark-long 不能同时使用");
+        return None;
+    }
+    if force_worktree && resume_task.is_none() {
+        eprintln!("--force-worktree 只对 --resume-task 有意义");
+        return None;
+    }
+    if task.is_none() && resume.is_none() && resume_task.is_none() && !list_sessions && !report && !benchmark && !benchmark_long {
+        eprintln!("缺少任务描述；恢复请用 --resume <id> 或 --resume-task <id>，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long\n\n{USAGE}");
         return None;
     }
 
@@ -155,12 +212,15 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         auto_approve,
         ai_review,
         resume,
+        resume_task,
+        force_worktree,
         list_sessions,
         kind,
         report,
         report_dir,
         json,
         benchmark,
+        benchmark_long,
     })
 }
 
@@ -226,6 +286,19 @@ impl ConsoleReporter {
                     );
                 }
             }
+            AuditEvent::ContextBudgeted {
+                tokens_before,
+                tokens_after,
+                dropped_tokens,
+                ..
+            } => {
+                // token 账与轮数账一起看：轮数是手段，token 才是花掉的钱。
+                if *dropped_tokens > 0 {
+                    println!(
+                        "[上下文] 约省下 {dropped_tokens} token（估算 {tokens_before} → {tokens_after}）",
+                    );
+                }
+            }
             AuditEvent::SummaryGenerated { covers, .. } => {
                 // 多花的一次调用要有出处：这行告诉读者"刚才那次慢，
                 // 是在补历史摘要"。
@@ -234,6 +307,14 @@ impl ConsoleReporter {
             AuditEvent::SummaryFailed { .. } => {
                 // 摘要失败只提示不报错：历史退回占位说明，任务继续跑。
                 println!("[摘要] 生成失败，继续用占位说明");
+            }
+            AuditEvent::ToolCallReplayed { tool, reason, .. } => {
+                // 重放提示要让人看见：那个调用可能已经跑过了，程序没有
+                // 自动再跑一次，而是把决定权交回给模型。
+                println!("[恢复] 工具 `{tool}` 之前已发起执行，未自动重跑：{reason}");
+            }
+            AuditEvent::ApprovalReasked { tool, .. } => {
+                println!("[恢复] 工具 `{tool}` 的审批重新问了一次（之前问过，没答复）");
             }
             AuditEvent::StepStarted { role, .. } => {
                 // 每步开始时报出角色：读者要知道接下来是"谁"在干活，
@@ -334,6 +415,45 @@ mod tests {
         assert_eq!(args.resume.as_deref(), Some("session-1"));
         assert!(args.task.is_none());
         assert!(args.auto_approve);
+    }
+
+    /// 任务级恢复有自己的开关。
+    #[test]
+    fn resume_task_takes_a_task_id() {
+        let args = parse_from(argv(&["--yes", "--resume-task", "task-1"])).unwrap();
+
+        assert_eq!(args.resume_task.as_deref(), Some("task-1"));
+        assert!(args.resume.is_none());
+        assert!(args.task.is_none());
+    }
+
+    /// 两种恢复不能同时给：它们恢复的是两样不同的东西。
+    #[test]
+    fn resume_and_resume_task_are_mutually_exclusive() {
+        let parsed = parse_from(argv(&["--resume", "s1", "--resume-task", "t1"]));
+        assert!(parsed.is_none(), "同时给两个恢复开关必须拒绝");
+    }
+
+    /// 任务级恢复同样沿用快照里的原任务，不接受新描述。
+    #[test]
+    fn resume_task_rejects_a_supplementary_task() {
+        let parsed = parse_from(argv(&["--resume-task", "t1", "再干一票"]));
+        assert!(parsed.is_none());
+    }
+
+    /// `--force-worktree` 只对任务级恢复有意义。
+    ///
+    /// 它是"我知道工作区被改过，继续"的声明——挂在别的模式上就是
+    /// 一个没人读的开关，不如当场拒掉。
+    #[test]
+    fn force_worktree_needs_resume_task() {
+        let parsed = parse_from(argv(&["--force-worktree", "--resume", "s1"]));
+        assert!(parsed.is_none(), "--force-worktree 单独给出没有意义");
+
+        let parsed = parse_from(argv(&["--force-worktree", "--resume-task", "t1"]));
+        assert!(parsed.is_some(), "--force-worktree 与 --resume-task 搭配应当放行");
+        let args = parse_from(argv(&["--force-worktree", "--resume-task", "t1"])).unwrap();
+        assert!(args.force_worktree);
     }
 
     #[test]

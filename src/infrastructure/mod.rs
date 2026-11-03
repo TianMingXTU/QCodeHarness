@@ -13,5 +13,7 @@ pub mod evidence;
 pub mod policy;
 pub mod clock;
 pub mod session_store;
+pub mod task_store;
+pub mod worktree;
 pub mod benchmark;
 pub mod sandbox;

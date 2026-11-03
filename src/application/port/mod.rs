@@ -115,6 +115,16 @@ pub struct ApprovalRequest {
     /// `#[serde(default)]` 让 P8 之前落盘的老快照仍能反序列化。
     #[serde(default)]
     pub reason: Option<String>,
+    /// 这是不是一次**恢复后的重新询问**。
+    ///
+    /// `true` 表示上一次已经问过、人没答复，恢复时必须再问一次：
+    /// 不能凭快照放行，也不能被会话信任免掉——那等于把"人没点过"
+    /// 当成"人点过了"。
+    ///
+    /// `#[serde(default)]` 让 P10 之前落盘的老快照仍能反序列化（缺省即
+    /// 常规请求）。
+    #[serde(default)]
+    pub resumed: bool,
 }
 
 /// 审批结论：`Ok(())` 放行；`Err(reason)` 否决，原因会作为拒绝观察回填给模型。

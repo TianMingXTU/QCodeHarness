@@ -126,6 +126,22 @@ pub enum AuditEvent {
         /// 被丢弃的轮次号。
         dropped: Vec<u32>,
     },
+    /// 按 token 预算裁剪历史的账。
+    ///
+    /// 与 [`AuditEvent::ContextCompacted`] 分开记：那条说"裁了几轮"，
+    /// 这条说"省了多少 token"。轮数是裁剪的**手段**，token 才是用户
+    /// 真正掏钱的东西——只报轮数，长任务里"裁了 3 轮"可能省了两百个
+    /// token，也可能省了两万个。
+    ContextBudgeted {
+        /// 即将进入的轮次号。
+        turn: u32,
+        /// 裁剪前的历史 token 估算。
+        tokens_before: u64,
+        /// 裁剪后实际发出的 token 估算。
+        tokens_after: u64,
+        /// 净减掉的 token 数。
+        dropped_tokens: u64,
+    },
     /// 为被裁历史额外花了一次模型调用生成摘要。
     ///
     /// 事后翻 JSONL 要能回答"这一轮为什么多了一次调用"——没有这条，
@@ -137,6 +153,41 @@ pub enum AuditEvent {
         covers: (u32, u32),
         /// 这次摘要调用的 token 用量。
         usage: TokenUsage,
+    },
+    /// 恢复时提示模型：某个调用在中断前可能已经执行过。
+    ///
+    /// 与 `ToolObserved` 互补而不是重复：`ToolObserved` 说"这次调用跑完了，
+    /// 结果是 X"，这条说"这次调用**可能**跑过了，结果未知"。
+    ///
+    /// 中断发生在调用发起之后、观察记下之前——副作用可能已经出去
+    /// （文件已写、命令已跑），而我们无从得知。恢复路径因此**不自动
+    /// 重跑**：重跑一次就是把同一次副作用做两遍。不重跑又不能装作
+    /// 没发生过，于是把这件事告诉模型，由它决定要不要再来一次。
+    ToolCallReplayed {
+        /// 轮次号。
+        turn: u32,
+        /// 可能已经执行过的工具名。
+        tool: String,
+        /// 为什么会有这条提示。
+        reason: String,
+        /// 同一调用（工具名与参数完全一致）此前执行过的结果。
+        ///
+        /// `None` 表示没有可参照的先例，或中断发生在执行期间、结果未知。
+        previous_outcome: Option<ToolOutcome>,
+    },
+    /// 恢复时重新问了一次审批。
+    ///
+    /// 单独记一条的原因：审批请求本身不落进事件流，只有"问过"与"答复"
+    /// 两种事件。从快照恢复时那一次"问过"发生在**上一个进程**里，当前
+    /// 证据文件里根本没有——没有这条事件，事后翻 JSONL 会以为人从头到尾
+    /// 只被问过一次，而实际是他被问了两次、第一次没答复。
+    ApprovalReasked {
+        /// 轮次号。
+        turn: u32,
+        /// 被重新询问的工具名。
+        tool: String,
+        /// 重新询问的理由。
+        reason: String,
     },
     /// 摘要调用失败，历史退回占位说明。
     ///
@@ -159,9 +210,12 @@ impl AuditEvent {
             | Self::Thought { turn, .. }
             | Self::ToolRequested { turn, .. }
             | Self::ToolObserved { turn, .. }
+            | Self::ToolCallReplayed { turn, .. }
+            | Self::ApprovalReasked { turn, .. }
             | Self::ApprovalDecided { turn, .. }
             | Self::PolicyEvaluated { turn, .. }
             | Self::ContextCompacted { turn, .. }
+            | Self::ContextBudgeted { turn, .. }
             | Self::SummaryGenerated { turn, .. }
             | Self::SummaryFailed { turn, .. } => *turn,
         }

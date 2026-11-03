@@ -1,0 +1,24 @@
+id = "long-utils-cleanup"
+kind = "bug-fix"
+description = "修复 bench-utils 库：五个模块各带一个缺陷（normalize 的 min_max 少算最后一个元素、stats 的 median 排序方向反了、format 的 percent 忘了乘 100、parse 的分隔符写成了中文顿号、validators 的 is_valid_id 长度边界写反），相关测试全部失败。任务跨多个模块：读 src/ 下五个模块与 tests/utils.rs，逐个定位根因，做最小修复，然后运行 cargo test 验证全部测试通过。缺陷相互独立，修复一个不会让其他测试变绿。"
+suite = "long"
+
+[long_run]
+# 第一次运行故意在第 4 轮耗尽预算：五个缺陷、四个工作流步骤，
+# 4 轮必然停在第一步的半路上。
+exhaust_turns = 4
+# 历史预算压小到必然触发裁剪：恢复段的历史最长，压缩判据从这里核对。
+context_max_tokens = 2000
+
+[criteria]
+test_command = "cargo test"
+requires_changes = true
+answer_must_mention = []
+# 长任务判据：至少 6 轮模型调用。实测自然完成是 8 轮（两段合计：
+# 首段 4 轮被打断，恢复段 4 轮改完五个缺陷并验证），下限设在自然值
+# 之下——它防的是"恢复段偷懒跳步"（几轮就交差），不是惩罚效率。
+min_turns = 6
+# 恢复后不许把跑过的验证命令再跑一遍。
+no_repeated_commands = ["cargo test --test utils"]
+# 压缩之后，模型仍然要知道自己动过的模块名。
+must_mention_after_compaction = ["median"]

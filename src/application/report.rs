@@ -14,6 +14,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::context::EvidenceIndex;
 use crate::domain::evidence::{AuditEvent, Evidence};
 use crate::domain::ids::SessionId;
 
@@ -111,6 +112,28 @@ pub struct SessionSummary {
     pub summary_calls: usize,
     /// 上下文裁剪次数（`ContextCompacted` 数）。
     pub compactions: usize,
+    /// 上下文裁剪净省下的 token 合计（`ContextBudgeted` 数）。
+    ///
+    /// 轮数是裁剪的手段，token 才是花掉的钱：长任务里"裁了 3 轮"可能
+    /// 省了两百个 token，也可能省了两万个。这个数是后者的合计。
+    pub dropped_context_tokens: u64,
+    /// 这个会话动过什么：读过的文件、写过的文件、跑过的命令、没成功的调用。
+    ///
+    /// 与模型在上下文里看到的是**同一份账**（同一套判定规则，见
+    /// [`EvidenceIndex::from_events`] 与 [`EvidenceIndex::from_session`]）：
+    /// 用户在这里看到的"做过什么"，与模型看到的不许有出入。
+    pub evidence_index: EvidenceIndex,
+    /// 恢复时提示"这个调用可能已经跑过"的次数（`ToolCallReplayed` 数）。
+    ///
+    /// 它是**可能发生**的重复副作用的计数，不是已经发生的：程序在这类
+    /// 情况下不会自动重跑，而是把决定权交回模型。数值不为 0 就说明
+    /// 这一趟里有调用是在"结果未知"的状态下被打断的。
+    pub replays: usize,
+    /// 恢复时重新询问审批的次数（`ApprovalReasked` 数）。
+    ///
+    /// 与 `approvals` 分开记：它回答的是"人被问了几次"——重新询问时人
+    /// 必须再点一次，那次的等待也真实地花在他身上。
+    pub approval_reasks: usize,
     /// 首事件时刻。
     pub started_at: Option<SystemTime>,
     /// 末事件时刻。
@@ -269,6 +292,10 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
         cost_usd: Some(0.0),
         summary_calls: 0,
         compactions: 0,
+        dropped_context_tokens: 0,
+        evidence_index: EvidenceIndex::default(),
+        replays: 0,
+        approval_reasks: 0,
         started_at: log.started_at(),
         ended_at: log.ended_at(),
         wall_clock_ms: wall_clock_of(log),
@@ -369,16 +396,25 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
                 crate::domain::policy::PolicyVerdict::Deny => summary.policy_deny += 1,
             },
             AuditEvent::ContextCompacted { .. } => summary.compactions += 1,
+            AuditEvent::ContextBudgeted { dropped_tokens, .. } => {
+                summary.dropped_context_tokens += dropped_tokens;
+            }
             AuditEvent::SummaryGenerated { usage, .. } => {
                 summary.summary_calls += 1;
                 add_usage(&mut summary, usage);
             }
             AuditEvent::SummaryFailed { .. } => summary.summary_calls += 1,
+            // 恢复路径的两类事件：可能已执行的调用与重新询问的审批。
+            AuditEvent::ToolCallReplayed { .. } => summary.replays += 1,
+            AuditEvent::ApprovalReasked { .. } => summary.approval_reasks += 1,
             // StepStarted 不计任何业务计数器，但它算事件总数的一员。
             AuditEvent::StepStarted { .. } => {}
         }
     }
     summary.repeated_calls = repeated;
+    // 证据台账：与模型在上下文里看到的是同一份账。
+    summary.evidence_index =
+        EvidenceIndex::from_events(log.events.iter().map(|evidence| &evidence.event));
 
     // 缓存命中率：分子读回、分母输入。分母 0 时是 None 而不是 0.0——
     // 0.0 的含义是"有输入但一次没命中"，与"没有输入可算"正好相反。
@@ -566,6 +602,23 @@ pub fn render_text(report: &BenchmarkReport) -> String {
         cost_label(report.total_cost_usd),
     ];
     out.push_str(&render_row(&total));
+
+    // 台账不进表格：它每一项都是列表，表格装不下。单独按会话列在表后
+    // ——"这个任务到底动过什么"是用户跑完长任务最想看的一句。
+    let ledgers: Vec<&SessionSummary> = report
+        .sessions
+        .iter()
+        .filter(|summary| !summary.evidence_index.is_empty())
+        .collect();
+    if !ledgers.is_empty() {
+        out.push_str("\n证据台账\n");
+        for summary in ledgers {
+            out.push_str(&format!("  会话 {}\n", summary.session_id.as_str()));
+            for line in summary.evidence_index.render().lines() {
+                out.push_str(&format!("    {line}\n"));
+            }
+        }
+    }
     out
 }
 
@@ -1202,6 +1255,34 @@ mod tests {
         let text = render_json(&report).expect("序列化");
         let back: BenchmarkReport = serde_json::from_str(&text).expect("反序列化");
         assert_eq!(back, report);
+    }
+
+    // ── P10 切片 3：证据台账 ──────────────────────────────────────────
+
+    /// 报表里要看得见"这个任务动过什么"。
+    ///
+    /// 台账每一项都是列表，进不了表格——它单独列在表后。读报表的人
+    /// 不用去翻 JSONL 才看得到动过哪些文件、跑过哪些命令。
+    #[test]
+    fn the_text_report_lists_the_evidence_ledger() {
+        let report = BenchmarkReport::from_sessions(&[synthetic_log(None)]);
+        let text = render_text(&report);
+
+        assert!(text.contains("证据台账"), "{text}");
+        assert!(text.contains("写过的文件"), "{text}");
+        // 没成功的调用必须出现在台账里：这是"未完成事项"的唯一来源。
+        assert!(text.contains("没成功的调用"), "{text}");
+        assert!(text.contains("文件不存在"), "{text}");
+    }
+
+    /// JSON 里也带着同一份台账：机器要能取到同一份账。
+    #[test]
+    fn the_json_report_carries_the_same_ledger() {
+        let report = BenchmarkReport::from_sessions(&[synthetic_log(None)]);
+        let text = render_json(&report).expect("序列化");
+
+        assert!(text.contains("evidence_index"), "{text}");
+        assert!(text.contains("文件不存在"), "{text}");
     }
 
     // ── P9-5 审批等待 ─────────────────────────────────────────────────

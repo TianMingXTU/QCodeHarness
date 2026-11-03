@@ -197,4 +197,53 @@ mod tests {
 
         assert_eq!(registry.specs().len(), 1, "同名去重后只剩一个规格");
     }
+
+    /// 证据台账的分类表要与真实注册表对得上。
+    ///
+    /// 两头都要守：表里的名字拼错了，台账会静默少记一项；真实工具没
+    /// 进表、也没说清为什么不记，新工具就会悄悄消失在台账里——用户
+    /// 看报表以为"这个任务没碰过那些文件"。
+    ///
+    /// 所以真实工具要么被分类，要么在"明确不记"名单里写清理由。
+    #[test]
+    fn the_evidence_ledger_knows_every_real_tool() {
+        let registry = ToolRegistry::new(crate::infrastructure::tool::all_tools(
+            crate::domain::workspace::WorkspaceRoot::new(std::env::temp_dir()),
+        ));
+        let specs = registry.specs();
+        let registered: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        let known = crate::domain::context::known_tool_names();
+
+        for name in known {
+            assert!(
+                registered.contains(name),
+                "台账分类表里的 `{name}` 不是真实注册的工具；已注册: {registered:?}"
+            );
+        }
+
+        // 明确不记的工具，以及不记的理由。
+        let deliberately_untracked: &[(&str, &str)] = &[
+            ("list_dir", "列目录不读文件内容，台账记的是文件"),
+            ("search_text", "按模式扫文件，命中的文件不固定"),
+            ("git_status", "查仓库状态，不指向具体文件"),
+            ("git_diff", "看的是改动，不是读过哪个文件"),
+        ];
+        for (name, reason) in deliberately_untracked {
+            assert!(
+                registered.contains(name),
+                "`{name}` 应当是真实注册的工具: {registered:?}"
+            );
+            assert!(
+                !known.contains(name),
+                "`{name}` 已进分类表，明确不记的理由（{reason}）要一并更新"
+            );
+        }
+
+        for name in &registered {
+            assert!(
+                known.contains(name) || deliberately_untracked.iter().any(|(untracked, _)| untracked == name),
+                "新工具 `{name}` 没进台账分类表：要么加进分类表，要么在明确不记的名单里写清理由"
+            );
+        }
+    }
 }

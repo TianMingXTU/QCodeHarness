@@ -11,5 +11,8 @@ pub mod agent_run;
 pub mod error;
 pub mod orchestrator;
 pub mod snapshot;
+pub mod step_prompt;
 pub mod summarizer;
+pub mod task_resume;
 pub mod tool_registry;
+pub mod worktree;

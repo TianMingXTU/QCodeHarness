@@ -160,7 +160,7 @@ mod tests {
         fs::write(path, lines.join("\n")).expect("写合成 JSONL");
     }
 
-    /// 覆盖全部 `AuditEvent` 变体的一组事件（当前 9 种）。
+    /// 覆盖全部 `AuditEvent` 变体的一组事件（当前 11 种）。
     /// 新增变体时这里必须同步——漏一个，全变体读回测试就会提醒。
     fn every_variant() -> Vec<Evidence> {
         let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
@@ -246,9 +246,28 @@ mod tests {
             ),
             Evidence::new(
                 9,
+                at(107),
+                AuditEvent::ToolCallReplayed {
+                    turn: 4,
+                    tool: "read_file".to_owned(),
+                    reason: "中断发生在这次调用执行期间".to_owned(),
+                    previous_outcome: Some(ToolOutcome::success("文件内容")),
+                },
+            ),
+            Evidence::new(
+                10,
+                at(107),
+                AuditEvent::ApprovalReasked {
+                    turn: 4,
+                    tool: "write_file".to_owned(),
+                    reason: "这个审批请求之前就问过，那时没答复".to_owned(),
+                },
+            ),
+            Evidence::new(
+                11,
                 at(108),
                 AuditEvent::SummaryFailed {
-                    turn: 4,
+                    turn: 5,
                     reason: "模型超时".to_owned(),
                 },
             ),

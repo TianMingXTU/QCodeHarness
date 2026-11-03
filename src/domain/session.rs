@@ -77,6 +77,21 @@ pub struct SessionSnapshot {
     pub summary: Option<Summary>,
 }
 
+impl SessionSnapshot {
+    /// 已经开始了多少步。
+    ///
+    /// 与 [`Session::started_steps`] 同一口径：从快照读回的历史还没被
+    /// 校验成会话，而恢复前要拿这个数核对"会话停在第几步"。
+    pub fn started_steps(&self) -> usize {
+        count_step_prompts(&self.turns)
+    }
+
+    /// 每一轮属于第几步（1-based）。与 [`Session::round_steps`] 同口径。
+    pub fn round_steps(&self) -> Vec<u32> {
+        round_step_numbers(&self.turns)
+    }
+}
+
 /// 会话历史的视图片段。
 ///
 /// 为什么不直接暴露 `&[Turn]`：`Turn` 是消息级的（Agent/Observation 交替），
@@ -143,6 +158,89 @@ impl Session {
     /// 没有观察可配，硬塞进 commit_round 只会造出一个空壳轮次。
     pub fn push_user(&mut self, message: impl Into<String>) {
         self.turns.push(Turn::User(message.into()));
+    }
+
+    /// 在第 `index` 条历史之前插入一条用户消息。
+    ///
+    /// P10 任务级恢复用：把已完成步骤的结论交回给模型时，结论要落在
+    /// "当前这一步的交代"**之前**——它是对前几步的总结，出现在这一步
+    /// 的交代之后就成了倒着说。
+    ///
+    /// `index` 越界时按"追加到末尾"处理：插入位置算错了也不该让
+    /// 恢复路径崩掉，消息本身追加着照样能被模型看见。
+    pub fn insert_user_at(&mut self, index: usize, message: impl Into<String>) {
+        let index = index.min(self.turns.len());
+        self.turns.insert(index, Turn::User(message.into()));
+    }
+
+    /// 当前步骤交代在历史里的位置。
+    ///
+    /// "当前步骤交代"= 最后一条**非交接**的用户消息。交接消息（结论
+    /// 交接）是总结，不是交代，不参与定位。
+    ///
+    /// 找不到时返回历史长度——即追加到末尾。
+    pub fn step_prompt_position(&self) -> usize {
+        self.turns
+            .iter()
+            .rposition(|turn| match turn {
+                Turn::User(text) => !crate::domain::task::is_handoff_message(text),
+                _ => false,
+            })
+            .unwrap_or(self.turns.len())
+    }
+
+    /// 已经开始了多少步。
+    ///
+    /// 每一步的交代是一条用户消息，任务交代就是第 1 步的交代——
+    /// 所以"非交接用户消息的条数"就是"已经开跑的步数"。
+    ///
+    /// 这个数与任务进度的关系是恢复前核对的关键：会话开了几步，
+    /// 任务就该走到第几步附近。对不上说明手里的两半不是同一个任务。
+    pub fn started_steps(&self) -> usize {
+        count_step_prompts(&self.turns)
+    }
+
+    /// 每一轮属于第几步（1-based）。
+    ///
+    /// 摘要按步骤分段时要用：模型要知道"这段历史是第几步的事"。
+    /// 步号由结构数出来（每条非交接的用户消息就是一步的交代），
+    /// 不去解析交代文本里的编号。
+    pub fn round_steps(&self) -> Vec<u32> {
+        round_step_numbers(&self.turns)
+    }
+
+    /// 历史里的全部步骤交代，按发生顺序。
+    ///
+    /// 排除交接消息：那是步骤的**结论**，不是步骤的**交代**。两者都是
+    /// 用户消息，长得却不一样——混在一起会让"会话开了几步"算错。
+    pub fn step_prompts(&self) -> Vec<&str> {
+        self.turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::User(text) if !crate::domain::task::is_handoff_message(text) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 历史里的最后一条消息是不是给定的用户消息。
+    ///
+    /// 恢复路径用：中断的那一步，它的交代已经进了历史；恢复时再推
+    /// 一遍就成了同一句交代出现两次——模型看到两条一模一样的指令，
+    /// 而"会话开了几步"也会因此算错。
+    pub fn ends_with_user_message(&self, text: &str) -> bool {
+        matches!(self.turns.last(), Some(Turn::User(last)) if last == text)
+    }
+
+    /// 历史里是否已经有这条一模一样的用户消息。
+    ///
+    /// 交接用：同一份快照恢复两次，第二次不该把同一句结论再推一遍。
+    pub fn has_user_message(&self, message: &str) -> bool {
+        self.turns.iter().any(|turn| {
+            matches!(turn, Turn::User(text) if text == message)
+        })
     }
 
     /// 已挂的摘要。
@@ -332,9 +430,45 @@ impl Session {
     }
 }
 
+/// 历史里的步骤交代有多少条（交接消息不算）。
+///
+/// 单独抽成函数：会话与它的快照都要数这个数，而两者的历史是同一份
+/// 数据形状（`Vec<Turn>`）——写成两处，两处就会慢慢分叉。
+pub fn count_step_prompts(turns: &[Turn]) -> usize {
+    turns
+        .iter()
+        .filter(|turn| match turn {
+            Turn::User(text) => !crate::domain::task::is_handoff_message(text),
+            _ => false,
+        })
+        .count()
+}
+
+/// 每一轮属于第几步（1-based）。
+///
+/// 步骤边界是**结构性的**：历史里每条非交接的用户消息就是一步的交代，
+/// 所以"这一轮属于第几步"数一遍用户消息就知道，不必去解析交代文本里
+/// 的步号——解析文本的话，格式一改就会悄悄对不上，而且对不上时没有
+/// 任何报错。
+///
+/// 与 [`count_step_prompts`] 同源：会话与它的快照都从这里取。
+pub fn round_step_numbers(turns: &[Turn]) -> Vec<u32> {
+    let mut steps = Vec::new();
+    let mut step = 0u32;
+    for turn in turns {
+        match turn {
+            Turn::User(text) if !crate::domain::task::is_handoff_message(text) => {
+                step += 1;
+            }
+            Turn::Agent(_) => steps.push(step),
+            _ => {}
+        }
+    }
+    steps
+}
+
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests {    use super::*;
     use crate::domain::ids::CallId;
     use serde_json::json;
 
@@ -624,6 +758,7 @@ mod tests {
         session.set_summary(Summary {
             covers: (1, 2),
             text: "前两轮读了文件".to_owned(),
+            steps: vec![1, 2],
         });
 
         let restored = Session::from_snapshot(SessionId::new("s1"), session.snapshot()).unwrap();
@@ -640,6 +775,7 @@ mod tests {
             summary: Some(Summary {
                 covers: (3, 1),
                 text: "坏摘要".to_owned(),
+                steps: Vec::new(),
             }),
             turns: vec![Turn::User("任务".to_owned())],
         };
@@ -651,6 +787,7 @@ mod tests {
             summary: Some(Summary {
                 covers: (1, 99),
                 text: "坏摘要".to_owned(),
+                steps: Vec::new(),
             }),
             turns: vec![Turn::User("任务".to_owned())],
         };

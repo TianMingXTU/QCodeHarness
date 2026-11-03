@@ -48,7 +48,7 @@ impl TaskKind {
 }
 
 /// 任务的当前状态。只能经 [`Task`] 的领域方法转移。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
     /// 已创建，未开始。
     Pending,
@@ -61,7 +61,7 @@ pub enum TaskState {
 }
 
 /// 一步任务：做什么、谁来做、做到什么程度算完。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskStep {
     /// 步骤说明，给人看也给模型看。必须自包含——步骤边界是一条新的
     /// 用户消息，模型是从它知道"现在做第几步"的；历史里虽有前面几步
@@ -75,7 +75,7 @@ pub struct TaskStep {
 }
 
 /// 失败的记录：停在哪一步、为什么。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskFailure {
     /// 失败发生在第几步（0-based）。
     pub step: usize,
@@ -83,8 +83,59 @@ pub struct TaskFailure {
     pub reason: String,
 }
 
+/// 一步的产出：这一步做完了什么。
+///
+/// 任务级快照要记住"每一步的结论"，而不只是"跑到了第几步"：恢复后
+/// 下一步的模型必须看得见前面几步得出了什么，否则它只能从零重新推。
+///
+/// 放在 domain 而不是快照模块：它是任务数据（"第 N 步的结论"），
+/// 快照只是它的载体。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepOutput {
+    /// 步骤号（0-based，与 [`TaskState::Running`] 的 `step` 同口径）。
+    pub step: usize,
+    /// 这一步执行者的角色。
+    pub role: AgentRole,
+    /// 这一步的结论：模型的最终答案。
+    pub answer: String,
+}
+
+impl StepOutput {
+    /// 把这一步的结论交给模型时用的用户消息。
+    ///
+    /// 用**用户消息**而不是普通轮次：裁剪时保留的是全部用户消息、
+    /// 丢弃的是轮次（见 `domain::context::compact`）。结论要活得比
+    /// 历史更久——恢复后的下一步靠它知道"第 1 步查出了什么"。
+    ///
+    /// 文本由 [`StepOutput`] 唯一决定：恢复时用它判断"这条结论是不是
+    /// 已经交接过了"，同一份快照重复恢复不会把同一句话推两遍。
+    pub fn handoff_message(&self) -> String {
+        format!(
+            "{HANDOFF_PREFIX}{} 步·{}] 结论：{}",
+            self.step + 1,
+            self.role.name(),
+            self.answer
+        )
+    }
+}
+
+/// 交接消息的前缀标记。
+///
+/// 它的用处有两个：恢复时靠它认出"这条用户消息是交接来的结论，不是
+/// 步骤交代"，从而不把它算进步骤交代的条数；重复恢复时靠它认出
+/// "这条结论已经交接过了"，不重复推第二遍。
+pub const HANDOFF_PREFIX: &str = "[已完成第 ";
+
+/// 这条用户消息是不是一条结论交接。
+pub fn is_handoff_message(text: &str) -> bool {
+    text.starts_with(HANDOFF_PREFIX)
+}
+
 /// 一次工程任务。
-#[derive(Debug, Clone)]
+///
+/// `Deserialize` 手写（见本文件下方的实现）：派生版本会接受"进度下标
+/// 越界"这类构造路径产生不出的状态。
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Task {
     id: TaskId,
     kind: TaskKind,
@@ -93,6 +144,61 @@ pub struct Task {
     state: TaskState,
     /// 失败详情。`state == Failed` 时必有值。
     failure: Option<TaskFailure>,
+}
+
+/// `Task` 的反序列化：逐条校验状态机的不变量。
+///
+/// 为什么手写而不派生：派生出来的 `Deserialize` 会接受任何组合，
+/// 于是快照里可以躺着一个"停在第 99 步、总共只有 3 个步骤"的任务——
+/// 它进了编排循环才在越界下标处崩，崩在一个看不懂的地方。反序列化
+/// 是外部数据进入领域的唯一入口，不变量必须在这里拦住。
+///
+/// 校验的三条与构造路径一一对应：
+/// - `Running { step }` 的 `step` 必须 `< steps.len()`：`start()` 只置 0，
+///   `advance()` 只在 `step + 1 < len` 时前进，从不越界；
+/// - `Completed` 的任务必有步骤：`start()` 拒绝空步骤任务；
+/// - `Failed` 必有失败详情：`fail()` 总是同时写状态与详情。
+#[derive(Deserialize)]
+struct TaskWire {
+    id: TaskId,
+    kind: TaskKind,
+    goal: String,
+    steps: Vec<TaskStep>,
+    state: TaskState,
+    #[serde(default)]
+    failure: Option<TaskFailure>,
+}
+
+impl<'de> Deserialize<'de> for Task {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = TaskWire::deserialize(deserializer)?;
+        if let TaskState::Running { step } = wire.state {
+            if step >= wire.steps.len() {
+                return Err(serde::de::Error::custom(format!(
+                    "任务状态是 Running {{ step: {step} }}，但只有 {} 个步骤——进度下标越界",
+                    wire.steps.len()
+                )));
+            }
+        }
+        if wire.state == TaskState::Completed && wire.steps.is_empty() {
+            return Err(serde::de::Error::custom(
+                "任务状态是 Completed，但它没有任何步骤——空任务不可能走到完成",
+            ));
+        }
+        if wire.state == TaskState::Failed && wire.failure.is_none() {
+            return Err(serde::de::Error::custom(
+                "任务状态是 Failed，却没有失败详情——失败原因会丢",
+            ));
+        }
+        Ok(Self {
+            id: wire.id,
+            kind: wire.kind,
+            goal: wire.goal,
+            steps: wire.steps,
+            state: wire.state,
+            failure: wire.failure,
+        })
+    }
 }
 
 /// 任务状态机的非法转移。
@@ -108,6 +214,13 @@ pub enum TaskError {
     /// 编排器跑完空循环就把任务标成 `Completed`，比报错难发现得多。
     #[error("任务没有任何步骤，无法开始（模板可能缺失或未找到）")]
     NoSteps,
+    /// 只有失败的任务能重新进入运行态。
+    ///
+    /// 与 [`TaskError::NotRunning`] 分开：一个是"没在跑"，一个是"没失败过"。
+    /// 两种误用的后果不同——对没失败过的任务调用 `retry()` 会让进度凭空
+    /// 倒退或跳步。
+    #[error("任务不是失败态，不能重试")]
+    NotFailed,
 }
 
 impl Task {
@@ -177,6 +290,28 @@ impl Task {
         self.state = TaskState::Failed;
     }
 
+    /// 把失败的任务放回运行态，从失败的那一步接着走。
+    ///
+    /// P10 任务级恢复的入口：任务被中断（预算耗尽、墙钟超时、被取消）
+    /// 之后，恢复的路径要能回到 `Running { step }` 而不是从头再来。
+    ///
+    /// 进度**不倒退**：失败时停在哪一步，恢复就从哪一步开始。
+    /// 前面已经做完的步骤不会重做——它们的结论在快照的
+    /// `completed_outputs` 里，恢复时会交回给模型。
+    ///
+    /// # Errors
+    ///
+    /// 任务不是 `Failed` 态时返回 [`TaskError::NotFailed`]。没失败过的
+    /// 任务不需要"重试"，对它调用这个方法多半是调用方的逻辑错了。
+    pub fn retry(&mut self) -> Result<(), TaskError> {
+        let TaskState::Failed = self.state else {
+            return Err(TaskError::NotFailed);
+        };
+        let step = self.failure.as_ref().map_or(0, |failure| failure.step);
+        self.state = TaskState::Running { step };
+        Ok(())
+    }
+
     /// 当前步骤。不在 `Running` 态时没有"当前"可言。
     pub fn current_step(&self) -> Option<&TaskStep> {
         let TaskState::Running { step } = self.state else {
@@ -194,6 +329,19 @@ impl Task {
             TaskState::Failed => self.failure.as_ref().map_or(0, |f| f.step),
         };
         (done, self.steps.len())
+    }
+
+    /// 当前进行到第几步（0-based）。
+    ///
+    /// 与 [`Task::progress`] 的第一个分量同口径，但语义不同：进度说的是
+    /// "做完了几步"，这里说的是"现在在第几步"——`Pending` 是 0，
+    /// `Completed` 是总步数（全都做完了），`Failed` 是失败的那一步
+    /// （那一步还没做完）。
+    ///
+    /// 任务级恢复要靠它决定"从哪一步接着走"，所以它必须对每种状态都
+    /// 有确定的值，不能只在 `Running` 态下有意义。
+    pub fn current_index(&self) -> usize {
+        self.progress().0
     }
 
     /// 任务 ID。
@@ -331,5 +479,80 @@ mod tests {
             assert_eq!(kind.name(), TaskKind::parse_name(kind.name()).unwrap().name());
         }
         assert_eq!(TaskKind::parse_name("deploy"), None, "未知类型必须拒绝");
+    }
+
+    // ── P10 切片 1a：任务可序列化，且重建时守住状态机不变量 ──────────
+
+    /// 任务在各个状态下都要能无损往返。
+    ///
+    /// 快照是跨进程、跨版本的持久数据：任何一个状态反序列化不过，
+    /// 那条路径上的任务就永远恢复不了。所以四种状态全测，
+    /// 失败态还要带上失败详情一起走。
+    #[test]
+    fn task_round_trips_through_serde_in_every_state() {
+        let mut running = three_step_task();
+        running.start().unwrap();
+
+        let mut failed = three_step_task();
+        failed.start().unwrap();
+        failed.advance().unwrap();
+        failed.fail("模型调用失败");
+
+        let mut completed = three_step_task();
+        completed.start().unwrap();
+        completed.advance().unwrap();
+        completed.advance().unwrap();
+        completed.advance().unwrap();
+
+        for task in [three_step_task(), running, failed, completed] {
+            let text = serde_json::to_string(&task).expect("任务应可序列化");
+            let restored: Task = serde_json::from_str(&text).expect("任务应可反序列化");
+            assert_eq!(restored.state(), task.state());
+            assert_eq!(restored.id(), task.id());
+            assert_eq!(restored.kind(), task.kind());
+            assert_eq!(restored.goal(), task.goal());
+            assert_eq!(restored.steps(), task.steps());
+            assert_eq!(restored.failure(), task.failure());
+        }
+    }
+
+    /// 恢复时的进度下标必须落在步骤范围内。
+    ///
+    /// 这是任务级恢复的第一条不变量：`Running { step }` 是进度的唯一
+    /// 真相来源，而 `step >= steps.len()` 的任务进了编排循环就越界。
+    /// 派生 `Deserialize` 会照单全收这种组合——手写的重建路径才拦得住。
+    #[test]
+    fn a_running_step_beyond_the_step_list_is_rejected() {
+        let mut task = three_step_task();
+        task.start().unwrap();
+        let mut wire = serde_json::to_value(&task).unwrap();
+        wire["state"] = serde_json::json!({"Running": {"step": 3}});
+
+        let error = serde_json::from_value::<Task>(wire).unwrap_err();
+
+        assert!(
+            error.to_string().contains("进度下标越界"),
+            "越界的进度下标必须被明确拒绝: {error}"
+        );
+    }
+
+    /// 状态与详情自相矛盾的组合一律拒绝。
+    ///
+    /// `Failed` 却没失败详情，意味着"为什么停在这里"会在恢复中丢失；
+    /// `Completed` 却一个步骤都没有，意味着这个任务不可能真的跑完。
+    #[test]
+    fn contradictory_state_and_details_are_rejected() {
+        let mut failed = three_step_task();
+        failed.fail("坏了");
+        let mut wire = serde_json::to_value(&failed).unwrap();
+        wire["failure"] = serde_json::Value::Null;
+        let error = serde_json::from_value::<Task>(wire).unwrap_err();
+        assert!(error.to_string().contains("没有失败详情"), "{error}");
+
+        let empty: Task = Task::new(TaskId::new("t0"), TaskKind::Review, "空任务", vec![]);
+        let mut wire = serde_json::to_value(&empty).unwrap();
+        wire["state"] = serde_json::json!("Completed");
+        let error = serde_json::from_value::<Task>(wire).unwrap_err();
+        assert!(error.to_string().contains("没有任何步骤"), "{error}");
     }
 }

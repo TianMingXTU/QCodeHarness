@@ -5,7 +5,7 @@
 //! 内存版一致，换存储不需要改读日志的代码。
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -68,10 +68,17 @@ impl JsonlEvidenceSink {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // 追加到已有文件时，序号要从文件里最后一条接着往下走。
+        //
+        // 不接上的话，重开一次 sink（会话级恢复、基准的两段式跑法）
+        // 就让序号归 1，文件里出现两段各自从 1 开始的编号——证据仍然
+        // 读得出来，但"序号连续"这条可检查的性质没了，而它正是用来
+        // 发现"证据被截断或改写"的。
+        let next_sequence = last_sequence(path).map_or(1, |sequence| sequence + 1);
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            next_sequence: AtomicU64::new(1),
+            next_sequence: AtomicU64::new(next_sequence),
             writer: Mutex::new(Some(BufWriter::new(file))),
         })
     }
@@ -153,6 +160,36 @@ fn unix_millis(time: SystemTime) -> u64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// 读出文件里最后一条证据的序号。
+///
+/// 只看文件尾部：证据文件可能有几万行，全读一遍只为拿最后一个数
+/// 不值当。尾部读不全（末行是崩溃留下的半截 JSON）就跳过它往前找；
+/// 一条都读不出来时返回 `None`——调用方按"从 1 开始"处理，性质变差
+/// 但证据一条不丢。
+fn last_sequence(path: &Path) -> Option<u64> {
+    /// 读的尾部字节数。够装下最后一条证据（它带一段工具输出，
+    /// 可能不小），又不用把整个文件读进内存。
+    const TAIL_BYTES: u64 = 64 * 1024;
+
+    let mut file = File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    if size == 0 {
+        return None;
+    }
+    let tail_len = size.min(TAIL_BYTES);
+    let mut buffer = vec![0u8; tail_len as usize];
+    file.seek(SeekFrom::Start(size - tail_len)).ok()?;
+    file.read_exact(&mut buffer).ok()?;
+    let text = String::from_utf8_lossy(&buffer);
+    text.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+            value.get("sequence")?.as_u64()
+        })
 }
 
 /// 会话 ID 里可能带路径分隔符（理论上），先做一次净化，否则
@@ -254,10 +291,11 @@ mod tests {
             })
             .collect();
 
-        // 追加写不重写文件，但序号在同一个 sink 生命周期内连续。
-        // 重新打开会从 1 重新编号，所以这里断言的是"两次运行共 3 行"。
+        // 重开 sink 是会话级恢复与两段式基准的必经路径：序号必须从文件
+        // 里最后一条接着走，而不是归 1——归 1 之后文件里出现两段各自
+        // 从 1 开始的编号，"序号连续"这条发现证据被截断的性质就没了。
         assert_eq!(content.lines().count(), 3);
-        assert_eq!(sequences, vec![1, 2, 1]);
+        assert_eq!(sequences, vec![1, 2, 3]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

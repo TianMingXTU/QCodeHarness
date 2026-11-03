@@ -236,7 +236,7 @@ async fn awaiting_approval_snapshot_reasks_the_gate_on_resume() {
 }
 
 #[tokio::test]
-async fn half_dispatched_snapshot_executes_only_the_remaining_call() {
+async fn half_dispatched_snapshot_does_not_rerun_the_call_that_was_in_flight() {
     // 手工构造"第二条调用执行前"的快照：两条调用，第一条已有观察。
     let call_1 = call("call_1", "a");
     let call_2 = call("call_2", "b");
@@ -273,20 +273,30 @@ async fn half_dispatched_snapshot_executes_only_the_remaining_call() {
     let outcome = runner.run(&Budget::new(5)).await.unwrap();
 
     assert_eq!(outcome.answer, "半轮续跑完成");
-    // 只有第二条真的执行；第一条不重跑，它的观察从 pending 里带过来。
-    assert_eq!(
-        invoker.executed.lock().unwrap().as_slice(),
-        [json!({"path": "b"}).to_string()],
-        "应只执行第二条调用"
+    // 两条都不重跑：第一条已有观察（重跑就是白读一遍），第二条是中断时
+    // 正在执行的那一条——它可能已经产生了副作用，恢复不替模型重跑一次。
+    assert!(
+        invoker.executed.lock().unwrap().is_empty(),
+        "已执行的与在途的调用都不得被自动重跑"
     );
     assert_eq!(runner.session().rounds(), 1, "半轮应配平并提交成完整一轮");
-    // 提交的那轮带两条观察：一条来自快照，一条是刚执行的。
+    // 提交的那轮带两条观察：一条来自快照，一条是重放提示。
     let turns = runner.session().snapshot().turns;
     let Some(Turn::Observation(outcomes)) = turns.last() else {
         panic!("最后一轮应是观察，实际 {:?}", turns.last());
     };
     assert_eq!(outcomes.len(), 2);
     assert_eq!(outcomes[0].content, "a 的内容");
+    assert!(
+        outcomes[1].content.contains("中断恢复"),
+        "在途的那条要收到重放提示: {}",
+        outcomes[1].content
+    );
+    assert!(
+        outcomes[1].content.contains("read_file"),
+        "重放提示要点名工具: {}",
+        outcomes[1].content
+    );
 }
 
 /// 恢复路径也必须过角色边界。

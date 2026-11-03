@@ -77,7 +77,10 @@ impl CliApprovalGate {
         // 它的全部意义就在于"这一次必须有人过目"，所以会话信任整体失效：
         // 不查信任、不接受 `a`/`p`。否则模型把同一条越界命令再发一遍，
         // 就会被第一次授出的信任无声放行。
-        let trustable = request.reason.is_none();
+        //
+        // 恢复后重新问的请求同样不吃会话信任：上一次问的是上一个进程里
+        // 的人，那次没答复——把它当成"人点过了"正是这条防线要防的事。
+        let trustable = request.reason.is_none() && !request.resumed;
 
         if trustable {
             if let Some(note) = self.trust_note(&request.call) {
@@ -105,6 +108,14 @@ impl CliApprovalGate {
             );
             if let Some(reason) = &request.reason {
                 let _ = writeln!(writer, "复核:   {reason}");
+            }
+            if request.resumed {
+                // 重新询问必须点破"之前问过、那次没答复"：人被问第二遍时
+                // 最自然的反应是"怎么又问我"，而不是"上次那个还没答复"。
+                let _ = writeln!(
+                    writer,
+                    "注意:   这是恢复后的重新询问——这个审批请求之前问过，那时没答复。"
+                );
             }
             let _ = write!(writer, "批准执行？");
             let _ = write!(writer, "[y] 允许  [n] 否决  ");
@@ -454,6 +465,7 @@ mod tests {
             },
             annotations: ToolAnnotations::new(false, true, false, false),
             reason: None,
+            resumed: false,
         }
     }
 
@@ -464,6 +476,14 @@ mod tests {
                 "策略已放行，但疑似越界写入：命令把输出重定向到 workspace 外的 `{command}`"
             )),
             ..request_with("run_command", json!({"command": command}))
+        }
+    }
+
+    /// 恢复后重新询问的审批请求。
+    fn resumed_request(name: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            resumed: true,
+            ..request_with(name, json!({"path": "src/main.rs"}))
         }
     }
 
@@ -733,6 +753,43 @@ mod tests {
         assert!(!printed.contains("[a]"), "复核请求不应提供 [a]: {printed}");
         assert!(!printed.contains("[p]"), "复核请求不应提供 [p]: {printed}");
         assert!(printed.contains("不适用会话信任"), "应说明原因: {printed}");
+    }
+
+    /// 重新询问时，提示必须点破"之前问过、那次没答复"。
+    ///
+    /// 人被问第二遍时最自然的反应是"怎么又问我"。不点破这一层，人可能
+    /// 以为程序出了故障——或者更糟，顺手按了 y。
+    #[test]
+    fn a_resumed_request_shows_that_it_was_asked_before() {
+        let gate = CliApprovalGate::new();
+        let mut reader = Cursor::new(b"y\n".as_slice());
+        let mut sink = Vec::new();
+
+        let _ = gate.decide_from(&mut reader, &mut sink, &resumed_request("write_file"));
+        let printed = String::from_utf8(sink).expect("输出是 UTF-8");
+
+        assert!(printed.contains("之前问过"), "应说明之前问过: {printed}");
+        assert!(printed.contains("没答复"), "应说明那次没答复: {printed}");
+    }
+
+    /// 重新询问不吃会话信任：上一次没答复，不等于这一次可以免掉。
+    ///
+    /// 信任记录记的是"人点过 yes"。恢复后被问的是另一次决定——人根本
+    /// 没看过这个提示（它在上一个进程里被关掉了）。拿旧信任放行新请求，
+    /// 等于把"人没点过"读成"人点过了"。
+    #[test]
+    fn a_resumed_request_ignores_session_trust() {
+        let gate = CliApprovalGate::new();
+        // 先授出一条精确信任：同工具同参数在普通请求里会被自动放行。
+        assert!(decide(&gate, "a\n", &request("write_file")).is_ok());
+        assert_eq!(gate.trusted_entries(), 1);
+
+        // 同样参数，但这次是重新询问：必须照问，读不到输入就否决。
+        let decision = decide(&gate, "", &resumed_request("write_file"));
+        assert!(
+            decision.is_err(),
+            "重新询问不得被会话信任免掉"
+        );
     }
 
     #[test]

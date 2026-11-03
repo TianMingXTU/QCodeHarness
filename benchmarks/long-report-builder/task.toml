@@ -1,0 +1,19 @@
+id = "long-report-builder"
+kind = "bug-fix"
+description = "修复 bench-report 库：处理链上四个环节各带一个缺陷（aggregate 的求平均分母多加了 1、rank 的排序方向反了、render 的标题后少了换行、observations 无缺陷但链路上游，需要先读它确认数据形状），相关测试全部失败。读 src/ 下四个模块与 tests/report.rs，逐个定位根因，做最小修复，然后运行 cargo test 验证全部测试通过。缺陷相互独立，修复一个不会让其他测试变绿。"
+suite = "long"
+
+[long_run]
+exhaust_turns = 5
+context_max_tokens = 1800
+
+[criteria]
+test_command = "cargo test"
+requires_changes = true
+answer_must_mention = []
+# 实测自然完成是 8 轮（两段合计，模型一轮能给多个调用），下限设在
+# 自然值之下：防"恢复段偷懒跳步"，不是惩罚效率——12 这种按"每模块
+# 两轮"预估的值会把高效完成误判成失败。
+min_turns = 7
+no_repeated_commands = ["cargo test --test report"]
+must_mention_after_compaction = ["average"]

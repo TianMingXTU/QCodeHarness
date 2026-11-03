@@ -16,4 +16,5 @@ pub mod context;
 pub mod evidence;
 pub mod policy;
 pub mod task;
+pub mod worktree;
 pub mod workflow;

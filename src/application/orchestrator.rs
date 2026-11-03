@@ -17,11 +17,14 @@ use crate::application::agent_roster::AgentRoster;
 use crate::application::agent_run::{new_session_id, AgentDependencies, AgentRunner};
 use crate::application::error::ApplicationError;
 use crate::application::port::EvidenceSink;
+use crate::application::snapshot::{TaskSnapshot, TaskStore, TASK_FORMAT};
+use crate::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
+use crate::application::worktree::WorktreeScanner;
 use crate::domain::agent::AgentSpec;
 use crate::domain::budget::Budget;
 use crate::domain::evidence::AuditEvent;
 use crate::domain::ids::{SessionId, TaskId};
-use crate::domain::task::{Task, TaskError, TaskKind, TaskState};
+use crate::domain::task::{StepOutput, Task, TaskError, TaskKind, TaskState};
 use crate::domain::workflow::WorkflowCatalog;
 
 /// 每任务证据汇的工厂：编排器为任务开一个会话与一份证据文件，怎么造汇
@@ -51,6 +54,19 @@ pub struct Orchestrator {
     /// 每个任务的证据汇工厂：一个任务只调用一次，为整个任务的唯一
     /// 会话建一份证据。
     evidence_factory: EvidenceFactory,
+    /// 任务快照存储。`None` 表示不落任务快照。
+    ///
+    /// 与 `deps.session_store` 分开：前者存"这个任务做到哪"，
+    /// 后者存"这个 runner 停在哪"。两者回答的问题不同，恢复的粒度
+    /// 也不同——任务级恢复能从步骤边界继续，会话级恢复只能从半轮继续。
+    task_store: Option<Arc<dyn TaskStore>>,
+    /// 工作区扫描器：存快照时记一份清单，恢复时拿它比对。
+    ///
+    /// `None` 表示不做工作区一致性检查。快照里的清单因此是空的，
+    /// 恢复时也拿不到可比的"当时的样子"——检查降级为"查不了"。
+    worktree_scanner: Option<Arc<dyn WorktreeScanner>>,
+    /// 工作区被改动时的处置策略。
+    worktree_policy: WorktreeChangePolicy,
 }
 
 impl Orchestrator {
@@ -81,7 +97,39 @@ impl Orchestrator {
             budget,
             templates: WorkflowCatalog::builtin(),
             evidence_factory,
+            task_store: None,
+            worktree_scanner: None,
+            worktree_policy: WorktreeChangePolicy::default(),
         }
+    }
+
+    /// 接上任务快照存储。
+    ///
+    /// 接上之后，任务每完成一步就落一份任务快照——中断时才有"这个任务
+    /// 做到哪"的记录可查。没接的话任务照跑，只是不能任务级恢复。
+    pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
+        self.task_store = Some(store);
+        self
+    }
+
+    /// 接上工作区扫描器。
+    ///
+    /// 接上之后，任务快照里会带一份工作区清单；恢复时拿它与当时的清单
+    /// 比对，得出"工作区有没有被人动过"。这是"不静默继续"的数据来源。
+    pub fn with_worktree_scanner(mut self, scanner: Arc<dyn WorktreeScanner>) -> Self {
+        self.worktree_scanner = Some(scanner);
+        self
+    }
+
+    /// 设定工作区被改动时的处置策略。
+    ///
+    /// 默认 [`WorktreeChangePolicy::Refuse`]：检测到改动就拒绝恢复。
+    /// 用户看过差异并确认之后，用
+    /// [`WorktreeChangePolicy::Confirmed`] 放行——那是人的决定，
+    /// 程序不替他做。
+    pub fn with_worktree_policy(mut self, policy: WorktreeChangePolicy) -> Self {
+        self.worktree_policy = policy;
+        self
     }
 
     /// 按任务类型从内置模板创建任务：模板步骤展开，`{goal}` 替换为目标。
@@ -100,9 +148,7 @@ impl Orchestrator {
     /// 步骤之间不另起 runner：`begin_step` 换角色、交代步骤、把上一步的
     /// 结论落进历史，会话 ID、轮数、墙钟与缓存路由键全部延续。
     ///
-    /// 从 `Running { step }` 接着跑：进度只有一个真相来源，将来
-    /// "编排中断恢复"就是从这里续。注意续跑会开一个**新**会话——
-    /// 快照恢复恢复的是单步 runner，不是整个任务（见 `--resume`）。
+    /// 从 `Running { step }` 接着跑：进度只有一个真相来源。
     ///
     /// # Errors
     ///
@@ -110,6 +156,25 @@ impl Orchestrator {
     /// 返回 [`ApplicationError::StepFailed`]，不继续后续步骤。
     /// 任务不在可执行状态时返回 [`ApplicationError::Task`]。
     pub async fn run(&mut self, task: &mut Task) -> Result<TaskOutcome, ApplicationError> {
+        let budget = self.budget;
+        self.run_with_budget(task, &budget).await
+    }
+
+    /// 用调用方给的预算跑一个任务，其余与 [`Self::run`] 相同。
+    ///
+    /// 长任务基准的第一段要用一个**故意设小**的轮数上限逼出中断，
+    /// 而编排器自带的预算是给正常运行用的——为这一个场景改装配里的
+    /// 预算，等于让装配配置为实验条件让路。预算是"这一次运行"的参数，
+    /// 不是编排器的身份，所以它跟在 run 后面而不是构造器里。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Self::run`] 相同。
+    pub async fn run_with_budget(
+        &mut self,
+        task: &mut Task,
+        budget: &Budget,
+    ) -> Result<TaskOutcome, ApplicationError> {
         if matches!(task.state(), TaskState::Pending) {
             task.start()?;
         }
@@ -126,20 +191,34 @@ impl Orchestrator {
         let mut runner: Option<AgentRunner> = None;
         let mut completed = 0usize;
         let mut last_answer = String::new();
+        // 每一步的结论。任务级恢复要靠它把"前面几步查出了什么"交回
+        // 给模型（见 `application::task_resume`）。
+        let mut completed_outputs: Vec<StepOutput> = Vec::new();
 
         for index in start..task.steps().len() {
+            let step_role = task.steps()[index].role;
             match self
-                .run_step(task, index, &session_id, &evidence, &mut runner)
+                .run_step(task, index, budget, &session_id, &evidence, &mut runner)
                 .await
             {
                 Ok(answer) => {
                     task.advance()?;
                     completed += 1;
-                    last_answer = answer;
+                    last_answer = answer.clone();
+                    completed_outputs.push(StepOutput {
+                        step: index,
+                        role: step_role,
+                        answer,
+                    });
+                    // 每完成一步就落一份任务快照：中断时"做到哪"才查得到。
+                    self.save_task_snapshot(task, runner.as_ref(), &completed_outputs);
                 }
                 Err(error) => {
                     let reason = format!("第 {} 步失败: {error}", index + 1);
                     task.fail(reason.clone());
+                    // 失败这一刻也要落快照：任务失败在第几步、失败前
+                    // 完成了哪些步骤，都在快照里。
+                    self.save_task_snapshot(task, runner.as_ref(), &completed_outputs);
                     return Err(ApplicationError::StepFailed {
                         step: index + 1,
                         message: reason,
@@ -159,6 +238,227 @@ impl Orchestrator {
         })
     }
 
+    /// 把当前的任务状态落成一份任务快照。
+    ///
+    /// 落盘失败降级为 stderr 警告：任务快照是恢复的便利，不是任务本身
+    /// 的成败——一次写盘失败不该把跑了几十轮的任务带崩（同
+    /// `AgentRunner::save_snapshot` 的立场）。
+    ///
+    /// 存不下就不存：没接存储的编排器（单测、基准）不受影响。
+    fn save_task_snapshot(
+        &self,
+        task: &Task,
+        runner: Option<&AgentRunner>,
+        completed_outputs: &[StepOutput],
+    ) {
+        let Some(store) = self.task_store.as_ref() else {
+            return;
+        };
+        let Some(runner) = runner else {
+            // 还没开跑就没有运行状态可存。第一步完成时 runner 一定在。
+            return;
+        };
+        let snapshot = TaskSnapshot {
+            format_version: TASK_FORMAT,
+            task: task.clone(),
+            run: runner.snapshot(),
+            completed_outputs: completed_outputs.to_vec(),
+            worktree: self.scan_worktree(),
+        };
+        if let Err(error) = store.save(&snapshot) {
+            eprintln!("警告：任务快照保存失败（任务继续）: {error}");
+        }
+    }
+
+    /// 扫一遍工作区，给快照留一份"当时的样子"。
+    ///
+    /// 扫不出来时给空清单：那意味着"当时是什么样"根本不知道，恢复时的
+    /// 工作区检查会降级为"查不了"——而不是假装没改动过。
+    fn scan_worktree(&self) -> crate::domain::worktree::WorktreeManifest {
+        match self.worktree_scanner.as_ref() {
+            Some(scanner) => scanner.scan().unwrap_or_default(),
+            None => crate::domain::worktree::WorktreeManifest::default(),
+        }
+    }
+
+    /// 恢复前核对工作区：被人动过就按策略处理。
+    ///
+    /// 三个分支：
+    ///
+    /// - **没动过**：放行。
+    /// - **动过且策略是 `Refuse`**：返回 [`ApplicationError::WorktreeChanged`]，
+    ///   差异清单带在错误里，用户看得见到底改了什么。
+    /// - **扫不出来**：只打一条警告就放行。查不了不等于没改动，
+    ///   但也拦不住——硬失败会让一个本来能恢复的任务彻底卡住，
+    ///   而工作区读不出来通常是环境问题，不是任务问题。
+    ///
+    /// 快照里没有清单（老版本的任务快照，或扫描没留下基准）时跳过检查：
+    /// 没有可比的基准，比出来的"没改动"是假的。跳过要出声——用户得知道
+    /// 这一道检查没有发生，而不是被一条看不见的绿灯骗过去。
+    fn check_worktree_unchanged(&self, snapshot: &TaskSnapshot) -> Result<(), ApplicationError> {
+        if snapshot.worktree.is_empty() {
+            eprintln!("警告：快照里没有工作区清单，跳过工作区一致性检查");
+            return Ok(());
+        }
+        let Some(scanner) = self.worktree_scanner.as_ref() else {
+            eprintln!("警告：没有装配工作区扫描器，跳过工作区一致性检查");
+            return Ok(());
+        };
+        match task_resume::check_worktree(&snapshot.worktree, scanner.as_ref()) {
+            ResumeCheck::Clean => Ok(()),
+            ResumeCheck::WorktreeChanged { changes } => {
+                if self.worktree_policy == WorktreeChangePolicy::Confirmed {
+                    return Ok(());
+                }
+                Err(ApplicationError::WorktreeChanged {
+                    changes: changes.iter().map(|change| change.describe()).collect(),
+                })
+            }
+            ResumeCheck::WorktreeUnreadable { reason } => {
+                eprintln!("警告：无法读取工作区（{reason}），跳过工作区一致性检查");
+                Ok(())
+            }
+        }
+    }
+
+    /// 从任务快照恢复一个任务，接着把剩下的步骤跑完。
+    ///
+    /// 与 [`Self::run`] 的分工：`run` 从头跑一个任务；这里接手一个
+    /// 中途断掉的任务，从它停下的那一步继续，前面做完的步骤**不重做**。
+    ///
+    /// 恢复要过的三道关（任一不过就不恢复）：
+    ///
+    /// 1. **快照版本**要对（[`task_resume::check_resumable`]）。
+    /// 2. **任务与会话要对得上**：任务的步骤数与会话里开跑的步数必须
+    ///    一致，`session_id` 也必须一致。对不上说明手里的两半不是同一个
+    ///    任务，拿它恢复等于用 A 的进度续 B 的历史。
+    /// 3. **工作区要没被人动过**：动过了就返回
+    ///    [`task_resume::ResumeCheck::WorktreeChanged`]，由调用方要求
+    ///    人确认——绝不静默继续。
+    ///
+    /// 恢复后每一步的结论会作为用户消息交回给模型（见
+    /// [`task_resume::hand_off_completed_outputs`]），所以第 3 步看得见
+    /// 第 1、2 步查出了什么。
+    ///
+    /// # Errors
+    ///
+    /// 核对不通过时返回 [`ApplicationError::Snapshot`]；工作区被改过时
+    /// 返回 [`ApplicationError::WorktreeChanged`]。
+    pub async fn resume(
+        &mut self,
+        snapshot: TaskSnapshot,
+    ) -> Result<TaskOutcome, ApplicationError> {
+        // 工作区检查：拿快照里存的"当时的样子"与"现在的样子"比对。
+        // 改动过就按策略处理——默认拒绝，绝不静默继续。
+        self.check_worktree_unchanged(&snapshot)?;
+        // 任务快照是**步骤边界**的快照。若进程死在某一步的半路上（等人
+        // 审批、正在执行工具），真正的现场在会话快照里——把它合并进来，
+        // 恢复才谈得上"不静默重复已发生的副作用"（见
+        // [`task_resume::merge_session_state`]）。
+        let snapshot = self.merge_session_state(snapshot);
+        task_resume::check_resumable(&snapshot, None)?;
+        let session_id = snapshot.run.session_id.clone();
+        let evidence = (self.evidence_factory)(&session_id)
+            .map_err(|error| ApplicationError::EvidenceInit(error.to_string()))?;
+        // 恢复沿用编排器的预算（轮数上限对整个任务计）。
+        let budget = &self.budget;
+
+        let mut task = snapshot.task.clone();
+        // 任务停在 Failed 上（被中断时编排器会标记失败）：放回运行态，
+        // 进度不倒退——从失败的那一步接着走。
+        if matches!(task.state(), TaskState::Failed) {
+            task.retry()?;
+        }
+        let start = match task.state() {
+            TaskState::Running { step } => step,
+            TaskState::Completed => {
+                return Ok(TaskOutcome {
+                    answer: snapshot
+                        .completed_outputs
+                        .last()
+                        .map(|output| output.answer.clone())
+                        .unwrap_or_default(),
+                    steps_completed: task.steps().len(),
+                    session_id,
+                });
+            }
+            _ => return Err(ApplicationError::Task(TaskError::NotRunning)),
+        };
+
+        // runner 从快照里的运行状态重建：会话历史、轮数、墙钟、缓存
+        // 路由键全部延续——换 runner 等于换了一个 agent 接手半截任务。
+        let mut deps = self.deps.clone();
+        deps.evidence = evidence.clone();
+        let mut runner = AgentRunner::resume(snapshot.run.clone(), deps)?;
+        // 把已完成步骤的结论交回给模型：恢复后的下一步必须看得见前面
+        // 几步查出了什么，否则它只能从零重推。
+        task_resume::hand_off_completed_outputs(&mut runner, &snapshot.completed_outputs);
+
+        let mut completed = 0usize;
+        let mut last_answer = String::new();
+        let mut completed_outputs = snapshot.completed_outputs.clone();
+        // runner 住在循环外：每一步都在同一个 runner 上推进一步，
+        // 历史、轮数、墙钟与缓存路由键因此跨步延续。
+        let mut runner = Some(runner);
+
+        for index in start..task.steps().len() {
+            let step_role = task.steps()[index].role;
+            match self
+                .run_step(&task, index, budget, &session_id, &evidence, &mut runner)
+                .await
+            {
+                Ok(answer) => {
+                    task.advance()?;
+                    completed += 1;
+                    last_answer = answer.clone();
+                    completed_outputs.push(StepOutput {
+                        step: index,
+                        role: step_role,
+                        answer,
+                    });
+                    self.save_task_snapshot(&task, runner.as_ref(), &completed_outputs);
+                }
+                Err(error) => {
+                    let reason = format!("第 {} 步失败: {error}", index + 1);
+                    task.fail(reason.clone());
+                    self.save_task_snapshot(&task, runner.as_ref(), &completed_outputs);
+                    return Err(ApplicationError::StepFailed {
+                        step: index + 1,
+                        message: reason,
+                        session_id,
+                        steps_completed: completed,
+                    });
+                }
+            }
+        }
+
+        Ok(TaskOutcome {
+            answer: last_answer,
+            steps_completed: completed,
+            session_id,
+        })
+    }
+
+    /// 把会话快照里的半轮现场合并进任务快照。
+    ///
+    /// 读盘在这里做，合并的判断在 [`task_resume::merge_session_state`]
+    /// （纯函数，可单独测）。会话快照读不出来或读坏了都按"没有现场"处理：
+    /// 退回到步骤边界恢复只是重做那一步，而拿一个坏现场去续会出事。
+    fn merge_session_state(&self, snapshot: TaskSnapshot) -> TaskSnapshot {
+        let Some(store) = self.deps.session_store.as_ref() else {
+            return snapshot;
+        };
+        let session = match store.load(&snapshot.run.session_id) {
+            Ok(Some(session)) => Some(session),
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!("警告：会话快照读取失败（按步骤边界恢复）: {error}");
+                None
+            }
+        };
+        task_resume::merge_session_state(snapshot, session)
+    }
+
     /// 执行第 `index` 步（0-based），返回该步的最终答案。
     ///
     /// 按步骤的角色装配：系统提示词来自角色档案，工具白名单由 runner 按
@@ -173,6 +473,7 @@ impl Orchestrator {
         &self,
         task: &Task,
         index: usize,
+        budget: &Budget,
         session_id: &SessionId,
         evidence: &Arc<dyn EvidenceSink>,
         runner: &mut Option<AgentRunner>,
@@ -193,13 +494,11 @@ impl Orchestrator {
             role: step.role,
             system_prompt: profile.system_prompt.clone(),
         };
-        let prompt = format!(
-            "任务：{goal}\n当前步骤（第 {now}/{total} 步）：{description}\n完成判据：{done_when}\n达成判据后停止调用工具，直接输出最终答案。",
-            goal = task.goal(),
-            now = index + 1,
-            total = total,
-            description = step.description,
-            done_when = step.done_when,
+        let prompt = crate::application::step_prompt::step_prompt(
+            task.goal(),
+            step,
+            index,
+            total,
         );
 
         let mut active = match runner.take() {
@@ -222,9 +521,12 @@ impl Orchestrator {
                 role: step.role,
             },
         );
-        let outcome = active.run(&self.budget).await?;
+        // 这一步失败时 runner **要放回去**：它带着这轮的历史、轮数与
+        // 墙钟，正是恢复需要的全部状态。丢掉它的话，任务快照存下来的
+        // 会话停在"上一步结束"的地方，恢复时那一步的交代与观察全没了。
+        let outcome = active.run(budget).await;
         *runner = Some(active);
-        Ok(outcome.answer)
+        Ok(outcome?.answer)
     }
 }
 #[cfg(test)]
@@ -841,7 +1143,8 @@ mod tests {
             ..deps(&mock)
         };
         let budget_context = ContextBudget {
-            max_rounds: 2,
+            max_tokens: Some(1),
+            min_recent_rounds: 2,
             keep_task: true,
             summarize: None,
         };

@@ -162,6 +162,17 @@ fn risk_flags(annotations: &ToolAnnotations) -> String {
 impl ApprovalGate for AiReviewGate {
     fn request<'a>(&'a self, request: &'a ApprovalRequest) -> BoxFuture<'a, Decision> {
         Box::pin(async move {
+            // 恢复后的重新询问直接交给人，不经审查员。
+            //
+            // "重新问一次，人要再点一次"是硬要求：上一次问的是上一个
+            // 进程里的人，那次没答复。让审查员替人点头，等于把"人没点过"
+            // 记成"人点过了"——那正是这条防线要防的事。
+            if request.resumed {
+                println!(
+                    "[AI 审查] 这是恢复后的重新询问（之前问过，没答复），直接问人"
+                );
+                return self.fallback.request(request).await;
+            }
             let spec = AgentSpec {
                 role: AgentRole::Reviewer,
                 system_prompt: REVIEWER_SYSTEM_PROMPT.to_owned(),
@@ -247,6 +258,7 @@ mod tests {
             },
             annotations: ToolAnnotations::new(false, true, false, false),
             reason: None,
+            resumed: false,
         }
     }
 
@@ -603,6 +615,28 @@ mod tests {
             !prompt.contains("策略追加的复核理由"),
             "无升级理由时不该有小标题: {prompt}"
         );
+    }
+
+    /// 恢复后的重新询问直接问人，不经审查员。
+    ///
+    /// "人要再点一次"是硬要求：上一次问的是上一个进程里的人，那次没
+    /// 答复。审查员替人点头等于把"人没点过"记成"人点过了"——那正是
+    /// 这条防线要防的事。
+    #[tokio::test]
+    async fn a_resumed_request_goes_straight_to_the_human() {
+        let reviewer = Arc::new(ScriptedReviewer::new(vec![
+            r#"{"decision":"approve","reason":"看着安全"}"#,
+        ]));
+        let fallback = RecordingFallback::approving();
+        let gate = AiReviewGate::new(Box::new(reviewer.clone()), Box::new(fallback.clone()));
+
+        let mut req = request("write_file", json!({"path": "out.txt"}));
+        req.resumed = true;
+        let decision = gate.request(&req).await;
+
+        assert_eq!(decision, Ok(()), "退路放行则放行");
+        assert_eq!(fallback.asked(), 1, "重新询问必须问人");
+        assert_eq!(reviewer.call_count(), 0, "重新询问不该经审查员");
     }
 
     /// 系统提示词要写清四条风险与"拿不准选 human"。

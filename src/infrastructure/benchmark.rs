@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::domain::benchmark::{BenchmarkTask, SuccessCriteria};
+use crate::domain::benchmark::{BenchmarkTask, LongRunConfig, SuccessCriteria};
 use crate::domain::task::TaskKind;
 
 /// 任务集装载失败。
@@ -51,20 +51,48 @@ struct TaskFile {
     id: String,
     kind: String,
     description: String,
+    /// 任务属于哪个套件。默认是 `default`（短任务套件）。
+    #[serde(default = "default_suite")]
+    suite: String,
     criteria: CriteriaFile,
+    /// 长任务的两阶段运行配置。短任务不写这一节。
+    #[serde(default)]
+    long_run: LongRunFile,
+}
+
+/// 默认套件名：短任务。
+fn default_suite() -> String {
+    "default".to_owned()
+}
+
+/// 长任务套件名。
+pub const LONG_SUITE: &str = "long";
+
+/// `[long_run]` 表的中间结构。两个旋钮都可选：没写就用运行器的默认。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LongRunFile {
+    exhaust_turns: Option<u32>,
+    context_max_tokens: Option<usize>,
 }
 
 /// `[criteria]` 表的中间结构。判据字段全部必填：漏写 `requires_changes`
 /// 这类判据等于悄悄放宽验收，宁可让作者把三个字段都写全。
+///
+/// 后三个判据可选：短任务用不上它们，缺省即"不检查"。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CriteriaFile {
     test_command: String,
     requires_changes: bool,
     answer_must_mention: Vec<String>,
+    min_turns: Option<u32>,
+    no_repeated_commands: Option<Vec<String>>,
+    #[serde(default)]
+    must_mention_after_compaction: Vec<String>,
 }
 
-/// 读取基准根目录下的全部任务，按目录名排序返回——顺序确定，
+/// 读取基准根目录下的全部短任务，按目录名排序返回——顺序确定，
 /// 基准结果才可复现、可对比。
 ///
 /// 只考虑子目录：根目录下的 README 等文件直接跳过。任何任务的
@@ -72,10 +100,39 @@ struct CriteriaFile {
 /// 不做"跳过坏任务继续跑"的静默降级：漏跑一个任务的基准比不跑
 /// 更误导人。
 ///
+/// 长任务不在这里：它们由 [`load_long_tasks`] 单独装载，两段式跑法
+/// 与短任务不同，混在一个列表里跑就是两套语义共用一条路。
+///
 /// # Errors
 ///
 /// 根目录不可读，或任一任务的配置不合法时返回 [`BenchmarkLoadError`]。
 pub fn load_tasks(benchmarks_root: &Path) -> Result<Vec<BenchmarkTask>, BenchmarkLoadError> {
+    load_suite(benchmarks_root, "default")
+}
+
+/// 读取长任务套件。
+///
+/// # Errors
+///
+/// 根目录不可读，或任一长任务的配置不合法时返回 [`BenchmarkLoadError`]。
+pub fn load_long_tasks(benchmarks_root: &Path) -> Result<Vec<BenchmarkTask>, BenchmarkLoadError> {
+    load_suite(benchmarks_root, LONG_SUITE)
+}
+
+/// 读取指定套件的任务。
+///
+/// **先全部装载校验，再按套件筛选**——顺序反过来（边装载边筛）会把
+/// 一个不合法任务的装载错误一起筛掉，坏任务静默消失，而"漏跑一个任务
+/// 的基准比不跑更误导人"对坏任务同样成立。
+///
+/// # Errors
+///
+/// 根目录不可读，或**任一**任务（无论属于哪个套件）的配置不合法时
+/// 返回 [`BenchmarkLoadError`]。
+pub fn load_suite(
+    benchmarks_root: &Path,
+    suite: &str,
+) -> Result<Vec<BenchmarkTask>, BenchmarkLoadError> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(benchmarks_root)?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -84,7 +141,8 @@ pub fn load_tasks(benchmarks_root: &Path) -> Result<Vec<BenchmarkTask>, Benchmar
         .collect();
     dirs.sort();
 
-    dirs.iter()
+    let all: Vec<BenchmarkTask> = dirs
+        .iter()
         .map(|dir| {
             let name = dir
                 .file_name()
@@ -92,7 +150,11 @@ pub fn load_tasks(benchmarks_root: &Path) -> Result<Vec<BenchmarkTask>, Benchmar
                 .unwrap_or_default();
             load_one(dir, &name)
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(all
+        .into_iter()
+        .filter(|task| task.suite == suite)
+        .collect())
 }
 
 /// 装载单个任务目录。
@@ -129,10 +191,18 @@ fn load_one(dir: &Path, name: &str) -> Result<BenchmarkTask, BenchmarkLoadError>
         id: file.id,
         kind,
         description: file.description,
+        suite: file.suite,
         criteria: SuccessCriteria {
             test_command: file.criteria.test_command,
             requires_changes: file.criteria.requires_changes,
             answer_must_mention: file.criteria.answer_must_mention,
+            min_turns: file.criteria.min_turns,
+            no_repeated_commands: file.criteria.no_repeated_commands,
+            must_mention_after_compaction: file.criteria.must_mention_after_compaction,
+        },
+        long_run: LongRunConfig {
+            exhaust_turns: file.long_run.exhaust_turns,
+            context_max_tokens: file.long_run.context_max_tokens,
         },
     })
 }
@@ -260,4 +330,86 @@ answer_must_mention = []
         let error = load_tasks(&root.join("no-such-dir")).unwrap_err();
         assert!(matches!(error, BenchmarkLoadError::RootIo(_)), "{error}");
     }
+
+    // ── P10 切片 4：套件划分 ──────────────────────────────────────────
+
+    /// 套件筛选：default 套件不返回 long 任务，反之亦然。
+    #[test]
+    fn suites_partition_the_task_set() {
+        let root = temp_root("suites");
+        write_task(&root, "demo", VALID_TASK);
+        write_task(&root, "demo-long", &LONG_TASK);
+
+        let default_tasks = load_tasks(&root).expect("装载");
+        let long_tasks = load_long_tasks(&root).expect("装载");
+
+        assert_eq!(
+            default_tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["demo"]
+        );
+        assert_eq!(
+            long_tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["demo-long"]
+        );
+        let long = &long_tasks[0];
+        assert_eq!(long.long_run.exhaust_turns, Some(3), "两段配置要装载进来");
+        assert_eq!(long.long_run.context_max_tokens, Some(2000));
+        assert_eq!(long.criteria.min_turns, Some(20));
+        assert_eq!(
+            long.criteria.no_repeated_commands,
+            Some(vec!["cargo test".to_owned()])
+        );
+        assert_eq!(
+            long.criteria.must_mention_after_compaction,
+            ["parser.rs"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 长任务的两段配置省略时按默认装载。
+    #[test]
+    fn a_long_task_without_a_long_run_table_loads_with_defaults() {
+        let root = temp_root("no-long-run");
+        write_task(&root, "demo-long", &LONG_TASK.replace("\n[long_run]\nexhaust_turns = 3\ncontext_max_tokens = 2000\n", "\n"));
+
+        let tasks = load_long_tasks(&root).expect("装载");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].long_run.exhaust_turns, None);
+        assert_eq!(tasks[0].long_run.context_max_tokens, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 坏任务不能靠"换个套件"逃过装载校验。
+    #[test]
+    fn an_invalid_task_is_rejected_even_if_it_is_in_another_suite() {
+        let root = temp_root("bad-suite");
+        write_task(&root, "demo", VALID_TASK);
+        // 长任务里类型写错：装载 long 套件时它必须报错，而不是被筛掉。
+        write_task(&root, "demo-long", &LONG_TASK.replace("bug-fix", "nonsense"));
+
+        let error = load_long_tasks(&root).unwrap_err();
+        assert!(matches!(&error, BenchmarkLoadError::Invalid { task, .. } if task == "demo-long"), "{error}");
+        // 短任务装载同样要被拦住——坏的是任务本身，不是套件的归属。
+        assert!(load_tasks(&root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 一个合法长任务任务书：带两段配置与长任务判据。
+    const LONG_TASK: &str = r#"id = "demo-long"
+kind = "bug-fix"
+description = "一个长任务"
+suite = "long"
+
+[long_run]
+exhaust_turns = 3
+context_max_tokens = 2000
+
+[criteria]
+test_command = "cargo test"
+requires_changes = true
+answer_must_mention = []
+min_turns = 20
+no_repeated_commands = ["cargo test"]
+must_mention_after_compaction = ["parser.rs"]
+"#;
 }

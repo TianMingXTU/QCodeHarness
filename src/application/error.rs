@@ -79,6 +79,19 @@ pub enum ApplicationError {
     #[error("任务状态错误: {0}")]
     Task(#[from] TaskError),
 
+    /// 工作区自快照以来被改过，恢复必须先由人确认。
+    ///
+    /// 不是硬失败：改动可能正是上一个 agent 留下的半成品，用户可能
+    /// 知道自己在改什么。但**必须有人拍板**——静默继续的话，恢复出来
+    /// 的模型会拿着过期的计划继续改，把用户刚做的修改覆盖掉。
+    ///
+    /// `changes` 列出差异，让用户看得见到底改了什么再决定。
+    #[error("工作区在任务中断后被改动过，恢复前需要确认：\n{}", format_changes(changes))]
+    WorktreeChanged {
+        /// 差异清单，每条一行。
+        changes: Vec<String>,
+    },
+
     /// 角色没有档案，该步的 runner 无法装配。花名册是装配的必要输入，
     /// 缺了就该显式失败——静默退回默认角色会让模型拿着错误的提示词
     /// 与工具集上场。
@@ -116,4 +129,16 @@ pub enum ApplicationError {
     /// 而不是把这个错误抛给任务。
     #[error("历史摘要生成失败: {0}")]
     SummaryFailed(String),
+}
+
+/// 把工作区差异清单排成多行文本。
+///
+/// 每条一行，前面加缩进——差异可能有好几十条，挤成一行的话用户
+/// 根本看不全，而"看不全"就等于"没看"。
+fn format_changes(changes: &[String]) -> String {
+    changes
+        .iter()
+        .map(|change| format!("  - {change}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

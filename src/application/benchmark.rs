@@ -24,12 +24,13 @@ use crate::application::error::ApplicationError;
 use crate::application::orchestrator::{EvidenceFactory, Orchestrator};
 use crate::application::port::EvidenceSink;
 use crate::application::report::{cost_label, hit_ratio_label, summarize};
+use crate::application::snapshot::TaskStore;
 use crate::application::tool_registry::ToolRegistry;
-use crate::domain::benchmark::{BenchmarkResult, BenchmarkTask, CriteriaObservation};
+use crate::domain::benchmark::{BenchmarkResult, BenchmarkTask, CriteriaObservation, LongBenchmarkResult};
 use crate::domain::budget::Budget;
 use crate::domain::ids::{SessionId, TaskId};
 use crate::domain::workspace::WorkspaceRoot;
-use crate::infrastructure::benchmark::{load_tasks, BenchmarkLoadError};
+use crate::infrastructure::benchmark::{load_long_tasks, load_tasks, BenchmarkLoadError};
 use crate::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
 use crate::infrastructure::evidence::reader::read_session;
 use crate::infrastructure::tool::shell::run_in_workspace;
@@ -91,6 +92,84 @@ pub async fn run_benchmark(
             wall_clock_label(result.wall_clock_ms),
             result.approvals,
             hit_ratio_label(result.cache_hit_ratio),
+            cost_label(result.cost_usd),
+        );
+        for reason in &result.failures {
+            println!("  - {reason}");
+        }
+        results.push(result);
+    }
+    Ok(results)
+}
+
+/// 跑完长任务基准任务集：每个任务先故意耗尽预算，再恢复着跑完。
+///
+/// 输出把**两次运行分开**——第一次的失败是设计好的实验条件，
+/// 不是任务失败；恢复后的结果才是被评测的东西。混在一起的话，
+/// "第一次运行预算耗尽"会被当成一次失败记录，长任务永远通不过。
+///
+/// # Errors
+///
+/// 任务集装载失败时返回装载错误。单个任务的两段运行失败不传播。
+pub async fn run_long_benchmark(
+    deps: &AgentDependencies,
+    budget: &Budget,
+    benchmarks_root: &Path,
+    workspace: &Path,
+) -> Result<Vec<LongBenchmarkResult>, BenchmarkLoadError> {
+    let tasks = load_long_tasks(benchmarks_root)?;
+    let total = tasks.len();
+    let mut results = Vec::with_capacity(total);
+    for (index, task) in tasks.iter().enumerate() {
+        println!("▶ [{}/{}] 长任务：{}", index + 1, total, task.description);
+        let result = match run_long_one(deps, budget, benchmarks_root, workspace, task).await {
+            Ok(result) => result,
+            Err(failure) => LongBenchmarkResult {
+                task_id: task.id.clone(),
+                session_id: None,
+                first_run_failure: failure.clone(),
+                first_run_steps: 0,
+                first_run_turns: 0,
+                first_run_turn_limit: task.long_run.exhaust_turns.unwrap_or_default(),
+                resume_failure: Some(failure.clone()),
+                resume_turns: 0,
+                total_turns: 0,
+                steps_total: 0,
+                steps_completed: 0,
+                passed: false,
+                failures: vec![failure],
+                repeated_commands: Vec::new(),
+                cost_usd: None,
+                wall_clock_ms: 0,
+            },
+        };
+        let verdict = if result.passed { "✓ 通过" } else { "✗ 未通过" };
+        if result.first_run_failure.is_empty() {
+            println!("  第一次运行：没有失败——任务一遍跑完了，这次没有测到中断恢复");
+        } else {
+            println!(
+                "  第一次运行：{}（第 {} 步后停 / {} 轮 / 上限 {} 轮）",
+                result.first_run_failure,
+                result.first_run_steps,
+                result.first_run_turns,
+                result.first_run_turn_limit,
+            );
+        }
+        match &result.resume_failure {
+            Some(reason) => println!("  恢复运行：失败 —— {reason}"),
+            None => println!(
+                "  恢复运行：从任务快照继续 → {}/{} 步 / 本段 {} 轮 / 总 {} 轮",
+                result.steps_completed, result.steps_total, result.resume_turns, result.total_turns,
+            ),
+        }
+        println!(
+            "{} 重复副作用 {} 次 / 墙钟 {} / 成本 {}",
+            verdict,
+            // 与判据共用同一本账：数的是 no_repeated_commands 里真正
+            // 违规的命令，不是所有重复过的命令——后者包括模型修完
+            // 一个缺陷重跑全量测试这类正常迭代。
+            task.criteria.forbidden_repeats(&result.repeated_commands).len(),
+            wall_clock_label(result.wall_clock_ms),
             cost_label(result.cost_usd),
         );
         for reason in &result.failures {
@@ -178,6 +257,9 @@ async fn run_one(
             test_exit_success: run_criterion_command(&repo, &task.criteria.test_command, &mut failures).await,
             has_changes,
             answer: &answer,
+            turns_used: 0,
+            repeated_commands: &[],
+            text_after_compaction: None,
         };
         failures.extend(task.criteria.evaluate(observation));
     }
@@ -199,6 +281,321 @@ async fn run_one(
     // 结果已定，临时仓库尽力清理：失败诊断看结果里的输出末尾与证据。
     let _ = fs::remove_dir_all(&repo);
     Ok(result)
+}
+
+/// 跑一个长任务：第一段故意耗尽预算，第二段从任务快照恢复。
+///
+/// **第一段**：把轮数上限压到任务配置的 `exhaust_turns`（故意设小），
+/// 编排器必然在中途报"预算耗尽"——这就是要测的中断。失败后任务快照
+/// 已经落盘（`--resume-task` 恢复用的就是它）。
+///
+/// **第二段**：把任务快照读回来，从步骤边界继续。此时：
+/// - 已完成步骤不重做（`completed_outputs` 原样带回）；
+/// - 消耗账从快照接着算（`consumption` 在快照里）；
+/// - 上下文按任务配置的 `context_max_tokens` 裁剪——这一段的历史最长，
+///   压缩判据的数据就从这里来。
+///
+/// 两段共用同一个 fixture 拷贝与同一个会话：恢复接着上一次的会话跑，
+/// 这才是"同一个任务"。
+async fn run_long_one(
+    deps: &AgentDependencies,
+    budget: &Budget,
+    benchmarks_root: &Path,
+    workspace: &Path,
+    task: &BenchmarkTask,
+) -> Result<LongBenchmarkResult, String> {
+    let repo = copy_fixture(benchmarks_root, task)?;
+    let before = snapshot_files(&repo);
+    let task_id = TaskId::new(format!("bench-long-{}", task.id));
+
+    let turn_limit = task
+        .long_run
+        .exhaust_turns
+        .unwrap_or(DEFAULT_EXHAUST_TURNS);
+
+    // ── 第一段：故意耗尽预算 ─────────────────────────────────────
+    let mut first_deps = deps.clone();
+    first_deps.tools = ToolRegistry::new(all_tools(WorkspaceRoot::new(repo.clone())));
+    // 快照落盘是恢复的前提：会话快照（半轮现场）与任务快照（步骤进度）
+    // 都要有。
+    let store = crate::infrastructure::session_store::json::JsonSessionStore::new(workspace);
+    let task_store = crate::infrastructure::task_store::JsonTaskStore::new(workspace);
+    first_deps.session_store = Some(std::sync::Arc::new(store) as _);
+    let evidence_factory: EvidenceFactory = shared_evidence_factory(workspace);
+    // 工作区扫描器也装上：快照要记下"当时的 fixture 拷贝长什么样"，
+    // 恢复段的一致性检查才拿得到基准。基准的工作区是独占的临时拷贝，
+    // 中断期间不会有外部改动，检查必然通过——装上它不是让基准变严，
+    // 是让恢复走的是与真实用户同一条路。
+    let mut orchestrator = Orchestrator::new(first_deps, *budget, evidence_factory)
+        .with_task_store(std::sync::Arc::new(task_store))
+        .with_worktree_scanner(std::sync::Arc::new(
+            crate::infrastructure::worktree::RootedWorktreeScanner::new(repo.clone()),
+        ));
+    let mut orchestrated = orchestrator.create_task(task_id.clone(), task.kind, &task.description);
+
+    let first_budget = Budget::new(turn_limit);
+    let first = orchestrator.run_with_budget(&mut orchestrated, &first_budget).await;
+    let (first_failure, first_steps, session_id) = match &first {
+        Err(ApplicationError::StepFailed {
+            session_id,
+            steps_completed,
+            message,
+            ..
+        }) => (message.clone(), *steps_completed, Some(session_id.clone())),
+        Err(error) => (error.to_string(), 0, None),
+        // 一遍跑完了：没测到想测的东西。如实带出会话 ID 与完成步数，
+        // 但"没有中断"这件事要在结果里说得清清楚楚——把一遍跑完当成
+        // "恢复成功"会让这次基准什么都没测到却显示通过。
+        Ok(outcome) => (String::new(), outcome.steps_completed, Some(outcome.session_id.clone())),
+    };
+    let Some(session_id) = session_id else {
+        let _ = fs::remove_dir_all(&repo);
+        return Err(first_failure);
+    };
+    // 第一次运行的轮数从证据文件分段数不出来（恢复段追加在同一个文件
+    // 里），用完成步数 × 每步脚本的轮数也不可靠。它有另一个来源：
+    // 恢复是从快照接账的，快照里的 `consumption.turns` 就是第一段跑完
+    // 时的账——从任务快照里取。
+    let first_turns = turns_at_snapshot(workspace, &task_id)
+        .unwrap_or_else(|| turns_of(workspace, &session_id));
+
+    // ── 第二段：恢复 ─────────────────────────────────────────────
+    // 第一次运行没失败时没有"恢复"可言：恢复段标记为"没测到"，
+    // 而不是把空跑一遍当成恢复成功。
+    let resume = if first_failure.is_empty() {
+        Err("第一次运行没有失败，没有可恢复的东西".to_owned())
+    } else {
+        run_long_resume(deps, budget, workspace, &repo, &task_id, task).await
+    };
+    let (resume_failure, resumed_steps, answer) = match resume {
+        Ok((steps, answer)) => (None, steps, answer),
+        Err(reason) => (Some(reason.clone()), 0, String::new()),
+    };
+    // 恢复段的轮数：两段共用一个会话，证据文件是两段追加起来的，
+    // 所以"本段轮数" = 文件总数 − 第一段的账。
+    let resume_turns = turns_of(workspace, &session_id).saturating_sub(first_turns);
+    let steps_completed = first_steps + resumed_steps;
+
+    let total_turns = first_turns + resume_turns;
+    let (cost_usd, wall_clock_ms, repeated) = usage_of_long(workspace, &session_id).await;
+    // 判据在两段都结束后核对：它对"整个过程"说话。
+    //
+    // 前提是**恢复真的发生过**。第一次运行没失败（`exhaust_turns` 配
+    // 大了）就没有恢复可言——任务的判据可能都满足，但这次基准要测的
+    // "中断 → 恢复"链路根本没发生。这种运行不通过，失败原因明说。
+    let mut failures = Vec::new();
+    if first_failure.is_empty() {
+        failures.push(
+            "第一次运行没有失败：exhaust_turns 配置过大，中断恢复链路没有被测到".to_owned(),
+        );
+    } else if resume_failure.is_none() {
+        let has_changes = snapshot_files(&repo) != before;
+        let text_after_compaction = text_after_first_compaction(workspace, &session_id);
+        let observation = CriteriaObservation {
+            test_exit_success: run_criterion_command(&repo, &task.criteria.test_command, &mut failures).await,
+            has_changes,
+            answer: &answer,
+            turns_used: total_turns,
+            repeated_commands: &repeated,
+            text_after_compaction: text_after_compaction.as_deref(),
+        };
+        failures.extend(task.criteria.evaluate(observation));
+    } else {
+        failures.push(resume_failure.clone().unwrap_or_default());
+    }
+
+    let result = LongBenchmarkResult {
+        task_id: task.id.clone(),
+        session_id: Some(session_id),
+        first_run_failure: first_failure,
+        first_run_steps: first_steps,
+        first_run_turns: first_turns,
+        first_run_turn_limit: turn_limit,
+        resume_failure,
+        resume_turns,
+        total_turns,
+        steps_total: orchestrated.steps().len(),
+        steps_completed,
+        passed: failures.is_empty(),
+        failures,
+        repeated_commands: repeated,
+        cost_usd,
+        wall_clock_ms,
+    };
+    let _ = fs::remove_dir_all(&repo);
+    Ok(result)
+}
+
+/// 恢复一段：读任务快照，接着把剩下的步骤跑完。
+///
+/// 与 `run_long_one` 的第一段分开写：恢复用的装配与第一次运行不同——
+/// 上下文预算按任务配置压小（长任务的历史最长，压缩就发生在这一段），
+/// 而轮数上限放开（恢复不该再被"故意设小"的预算打断）。
+async fn run_long_resume(
+    deps: &AgentDependencies,
+    budget: &Budget,
+    workspace: &Path,
+    repo: &Path,
+    task_id: &TaskId,
+    task: &BenchmarkTask,
+) -> Result<(usize, String), String> {
+    let task_store = crate::infrastructure::task_store::JsonTaskStore::new(workspace);
+    let Some(snapshot) = task_store.load(task_id).map_err(|error| format!("读取任务快照失败: {error}"))? else {
+        return Err(format!("任务 {task_id} 的快照不存在，无法恢复"));
+    };
+
+    let mut resume_deps = deps.clone();
+    resume_deps.tools = ToolRegistry::new(all_tools(WorkspaceRoot::new(repo.to_path_buf())));
+    resume_deps.session_store = Some(std::sync::Arc::new(
+        crate::infrastructure::session_store::json::JsonSessionStore::new(workspace),
+    ) as _);
+    // 压缩判据的前提：恢复段的上下文预算压到任务配置的值。
+    if let Some(max_tokens) = task.long_run.context_max_tokens {
+        resume_deps.context_budget.max_tokens = Some(max_tokens);
+    }
+    let evidence_factory: EvidenceFactory = shared_evidence_factory(workspace);
+    // 与第一段同口径装配扫描器：恢复前核对工作区，走真实用户那条路。
+    let mut resume_orchestrator = Orchestrator::new(resume_deps, *budget, evidence_factory)
+        .with_task_store(std::sync::Arc::new(task_store))
+        .with_worktree_scanner(std::sync::Arc::new(
+            crate::infrastructure::worktree::RootedWorktreeScanner::new(repo.to_path_buf()),
+        ));
+
+    let outcome = resume_orchestrator
+        .resume(snapshot)
+        .await
+        .map_err(|error| error.to_string())?;
+    // steps_completed 是**本段**完成的步数；结果里要报的是任务总进度，
+    // 由调用方（run_long_one）加上第一段的步数。
+    Ok((outcome.steps_completed, outcome.answer))
+}
+
+/// 任务快照里记的已消耗轮数（第一段结束时的账）。
+///
+/// 恢复从快照接账，这份账就是第一段的轮数——比从证据文件里分段数
+/// 可靠得多：两段追加在同一个文件里，中间没有可辨认的分界。
+fn turns_at_snapshot(workspace: &Path, task_id: &TaskId) -> Option<u32> {
+    let store = crate::infrastructure::task_store::JsonTaskStore::new(workspace);
+    let snapshot = store.load(task_id).ok()??;
+    Some(snapshot.run.consumption.turns)
+}
+
+/// 一个任务的证据汇工厂：两段跑法共用同一个文件。
+fn shared_evidence_factory(workspace: &Path) -> EvidenceFactory {
+    let workspace = workspace.to_path_buf();
+    Arc::new(move |session_id: &SessionId| {
+        let path = session_path(&workspace, session_id.as_str());
+        let jsonl = JsonlEvidenceSink::open(&path)?;
+        Ok(Arc::new(jsonl) as Arc<dyn EvidenceSink>)
+    })
+}
+
+/// 长任务"故意耗尽"的默认轮数上限。
+///
+/// 任务配置没写 `exhaust_turns` 时用它：小到必然在第一步内被打断，
+/// 又不至于一轮都跑不完（每步至少要有机会动一次手）。
+const DEFAULT_EXHAUST_TURNS: u32 = 2;
+
+/// 统计一个会话到目前为止的模型调用轮数。
+fn turns_of(workspace: &Path, session: &SessionId) -> u32 {
+    let path = session_path(workspace, session.as_str());
+    match read_session(&path) {
+        Ok(Some(log)) => summarize(&log).model_calls as u32,
+        _ => 0,
+    }
+}
+
+/// 第一次上下文压缩**之后**模型说的话（最后一条思考文本）。
+///
+/// 压缩判据的数据来源：它回答"历史被裁掉之后，模型还有没有提过
+/// 关键的东西"——取压缩之后的最后一条思考，而不是最终答案：最终
+/// 答案是润色过的结论，压缩之后的工作过程只在中间的思考里。
+fn text_after_first_compaction(workspace: &Path, session: &SessionId) -> Option<String> {
+    let path = session_path(workspace, session.as_str());
+    let log = read_session(&path).ok()??;
+    let first_compaction = log
+        .events
+        .iter()
+        .position(|evidence| matches!(evidence.event, crate::domain::evidence::AuditEvent::ContextCompacted { .. }))?;
+    log.events[first_compaction..]
+        .iter()
+        .rev()
+        .find_map(|evidence| match &evidence.event {
+            crate::domain::evidence::AuditEvent::Thought { text, .. } if !text.trim().is_empty() => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+}
+
+/// 汇总长任务两段的账：成本、墙钟、重复执行过的命令。
+///
+/// 重复命令按 `ToolObserved` 数（规格口径），且只算真正跑过的执行：
+/// 只有跑完才谈得上副作用，恢复路径上只留 `ToolCallReplayed` 记录
+/// 而没有重跑的调用、以及被拒绝的调用，都不算"副作用重复"。
+async fn usage_of_long(
+    workspace: &Path,
+    session: &SessionId,
+) -> (Option<f64>, u64, Vec<String>) {
+    let path = session_path(workspace, session.as_str());
+    let mut cost = None;
+    let mut wall_clock = 0u64;
+    let mut repeated = Vec::new();
+    if let Ok(Some(log)) = read_session(&path) {
+        let summary = summarize(&log);
+        cost = summary.cost_usd;
+        wall_clock = summary.wall_clock_ms;
+        for evidence in &log.events {
+            if let crate::domain::evidence::AuditEvent::ToolObserved { call, .. } = &evidence.event {
+                if call.name == "run_command" {
+                    if let Some(command) = call.arguments.get("command").and_then(|v| v.as_str()) {
+                        // 只记正文，前导空白不影响判定。
+                        let command = command.trim().to_owned();
+                        if repeated.contains(&command) {
+                            continue;
+                        }
+                        if seen_twice(&log.events, &command) {
+                            repeated.push(command);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (cost, wall_clock, repeated)
+}
+
+/// 某条命令在证据里是否被执行了不止一次。
+///
+/// 只数**真正跑过**的执行：被拒绝的调用（策略拦下、审批否决、工具未
+/// 注册）根本没执行，没有副作用——把它们算成"重复执行"，判据会冤枉
+/// 一次没有发生的副作用。执行了但失败的算：命令跑了，副作用可能已经
+/// 发生，只是结果不对。
+fn seen_twice(events: &[crate::domain::evidence::Evidence], command: &str) -> bool {
+    let mut count = 0usize;
+    for evidence in events {
+        if let crate::domain::evidence::AuditEvent::ToolObserved { call, outcome, .. } =
+            &evidence.event
+        {
+            if outcome.status == crate::domain::tool::OutcomeStatus::Refused {
+                continue;
+            }
+            if call.name == "run_command"
+                && call
+                    .arguments
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    == Some(command)
+            {
+                count += 1;
+                if count > 1 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// 在 fixture 拷贝里跑判据的测试命令。返回是否 0 退出；命令执行
@@ -296,14 +693,28 @@ async fn usage_of(
 }
 
 /// 把任务的 fixture 仓库复制到临时目录，返回拷贝根。
+///
+/// 目录名带任务 id 与一个**原子自增序号**：只带任务 id 的话，同一进程
+/// 内两个同名任务并行跑（集成测试就是这么跑的）会互相删对方的拷贝。
+/// 序号保证进程内唯一；进程 id 保证跨进程不串。
 fn copy_fixture(benchmarks_root: &Path, task: &BenchmarkTask) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_COPY: AtomicU64 = AtomicU64::new(0);
     let source = benchmarks_root.join(&task.id).join("repo");
-    // 目录名带任务 id：多个任务的临时目录互不覆盖，崩溃后也认得出是谁的。
-    let dest = std::env::temp_dir().join(format!("qch-bench-{}-{}", task.id, std::process::id()));
+    let serial = NEXT_COPY.fetch_add(1, Ordering::Relaxed);
+    let dest = std::env::temp_dir().join(format!(
+        "qch-bench-{}-{}-{serial}",
+        task.id,
+        std::process::id()
+    ));
+    COPIES_MADE.store(serial + 1, Ordering::Relaxed);
     let _ = fs::remove_dir_all(&dest);
     copy_dir(&source, &dest).map_err(|error| format!("复制 fixture {} 失败: {error}", source.display()))?;
     Ok(dest)
 }
+
+/// 本进程至今造出的拷贝份数。测试用它定位"最后一次拷贝"的序号。
+static COPIES_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 递归拷目录，跳过 `target`——fixture 里可能残留本地构建产物，
 /// 不该跟着进基准环境。
@@ -373,14 +784,43 @@ mod tests {
     use super::*;
     use crate::application::agent_roster::AgentRoster;
     use crate::application::port::ApprovalGate;
+    use crate::domain::evidence::AuditEvent;
+    use crate::domain::policy::PolicyEngine;
+    use crate::domain::tool::{OutcomeStatus, ToolOutcome};
     use crate::infrastructure::approval::auto::AutoApproveGate;
     use crate::infrastructure::clock::SystemClock;
     use crate::infrastructure::evidence::memory::MemoryEvidenceSink;
     use crate::infrastructure::model::rig_chat::RigChatGateway;
-    use crate::domain::policy::PolicyEngine;
+
+    use std::time::SystemTime;
 
     use rig::test_utils::{MockCompletionModel, MockTurn};
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    /// 一条工具执行完毕的证据，结局自选。
+    fn observed(
+        name: &str,
+        arguments: Value,
+        status: OutcomeStatus,
+    ) -> crate::domain::evidence::Evidence {
+        crate::domain::evidence::Evidence::new(
+            1,
+            SystemTime::now(),
+            AuditEvent::ToolObserved {
+                turn: 1,
+                call: crate::domain::tool::ToolCall {
+                    id: crate::domain::ids::CallId::new("c"),
+                    name: name.to_owned(),
+                    arguments,
+                },
+                outcome: match status {
+                    OutcomeStatus::Success => ToolOutcome::success("ok"),
+                    OutcomeStatus::Failed => ToolOutcome::failed("坏"),
+                    OutcomeStatus::Refused => ToolOutcome::refused("拒绝"),
+                },
+            },
+        )
+    }
 
     /// 装配模板：模型用脚本化 mock，工具由运行器按任务重建。
     fn bench_deps(mock: &MockCompletionModel) -> AgentDependencies {
@@ -450,13 +890,24 @@ mod tests {
         assert_eq!(result.turns_used, 5, "五次模型调用各记一轮思考");
         assert!(result.session_id.is_some(), "有动手过程就有会话");
         assert_eq!(result.cost_usd, None, "mock 模型没有定价信息：成本是未知而非 0");
-        // fixture 真的被改了（has_changes 判据的事实来源）。
-        let notes = fs::read_to_string(std::env::temp_dir().join(format!(
-            "qch-bench-demo-fix-{}",
-            std::process::id()
-        ))).ok();
         // 运行器跑完会清理临时仓库；文件改动已由判据在清理前确认。
-        assert!(notes.is_none(), "临时仓库应已清理");
+        // 拷贝目录带序号（进程内原子自增），这次运行造出的拷贝必然是
+        // 序号最大（且最新）的那个——只查它，不去管历史运行留下的
+        // 残骸（那些不是本测试的事）。
+        let latest = (0..COPIES_MADE.load(std::sync::atomic::Ordering::Relaxed))
+            .rev()
+            .find_map(|serial| {
+                let path = std::env::temp_dir().join(format!(
+                    "qch-bench-demo-fix-{}-{serial}",
+                    std::process::id()
+                ));
+                path.exists().then_some(path)
+            });
+        assert!(
+            latest.is_none(),
+            "临时仓库应已清理: {:?}",
+            latest.map(|path| path.display().to_string())
+        );
 
         let _ = fs::remove_dir_all(&benchmarks);
         let _ = fs::remove_dir_all(&workspace);
@@ -575,5 +1026,66 @@ mod tests {
         assert_eq!(after.len(), 1, "target/ 与 Cargo.lock 不进快照: {:?}", after.keys());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refused_repeats_are_not_side_effect_repeats() {
+        // 被拒绝的调用从没执行过，没有副作用。把两次"拒绝"算成重复
+        // 副作用，判据会冤枉一次根本没发生的执行——这正是拒绝的本意。
+        let events = vec![
+            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Refused),
+            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Refused),
+        ];
+        assert!(!seen_twice(&events, "cargo test"), "两次拒绝不构成重复执行");
+    }
+
+    #[test]
+    fn executed_repeats_count_as_side_effect_repeats() {
+        // 成功执行两次：副作用发生了两遍，这是判据要抓的重复。
+        let events = vec![
+            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Success),
+            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Success),
+        ];
+        assert!(seen_twice(&events, "cargo test"), "两次成功执行是重复副作用");
+
+        // 执行了但失败：命令跑了，副作用可能已经发生只是结果不对，
+        // 与拒绝不同，仍计入。
+        let failed = vec![
+            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Failed),
+            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Failed),
+        ];
+        assert!(seen_twice(&failed, "cargo test"), "失败也算执行过");
+
+        // 一次成功 + 一次拒绝：真正执行只有一次，不算重复。
+        let mixed = vec![
+            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Success),
+            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Refused),
+        ];
+        assert!(!seen_twice(&mixed, "cargo test"), "一次执行一次拒绝不算重复");
+    }
+
+    #[test]
+    fn seen_twice_only_looks_at_run_command_with_matching_command() {
+        // 其他工具即使同名参数也不该参与"命令重复"的账。
+        let other_tool = vec![
+            observed("write_file", json!({"command": "cargo test"}), OutcomeStatus::Success),
+            observed("write_file", json!({"command": "cargo test"}), OutcomeStatus::Success),
+        ];
+        assert!(!seen_twice(&other_tool, "cargo test"), "非 run_command 不计");
+
+        // 不同的命令不互相计数：各执行一次都不算重复。
+        let different = vec![
+            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Success),
+            observed("run_command", json!({"command": "cargo build"}), OutcomeStatus::Success),
+        ];
+        assert!(!seen_twice(&different, "cargo test"), "cargo build 不该算进 cargo test");
+        assert!(!seen_twice(&different, "cargo build"), "反向同理");
+
+        // 参数里多出的空白按 trim 归一：模型常带尾随空格。
+        let spaced = vec![
+            observed("run_command", json!({"command": "cargo test "}), OutcomeStatus::Success),
+            observed("run_command", json!({"command": " cargo test"}), OutcomeStatus::Success),
+        ];
+        assert!(seen_twice(&spaced, "cargo test"), "首尾空白不影响同一条命令的认定");
     }
 }
