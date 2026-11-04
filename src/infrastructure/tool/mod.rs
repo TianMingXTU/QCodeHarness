@@ -5,9 +5,11 @@
 //! 工具共享一堆用不上的字段。"加一个工具"只在一处发生——写好结构体，
 //! 到 [`all_tools`] 登记一行。
 
+pub mod apply_patch;
 pub mod edit;
 pub mod file;
 pub mod git;
+pub mod patch_format;
 pub mod search;
 pub mod shell;
 
@@ -53,6 +55,12 @@ pub fn all_tools(root: WorkspaceRoot) -> Vec<ToolEntry> {
         ToolEntry {
             spec: edit::EditFile::spec(),
             invoker: Arc::new(edit::EditFile::new(root.clone())),
+        },
+        // apply_patch 紧挨 edit_file：一个"改一处"、一个"改多处"，两个
+        // 改文件的工具挨着放，模型更容易注意到两者的分工关系。
+        ToolEntry {
+            spec: apply_patch::ApplyPatch::spec(),
+            invoker: Arc::new(apply_patch::ApplyPatch::new(root.clone())),
         },
         ToolEntry {
             spec: shell::RunCommand::spec(),
@@ -284,5 +292,63 @@ mod tests {
             .position(|name| name == "read_file")
             .expect("read_file 应登记进注册表");
         assert_eq!(batch, single + 1, "read_files 应紧挨 read_file: {names:?}");
+    }
+
+    /// `apply_patch` 必须登记进注册表，且紧挨着 `edit_file`。
+    ///
+    /// 理由同 read_files：漏登记的表现是"模型看得见却调不动"；挨着放是
+    /// 让"改一处"与"改多处"两个改文件的工具在清单上连贯，模型更容易
+    /// 注意到分工。
+    #[test]
+    fn apply_patch_is_registered_next_to_edit_file() {
+        let names: Vec<String> = all_tools(WorkspaceRoot::new(std::env::temp_dir()))
+            .into_iter()
+            .map(|entry| entry.spec.name)
+            .collect();
+
+        let patch = names
+            .iter()
+            .position(|name| name == "apply_patch")
+            .expect("apply_patch 应登记进注册表");
+        let edit = names
+            .iter()
+            .position(|name| name == "edit_file")
+            .expect("edit_file 应登记进注册表");
+        assert_eq!(patch, edit + 1, "apply_patch 应紧挨 edit_file: {names:?}");
+    }
+
+    /// 工具描述之间互相指路（P9-4 的规矩，P11-1 扩展到 apply_patch）。
+    ///
+    /// 模型对工具分工的全部认识来自描述本身：读工具要告诉它"改代码用
+    /// apply_patch"，写工具要告诉它"改多处用 apply_patch"，而 apply_patch
+    /// 自己要指回 edit_file / write_file。缺了任何一环，模型就会在该用
+    /// 补丁的时候逐处 edit_file，或用 write_file 整体覆盖。
+    #[test]
+    fn tool_descriptions_cross_reference_apply_patch() {
+        for name in ["read_file", "read_files", "edit_file", "write_file"] {
+            let spec = all_tools(WorkspaceRoot::new(std::env::temp_dir()))
+                .into_iter()
+                .find(|entry| entry.spec.name == name)
+                .expect("工具应已登记")
+                .spec;
+            assert!(
+                spec.description.contains("apply_patch"),
+                "{name} 的描述应指路 apply_patch: {}",
+                spec.description
+            );
+        }
+
+        let patch = all_tools(WorkspaceRoot::new(std::env::temp_dir()))
+            .into_iter()
+            .find(|entry| entry.spec.name == "apply_patch")
+            .expect("apply_patch 应已登记")
+            .spec;
+        for referenced in ["edit_file", "write_file"] {
+            assert!(
+                patch.description.contains(referenced),
+                "apply_patch 的描述应指路 {referenced}: {}",
+                patch.description
+            );
+        }
     }
 }

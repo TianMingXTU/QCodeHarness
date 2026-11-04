@@ -38,6 +38,9 @@ fn spec() -> AgentSpec {
     AgentSpec {
         role: AgentRole::Coder,
         system_prompt: "恢复测试".to_owned(),
+        model: None,
+        effort: None,
+        verbosity: None,
     }
 }
 
@@ -321,6 +324,9 @@ async fn dispatching_snapshot_of_a_restricted_role_still_refuses_the_write() {
     let reviewer = AgentSpec {
         role: AgentRole::Reviewer,
         system_prompt: "恢复测试：评审者".to_owned(),
+        model: None,
+        effort: None,
+        verbosity: None,
     };
     let snapshot = RunSnapshot {
         format_version: RUN_FORMAT,

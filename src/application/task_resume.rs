@@ -352,6 +352,9 @@ mod tests {
                 spec: AgentSpec {
                     role: AgentRole::Coder,
                     system_prompt: "系统提示".to_owned(),
+                    model: None,
+                    effort: None,
+                    verbosity: None,
                 },
                 state: RunState::AwaitingModel,
                 consumption: Consumption {
@@ -379,6 +382,9 @@ mod tests {
             spec: AgentSpec {
                 role: AgentRole::Coder,
                 system_prompt: "系统提示".to_owned(),
+                model: None,
+                effort: None,
+                verbosity: None,
             },
             session,
             state,

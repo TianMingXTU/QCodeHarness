@@ -616,7 +616,7 @@ mod tests {
             "内置 read_file 只有一个"
         );
         assert!(names.contains(&"mcp__ext__read_file"), "MCP 版本以前缀名并存");
-        assert_eq!(names.len(), 10, "9 个内置 + 1 个 MCP，谁也不覆盖谁");
+        assert_eq!(names.len(), 11, "10 个内置 + 1 个 MCP，谁也不覆盖谁");
     }
 
     #[tokio::test]

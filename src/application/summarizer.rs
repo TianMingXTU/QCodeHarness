@@ -81,10 +81,10 @@ impl Summarizer {
         prompt.push_str("\n【对话历史片段】\n");
         prompt.push_str(&input.dropped_transcript);
 
-        let spec = AgentSpec {
-            role: crate::domain::agent::AgentRole::Coder,
-            system_prompt: "你是编码任务的会话记录员，负责压缩对话历史供后续轮次参考。".to_owned(),
-        };
+        let spec = AgentSpec::new(
+            crate::domain::agent::AgentRole::Coder,
+            "你是编码任务的会话记录员，负责压缩对话历史供后续轮次参考。",
+        );
         let request = ModelRequest {
             history: vec![ContextSlice::User(Cow::Owned(prompt))],
             spec: &spec,

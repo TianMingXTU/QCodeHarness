@@ -45,6 +45,11 @@ tool = "edit_file"
 verdict = "require_approval"
 description = "修改文件内容，每次都要人确认"
 
+[[rules]]
+tool = "apply_patch"
+verdict = "require_approval"
+description = "补丁可一次改多个文件，每次都要人确认"
+
 # run_command 的规则在下面的"参数级作用域"一节：cargo test 一族免审，
 # 其余一律审批。写在这里会被那条宽规则挡住，见该节的顺序说明。
 

@@ -493,6 +493,12 @@ impl Orchestrator {
         let spec = AgentSpec {
             role: step.role,
             system_prompt: profile.system_prompt.clone(),
+            // 角色专属的模型与档位：档案里配了就用，没配就用运行时的默认。
+            // P11-3 起这一步是"能力与延迟"的分水岭——规划要强推理，
+            // 测试跑命令读输出就行。
+            model: profile.model.clone(),
+            effort: profile.effort,
+            verbosity: profile.verbosity,
         };
         let prompt = crate::application::step_prompt::step_prompt(
             task.goal(),
@@ -531,6 +537,7 @@ impl Orchestrator {
 }
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::*;
@@ -583,7 +590,7 @@ mod tests {
         (factory, sink)
     }
 
-    /// 全量 9 个内置工具的注册表（真实规格），角色边界测试的底座。
+    /// 全量 10 个内置工具的注册表（真实规格），角色边界测试的底座。
     /// 工具本身会被真的执行（白名单测试就要看文件有没有被改动）。
     fn full_registry() -> ToolRegistry {
         let root = std::env::temp_dir().join(format!("qch-orch-tools-{}", std::process::id()));
@@ -776,9 +783,9 @@ mod tests {
 
         assert_eq!(mock.requests().len(), 4);
         // 全量注册表：不再按角色裁掉模型可见的工具。
-        // 9 = read_file / read_files / list_dir / write_file / search_text /
-        //     edit_file / run_command / git_status / git_diff。
-        assert_eq!(offered_tools(&mock, 0).len(), 9);
+        // 10 = read_file / read_files / list_dir / write_file / search_text /
+        //      edit_file / apply_patch / run_command / git_status / git_diff。
+        assert_eq!(offered_tools(&mock, 0).len(), 10);
         let baseline = tools_json(&mock, 0);
         for index in 1..4 {
             assert_eq!(
@@ -1082,6 +1089,90 @@ mod tests {
         orchestrator.run(&mut task).await.expect("应跑完");
 
         assert_eq!(system_prompt_of(&mock, 0), expected);
+    }
+
+    // ── P11-3：按角色分配模型与档位 ───────────────────────────────────
+
+    /// 四步任务里，每一步都用它自己角色的模型。
+    ///
+    /// 编排器按步骤查档案、把档案里的模型名带进 `AgentSpec`，网关再把
+    /// 它写到请求的 `model` 字段上——这条断言把整条链路钉住：哪一环
+    /// 漏传，模型名都会退回成 rig 填的默认值，测试立刻红。
+    ///
+    /// 用 `Refactor` 模板而不是 `BugFix`：它的四步刚好覆盖四个角色
+    /// （测试者/编码者/测试者/评审者），`BugFix` 只有三步且不含评审者。
+    #[tokio::test]
+    async fn each_step_uses_the_model_of_its_own_role() {
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::text("基线跑完了"),
+            MockTurn::text("改完了"),
+            MockTurn::text("回归跑完了"),
+            MockTurn::text("审完了"),
+        ]);
+        let models = HashMap::from([
+            (AgentRole::Planner, "planner-model".to_owned()),
+            (AgentRole::Coder, "coder-model".to_owned()),
+            (AgentRole::Tester, "tester-model".to_owned()),
+            (AgentRole::Reviewer, "reviewer-model".to_owned()),
+        ]);
+        let roster = AgentRoster::builtin().with_role_models(&models, &HashMap::new(), &HashMap::new());
+        let mut orchestrator =
+            Orchestrator::with_roster(deps(&mock), Budget::new(20), test_factory(), roster);
+        let mut task =
+            orchestrator.create_task(TaskId::new("t-role-model"), TaskKind::Refactor, "重构它");
+
+        orchestrator.run(&mut task).await.expect("四步都应跑完");
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 4, "一步一次模型调用");
+        // Refactor 模板：测试者 → 编码者 → 测试者 → 评审者。
+        let expected = [
+            "tester-model",
+            "coder-model",
+            "tester-model",
+            "reviewer-model",
+        ];
+        for (index, model) in expected.iter().enumerate() {
+            assert_eq!(
+                requests[index].model.as_deref(),
+                Some(*model),
+                "第 {index} 步应用它自己角色的模型"
+            );
+        }
+    }
+
+    /// 没配角色模型时，请求里的模型名是 rig 自己填的默认值，我们不覆盖它。
+    ///
+    /// rig 的 operation 层在发送前会把空的 `request.model` 补成 wire 自己的
+    /// 模型名（`operation/completion.rs` 的 `request.model.take()...or_else(
+    /// || Some(target.model()))`），所以生产路径上"没配"表现为**请求里
+    /// 带着 provider 的默认模型**，而不是不带模型。
+    ///
+    /// 这条断言守的是反方向：没配时我们绝不能塞一个模型名进去。塞进去
+    /// 就等于把用户部署的默认模型顶掉——那正是"没配却变了"。
+    /// 请求里"确实没有我们设的模型名"这一条由
+    /// `rig_chat` 的 `without_a_configured_model_the_request_carries_none`
+    /// 在 build_request 层守住（那里能看见 rig 填充之前的原始请求）。
+    #[tokio::test]
+    async fn without_role_models_the_request_keeps_the_default_model() {
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::text("规划完了"),
+            MockTurn::text("改完了"),
+            MockTurn::text("测完了"),
+            MockTurn::text("汇总完了"),
+        ]);
+        let mut orchestrator = Orchestrator::new(deps(&mock), Budget::new(20), test_factory());
+        let mut task = orchestrator.create_task(TaskId::new("t-no-model"), TaskKind::BugFix, "修好它");
+
+        orchestrator.run(&mut task).await.expect("四步都应跑完");
+
+        for (index, request) in mock.requests().iter().enumerate() {
+            assert_eq!(
+                request.model.as_deref(),
+                Some("mock-model"),
+                "第 {index} 步不该被我们覆盖成别的模型"
+            );
+        }
     }
 
     // ── P9-3：单会话编排的预算与裁剪 ─────────────────────────────────

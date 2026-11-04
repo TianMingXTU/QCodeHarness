@@ -15,7 +15,10 @@ use rig::completion::{
     AssistantContent, AssistantMessage, CompletionRequest, CompletionResponse, Message,
     ToolAnnotations as RigToolAnnotations, ToolDefinition, Usage,
 };
-use rig::completion::options::{CacheRetention, GenerationOptions, OnUnsupported};
+use rig::completion::options::{
+    CacheRetention, Effort as RigEffort, GenerationOptions, OnUnsupported, Reasoning,
+    Verbosity as RigVerbosity,
+};
 use rig::driver::DynModel;
 use rig::message::{CallId as RigCallId, ToolCall as RigToolCall, ToolFunction, ToolName, ToolResult, ToolResultContent};
 use rig::operation::Completion;
@@ -23,7 +26,7 @@ use tokio::time::timeout;
 
 use crate::application::error::ApplicationError;
 use crate::application::port::{BoxFuture, ModelGateway, ModelReply, ModelRequest};
-use crate::domain::agent::{AgentSpec, AgentTurn};
+use crate::domain::agent::{AgentSpec, AgentTurn, Effort, Verbosity};
 use crate::domain::evidence::TokenUsage;
 use crate::domain::ids::CallId;
 use crate::domain::session::ContextSlice;
@@ -174,14 +177,24 @@ fn build_request(
     // 没有理由让一条畸形历史把整个进程带走。
     let prompt = messages.pop().ok_or(ApplicationError::EmptyHistory)?;
 
-    Ok(CompletionRequest::new(prompt)
+    let mut request = CompletionRequest::new(prompt)
         .messages(messages)
         .preamble(spec.system_prompt.clone())
         .tools(tools.iter().map(ToolDefinition::from))
-        .options(generation_options(cache_key)))
+        .options(generation_options(cache_key, spec.effort, spec.verbosity));
+    // 按请求覆盖模型名：`None` 时 provider 用自己的默认模型。
+    //
+    // rig 的 OpenAI Chat 编码器是 `request.model.clone().unwrap_or_else(
+    // || self.model.clone())`——一个客户端服务多个模型靠的就是这一行。
+    // 一个 `DynModel` 因此能服务多个角色，模型名来自配置而不是代码。
+    if let Some(model) = &spec.model {
+        request.model = Some(model.clone());
+    }
+    Ok(request)
 }
 
-/// 一次请求的生成选项：缓存保留期、路由键、并行工具调用、降级策略。
+/// 一次请求的生成选项：缓存保留期、路由键、并行工具调用、降级策略、
+/// 推理档位与输出档位。
 ///
 /// **不设 `cache_points`，这不是遗漏。** rig-core 0.45 的
 /// `CompletionRequest.cache_points` 只有 Anthropic Messages 编码器会读
@@ -208,19 +221,52 @@ fn build_request(
 /// 缓存严重得多。代价是降级静默，所以网关在第一次调用前用 `check()`
 /// 主动查一遍并把结果告诉用户（见 [`RigChatGateway::warn_once_about_unsupported`]）。
 ///
-/// `None` 的 `cache_key` 是"这个请求压根不参与前缀缓存"（摘要、AI 审查
+/// **`effort` / `verbosity` 也走同一个降级策略**：很多 provider 不认
+/// `verbosity`（OpenAI 之外的大多数），不认就丢掉这个字段继续跑——
+/// 让整个 agent 不可用比少一个字段糟糕得多。
+///
+/// **`None` 的 `cache_key` 是"这个请求压根不参与前缀缓存"**（摘要、AI 审查
 /// 这类一次性调用），此时**不发这个字段**。不能拿空字符串顶替：rig 只把
 /// `None` 映射成 `Mapping::Nothing`，`Some("")` 会映射成
 /// `Mapping::Send({"prompt_cache_key": ""})`（见 rig-core 的
 /// `providers/openai/options.rs`），于是所有一次性请求共用一个固定的空键。
-fn generation_options(cache_key: Option<&str>) -> GenerationOptions {
-    let options = GenerationOptions::new()
+fn generation_options(
+    cache_key: Option<&str>,
+    effort: Option<Effort>,
+    verbosity: Option<Verbosity>,
+) -> GenerationOptions {
+    let mut options = GenerationOptions::new()
         .cache(CacheRetention::Short)
         .parallel_tool_calls(true)
         .on_unsupported(OnUnsupported::Ignore);
+    if let Some(effort) = effort {
+        options = options.reasoning(Reasoning::Effort(rig_effort(effort)));
+    }
+    if let Some(verbosity) = verbosity {
+        options = options.verbosity(rig_verbosity(verbosity));
+    }
     match cache_key {
         Some(key) => options.cache_key(key),
         None => options,
+    }
+}
+
+/// 领域档位 → rig 档位。
+fn rig_effort(effort: Effort) -> RigEffort {
+    match effort {
+        Effort::Minimal => RigEffort::Minimal,
+        Effort::Low => RigEffort::Low,
+        Effort::Medium => RigEffort::Medium,
+        Effort::High => RigEffort::High,
+    }
+}
+
+/// 领域档位 → rig 档位。
+fn rig_verbosity(verbosity: Verbosity) -> RigVerbosity {
+    match verbosity {
+        Verbosity::Low => RigVerbosity::Low,
+        Verbosity::Medium => RigVerbosity::Medium,
+        Verbosity::High => RigVerbosity::High,
     }
 }
 
@@ -375,6 +421,9 @@ mod tests {
         AgentSpec {
             role: AgentRole::Coder,
             system_prompt: "系统提示".to_owned(),
+            model: None,
+            effort: None,
+            verbosity: None,
         }
     }
 
@@ -618,5 +667,92 @@ mod tests {
             "Chat 路由不读 cache_points，设了也是装饰: {:?}",
             request.cache_points
         );
+    }
+
+    // ── P11-3 按角色分配模型与档位 ─────────────────────────────────────
+
+    /// 规格里配了模型名时，请求的 `model` 字段被覆盖成它。
+    ///
+    /// rig 的 OpenAI Chat 编码器是 `request.model.clone().unwrap_or_else(
+    /// || self.model.clone())`——一个客户端服务多个模型靠的就是这一行。
+    /// 断言它被覆盖，才算证明"按角色换模型"真的落到 wire 上，而不只是
+    /// 在配置里躺了一字段。
+    #[test]
+    fn the_spec_model_overrides_the_request_model() {
+        let session = Session::new(SessionId::new("s1"), "任务");
+        let mut spec = spec_with();
+        spec.model = Some("qwen3-coder".to_owned());
+
+        let request = build_request(&session.slices(), &spec, &[], Some("s1")).unwrap();
+
+        assert_eq!(
+            request.model.as_deref(),
+            Some("qwen3-coder"),
+            "规格里的模型名应覆盖到请求上"
+        );
+    }
+
+    /// **没有配角色模型时行为与 P10 完全一致**（回归保护）。
+    ///
+    /// P10 的请求不带 `model` 字段，由 provider 用自己配置的默认模型。
+    /// P11 加了按角色选模型之后，最容易出的岔子就是"没配也发一个模型
+    /// 名"——那会让所有部署的默认模型悄悄失效。这条断言把"没配 = 不发"
+    /// 钉住：没配时 `request.model` 必须是 `None`。
+    #[test]
+    fn without_a_configured_model_the_request_carries_none() {
+        let session = Session::new(SessionId::new("s1"), "任务");
+        let spec = spec_with();
+        assert_eq!(spec.model, None, "内置规格不带模型");
+
+        let request = build_request(&session.slices(), &spec, &[], Some("s1")).unwrap();
+
+        assert_eq!(
+            request.model, None,
+            "没配角色模型时不该发 model 字段，否则默认模型会被顶掉"
+        );
+    }
+
+    /// 推理档位与输出档位落到请求的生成选项上。
+    ///
+    /// 两者都是 provider 不一定认的字段，所以同时要断言降级策略还是
+    /// `Ignore`——档位一加进来，降级策略就跟着成了它们的最后一道防线。
+    #[test]
+    fn the_spec_tiers_reach_the_generation_options() {
+        let session = Session::new(SessionId::new("s1"), "任务");
+        let mut spec = spec_with();
+        spec.effort = Some(Effort::High);
+        spec.verbosity = Some(Verbosity::Low);
+
+        let request = build_request(&session.slices(), &spec, &[], Some("s1")).unwrap();
+
+        assert_eq!(
+            request.options.reasoning,
+            Some(Reasoning::Effort(RigEffort::High)),
+            "推理档位应落到 reasoning 选项上"
+        );
+        assert_eq!(
+            request.options.verbosity,
+            Some(RigVerbosity::Low),
+            "输出档位应落到 verbosity 选项上"
+        );
+        assert_eq!(
+            request.options.on_unsupported,
+            Some(OnUnsupported::Ignore),
+            "provider 不认档位时降级而不是让 agent 不可用"
+        );
+    }
+
+    /// 没配档位时选项里不出现 reasoning / verbosity。
+    ///
+    /// 与模型名同理：不配就是不设。硬塞一个 `None` 之外的默认值会让
+    /// provider 以为自己收到了一个明确的档位指令，从而覆盖它自己的默认
+    /// 行为——那正是"没配却变了"的形态。
+    #[test]
+    fn without_configured_tiers_no_tier_options_are_sent() {
+        let session = Session::new(SessionId::new("s1"), "任务");
+        let request = build_request(&session.slices(), &spec_with(), &[], Some("s1")).unwrap();
+
+        assert_eq!(request.options.reasoning, None, "没配推理档位就不设该字段");
+        assert_eq!(request.options.verbosity, None, "没配输出档位就不设该字段");
     }
 }

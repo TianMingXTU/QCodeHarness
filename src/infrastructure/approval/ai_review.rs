@@ -173,10 +173,7 @@ impl ApprovalGate for AiReviewGate {
                 );
                 return self.fallback.request(request).await;
             }
-            let spec = AgentSpec {
-                role: AgentRole::Reviewer,
-                system_prompt: REVIEWER_SYSTEM_PROMPT.to_owned(),
-            };
+            let spec = AgentSpec::new(AgentRole::Reviewer, REVIEWER_SYSTEM_PROMPT);
             let model_request = crate::application::port::ModelRequest {
                 history: vec![ContextSlice::User(std::borrow::Cow::Owned(
                     Self::review_prompt(request),

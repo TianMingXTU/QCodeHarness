@@ -31,7 +31,8 @@ impl EditFile {
         ToolSpec {
             name: EDIT_FILE.to_owned(),
             description: "在 workspace 内的已有文件中做一次精确替换：`old_string` 必须在文件中恰好出现一次，\
-                          否则拒绝执行。适合小段修改；创建新文件或整体重写请用 write_file。"
+                          否则拒绝执行。适合小段修改；一次改多处用 apply_patch，\
+                          创建新文件或整体重写请用 write_file。"
                 .to_owned(),
             parameters: json!({
                 "type": "object",

@@ -9,7 +9,7 @@
 //! 调用拿到一条指明角色可用工具的拒绝观察，工具根本不会执行。这里的
 //! 数据因此就是边界的唯一真相来源，应用层（`AgentRunner`）按它逐条判断。
 
-use super::agent::AgentRole;
+use super::agent::{AgentRole, Effort, Verbosity};
 
 /// 一个角色的完整档案：系统提示词 + 能用哪些工具。
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +20,16 @@ pub struct AgentProfile {
     pub system_prompt: String,
     /// 这个角色允许使用的工具名。`None` 表示不限（用全部已注册工具）。
     pub tools: Option<Vec<String>>,
+    /// 这个角色用的模型名。`None` = 用运行时的默认模型。
+    ///
+    /// **模型是运行时的属性，不是 agent 规格的一部分**——同一个角色在
+    /// 不同部署里该用不同的模型，用户在自己的网关上跑什么模型只有他
+    /// 知道。所以这里存的是"要覆盖成什么"，具体值由配置注入。
+    pub model: Option<String>,
+    /// 这个角色的推理档位。`None` = provider 默认。
+    pub effort: Option<Effort>,
+    /// 这个角色的输出详略档位。`None` = provider 默认。
+    pub verbosity: Option<Verbosity>,
 }
 
 /// 只读工具集：Planner 与 Reviewer 共用。任何会改动文件或执行命令的
@@ -65,6 +75,9 @@ impl AgentProfile {
                 ),
                 // 只读 5 件套。
                 tools: Some(READ_ONLY_TOOLS.iter().map(|name| (*name).to_owned()).collect()),
+                model: None,
+                effort: None,
+                verbosity: None,
             },
             AgentProfile {
                 role: AgentRole::Coder,
@@ -86,6 +99,9 @@ impl AgentProfile {
                 // 编码者是动手角色：不限工具，注册什么用什么
                 //（包括将来经 MCP 接入的外部工具，照常走策略与审批）。
                 tools: None,
+                model: None,
+                effort: None,
+                verbosity: None,
             },
             AgentProfile {
                 role: AgentRole::Tester,
@@ -116,6 +132,9 @@ impl AgentProfile {
                     .map(|name| (*name).to_owned())
                     .collect(),
                 ),
+                model: None,
+                effort: None,
+                verbosity: None,
             },
             AgentProfile {
                 role: AgentRole::Reviewer,
@@ -133,6 +152,9 @@ impl AgentProfile {
 - 最终答案要包含：改动范围的理解、问题清单（按严重程度排序，引用具体代码）、明确的合并建议。"
                 ),
                 tools: Some(READ_ONLY_TOOLS.iter().map(|name| (*name).to_owned()).collect()),
+                model: None,
+                effort: None,
+                verbosity: None,
             },
         ]
     }
@@ -229,5 +251,32 @@ mod tests {
                 "{role:?} 的提示词应写明禁止事项"
             );
         }
+    }
+
+    /// `apply_patch` 是破坏性工具（P11-1 登记），只该让不限工具的 Coder 用到。
+    ///
+    /// 受限三角色的白名单都不得出现它；Coder 的 `tools: None` 表示不限，
+    /// 登记进注册表即自动可用。白名单是边界的唯一真相来源（见本模块
+    /// 顶部说明），这里钉住新写工具不会漏进只读角色。
+    #[test]
+    fn apply_patch_stays_out_of_the_restricted_roles() {
+        for role in [AgentRole::Planner, AgentRole::Tester, AgentRole::Reviewer] {
+            let tools = AgentProfile::builtin()
+                .into_iter()
+                .find(|profile| profile.role == role)
+                .expect("应有档案")
+                .tools
+                .expect("受限角色应有限定工具集");
+            assert!(
+                !tools.iter().any(|name| name == "apply_patch"),
+                "{role:?} 不应持有 apply_patch: {tools:?}"
+            );
+        }
+
+        let coder = AgentProfile::builtin()
+            .into_iter()
+            .find(|profile| profile.role == AgentRole::Coder)
+            .unwrap();
+        assert_eq!(coder.tools, None, "Coder 不限工具，apply_patch 自动可用");
     }
 }

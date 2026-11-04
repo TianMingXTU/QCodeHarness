@@ -118,6 +118,9 @@ mod tests {
             spec: AgentSpec {
                 role: AgentRole::Coder,
                 system_prompt: "系统提示".to_owned(),
+                model: None,
+                effort: None,
+                verbosity: None,
             },
             session: session.snapshot(),
             state: RunState::AwaitingModel,

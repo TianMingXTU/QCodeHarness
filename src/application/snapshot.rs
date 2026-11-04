@@ -236,6 +236,9 @@ mod tests {
             spec: AgentSpec {
                 role: AgentRole::Coder,
                 system_prompt: "系统提示".to_owned(),
+                model: None,
+                effort: None,
+                verbosity: None,
             },
             session: session.snapshot(),
             state: RunState::Dispatching(vec![ToolCall {
@@ -348,6 +351,9 @@ mod tests {
             spec: AgentSpec {
                 role: AgentRole::Coder,
                 system_prompt: "系统提示".to_owned(),
+                model: None,
+                effort: None,
+                verbosity: None,
             },
             session: Session::new(session_id, "修好它").snapshot(),
             state: RunState::AwaitingModel,

@@ -50,6 +50,31 @@ impl AgentRoster {
             .and_then(|profile| profile.tools.as_deref())
     }
 
+    /// 给每个角色配上自己的模型名与档位。
+    ///
+    /// **模型与档位只影响"用哪个模型"，不影响"能干什么"。** 工具白名单
+    /// 是硬边界，不在这里动——给 Tester 配一个更强的模型不等于让它能改
+    /// 文件。
+    ///
+    /// 没配到的角色保持 `None`（用运行时的默认模型与 provider 默认档位），
+    /// 与 P10 的行为逐字一致。
+    ///
+    /// 装配期就把配置写进档案：编排器按角色取档案时一并取到模型，
+    /// 不用在运行路径上再读一次环境变量（那会让 domain 与 IO 搅在一起）。
+    pub fn with_role_models(
+        mut self,
+        models: &std::collections::HashMap<AgentRole, String>,
+        efforts: &std::collections::HashMap<AgentRole, crate::domain::agent::Effort>,
+        verbosities: &std::collections::HashMap<AgentRole, crate::domain::agent::Verbosity>,
+    ) -> Self {
+        for profile in &mut self.profiles {
+            profile.model = models.get(&profile.role).cloned();
+            profile.effort = efforts.get(&profile.role).copied();
+            profile.verbosity = verbosities.get(&profile.role).copied();
+        }
+        self
+    }
+
     /// 给每个角色的提示词追加项目指令。
     ///
     /// 注入点在构造花名册时，不在 runner 里：快照存的是 `AgentSpec`，
@@ -80,6 +105,8 @@ const PROJECT_INSTRUCTIONS_HEADER: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::agent::{Effort, Verbosity};
+    use std::collections::HashMap;
 
     #[test]
     fn builtin_roster_covers_all_four_roles() {
@@ -215,6 +242,110 @@ mod tests {
         let after = before.clone().with_project_instructions("随便写点什么");
         for role in [AgentRole::Planner, AgentRole::Coder, AgentRole::Tester, AgentRole::Reviewer] {
             assert_eq!(after.allowed_tools(role), before.allowed_tools(role));
+        }
+    }
+
+    // ── P11-3 按角色分配模型与档位 ─────────────────────────────────────
+
+    /// 四个角色各自拿到自己的模型与档位。
+    ///
+    /// 配置的用途就是"这一步该用哪个模型"，所以每个角色都要能独立配。
+    /// 漏配一个角色会让它在四步任务里静默地用着默认模型——而默认模型
+    /// 往往是那个最贵的。
+    #[test]
+    fn each_role_gets_its_own_model_and_tiers() {
+        let models = HashMap::from([
+            (AgentRole::Planner, "planner-model".to_owned()),
+            (AgentRole::Coder, "coder-model".to_owned()),
+            (AgentRole::Tester, "tester-model".to_owned()),
+            (AgentRole::Reviewer, "reviewer-model".to_owned()),
+        ]);
+        let efforts = HashMap::from([
+            (AgentRole::Planner, Effort::High),
+            (AgentRole::Coder, Effort::High),
+            (AgentRole::Tester, Effort::Low),
+            (AgentRole::Reviewer, Effort::Medium),
+        ]);
+        let verbosities = HashMap::from([
+            (AgentRole::Planner, Verbosity::Medium),
+            (AgentRole::Coder, Verbosity::Low),
+            (AgentRole::Tester, Verbosity::Low),
+            (AgentRole::Reviewer, Verbosity::High),
+        ]);
+
+        let roster =
+            AgentRoster::builtin().with_role_models(&models, &efforts, &verbosities);
+
+        assert_eq!(
+            roster.find(AgentRole::Planner).unwrap().model.as_deref(),
+            Some("planner-model")
+        );
+        assert_eq!(
+            roster.find(AgentRole::Coder).unwrap().model.as_deref(),
+            Some("coder-model")
+        );
+        assert_eq!(
+            roster.find(AgentRole::Tester).unwrap().model.as_deref(),
+            Some("tester-model")
+        );
+        assert_eq!(
+            roster.find(AgentRole::Reviewer).unwrap().model.as_deref(),
+            Some("reviewer-model")
+        );
+
+        assert_eq!(
+            roster.find(AgentRole::Tester).unwrap().effort,
+            Some(Effort::Low),
+            "测试者用低推理档：它跑命令读输出，不需要强推理"
+        );
+        assert_eq!(
+            roster.find(AgentRole::Coder).unwrap().verbosity,
+            Some(Verbosity::Low)
+        );
+    }
+
+    /// 没配的角色保持 `None`：用运行时的默认模型与 provider 默认档位。
+    ///
+    /// 这是 P11 的兼容底线——没配角色模型时，行为必须与 P10 逐字一致
+    /// （`request.model` 为 `None`，请求里连 `model` 字段都不出现）。
+    #[test]
+    fn roles_without_configuration_keep_the_defaults() {
+        let models = HashMap::from([(AgentRole::Coder, "coder-model".to_owned())]);
+
+        let roster = AgentRoster::builtin().with_role_models(&models, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            roster.find(AgentRole::Coder).unwrap().model.as_deref(),
+            Some("coder-model")
+        );
+        for role in [AgentRole::Planner, AgentRole::Tester, AgentRole::Reviewer] {
+            let profile = roster.find(role).unwrap();
+            assert_eq!(profile.model, None, "{role:?} 未配置应保持 None");
+            assert_eq!(profile.effort, None);
+            assert_eq!(profile.verbosity, None);
+        }
+    }
+
+    /// 配模型与档位不改变任何角色的工具白名单。
+    ///
+    /// **模型与档位只影响"用哪个模型"，不影响"能干什么"。** 给测试者
+    /// 配一个更强的模型，不等于让它能改文件——白名单是硬边界，与模型
+    /// 能力无关。
+    #[test]
+    fn role_models_do_not_change_tool_whitelists() {
+        let before = AgentRoster::builtin();
+        let after = before.clone().with_role_models(
+            &HashMap::from([(AgentRole::Tester, "stronger-model".to_owned())]),
+            &HashMap::from([(AgentRole::Tester, Effort::High)]),
+            &HashMap::from([(AgentRole::Tester, Verbosity::High)]),
+        );
+
+        for role in [AgentRole::Planner, AgentRole::Coder, AgentRole::Tester, AgentRole::Reviewer] {
+            assert_eq!(
+                after.allowed_tools(role),
+                before.allowed_tools(role),
+                "{role:?} 的白名单不应因换模型而变"
+            );
         }
     }
 }

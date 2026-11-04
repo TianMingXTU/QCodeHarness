@@ -111,6 +111,9 @@ async fn fixes_a_failing_test_in_an_isolated_repo() {
         AgentSpec {
             role: AgentRole::Coder,
             system_prompt: "修复失败的测试".to_owned(),
+            model: None,
+            effort: None,
+            verbosity: None,
         },
         SessionId::new("e2e-bugfix"),
         "修复 broken-repo 里失败的测试",

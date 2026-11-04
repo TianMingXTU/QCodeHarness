@@ -227,6 +227,12 @@ mod tests {
             ("search_text", "按模式扫文件，命中的文件不固定"),
             ("git_status", "查仓库状态，不指向具体文件"),
             ("git_diff", "看的是改动，不是读过哪个文件"),
+            // apply_patch 的参数是一整块补丁文本，没有 path/paths 字段，
+            // 台账的 subject() 取不到对象，只能退化成工具名本身——把
+            // "apply_patch" 当文件名记进"写过的文件"是错的。动过哪些
+            // 文件要从补丁文本里解析，那是基础设施层的事，台账宁可少记
+            // 一类也不记错。
+            ("apply_patch", "参数是补丁文本，没有路径字段，台账取不到对象"),
         ];
         for (name, reason) in deliberately_untracked {
             assert!(

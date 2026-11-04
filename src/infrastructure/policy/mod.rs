@@ -473,8 +473,8 @@ description = "忘了写 verdict"
         let engine = load(Some(&path)).expect("policy.example.toml 应能解析");
 
         assert!(
-            engine.rules.len() >= 8,
-            "示例应覆盖八个内置工具，实际 {} 条",
+            engine.rules.len() >= 9,
+            "示例应覆盖九个内置工具，实际 {} 条",
             engine.rules.len()
         );
     }

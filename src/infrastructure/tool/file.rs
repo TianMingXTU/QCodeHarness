@@ -49,7 +49,8 @@ impl ReadFile {
                 "读取 workspace 内指定文本文件的内容，返回 UTF-8 文本。\
                  默认最多显示前 {READ_FILE_DEFAULT_LINES} 行，超长时只返回开头并附总行数；\
                  大文件请先用 search_text 定位目标位置，再调大 max_lines（上限 {READ_FILE_HARD_MAX_LINES}）读取。\
-                 已经知道要读哪几个文件时改用 read_files 一次读回，省掉逐个调用的往返。"
+                 已经知道要读哪几个文件时改用 read_files 一次读回，省掉逐个调用的往返。\
+                 要改代码时用 apply_patch，不要用 write_file 整体覆盖。"
             ),
             parameters: json!({
                 "type": "object",
@@ -144,7 +145,8 @@ impl ReadFiles {
                  单个文件失败不影响其他文件，失败的那一节内说明原因；\
                  每个文件的行数上限与 read_file 相同（默认 {READ_FILE_DEFAULT_LINES}，上限 {READ_FILE_HARD_MAX_LINES}），\
                  超长文件同样只返回开头并附总行数。\
-                 还不确定有哪些文件时，先用 list_dir 看目录结构、用 search_text 定位内容，不要用它碰运气。"
+                 还不确定有哪些文件时，先用 list_dir 看目录结构、用 search_text 定位内容，不要用它碰运气。\
+                 要改代码时用 apply_patch，不要用 write_file 整体覆盖。"
             ),
             parameters: json!({
                 "type": "object",
@@ -350,7 +352,8 @@ impl WriteFile {
         ToolSpec {
             name: WRITE_FILE.to_owned(),
             description: "把文本内容写入 workspace 内的指定文件（覆盖写入，父目录必须已存在）。\
-                          适合创建新文件；修改已有文件中的一段请改用 edit_file，它只替换指定片段、更安全。"
+                          适合创建新文件（或用 apply_patch 的 Add File）；修改已有文件中的一段请改用 edit_file，\
+                          一次改多处用 apply_patch。"
                 .to_owned(),
             parameters: json!({
                 "type": "object",

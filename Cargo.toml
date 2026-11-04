@@ -29,6 +29,8 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "ti
 # 需要 CMake/NASM，见上面 rig 的注释）。这三个 feature 不碰 HTTP/TLS，
 # `cargo tree -i rustls` 为空是 P5-2 的验收项之一。
 rmcp = { version = "3.8.0", default-features = false, features = ["client", "transport-child-process", "transport-async-rw"] }
+ignore = "0.4.34"
+regex = "1.13.1"
 
 # Windows Job Object：进程树的资源限制与整树终止（P7 沙箱）。
 # 只挑 Win32 的三个子 feature（句柄基础 + Job Objects + 进程/线程），

@@ -9,6 +9,7 @@
 //! 全部逻辑在库目标（`src/lib.rs`）里，本文件只消费它——
 //! 集成测试因此能用与生产完全相同的装配路径。
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use qcode_harness::application::report::{render_json, render_text, BenchmarkRepo
 use qcode_harness::application::snapshot::{RunSnapshot, SessionStore, TaskStore};
 use qcode_harness::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
 use qcode_harness::application::tool_registry::ToolRegistry;
+use qcode_harness::domain::agent::{AgentRole, Effort, Verbosity};
 use qcode_harness::domain::budget::Budget;
 use qcode_harness::domain::context::ContextBudget;
 use qcode_harness::domain::ids::{SessionId, TaskId};
@@ -79,6 +81,12 @@ struct LlmConfig {
     /// 被裁历史累积到多少轮才生成一次 LLM 摘要。未设置时不做摘要
     /// （裁剪退回占位说明，P3 行为）。
     summarize_min_dropped: Option<usize>,
+    /// 各角色专属的模型名。未设置的角色用默认模型。
+    role_models: HashMap<AgentRole, String>,
+    /// 各角色专属的推理档位。未设置的档位用 provider 默认。
+    role_efforts: HashMap<AgentRole, Effort>,
+    /// 各角色专属的输出详略档位。未设置的档位用 provider 默认。
+    role_verbosities: HashMap<AgentRole, Verbosity>,
 }
 
 impl LlmConfig {
@@ -130,8 +138,102 @@ impl LlmConfig {
             auto_approve: std::env::var("QCH_AUTO_APPROVE").as_deref() == Ok("1"),
             max_wall_clock,
             summarize_min_dropped,
+            role_models: read_role_models(),
+            role_efforts: read_role_efforts()?,
+            role_verbosities: read_role_verbosities()?,
         })
     }
+}
+
+/// 读各角色专属的模型名。
+///
+/// 变量名按 `LLM_MODEL_<角色>` 的规律拼（见
+/// [`AgentRole::model_env_name`]）。没设置的角色不进表——编排器据此
+/// 用运行时的默认模型，行为与 P10 逐字一致。
+fn read_role_models() -> HashMap<AgentRole, String> {
+    read_role_models_from(|name| std::env::var(name).ok())
+}
+
+/// 从任意取值源读各角色专属的模型名。
+///
+/// 逻辑与读环境变量分开，是为了能测：进程环境变量是全局状态，测试
+/// 里改它会与并行跑的其他测试互相污染。取值源做成参数，测试就能喂
+/// 一张假的变量表。
+fn read_role_models_from(lookup: impl Fn(&str) -> Option<String>) -> HashMap<AgentRole, String> {
+    let mut models = HashMap::new();
+    for role in AgentRole::all() {
+        if let Some(name) = lookup(role.model_env_name()) {
+            let name = name.trim().to_owned();
+            // 空串当作没配：环境变量存在但留空（`LLM_MODEL_CODER= `）是
+            // 很常见的写法，把它当成一个叫空串的模型会让请求打到一个
+            // 不存在的模型上。
+            if !name.is_empty() {
+                models.insert(role, name);
+            }
+        }
+    }
+    models
+}
+
+/// 读各角色专属的推理档位。
+///
+/// 档位写错必须让进程停下来：一个静默失效的档位配置等于"配了但没生效"，
+/// 用户会以为强推理已经开上了。
+fn read_role_efforts() -> Result<HashMap<AgentRole, Effort>, String> {
+    read_role_efforts_from(|name| std::env::var(name).ok())
+}
+
+/// 从任意取值源读各角色专属的推理档位。
+fn read_role_efforts_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<HashMap<AgentRole, Effort>, String> {
+    let mut efforts = HashMap::new();
+    for role in AgentRole::all() {
+        if let Some(text) = lookup(role.effort_env_name()) {
+            let effort = Effort::parse(&text).map_err(|error| {
+                format!("{}: {error}", role.effort_env_name())
+            })?;
+            efforts.insert(role, effort);
+        }
+    }
+    Ok(efforts)
+}
+
+/// 读各角色专属的输出详略档位。
+fn read_role_verbosities() -> Result<HashMap<AgentRole, Verbosity>, String> {
+    read_role_verbosities_from(|name| std::env::var(name).ok())
+}
+
+/// 从任意取值源读各角色专属的输出详略档位。
+fn read_role_verbosities_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<HashMap<AgentRole, Verbosity>, String> {
+    let mut verbosities = HashMap::new();
+    for role in AgentRole::all() {
+        if let Some(text) = lookup(role.verbosity_env_name()) {
+            let verbosity = Verbosity::parse(&text).map_err(|error| {
+                format!("{}: {error}", role.verbosity_env_name())
+            })?;
+            verbosities.insert(role, verbosity);
+        }
+    }
+    Ok(verbosities)
+}
+
+/// 按配置装配内置花名册：给每个角色带上自己的模型与档位。
+///
+/// **模型与档位只影响"用哪个模型"，不影响"能干什么"。** 工具白名单
+/// 在 [`AgentRoster::builtin`] 里定死，这里不碰——给 Tester 配一个更
+/// 强的模型不等于让它能改文件。
+///
+/// 没配到的角色保持 `None`，跑起来的请求与 P10 逐字一致（`model` 不
+/// 出现在请求里，档位由 provider 取默认）。
+fn roster_with_role_models(config: &LlmConfig) -> AgentRoster {
+    AgentRoster::builtin().with_role_models(
+        &config.role_models,
+        &config.role_efforts,
+        &config.role_verbosities,
+    )
 }
 
 #[tokio::main]
@@ -194,7 +296,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             approvals: Arc::new(AutoApproveGate),
             clock: Arc::new(SystemClock),
             policy,
-            roster: AgentRoster::builtin(),
+            roster: roster_with_role_models(&config),
             context_budget,
             evidence: Arc::new(MemoryEvidenceSink::new()),
             // 短任务基准不留快照：恢复它们只会把任务跑回当前工作区，
@@ -323,7 +425,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 evidence,
                 clock,
                 policy,
-                roster: AgentRoster::builtin(),
+                roster: roster_with_role_models(&config),
                 context_budget,
                 session_store: Some(store.clone()),
             },
@@ -386,7 +488,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             approvals,
             clock,
             policy,
-            roster: AgentRoster::builtin(),
+            roster: roster_with_role_models(&config),
             context_budget,
             evidence: Arc::new(MemoryEvidenceSink::new()),
             session_store: Some(store.clone()),
@@ -445,9 +547,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 loaded.source.display(),
                 loaded.text.len()
             );
-            AgentRoster::builtin().with_project_instructions(&loaded.text)
+            roster_with_role_models(&config).with_project_instructions(&loaded.text)
         }
-        None => AgentRoster::builtin(),
+        None => roster_with_role_models(&config),
     };
 
     println!("任务: {task}");
@@ -673,5 +775,150 @@ impl EvidenceSink for FanoutEvidenceSink {
                 eprintln!("警告：某个证据汇处理事件时 panic，已跳过该汇");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 从一张假变量表里取值：只有表里有的名字才有值。
+    fn table(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs = pairs.to_vec();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    /// 每个角色读各自的环境变量，互不串味。
+    #[test]
+    fn role_models_come_from_their_own_variables() {
+        let models = read_role_models_from(&table(&[
+            ("LLM_MODEL_PLANNER", "planner-model"),
+            ("LLM_MODEL_CODER", "coder-model"),
+            ("LLM_MODEL_TESTER", "tester-model"),
+            ("LLM_MODEL_REVIEWER", "reviewer-model"),
+        ]));
+
+        assert_eq!(models.len(), 4);
+        assert_eq!(models[&AgentRole::Planner], "planner-model");
+        assert_eq!(models[&AgentRole::Coder], "coder-model");
+        assert_eq!(models[&AgentRole::Tester], "tester-model");
+        assert_eq!(models[&AgentRole::Reviewer], "reviewer-model");
+    }
+
+    /// 没配的角色不进表：编排器据此让该角色用运行时的默认模型。
+    #[test]
+    fn an_unconfigured_role_is_absent_from_the_table() {
+        let models = read_role_models_from(&table(&[("LLM_MODEL_CODER", "coder-model")]));
+
+        assert_eq!(models.len(), 1);
+        assert!(!models.contains_key(&AgentRole::Planner));
+        assert!(!models.contains_key(&AgentRole::Tester));
+    }
+
+    /// 一个角色都没配时，表是空的——请求里不会出现 `model` 字段。
+    ///
+    /// 这是 P11 的兼容底线：默认部署的行为必须与 P10 逐字一致。
+    #[test]
+    fn without_any_configuration_the_tables_are_empty() {
+        assert!(read_role_models_from(&table(&[])).is_empty());
+        assert!(read_role_efforts_from(&table(&[])).unwrap().is_empty());
+        assert!(read_role_verbosities_from(&table(&[])).unwrap().is_empty());
+    }
+
+    /// 留空的值当作没配。
+    ///
+    /// `LLM_MODEL_CODER=` 是很常见的写法（先占个位、以后再填）。当成一个
+    /// 叫空串的模型会让请求打到一个不存在的模型上，报错还难懂。
+    #[test]
+    fn a_blank_value_counts_as_unset() {
+        let models = read_role_models_from(&table(&[("LLM_MODEL_CODER", "   ")]));
+
+        assert!(models.is_empty(), "空值不应被当成一个模型名");
+    }
+
+    /// 推理档位按角色读，拼错时报出是哪个变量名。
+    #[test]
+    fn role_efforts_are_read_per_role() {
+        let efforts = read_role_efforts_from(&table(&[
+            ("LLM_EFFORT_PLANNER", "high"),
+            ("LLM_EFFORT_TESTER", "low"),
+        ]))
+        .expect("档位应能解析");
+
+        assert_eq!(efforts[&AgentRole::Planner], Effort::High);
+        assert_eq!(efforts[&AgentRole::Tester], Effort::Low);
+        assert!(!efforts.contains_key(&AgentRole::Coder));
+    }
+
+    /// 档位写错要让进程停下来，并说清是哪个变量名。
+    #[test]
+    fn a_bad_effort_names_the_variable_that_went_wrong() {
+        let error = read_role_efforts_from(&table(&[("LLM_EFFORT_CODER", "最大")]))
+            .expect_err("认不出的档位应当报错");
+
+        assert!(
+            error.contains("LLM_EFFORT_CODER"),
+            "报错要说清是哪个变量: {error}"
+        );
+    }
+
+    /// 输出档位同样按角色读，同样在写错时报出变量名。
+    #[test]
+    fn role_verbosities_are_read_per_role() {
+        let verbosities = read_role_verbosities_from(&table(&[
+            ("LLM_VERBOSITY_REVIEWER", "high"),
+            ("LLM_VERBOSITY_CODER", "low"),
+        ]))
+        .expect("档位应能解析");
+
+        assert_eq!(verbosities[&AgentRole::Reviewer], Verbosity::High);
+        assert_eq!(verbosities[&AgentRole::Coder], Verbosity::Low);
+        assert!(!verbosities.contains_key(&AgentRole::Planner));
+    }
+
+    #[test]
+    fn a_bad_verbosity_names_the_variable_that_went_wrong() {
+        let error = read_role_verbosities_from(&table(&[("LLM_VERBOSITY_TESTER", "啰嗦")]))
+            .expect_err("认不出的档位应当报错");
+
+        assert!(
+            error.contains("LLM_VERBOSITY_TESTER"),
+            "报错要说清是哪个变量: {error}"
+        );
+    }
+
+    /// 装配出的花名册：配了的角色拿到模型，没配的保持 `None`。
+    #[test]
+    fn the_roster_carries_the_configured_models() {
+        let config = LlmConfig {
+            base_url: "http://localhost".to_owned(),
+            api_key: "k".to_owned(),
+            model: "default-model".to_owned(),
+            max_turns: 20,
+            policy_path: None,
+            auto_approve: false,
+            max_wall_clock: None,
+            summarize_min_dropped: None,
+            role_models: read_role_models_from(&table(&[("LLM_MODEL_CODER", "coder-model")])),
+            role_efforts: read_role_efforts_from(&table(&[("LLM_EFFORT_CODER", "high")])).unwrap(),
+            role_verbosities: read_role_verbosities_from(&table(&[])).unwrap(),
+        };
+
+        let roster = roster_with_role_models(&config);
+
+        assert_eq!(
+            roster.find(AgentRole::Coder).unwrap().model.as_deref(),
+            Some("coder-model")
+        );
+        assert_eq!(
+            roster.find(AgentRole::Coder).unwrap().effort,
+            Some(Effort::High)
+        );
+        assert_eq!(roster.find(AgentRole::Tester).unwrap().model, None);
     }
 }
