@@ -263,6 +263,14 @@ impl ConsoleReporter {
             AuditEvent::ToolObserved { outcome, .. } => {
                 println!("[观察] {}", preview(&outcome.content));
             }
+            AuditEvent::SandboxApplied { platform, active, .. } => {
+                // 生效时不播报：那是默认预期，每条命令刷一行只会让人
+                // 跳过所有行。未生效必须立刻看见——"有沙箱"的假设一旦
+                // 悄悄成立，就没有人会去查它。
+                if !active {
+                    println!("[边界] {platform}：本次执行无进程沙箱保护");
+                }
+            }
             AuditEvent::PolicyEvaluated { verdict, reason, .. } => {
                 // 只播报被拒绝的裁决：放行和"要审批"对读者没有新信息，
                 // 而拒绝必须让人立刻看见——那是模型被拦下来的地方。
@@ -567,6 +575,7 @@ mod tests {
                 outcome: ToolOutcome {
                     content: "内容".to_owned(),
                     status: OutcomeStatus::Success,
+                    execution: None,
                 },
             },
         );

@@ -9,6 +9,13 @@
 //!   子进程默认全盘继承，不清洗等于任何命令都能 `env | grep KEY`。
 //! - **退出码非 0 也是 failed 但输出照回**：测试失败的线索全在输出里，
 //!   模型要靠它修 bug。
+//! - **Windows 沙箱创建失败 → 拒绝执行**（P11 fail-closed）：JobObject 是
+//!   最后一道机械防线，创建失败说明这道防线没了，让命令裸跑等于把
+//!   "有沙箱"的假设骗过去。降级只在"平台本来没实现"（非 Windows）
+//!   与"纳沙箱失败"（子进程已启动的窄边缘）两处允许。
+//! - **文件系统边界检查**（P11 新增）：命令参数里出现指向 workspace
+//!   外的绝对路径 / UNC / `..` 穿越时**直接拒绝**，不再升级审批。
+//!   P8 的升级流程仍保留在策略层作为纵深，这里的拒绝是最后一道。
 
 use serde::Deserialize;
 use serde_json::json;
@@ -18,7 +25,10 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 use crate::application::port::{BoxFuture, ToolInvoker};
-use crate::domain::sandbox::SandboxPolicy;
+use crate::domain::sandbox::{
+    write_escape_beyond, ExecutionBoundary, PlatformCapabilities, SandboxPolicy,
+    SANDBOX_DOWNGRADE_NOTICE,
+};
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 use crate::domain::workspace::WorkspaceRoot;
 use crate::infrastructure::sandbox::{assign_child, JobGuard};
@@ -124,30 +134,83 @@ fn shell_program(command: &str) -> (String, Vec<String>) {
     }
 }
 
+/// 保留启动前拒绝、启动失败和启动后失败的区别，供所有进程工具共用。
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RunError {
+    #[error("{0}")]
+    Refused(String),
+    #[error("{0}")]
+    NotStarted(String),
+    #[error("{message}")]
+    Failed {
+        message: String,
+        sandbox_active: bool,
+    },
+}
+
+impl RunError {
+    pub(crate) fn into_outcome(self, boundary_checked: bool) -> ToolOutcome {
+        match self {
+            Self::Refused(message) => ToolOutcome::refused(message),
+            Self::NotStarted(message) => ToolOutcome::failed(message),
+            Self::Failed { message, sandbox_active } => with_process_boundary(
+                ToolOutcome::failed(message), sandbox_active, boundary_checked,
+            ),
+        }
+    }
+}
+
+impl RawOutput {
+    /// 成功与非零退出共用边界交接，避免错误分支漏掉降级说明。
+    pub(crate) fn into_outcome(self, body: String, boundary_checked: bool) -> ToolOutcome {
+        let outcome = if self.code == 0 {
+            ToolOutcome::success(body)
+        } else {
+            ToolOutcome::failed(body)
+        };
+        with_process_boundary(outcome, self.sandbox_active, boundary_checked)
+    }
+}
+
+fn with_process_boundary(
+    mut outcome: ToolOutcome,
+    sandbox_active: bool,
+    boundary_checked: bool,
+) -> ToolOutcome {
+    if !sandbox_active {
+        outcome.content = format!("{SANDBOX_DOWNGRADE_NOTICE}\n{}", outcome.content);
+    }
+    outcome.with_execution(ExecutionBoundary::process(sandbox_active, boundary_checked))
+}
+
 /// 在 `root` 下执行命令，捕获输出。供本模块与 git 工具复用。
 ///
 /// 命令在进程沙箱（Windows Job Object，见 `infrastructure::sandbox`）
-/// 内执行：整树内存/进程数受限、超时或句柄关闭时整树终止。沙箱创建
-/// 或 assign 失败时**降级不阻断**——命令照常跑，但 `sandbox_active`
-/// 带回 false，由调用方在模型可见文本里声明"未受保护"。
+/// 内执行：整树内存/进程数受限、超时或句柄关闭时整树终止。
+///
+/// 沙箱拿不到时的取向（P11）：
+/// - **平台没实现**（非 Windows）或 **assign 失败** → 降级不阻断，
+///   `sandbox_active` 带回 false，由调用方在模型可见文本里声明"未受保护"；
+/// - **Windows 上创建失败** → 命令不执行，返回 [`RunError::Refused`]。
 ///
 /// # Errors
 ///
-/// 进程启动失败（命令不存在等）或超时时返回说明文本。
+/// 启动前拒绝返回 `Refused`，启动失败返回 `NotStarted`；
+/// 启动后的超时或 I/O 错误返回携带实际沙箱状态的 `Failed`。
 pub(crate) async fn run_in_workspace(
     root: &WorkspaceRoot,
     command: &str,
     timeout: Duration,
-) -> Result<RawOutput, String> {
+) -> Result<RawOutput, RunError> {
     run_with_policy(root, command, timeout, &SandboxPolicy::default()).await
 }
 
-async fn run_with_policy(
+pub(crate) async fn run_with_policy(
     root: &WorkspaceRoot,
     command: &str,
     timeout: Duration,
     policy: &SandboxPolicy,
-) -> Result<RawOutput, String> {
+) -> Result<RawOutput, RunError> {
     let (program, args) = shell_program(command);
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
@@ -167,58 +230,60 @@ async fn run_with_policy(
         }
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|error| format!("启动 `{program}` 失败: {error}"))?;
-
-    // ── 沙箱：spawn 后立即把子进程纳入 Job。──
-    // 降级立场：创建/assign 失败不拦死命令（审批闸门才是"能不能跑"
-    // 的裁决者），但降级要三处知情——模型（content 前缀）、人
-    // （stderr 警告）、审计（ToolObserved 全文）。
-    let (sandbox, sandbox_warning) = match JobGuard::create(policy) {
-        Ok(job) => match assign_child(&job, &child) {
-            Ok(()) => (Some(job), None),
-            Err(error) => (None, Some(format!("进程纳入沙箱失败: {error}"))),
-        },
-        Err(error) => (None, Some(format!("沙箱创建失败: {error}"))),
+    // 必须先创建 Job：先 spawn 再拒绝无法撤回副作用，也可能遗留孙进程。
+    let sandbox = match JobGuard::create(policy) {
+        Ok(job) => Some(job),
+        Err(error) if !PlatformCapabilities::detect().has_process_sandbox => {
+            eprintln!("警告：{error}");
+            None
+        }
+        Err(error) => return Err(RunError::Refused(format!(
+            "沙箱创建失败: {error}（P11 fail-closed：拒绝执行）"
+        ))),
     };
-    if let Some(warning) = &sandbox_warning {
-        eprintln!("警告：{warning}");
-    }
+    let mut child = cmd.spawn().map_err(|error| {
+        RunError::NotStarted(format!("启动 `{program}` 失败: {error}"))
+    })?;
+
+    // 纳入失败仍按已批准的降级策略执行；所有退出路径都交回这个事实。
+    // spawn 到 assign 之间仍有窗口，这里不承诺 OS 级隔离。
+    let sandbox = sandbox.and_then(|job| match assign_child(&job, &child) {
+        Ok(()) => Some(job),
+        Err(error) => {
+            eprintln!("警告：进程纳入沙箱失败: {error}");
+            None
+        }
+    });
+    let sandbox_active = sandbox.is_some();
 
     // take() 之后管道归我们所有，读结束后子进程写端关闭会自然 EOF。
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| "无法捕获 stdout".to_owned())?;
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| "无法捕获 stderr".to_owned())?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout 已配置为 piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr 已配置为 piped");
 
     // 三个 future 并发跑：两个管道同时排空（防死锁），wait 等退出。
     // timeout 包住整体——任何一个先卡住都不会拖过死线。
     let run = async {
         let read_stdout = async {
             let mut buf = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut buf).await;
-            buf
+            stdout_pipe.read_to_end(&mut buf).await.map(|_| buf)
         };
         let read_stderr = async {
             let mut buf = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut buf).await;
-            buf
+            stderr_pipe.read_to_end(&mut buf).await.map(|_| buf)
         };
         tokio::join!(read_stdout, read_stderr, child.wait())
     };
 
     match tokio::time::timeout(timeout, run).await {
         Ok((stdout, stderr, status)) => {
-            let code = status.map(|status| status.code().unwrap_or(-1)).unwrap_or(-1);
-            // sandbox_active 先取走：RawOutput 不持有 JobGuard，守卫在
-            // 本分支结尾 drop，KILL_ON_JOB_CLOSE 清理还挂着的残留进程
-            // ——此刻管道已 EOF、子进程已 wait，树内不会有活进程。
-            let sandbox_active = sandbox.is_some();
+            let execution_error = |error| RunError::Failed {
+                message: format!("等待命令结果失败: {error}"),
+                sandbox_active,
+            };
+            let stdout = stdout.map_err(execution_error)?;
+            let stderr = stderr.map_err(execution_error)?;
+            let code = status.map_err(execution_error)?.code().unwrap_or(-1);
+            // 关闭 Job 时清理残留后代；RawOutput 只保留执行时的边界事实。
             drop(sandbox);
             Ok(RawOutput {
                 code,
@@ -237,11 +302,14 @@ async fn run_with_policy(
             let _ = child.kill().await;
             let _ = child.wait().await;
             drop(sandbox);
-            Err(format!(
-                "命令超时：{} 秒内未结束，进程已被终止。长任务请拆小，或调大 timeout_seconds（上限 {} 秒）",
-                timeout.as_secs(),
-                HARD_MAX_TIMEOUT_SECS
-            ))
+            Err(RunError::Failed {
+                message: format!(
+                    "命令超时：{} 秒内未结束，已请求终止进程。长任务请拆小，或调大 timeout_seconds（上限 {} 秒）",
+                    timeout.as_secs(),
+                    HARD_MAX_TIMEOUT_SECS
+                ),
+                sandbox_active,
+            })
         }
     }
 }
@@ -266,6 +334,21 @@ impl ToolInvoker for RunCommand {
             if args.command.trim().is_empty() {
                 return ToolOutcome::failed("command 不能为空");
             }
+            // P11 边界检查：命令参数里出现指向 workspace 外的路径直接拒。
+            //
+            // 用的是**根感知**判据（`write_escape_beyond` 而不是
+            // `write_escape_suspect`）：模型最常写 `type D:\repo\src\main.rs`
+            // 这类根内的绝对路径，无根判据会把这些正常命令一起拒掉。
+            // 与策略层的 P8 升级不同——那条给"人再决定"的口子，这条
+            // 是最后一道机械防线：人审过了、策略放行了，越界仍然被拦。
+            if let Some(violation) = write_escape_beyond(&args.command, self.root.as_path()) {
+                return ToolOutcome::refused(format!(
+                    "命令越出 workspace 边界：{violation}。当前 workspace 根：{}。\
+                     P11 起这一层是硬拒绝，审批与策略都不能覆盖；\
+                     需要跨目录操作请把 workspace 换到目标目录。",
+                    self.root.as_path().display()
+                ));
+            }
             let timeout = Duration::from_secs(
                 args.timeout_seconds
                     .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -273,21 +356,10 @@ impl ToolInvoker for RunCommand {
             );
 
             match run_with_policy(&self.root, &args.command, timeout, &self.policy).await {
-                Err(message) => ToolOutcome::failed(message),
+                Err(error) => error.into_outcome(true),
                 Ok(output) => {
-                    let mut rendered = render_output(&output);
-                    // 沙箱未生效要让模型的第一个字就读到：它应当因此
-                    // 更保守（不假设资源受限、不留后台进程）。这段文本
-                    // 随 ToolObserved 进证据，审计链同样完整。
-                    if !output.sandbox_active {
-                        rendered = format!("{}\n{rendered}", super::git::SANDBOX_DOWNGRADE_NOTICE);
-                    }
-                    // 退出码非 0 也是 failed，但输出原样带回——模型要靠它修 bug。
-                    if output.code == 0 {
-                        ToolOutcome::success(rendered)
-                    } else {
-                        ToolOutcome::failed(rendered)
-                    }
+                    let rendered = render_output(&output);
+                    output.into_outcome(rendered, true)
                 }
             }
         })
@@ -363,7 +435,7 @@ mod tests {
         )
         .await;
         assert!(
-            outcome.is_err() && outcome.err().unwrap().contains("超时"),
+            outcome.is_err() && outcome.err().unwrap().to_string().contains("超时"),
             "受害进程必须被超时收口"
         );
 
@@ -399,25 +471,150 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// Windows：沙箱创建失败 → 拒绝执行（P11 fail-closed）。
+    ///
+    /// 用明确未实现的 `cpu_time` 限额稳定触发创建失败，不依赖宿主机权限
+    /// 或资源耗尽。P7 的取向是"降级照跑"，P11 改成"跑不了就别跑"：
+    /// 降级裸跑会让模型和策略都以为有沙箱。
+    #[cfg(windows)]
     #[tokio::test]
-    async fn sandbox_downgrade_keeps_command_running_with_a_visible_notice() {
-        let root = temp_workspace("sandbox-downgrade");
+    async fn sandbox_creation_failure_refuses_the_command() {
+        let root = temp_workspace("sandbox-failclosed");
         let mut cmd = tool(&root);
-        // CPU 限额明确未实现，稳定触发创建失败，不依赖宿主机权限或资源耗尽。
         cmd.policy.cpu_time = Some(Duration::from_secs(1));
-        let outcome = cmd.invoke(&call(run_args(
-            "echo downgrade_ok > ran.txt && echo downgrade_ok",
-        ))).await;
+
+        let outcome = cmd
+            .invoke(&call(run_args("echo should_not_run > ran.txt")))
+            .await;
+
+        // 拒绝而不是失败：命令压根没跑，与"跑了但没成"是两种结局，
+        // 证据要能分辨——`SandboxApplied` 只给真跑过的命令记账。
+        assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
+        assert!(outcome.content.contains("沙箱创建失败"), "{}", outcome.content);
+        assert!(outcome.content.contains("fail-closed"), "{}", outcome.content);
+        assert!(outcome.execution.is_none(), "没启动进程就不能发边界证据");
+        assert!(!root.join("ran.txt").exists(), "创建失败时命令不得执行");
+        // 拒绝执行与降级执行是两件事，不能同时说：前者是"没跑"，
+        // 后者才是"跑了但没保护"。
+        assert!(
+            !outcome.content.contains("进程沙箱未生效"),
+            "拒绝执行时不该再给降级说明: {}",
+            outcome.content
+        );
+
+        let error = match run_with_policy(&cmd.root, "echo ok", Duration::from_secs(30), &cmd.policy)
+            .await
+        {
+            Ok(_) => panic!("沙箱创建失败必须向上传播错误而不是降级"),
+            Err(RunError::Refused(message)) => message,
+            Err(other) => panic!("创建失败必须是拒绝: {other}"),
+        };
+        assert!(error.contains("沙箱创建失败"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 非 Windows：平台没有实现进程沙箱 → 降级但命令照跑，且开头声明。
+    ///
+    /// "平台本来没这个能力"与"有能力却创建失败"必须走不同分支：前者拒绝
+    /// 执行就等于在该平台上完全不能跑命令，后者拒绝执行才是正确取向。
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn unsupported_platform_degrades_with_a_visible_notice() {
+        let root = temp_workspace("sandbox-downgrade");
+        let cmd = tool(&root);
+
+        let outcome = cmd
+            .invoke(&call(run_args("echo downgrade_ok > ran.txt")))
+            .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        assert!(outcome.content.starts_with("⚠️ 进程沙箱未生效"), "{}", outcome.content);
-        assert!(outcome.content.contains("退出码: 0"), "{}", outcome.content);
-        assert_eq!(std::fs::read_to_string(root.join("ran.txt")).unwrap().trim(), "downgrade_ok");
+        assert!(
+            outcome.content.starts_with("⚠️ 进程沙箱未生效"),
+            "{}",
+            outcome.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("ran.txt")).unwrap().trim(),
+            "downgrade_ok"
+        );
 
-        let raw = run_with_policy(&cmd.root, "echo ok", Duration::from_secs(30), &cmd.policy)
-            .await.expect("降级后命令仍应执行");
+        let raw = run_in_workspace(&cmd.root, "echo ok", Duration::from_secs(30))
+            .await
+            .expect("不支持沙箱不该阻断命令");
         assert!(!raw.sandbox_active);
         assert_eq!(raw.code, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 边界检查（P11）：越出 workspace 的命令在执行层就被拒。
+    #[tokio::test]
+    async fn command_reaching_outside_the_workspace_is_refused() {
+        let root = temp_workspace("boundary");
+        std::fs::write(root.join("inside.txt"), "内容").expect("写待读文件");
+        let cmd = tool(&root);
+
+        let escaping = [
+            // 重定向到别的盘。
+            r"echo x > C:\Windows\temp\y",
+            // 读越界同样要拦：外传与读取都靠这一条机械防线兜。
+            r"type ..\outside",
+            // 基线放行的 `git diff *` 一族用 --output 往外卖内容。
+            r"git diff --output=D:\x",
+            // UNC。
+            r"copy inside.txt \\server\share\x",
+        ];
+        for command in escaping {
+            let outcome = cmd.invoke(&call(run_args(command))).await;
+            assert_eq!(
+                outcome.status,
+                OutcomeStatus::Refused,
+                "`{command}` 应被执行层拒绝，实际: {}",
+                outcome.content
+            );
+            assert!(
+                outcome.content.contains("越出 workspace 边界"),
+                "`{command}` 的拒绝理由要说明边界: {}",
+                outcome.content
+            );
+        }
+
+        // 对照：workspace 内的读写照旧放行，否则这条检查就成了禁用 run_command。
+        let outcome = cmd.invoke(&call(run_args("type inside.txt"))).await;
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert!(outcome.execution.is_some(), "真启动的命令要带边界事实");
+
+        // 根内的绝对路径同样放行：模型常写 `type D:\repo\src\main.rs` 这种
+        // 命令，硬拒绝必须认得"它其实在根里面"。
+        let absolute = root.join("inside.txt");
+        let outcome = cmd
+            .invoke(&call(run_args(&format!("type {}", absolute.display()))))
+            .await;
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 拒绝发生在执行之前，不是执行之后：越界命令一个字都不该落盘。
+    ///
+    /// 这是"拦截"与"报错"的差别——先跑了再判失败，副作用已经出去了。
+    #[tokio::test]
+    async fn refused_command_leaves_no_side_effect() {
+        let root = temp_workspace("boundary-noop");
+        let outside = std::env::temp_dir().join(format!(
+            "qch-boundary-outside-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&outside);
+        let cmd = tool(&root);
+
+        let outcome = cmd
+            .invoke(&call(run_args(&format!(
+                "echo leaked > {}",
+                outside.display()
+            ))))
+            .await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
+        assert!(!outside.exists(), "被拒的命令不该在 workspace 外留下文件");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -494,6 +691,7 @@ mod tests {
             let outcome = cmd.invoke(&call(args)).await;
             assert_eq!(outcome.status, OutcomeStatus::Failed);
             assert!(outcome.content.contains("不能为空"));
+            assert!(outcome.execution.is_none(), "没启动进程不能伪造边界证据");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -534,6 +732,10 @@ mod tests {
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
         assert!(outcome.content.contains("超时"), "{}", outcome.content);
+        assert!(
+            outcome.execution.is_some_and(|boundary| boundary.boundary_checked),
+            "超时前已启动进程，必须留下真实执行边界"
+        );
 
         // 给"假死但没被杀"的进程留足完成时间，再验证标记不存在。
         tokio::time::sleep(Duration::from_millis(4500)).await;

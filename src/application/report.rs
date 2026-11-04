@@ -134,6 +134,15 @@ pub struct SessionSummary {
     /// 与 `approvals` 分开记：它回答的是"人被问了几次"——重新询问时人
     /// 必须再点一次，那次的等待也真实地花在他身上。
     pub approval_reasks: usize,
+    /// 启用进程限额与进程树管理的执行次数（`SandboxApplied` 且 `active`）。
+    #[serde(default)]
+    pub sandbox_protected_runs: usize,
+    /// 未启用进程限额与进程树管理的记录数（`SandboxApplied` 且非 `active`）。
+    ///
+    /// 包括非 Windows 平台的本地子进程、Windows 上启动后 `assign`
+    /// 失败的子进程，以及交给外部 MCP Server 的调用尝试。
+    #[serde(default)]
+    pub sandbox_unprotected_runs: usize,
     /// 首事件时刻。
     pub started_at: Option<SystemTime>,
     /// 末事件时刻。
@@ -296,6 +305,8 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
         evidence_index: EvidenceIndex::default(),
         replays: 0,
         approval_reasks: 0,
+        sandbox_protected_runs: 0,
+        sandbox_unprotected_runs: 0,
         started_at: log.started_at(),
         ended_at: log.ended_at(),
         wall_clock_ms: wall_clock_of(log),
@@ -407,6 +418,15 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
             // 恢复路径的两类事件：可能已执行的调用与重新询问的审批。
             AuditEvent::ToolCallReplayed { .. } => summary.replays += 1,
             AuditEvent::ApprovalReasked { .. } => summary.approval_reasks += 1,
+            // 按每次调用的 active 计数；同一会话可混用本地进程与 MCP，
+            // platform 标签不一定相同，详情保留在 JSONL 中。
+            AuditEvent::SandboxApplied { active, .. } => {
+                if *active {
+                    summary.sandbox_protected_runs += 1;
+                } else {
+                    summary.sandbox_unprotected_runs += 1;
+                }
+            }
             // StepStarted 不计任何业务计数器，但它算事件总数的一员。
             AuditEvent::StepStarted { .. } => {}
         }
@@ -781,12 +801,56 @@ mod tests {
         );
         assert_eq!(summary.summary_calls, 1);
         assert_eq!(summary.compactions, 1);
+        assert_eq!(summary.sandbox_protected_runs, 0);
+        assert_eq!(summary.sandbox_unprotected_runs, 0);
         // Thought(100/20) + Thought(50/10) + Summary(200/40)。
         assert_eq!(summary.input_tokens, 350);
         assert_eq!(summary.output_tokens, 70);
         // 0.25 + 0.5 + 0.125，全部是二进制可精确表示的小数。
         assert_eq!(summary.cost_usd, Some(0.875));
         assert!(summary.started_at.is_some() && summary.ended_at.is_some());
+    }
+
+    #[test]
+    fn sandbox_counts_use_active_for_mixed_windows_and_mcp_calls() {
+        let log = SessionLog {
+            session_id: SessionId::new("mixed-boundaries"),
+            events: [
+                ("run_command", "Windows JobObject", true, true),
+                ("git_status", "Windows JobObject", true, false),
+                ("git_diff", "Windows JobObject", false, false),
+                ("run_command", "Windows JobObject", false, true),
+                ("mcp__server__search", "MCP subprocess", false, false),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (tool, platform, active, boundary_checked))| {
+                evidence(
+                    index as u64 + 1,
+                    AuditEvent::SandboxApplied {
+                        turn: 1,
+                        call: call(tool),
+                        platform: platform.to_owned(),
+                        active,
+                        boundary_checked,
+                    },
+                )
+            })
+            .collect(),
+            skipped_lines: 0,
+        };
+
+        let summary = summarize(&log);
+        assert_eq!(summary.sandbox_protected_runs, 2);
+        assert_eq!(summary.sandbox_unprotected_runs, 3);
+
+        let report = BenchmarkReport::from_sessions(&[log]);
+        let text = render_json(&report).expect("序列化");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("JSON 报表");
+        assert_eq!(value["sessions"][0]["sandbox_protected_runs"], 2);
+        assert_eq!(value["sessions"][0]["sandbox_unprotected_runs"], 3);
+        let back: BenchmarkReport = serde_json::from_str(&text).expect("反序列化");
+        assert_eq!(back, report);
     }
 
     #[test]
@@ -1254,6 +1318,21 @@ mod tests {
 
         let text = render_json(&report).expect("序列化");
         let back: BenchmarkReport = serde_json::from_str(&text).expect("反序列化");
+        assert_eq!(back, report);
+    }
+
+    #[test]
+    fn legacy_json_report_defaults_missing_sandbox_counts_to_zero() {
+        let report = BenchmarkReport::from_sessions(&[synthetic_log(Some(0.25))]);
+        let text = render_json(&report).expect("序列化");
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("JSON 报表");
+        let session = value["sessions"][0].as_object_mut().expect("会话摘要");
+        session.remove("sandbox_protected_runs").expect("新增字段");
+        session.remove("sandbox_unprotected_runs").expect("新增字段");
+
+        let back: BenchmarkReport = serde_json::from_value(value).expect("旧报表必须能读");
+        assert_eq!(back.sessions[0].sandbox_protected_runs, 0);
+        assert_eq!(back.sessions[0].sandbox_unprotected_runs, 0);
         assert_eq!(back, report);
     }
 

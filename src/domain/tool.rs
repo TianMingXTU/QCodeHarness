@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::ids::CallId;
+use super::sandbox::ExecutionBoundary;
+
+/// MCP 工具注册名的前缀：`mcp__<server>__<tool>`。
+pub const MCP_TOOL_PREFIX: &str = "mcp__";
 
 /// 工具的风险注解：向模型和审批环节声明这个工具的副作用特征。
 ///
@@ -92,6 +96,12 @@ pub struct ToolOutcome {
     pub content: String,
     /// 结局分类，决定回填时是否标记 `is_error`。
     pub status: OutcomeStatus,
+    /// 执行器交给应用层的边界事实；未启动进程或未调用外部工具时为 None。
+    ///
+    /// 只作进程内交接，应用层取走后单独记入 `SandboxApplied`。
+    /// 不写入 `ToolObserved` 或快照，保持既有 JSON 字段形状兼容。
+    #[serde(skip)]
+    pub execution: Option<ExecutionBoundary>,
 }
 
 impl ToolOutcome {
@@ -100,6 +110,7 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             status: OutcomeStatus::Success,
+            execution: None,
         }
     }
 
@@ -108,6 +119,7 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             status: OutcomeStatus::Failed,
+            execution: None,
         }
     }
 
@@ -116,12 +128,47 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             status: OutcomeStatus::Refused,
+            execution: None,
         }
+    }
+
+    /// 附加已执行操作的边界事实，由执行器在启动进程或调用外部工具后填写。
+    pub fn with_execution(mut self, boundary: ExecutionBoundary) -> Self {
+        self.execution = Some(boundary);
+        self
     }
 
     /// 回填给模型时是否标记为错误。拒绝同样算错误——模型需要知道
     /// 这一步没成，才能换路子，而不是假设成功继续往下编。
     pub fn is_error(&self) -> bool {
         !matches!(self.status, OutcomeStatus::Success)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn execution_metadata_does_not_change_persisted_outcomes() {
+        let outcome = ToolOutcome::failed("命令超时")
+            .with_execution(ExecutionBoundary::process(false, true));
+        let old_shape = json!({"content": "命令超时", "status": "Failed"});
+        assert_eq!(serde_json::to_value(&outcome).unwrap(), old_shape);
+        let restored: ToolOutcome = serde_json::from_value(old_shape).unwrap();
+        assert_eq!(restored, ToolOutcome::failed("命令超时"));
+        assert!(restored.execution.is_none());
+    }
+
+    #[test]
+    fn outcome_text_does_not_assert_execution() {
+        for outcome in [
+            ToolOutcome::success("退出码: 0"),
+            ToolOutcome::failed("命令超时"),
+            ToolOutcome::refused("拒绝执行"),
+        ] {
+            assert!(outcome.execution.is_none());
+        }
     }
 }

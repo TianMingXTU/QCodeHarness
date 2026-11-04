@@ -612,8 +612,8 @@ async fn run_criterion_command(repo: &Path, command: &str, failures: &mut Vec<St
             ));
             false
         }
-        Err(message) => {
-            failures.push(format!("测试命令 `{command}` 执行失败: {message}"));
+        Err(error) => {
+            failures.push(format!("测试命令 `{command}` 执行失败: {error}"));
             false
         }
     }

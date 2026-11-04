@@ -1,13 +1,66 @@
-//! 进程沙箱策略：对 agent 发起的子进程树施加的资源与生命周期约束。
+//! 进程沙箱策略、执行边界元数据与命令的字面路径检查。
 //!
-//! 这是"防御纵深"的第二层：审批闸门决定"能不能跑"（策略 + 人工），
-//! 沙箱决定"跑起来之后最多能祸害多少"。两层缺一不可——审批是人疲劳
-//! 会失误的流程控制，沙箱是不依赖任何人清醒的机械边界。
-//!
-//! 本模块只有纯数据与默认值，强制执行在 infrastructure/sandbox
-//! （Windows Job Object）——领域层不碰任何平台 API。
+//! 领域层只计算纯数据；资源与生命周期约束由 infrastructure/sandbox
+//! 强制执行。Windows Job Object 不提供文件系统或网络隔离。
 
+use std::path::Path;
 use std::time::Duration;
+
+/// 当前编译目标具备的隔离能力，不代表某次命令已经成功启用沙箱。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformCapabilities {
+    pub has_process_sandbox: bool,
+    pub has_filesystem_isolation: bool,
+    pub has_network_isolation: bool,
+}
+
+impl PlatformCapabilities {
+    pub fn detect() -> Self {
+        Self {
+            has_process_sandbox: cfg!(windows),
+            has_filesystem_isolation: false,
+            has_network_isolation: false,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        if self.has_process_sandbox {
+            "Windows JobObject"
+        } else {
+            "Unsupported"
+        }
+    }
+}
+
+pub const SANDBOX_DOWNGRADE_NOTICE: &str =
+    "⚠️ 进程沙箱未生效：本命令在无资源限制的宿主机环境执行，请格外保守。";
+pub const MCP_BOUNDARY_LABEL: &str = "MCP subprocess";
+
+/// 执行方报告的实际边界状态，不能从命令输出文本推断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionBoundary {
+    pub platform: &'static str,
+    pub active: bool,
+    pub boundary_checked: bool,
+}
+
+impl ExecutionBoundary {
+    pub fn process(active: bool, boundary_checked: bool) -> Self {
+        Self {
+            platform: PlatformCapabilities::detect().label(),
+            active,
+            boundary_checked,
+        }
+    }
+
+    pub fn mcp() -> Self {
+        Self {
+            platform: MCP_BOUNDARY_LABEL,
+            active: false,
+            boundary_checked: false,
+        }
+    }
+}
 
 /// 进程沙箱策略。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,152 +103,199 @@ impl Default for SandboxPolicy {
     }
 }
 
-/// 判断一条 shell 命令是否"疑似把写操作伸到 workspace 外"，命中则给出原因。
+/// 判断命令是否可能把写操作伸到 workspace 外；命中后用于升级审批。
 ///
-/// 存在的理由是策略层的一个真实缺口：策略按工具名和参数文本放行
-/// `run_command` 之后，命令内容就不受任何约束了——模型可以敲
-/// `echo x > C:\Windows\temp\y`，而策略看到的是"run_command，已放行"。
-/// 于是这里补一道**升级**检查：策略说 Allow 但命令看着像越界写入时，
-/// 应用层把它改判为 RequireApproval，让人再看一眼。
-///
-/// 这是启发式，不是隔离。它抓的是"字面上就写着越界目标"的命令，
-/// 抓不住变量拼接（`set P=C:\Windows & echo x > %P%\y`）或编码绕过。
-/// 真正的边界在 P7 的进程沙箱与后续的 OS 级隔离；这里的价值是把
-/// 最常见的直白写法从"无声放行"变成"有人过目"。
-///
-/// **任何指向 workspace 外的参数都算嫌疑，不限写入型动词。** P9-5 的
-/// 默认基线放行 `cargo test *` / `git diff *` 一族之后，这条检查从
-/// "补漏"升格为"主防线"：`git diff --output=C:\x` 既没有写入型动词
-/// 也没有 `>`，只按动词判就整个漏掉，而它确实把 workspace 的内容写到
-/// 了外面（`--output` 是 git 自己的写文件选项）。动词门槛原本是为
-/// `rd /s /q build` 这类带开关的命令降噪，而 [`escapes_workspace`]
-/// 已经不把 `/q` 当路径——降噪交给它就够了，门槛留着只会漏。
-///
-/// 网络类操作（`git push`、`curl`）不在范围内：外传数据的形态太多，
-/// 硬列只会制造噪音，让用户对真正的越界写入提示脱敏。
+/// 这是字面路径启发式，不是隔离。变量拼接、编码和链接仍可绕过；真正的
+/// 进程边界由基础设施层建立。
 pub fn write_escape_suspect(command: &str) -> Option<String> {
-    // 重定向目标越界时不需要动词：`echo hi > C:\x` 一个字型动词都没有，
-    // 但它确实在 workspace 外落了盘。
-    if let Some(target) = redirect_target(&command) {
-        if escapes_workspace(target) {
-            return Some(format!("命令把输出重定向到 workspace 外的 `{target}`"));
+    escape_reason(command, None)
+}
+
+pub fn write_escape_beyond(command: &str, root: &Path) -> Option<String> {
+    escape_reason(command, Some(root))
+}
+
+/// 两个入口共用切词与字面路径判定；无根时按 P8 的保守口径处理。
+fn escape_reason(command: &str, root: Option<&Path>) -> Option<String> {
+    for target in redirect_targets(command) {
+        if let Some(reason) = path_escape_reason(&target, root) {
+            return Some(format!("命令把输出重定向到 workspace 外：{reason}"));
         }
     }
-
-    if let Some(target) = escaping_argument(&command) {
-        // 有写入型动词时理由说清"它在动什么"，没有时只说"提到了外面"——
-        // 后者同样是升级的充分理由，见下面的说明。
-        return Some(match write_verb(&command) {
-            Some(verb) => format!("命令用 `{verb}` 操作 workspace 外的 `{target}`"),
-            None => format!("命令提到 workspace 外的 `{target}`"),
-        });
-    }
-
-    None
+    let target = tokenize(command).find_map(|token| {
+        let candidate = token
+            .split_once('=')
+            .map(|(_, value)| value)
+            .unwrap_or(&token);
+        path_escape_reason(candidate, root).map(|reason| (token, reason))
+    });
+    target.map(|(target, reason)| match write_verb(command) {
+        Some(verb) => format!("命令用 `{verb}` 操作 workspace 外的 `{target}`：{reason}"),
+        None => format!("命令提到 workspace 外的 `{target}`：{reason}"),
+    })
 }
-/// 写入型命令的动词。命中其中任意一个，后面的参数才按"写目标"审视。
-///
-/// 只收命令名本身，不收开关：`/s`、`-Recurse` 只是修饰，判断越界看的是
-/// 目标路径。
-const WRITE_VERBS: [&str; 11] = [
-    "del",
-    "rd",
-    "rmdir",
-    "move",
-    "ren",
-    "copy",
-    "remove-item",
-    "rm",
-    "mv",
-    "cp",
-    "mkdir",
-];
 
-/// 命令里第一个作为独立词出现的写入型动词。
+/// 命令里所有重定向目标；`echo x > a 2> /outside` 不能只看第一个。
+fn redirect_targets(command: &str) -> impl Iterator<Item = String> {
+    let mut tokens = tokenize(command).peekable();
+    std::iter::from_fn(move || {
+        while let Some(token) = tokens.next() {
+            if is_redirect(&token) {
+                let target = tokens.next()?;
+                return Some(unquote(&target).to_owned());
+            }
+        }
+        None
+    })
+}
+
+/// 词法切分：引号内的整段路径保留，shell 链接符单独成词。
+fn tokenize(command: &str) -> impl Iterator<Item = String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            c if c.is_whitespace() || matches!(c, '|' | '&' | ';' | '(' | ')') => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(c.to_string());
+            }
+            '>' | '<' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                let mut op = ch.to_string();
+                if ch == '>' && chars.peek() == Some(&'>') {
+                    op.push(chars.next().unwrap());
+                }
+                tokens.push(op);
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens.into_iter()
+}
+
+/// 写入型动词用于生成可读理由；P9 起任何越界路径都会触发，不再以动词为门槛。
 fn write_verb(command: &str) -> Option<&'static str> {
+    const WRITE_VERBS: [&str; 11] = [
+        "del", "rd", "rmdir", "move", "ren", "copy", "remove-item",
+        "rm", "mv", "cp", "mkdir",
+    ];
     WRITE_VERBS
         .into_iter()
-        .find(|verb| has_word(command, verb))
-}
-
-/// 命令里是否出现了作为独立词的 `verb`。
-///
-/// 按空白与常见 shell 分隔符切词：不切词的话 `del` 会命中 `model`，
-/// 把一堆正常命令送去审批，用户很快就会养成"一律放行"的习惯。
-fn has_word(command: &str, verb: &str) -> bool {
-    // 大小写不敏感：cmdlet 与 Unix 命令都可能被写成任意大小写，
-    // 漏一种写法就是一个绕过。
-    split_tokens(command).any(|token| token.eq_ignore_ascii_case(verb))
-}
-
-/// `>` 或 `>>` 之后的重定向目标。有多个重定向时取第一个。
-fn redirect_target(command: &str) -> Option<&str> {
-    let index = command.find('>')?;
-    let rest = command[index..].trim_start_matches('>');
-    split_tokens(rest).next()
-}
-
-/// 第一个越出 workspace 的参数。
-///
-/// `--flag=value` 形态要连值一起看：`--output=C:\x` 整个词不是绝对路径
-/// （开头是 `-`），只比整个词会把最常用的开关写法整个漏掉。
-fn escaping_argument(command: &str) -> Option<&str> {
-    split_tokens(command).find(|token| points_outside(token))
-}
-
-/// 这个词本身、或它 `=` 后面的值，是否指向 workspace 之外。
-fn points_outside(token: &str) -> bool {
-    if escapes_workspace(token) {
-        return true;
-    }
-    match token.split_once('=') {
-        Some((_, value)) => escapes_workspace(value),
-        None => false,
-    }
-}
-
-/// 按空白与常见分隔符切词。
-///
-/// 分隔符里故意不含 `-`：`remove-item` 是一个词。路径里的 `\` 和 `/`
-/// 必须留在词内，否则 `..\foo` 会被切成两半而漏判。
-///
-/// 过滤空片段：`a > b` 里 `>` 两侧都是分隔符，不过滤的话第一个"词"
-/// 会是空字符串，重定向目标就取错了。
-fn split_tokens(command: &str) -> impl Iterator<Item = &str> {
-    command
-        .split(|c: char| {
-            c.is_whitespace() || matches!(c, '|' | '&' | ';' | '(' | ')' | '<' | '>' | '"' | '\'')
+        .find(|verb| {
+            tokenize(command).any(|token| token.eq_ignore_ascii_case(verb))
         })
-        .filter(|token| !token.is_empty())
 }
 
-/// 这个参数是否指向 workspace 之外。
-///
-/// 两种形态：盘符绝对路径（`C:\x`、`D:/x`，含 UNC `\\server\share`），
-/// 以及 `..` 作为完整路径成分出现（`..\foo`、`a/../b`）。
-///
-/// 故意不把裸 `/` 开头的参数算作绝对路径：`rd /s /q build` 里的 `/s`
-/// 是开关不是根目录，误报会让整条规则失去可信度。POSIX 下的穿越由
-/// `..` 那一支覆盖。
-fn escapes_workspace(token: &str) -> bool {
-    if is_absolute_windows_path(token) || token.starts_with(r"\\") {
-        return true;
+fn is_redirect(token: &str) -> bool {
+    matches!(token, ">" | ">>" | "1>" | "2>" | "&>")
+}
+
+fn unquote(token: &str) -> &str {
+    token.trim_matches(['"', '\''])
+}
+
+/// 判断一个字面路径词元是否越界。不模拟变量或命令替换。
+fn path_escape_reason(token: &str, root: Option<&Path>) -> Option<String> {
+    let token = unquote(token);
+    if token.is_empty()
+        || token.starts_with('-')
+        || matches!(token, "|" | "||" | "&" | "&&" | ";" | "(" | ")" | ">" | ">>" | "<")
+    {
+        return None;
     }
-    token
-        .split(['\\', '/'])
-        .any(|component| component == "..")
+    if token.split(['\\', '/']).any(|part| part == "..") {
+        return Some(format!("`{token}` 含父目录"));
+    }
+    if root.is_none() {
+        return escape_shape(token).then(|| format!("`{token}` 指向 workspace 外的绝对路径"));
+    }
+    let root = root.unwrap();
+    if !is_absolute_path(token) {
+        return None;
+    }
+    let normalized = normalize_path(token);
+    let root_parts = normalize_path(&root.to_string_lossy());
+    if normalized.starts_with(&root_parts) {
+        return None;
+    }
+    Some(format!("`{token}` 不在当前 workspace 根下"))
 }
 
-/// 是否是 `X:\` 或 `X:/` 形态的盘符绝对路径。
-///
-/// 要求第三个字符是分隔符：单独的 `C:` 是"切换到 C 盘"，不是写目标。
-fn is_absolute_windows_path(token: &str) -> bool {
+/// 无 workspace 根时，所有能识别的绝对路径与设备前缀都保守视为嫌疑。
+fn escape_shape(token: &str) -> bool {
     let bytes = token.as_bytes();
-    bytes.len() >= 3
+    let drive_absolute = bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let drive_relative = bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':';
+    let unc = token.starts_with("//") || token.starts_with(r"\\")
+        || token.starts_with("/\\") || token.starts_with("\\/");
+    // 裸 `/` 判据区分开关与带目录分隔符的路径：/s 放行，/tmp/out 收紧。
+    let posix_absolute = token.starts_with('/') && token[1..].contains(['/', '\\']);
+    unc || drive_absolute || drive_relative || posix_absolute
+        || token.starts_with('\\') && token.len() > 1
 }
+
+fn is_absolute_path(token: &str) -> bool {
+    escape_shape(token)
+}
+
+/// 纯词法规范化：统一分隔符、剥设备/UNC 装饰、抵消 `.` 与 `..`，
+/// 并按目标平台决定是否忽略大小写。绝不做文件系统解析。
+fn normalize_path(raw: &str) -> Vec<String> {
+    let trimmed = trim_device_prefix(raw);
+    let mut parts: Vec<String> = Vec::new();
+    for part in trimmed.split(['\\', '/']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            name => parts.push(if cfg!(windows) {
+                name.to_ascii_lowercase()
+            } else {
+                name.to_owned()
+            }),
+        }
+    }
+    parts
+}
+
+/// `\\?\C:\x`、`//?/UNC/server/share/x` 等前缀只影响 Windows 的路径解释，
+/// 不改变它指向的卷或共享；UNC 的 server/share 也一并作为普通组件比较。
+fn trim_device_prefix(raw: &str) -> &str {
+    let mut text = raw;
+    for prefix in [r"\\?\UNC\", r"\\.\", r"\\?\", "//?/UNC/", "//./", "//?/"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest;
+            break;
+        }
+    }
+    text
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -287,6 +387,82 @@ mod tests {
                 "`{command}` 不应被判为越界写入"
             );
         }
+    }
+
+    #[test]
+    fn write_escape_suspect_covers_additional_literal_paths() {
+        let commands = [
+            r"copy src //server/share/x",
+            r"copy src /\server/share/x",
+            r"copy src \/server\share/x",
+            r"echo x > //?/D:/outside",
+            r"echo x > //./pipe/name",
+            r"echo x > \outside",
+            r"copy src D:outside",
+            r"echo x > /tmp/out",
+            r"git diff --output=/tmp/out",
+            r"echo x > local.txt 2>/tmp/out",
+        ];
+        for command in commands {
+            assert!(
+                write_escape_suspect(command).is_some(),
+                "应保守检查 `{command}`"
+            );
+        }
+    }
+
+    #[test]
+    fn write_escape_beyond_allows_only_paths_under_the_exact_root() {
+        let root = Path::new(r"D:/repo/src/..");
+        let allowed = [
+            r"type D:\repo\src\main.rs",
+            r"cargo build --manifest-path=d:/REPO/Cargo.toml",
+            r#"type "D:\repo\sub dir\main.rs""#,
+            r"echo x > D:\repo\out.txt",
+            "cargo test",
+            "rd /s /q build",
+        ];
+        for command in allowed {
+            assert_eq!(
+                write_escape_beyond(command, root),
+                None,
+                "`{command}` 应视为 workspace 内路径"
+            );
+        }
+        let refused = [
+            r"type D:\repo-evil\main.rs",
+            r"type D:\repo.exe\main.rs",
+            r"echo x > //server/share/x",
+            r"echo x > //?/D:/outside/x",
+            r"echo x > \Windows\temp\x",
+            r"type D:secret.txt",
+            r"echo x > /tmp/out",
+            r"git diff --output=D:\other\x",
+            r"type ..\outside",
+            r#"type "D:\repo\..\secret""#,
+        ];
+        for command in refused {
+            assert!(
+                write_escape_beyond(command, root).is_some(),
+                "`{command}` 必须被硬拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_absolute_paths_are_compared_against_a_posix_workspace_root() {
+        let root = Path::new("/home/user/repo");
+        assert_eq!(write_escape_beyond("cat /home/user/repo/src/main.rs", root), None);
+        assert!(write_escape_beyond("cat /etc/passwd", root).is_some());
+        assert!(write_escape_beyond("echo x > /tmp/out", root).is_some());
+        assert!(write_escape_beyond("cat /home/user/repo/../secret", root).is_some());
+    }
+
+    #[test]
+    fn quoted_redirect_reason_keeps_the_complete_path() {
+        let reason = write_escape_suspect(r#"echo x > "D:\repo space\out.txt""#)
+            .expect("绝对路径应升级审批");
+        assert!(reason.contains(r"D:\repo space\out.txt"), "{reason}");
     }
 
     /// 返回的原因要能直接进审批理由：用户和模型都得看懂它在说什么。

@@ -189,6 +189,35 @@ pub enum AuditEvent {
         /// 重新询问的理由。
         reason: String,
     },
+    /// 本地子进程或外部 MCP 调用的执行边界记录。
+    ///
+    /// `run_command`、`git_status`、`git_diff` 只在实际启动子进程后记录；
+    /// 启动前的拒绝或失败不生成此事件。MCP 工具记录将调用交给外部
+    /// Server 的尝试，不表示服务端已经执行或调用成功。
+    ///
+    /// 与 `ToolObserved` 分开记录：本事件描述进程管理与调用前检查，
+    /// 工具结果仍由 `ToolObserved` 表达。两者都不承诺文件系统隔离。
+    SandboxApplied {
+        /// 轮次号。
+        turn: u32,
+        /// 本次执行或尝试交给外部 Server 的调用。
+        call: ToolCall,
+        /// 执行边界标记：`"Windows JobObject"` / `"Unsupported"` / `"MCP subprocess"`。
+        ///
+        /// 同一会话可以同时包含本地子进程与外部 MCP 调用，标签按调用记录。
+        platform: String,
+        /// 本 harness 的进程限额与进程树管理是否实际生效。
+        ///
+        /// Windows 子进程成功纳入 Job 后为 true；启动后 `assign` 失败
+        /// 仍记录本事件，但为 false。启动前 Job 创建失败则拒绝执行，
+        /// 不生成本事件。非 Windows 平台与 MCP 调用均为 false。
+        active: bool,
+        /// `run_command` 是否做过命令字面路径检查。
+        ///
+        /// 不覆盖脚本运行时计算的路径，也不提供文件系统隔离。
+        /// `git_status`、`git_diff` 与 MCP 调用为 false；文件类工具不发此事件。
+        boundary_checked: bool,
+    },
     /// 摘要调用失败，历史退回占位说明。
     ///
     /// 与 `SummaryGenerated` 成对：摘要是一次真实的模型调用，失败了也是
@@ -210,6 +239,7 @@ impl AuditEvent {
             | Self::Thought { turn, .. }
             | Self::ToolRequested { turn, .. }
             | Self::ToolObserved { turn, .. }
+            | Self::SandboxApplied { turn, .. }
             | Self::ToolCallReplayed { turn, .. }
             | Self::ApprovalReasked { turn, .. }
             | Self::ApprovalDecided { turn, .. }

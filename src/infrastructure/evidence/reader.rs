@@ -160,8 +160,8 @@ mod tests {
         fs::write(path, lines.join("\n")).expect("写合成 JSONL");
     }
 
-    /// 覆盖全部 `AuditEvent` 变体的一组事件（当前 11 种）。
-    /// 新增变体时这里必须同步——漏一个，全变体读回测试就会提醒。
+    /// 当前 13 种 `AuditEvent` 变体各一条，验证这些样本的读回契约。
+    /// 样本需在新增变体时手动维护；测试不会自动发现遗漏的变体。
     fn every_variant() -> Vec<Evidence> {
         let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
         let call = |name: &str| ToolCall {
@@ -237,6 +237,16 @@ mod tests {
             ),
             Evidence::new(
                 8,
+                at(106),
+                AuditEvent::ContextBudgeted {
+                    turn: 3,
+                    tokens_before: 10_000,
+                    tokens_after: 8_000,
+                    dropped_tokens: 2_000,
+                },
+            ),
+            Evidence::new(
+                9,
                 at(107),
                 AuditEvent::SummaryGenerated {
                     turn: 3,
@@ -245,7 +255,7 @@ mod tests {
                 },
             ),
             Evidence::new(
-                9,
+                10,
                 at(107),
                 AuditEvent::ToolCallReplayed {
                     turn: 4,
@@ -255,7 +265,7 @@ mod tests {
                 },
             ),
             Evidence::new(
-                10,
+                11,
                 at(107),
                 AuditEvent::ApprovalReasked {
                     turn: 4,
@@ -264,7 +274,18 @@ mod tests {
                 },
             ),
             Evidence::new(
-                11,
+                12,
+                at(107),
+                AuditEvent::SandboxApplied {
+                    turn: 4,
+                    call: call("run_command"),
+                    platform: "Windows JobObject".to_owned(),
+                    active: true,
+                    boundary_checked: true,
+                },
+            ),
+            Evidence::new(
+                13,
                 at(108),
                 AuditEvent::SummaryFailed {
                     turn: 5,
@@ -292,7 +313,7 @@ mod tests {
 
         let log = read_session(&path).unwrap().expect("文件存在");
         assert_eq!(log.session_id.as_str(), "session-1");
-        assert_eq!(log.events.len(), events.len());
+        assert_eq!(log.events.len(), 13);
         assert_eq!(log.skipped_lines, 0);
         assert!(log.is_sequential());
         // 深度相等：事件类型、字段、轮次号全部还原。

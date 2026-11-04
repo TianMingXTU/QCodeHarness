@@ -14,11 +14,12 @@ use serde_json::json;
 use std::time::Duration;
 
 use crate::application::port::{BoxFuture, ToolInvoker};
+use crate::domain::sandbox::SandboxPolicy;
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 use crate::domain::workspace::WorkspaceRoot;
 
 use super::parse_args;
-use super::shell::{clamp_output, run_in_workspace};
+use super::shell::{clamp_output, run_with_policy};
 
 const GIT_STATUS: &str = "git_status";
 const GIT_DIFF: &str = "git_diff";
@@ -30,12 +31,13 @@ const DIFF_MAX_CHARS: usize = 4000;
 /// 查看工作区状态。
 pub struct GitStatus {
     root: WorkspaceRoot,
+    policy: SandboxPolicy,
 }
 
 impl GitStatus {
     /// 以 `root` 为仓库根构造。
     pub fn new(root: WorkspaceRoot) -> Self {
-        Self { root }
+        Self { root, policy: SandboxPolicy::default() }
     }
 
     /// 工具规格。
@@ -56,29 +58,10 @@ impl GitStatus {
         if let Some(notice) = not_a_repo_notice(&self.root) {
             return ToolOutcome::failed(notice);
         }
-        match run_in_workspace(&self.root, "git status --porcelain=v1", GIT_TIMEOUT).await {
-            Err(message) => git_failure(message),
-            Ok(output) => {
-                if output.code != 0 {
-                    return git_failure(format!(
-                        "git status 退出码 {}：{}",
-                        output.code,
-                        output.stderr.trim_end()
-                    ));
-                }
-                let stdout = output.stdout.trim_end();
-                let body = if stdout.is_empty() {
-                    "（工作区干净，没有未提交的改动）".to_owned()
-                } else {
-                    stdout.to_owned()
-                };
-                if output.sandbox_active {
-                    ToolOutcome::success(body)
-                } else {
-                    ToolOutcome::success(with_sandbox_notice(body))
-                }
-            }
-        }
+        let execution = run_with_policy(
+            &self.root, "git status --porcelain=v1", GIT_TIMEOUT, &self.policy,
+        ).await;
+        git_outcome(execution, true)
     }
 }
 
@@ -91,12 +74,13 @@ impl ToolInvoker for GitStatus {
 /// 查看差异。
 pub struct GitDiff {
     root: WorkspaceRoot,
+    policy: SandboxPolicy,
 }
 
 impl GitDiff {
     /// 以 `root` 为仓库根构造。
     pub fn new(root: WorkspaceRoot) -> Self {
-        Self { root }
+        Self { root, policy: SandboxPolicy::default() }
     }
 
     /// 工具规格。
@@ -127,29 +111,8 @@ impl GitDiff {
         } else {
             "git diff"
         };
-        match run_in_workspace(&self.root, command, GIT_TIMEOUT).await {
-            Err(message) => git_failure(message),
-            Ok(output) => {
-                if output.code != 0 {
-                    return git_failure(format!(
-                        "git diff 退出码 {}：{}",
-                        output.code,
-                        output.stderr.trim_end()
-                    ));
-                }
-                let stdout = output.stdout.trim_end().to_owned();
-                let body = if stdout.is_empty() {
-                    "（没有差异）".to_owned()
-                } else {
-                    clamp_output(stdout, DIFF_MAX_CHARS)
-                };
-                if output.sandbox_active {
-                    ToolOutcome::success(body)
-                } else {
-                    ToolOutcome::success(with_sandbox_notice(body))
-                }
-            }
-        }
+        let execution = run_with_policy(&self.root, command, GIT_TIMEOUT, &self.policy).await;
+        git_outcome(execution, false)
     }
 }
 
@@ -196,25 +159,37 @@ fn not_a_repo_notice(root: &WorkspaceRoot) -> Option<String> {
     ))
 }
 
-/// 沙箱未生效时给观察加的前缀。与 `run_command` 用同一份文本：模型
-/// 在不同工具里看到的降级说明必须一致，否则它会以为是另一回事。
-pub(crate) fn with_sandbox_notice(body: String) -> String {
-    format!("{SANDBOX_DOWNGRADE_NOTICE}\n{body}")
-}
-
-/// 降级说明的正文。抽取成常量是让 `run_command` 与 git 工具共用：
-/// "三处知情"承诺里的模型可见一环，两条命令路径都得兑现。
-pub(crate) const SANDBOX_DOWNGRADE_NOTICE: &str =
-    "⚠️ 进程沙箱未生效：本命令在无资源限制的宿主机环境执行，请格外保守。";
-
-/// 把执行层的失败翻译成面向模型的失败观察。///
-/// 启动失败（git 不在 PATH）和 git 自身报错（不是仓库等）在这里归并：
-/// 模型只需要知道"git 没跑成、为什么"，不需要区分进程层还是 git 层。
-fn git_failure(message: String) -> ToolOutcome {
-    if message.contains("启动 `git` 失败") {
-        ToolOutcome::failed(format!("找不到 git 可执行文件（可能不在 PATH 中）: {message}"))
-    } else {
-        ToolOutcome::failed(message)
+fn git_outcome(
+    execution: Result<super::shell::RawOutput, super::shell::RunError>,
+    is_status: bool,
+) -> ToolOutcome {
+    match execution {
+        Err(error) => error.into_outcome(false),
+        Ok(output) => {
+            let command = if is_status { "git status" } else { "git diff" };
+            let body = if output.code != 0 {
+                format!(
+                    "{} 退出码 {}：{}",
+                    command,
+                    output.code,
+                    output.stderr.trim_end()
+                )
+            } else {
+                let stdout = output.stdout.trim_end();
+                if stdout.is_empty() {
+                    if is_status {
+                        "（工作区干净，没有未提交的改动）".to_owned()
+                    } else {
+                        "（没有差异）".to_owned()
+                    }
+                } else if is_status {
+                    stdout.to_owned()
+                } else {
+                    clamp_output(stdout.to_owned(), DIFF_MAX_CHARS)
+                }
+            };
+            output.into_outcome(body, false)
+        }
     }
 }
 
@@ -289,6 +264,10 @@ mod tests {
             outcome.content.contains("不是 git 仓库根"),
             "{}",
             outcome.content
+        );
+        assert!(
+            outcome.execution.is_none(),
+            "没启动 git 进程就不能发出受保护执行记录"
         );
         assert!(
             outcome.content.contains(".git"),
@@ -452,6 +431,26 @@ mod tests {
         let bad = tool.invoke(&call(GIT_DIFF, json!({"staged": "yes"}))).await;
         assert_eq!(bad.status, OutcomeStatus::Failed);
         assert!(bad.content.contains("参数解析失败"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn git_tools_refuse_when_the_sandbox_cannot_be_created() {
+        let dir = std::env::temp_dir().join(format!("qch-git-failclosed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        std::fs::create_dir_all(dir.join(".git")).expect("造仓库根标记");
+        let mut status = GitStatus::new(WorkspaceRoot::new(&dir));
+        let mut diff = GitDiff::new(WorkspaceRoot::new(&dir));
+        status.policy.cpu_time = Some(Duration::from_secs(1));
+        diff.policy.cpu_time = Some(Duration::from_secs(1));
+
+        for outcome in [status.run().await, diff.run(false).await] {
+            assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
+            assert!(outcome.content.contains("沙箱创建失败"), "{}", outcome.content);
+            assert!(outcome.execution.is_none(), "命令没跑不能记边界证据");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

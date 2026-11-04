@@ -25,7 +25,8 @@ use serde_json::Value;
 
 use crate::application::port::{BoxFuture, ToolInvoker};
 use crate::application::tool_registry::ToolEntry;
-use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
+use crate::domain::sandbox::ExecutionBoundary;
+use crate::domain::tool::{MCP_TOOL_PREFIX, ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 
 /// 连接超时：覆盖子进程启动 + MCP 握手 + 工具发现。
 ///
@@ -52,7 +53,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// 前缀让来源在证据、审批请求与策略规则里都肉眼可辨；也从根本上杜绝
 /// 与内置工具（或别的 Server 的同名工具）撞名后被静默覆盖。
 pub fn mcp_tool_name(server: &str, tool: &str) -> String {
-    format!("mcp__{server}__{tool}")
+    format!("{MCP_TOOL_PREFIX}{server}__{tool}")
 }
 
 /// 判断词是不是"读"类动词（整词匹配，避免 `delete` 里的 `le` 之类误伤）。
@@ -338,7 +339,7 @@ impl McpToolSource {
             .map(|spec| {
                 let remote_name = spec
                     .name
-                    .strip_prefix(&format!("mcp__{}__", self.server))
+                    .strip_prefix(&format!("{MCP_TOOL_PREFIX}{}__", self.server))
                     .expect("tools 由 from_client 生成，必带本 Server 前缀")
                     .to_owned();
                 ToolEntry {
@@ -369,11 +370,13 @@ impl ToolInvoker for McpToolInvoker {
                 .call_tool(&self.remote_name, call.arguments.clone())
                 .await
             {
-                Ok(text) => ToolOutcome::success(text),
+                Ok(text) => ToolOutcome::success(text)
+                    .with_execution(ExecutionBoundary::mcp()),
                 Err(error) => ToolOutcome::failed(format!(
                     "MCP 工具 `{}.{}` 调用失败: {error}",
                     self.server, self.remote_name
-                )),
+                ))
+                .with_execution(ExecutionBoundary::mcp()),
             }
         })
     }
@@ -575,6 +578,11 @@ mod tests {
 
         assert_eq!(outcome.status, crate::domain::tool::OutcomeStatus::Success);
         assert_eq!(outcome.content, "工具结果");
+        assert_eq!(
+            outcome.execution,
+            Some(ExecutionBoundary::mcp()),
+            "MCP 成功调用要显式交代它跑在外部进程"
+        );
         assert_eq!(client.calls.lock().unwrap().as_slice(), ["get_page"]);
     }
 
@@ -595,6 +603,11 @@ mod tests {
         assert!(outcome.content.contains("fetch.get_page"));
         assert!(outcome.content.contains("连接已断"));
         assert!(outcome.is_error());
+        assert_eq!(
+            outcome.execution,
+            Some(ExecutionBoundary::mcp()),
+            "调用外部 Server 的尝试同样不受本进程沙箱保护"
+        );
     }
 
     #[tokio::test]

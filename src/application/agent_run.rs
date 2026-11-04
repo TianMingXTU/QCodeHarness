@@ -1139,11 +1139,23 @@ impl AgentRunner {
         outcome: ToolOutcome,
     ) -> Result<RunState, ApplicationError> {
         let turn = self.session.rounds() + 1;
+        let mut outcome = outcome;
+        // 执行器报告边界事实，应用层只负责转成证据；观察文本不再当判据用。
+        let boundary = outcome.execution.take();
         self.record(AuditEvent::ToolObserved {
             turn,
-            call,
+            call: call.clone(),
             outcome: outcome.clone(),
         });
+        if let Some(boundary) = boundary {
+            self.record(AuditEvent::SandboxApplied {
+                turn,
+                call,
+                platform: boundary.platform.to_owned(),
+                active: boundary.active,
+                boundary_checked: boundary.boundary_checked,
+            });
+        }
 
         // 先在一个块里把 pending 改完并取出决策依据，避免整个函数
         // 都借着他、后面没法动 self.state。
@@ -1369,17 +1381,37 @@ mod tests {
         }
     }
 
-    /// 记录调用但不真做事的执行器。
+    /// 记录调用但不真做事的执行器；边界事实按需显式附加，模拟真实执行器。
     #[derive(Default)]
     struct RecordingInvoker {
         calls: std::sync::Mutex<Vec<String>>,
+        boundary: Option<crate::domain::sandbox::ExecutionBoundary>,
+    }
+
+    impl RecordingInvoker {
+        fn with_boundary(boundary: crate::domain::sandbox::ExecutionBoundary) -> Self {
+            Self { calls: Default::default(), boundary: Some(boundary) }
+        }
     }
 
     impl ToolInvoker for RecordingInvoker {
         fn invoke<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolOutcome> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(call.name.clone());
-                ToolOutcome::success("文件内容")
+                let content = match call.name.as_str() {
+                    "empty_command" => "command 不能为空".to_owned(),
+                    "git_status" => "不是 git 仓库根".to_owned(),
+                    _ => "文件内容".to_owned(),
+                };
+                let status = match call.name.as_str() {
+                    "empty_command" | "git_status" => OutcomeStatus::Failed,
+                    _ => OutcomeStatus::Success,
+                };
+                let mut outcome = ToolOutcome { content, status, execution: None };
+                if let Some(boundary) = self.boundary {
+                    outcome = outcome.with_execution(boundary);
+                }
+                outcome
             })
         }
     }
@@ -1450,12 +1482,20 @@ mod tests {
         tools: Vec<ToolSpec>,
         policy: PolicyEngine,
     ) -> Harness {
+        harness_with_invoker(turns, tools, policy, Arc::new(RecordingInvoker::default()))
+    }
+
+    /// 同上，但可指定执行器返回的边界事实。
+    fn harness_with_invoker(
+        turns: Vec<MockTurn>,
+        tools: Vec<ToolSpec>,
+        policy: PolicyEngine,
+        invoker: Arc<dyn ToolInvoker>,
+    ) -> Harness {
         let mock = MockCompletionModel::from_turns(turns);
         let evidence = Arc::new(MemoryEvidenceSink::new());
         let approvals = Arc::new(CountingGate::default());
-        // 全部规格共用一个 RecordingInvoker：这些测试只关心循环行为，
-        // 不关心具体工具做什么。
-        let registry = registry_with(Arc::new(RecordingInvoker::default()), tools);
+        let registry = registry_with(invoker, tools);
         let runner = AgentRunner::new(
             spec_with(),
             SessionId::new("test-session"),
@@ -2401,6 +2441,191 @@ mod tests {
             })
             .collect();
         assert_eq!(evaluated, vec![PolicyVerdict::Allow], "证据应记策略原判");
+    }
+
+    /// 策略层先升级、人再放行，仍不会让硬边界失效（P8/P11 两道闸门）。
+    ///
+    /// P8 的升级判据不改：这条测试只把"人点头后执行层仍可拒"的落差钉住，
+    /// 免得后人误以为审批能覆盖机械边界，或把行为改成静默放行。
+    #[tokio::test]
+    async fn approval_cannot_override_the_tool_level_boundary_refusal() {
+        let escape = r"echo hi > C:\Windows\temp\x";
+        let boundary_path = crate::domain::workspace::WorkspaceRoot::new("D:/repo");
+        assert!(
+            crate::domain::sandbox::write_escape_beyond(escape, boundary_path.as_path()).is_some(),
+            "本用例的命令必须真的越过根"
+        );
+        let policy = policy_with("run_command", PolicyVerdict::Allow, "shell 免审");
+        let spec = ToolSpec {
+            name: "run_command".to_owned(),
+            description: "跑命令".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(false, true, false, true),
+        };
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call("call_1", "run_command", json!({"command": escape})),
+                MockTurn::text("看到拒绝"),
+            ],
+            vec![spec],
+            policy,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(harness.approvals.requested_tools(), vec!["run_command"]);
+        let decisions: Vec<_> = harness.evidence.events().into_iter()
+            .filter_map(|entry| match entry.event {
+                AuditEvent::ApprovalDecided { allowed, .. } => Some(allowed),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decisions, vec![true], "P8 升级后闸门应被问过并获批准");
+        assert!(boundaries(&harness).is_empty(), "未执行的拒绝调用不能记边界证据");
+    }
+
+    // ── P11：执行边界证据 ─────────────────────────────────────────────
+
+    /// 取出证据里全部 `SandboxApplied`，断言时只看这条通道说了什么。
+    fn boundaries(harness: &Harness) -> Vec<(String, bool, bool)> {
+        harness
+            .evidence
+            .events()
+            .into_iter()
+            .filter_map(|e| match e.event {
+                AuditEvent::SandboxApplied {
+                    platform,
+                    active,
+                    boundary_checked,
+                    ..
+                } => Some((platform, active, boundary_checked)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 真跑过的 `run_command` 必须留下一条边界记录，执行器给什么事实记什么事实。
+    ///
+    /// 验收项"高风险工具的能力边界由运行时验证"的证据侧一半：策略与审批
+    /// 各自记了"准不准跑"，只有这条记"跑的时候有没有保护"。
+    #[tokio::test]
+    async fn a_ran_command_leaves_a_boundary_record() {
+        let run_command_spec = ToolSpec {
+            name: "run_command".to_owned(),
+            description: "跑命令".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(false, true, false, true),
+        };
+        let invoker = Arc::new(RecordingInvoker::with_boundary(
+            crate::domain::sandbox::ExecutionBoundary::process(true, true),
+        ));
+        let mut harness = harness_with_invoker(
+            vec![
+                MockTurn::tool_call("call_1", "run_command", json!({"command": "cargo test"})),
+                MockTurn::text("跑完了"),
+            ],
+            vec![read_file_spec(), run_command_spec],
+            PolicyEngine::new(),
+            invoker,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(
+            boundaries(&harness),
+            vec![(
+                crate::domain::sandbox::PlatformCapabilities::detect()
+                    .label()
+                    .to_owned(),
+                true,
+                true
+            )],
+            "执行成功且未降级：一条生效的沙箱记录"
+        );
+    }
+
+    /// MCP 工具的边界记录写的是"外部进程、无保护"，而不是没有记录。
+    ///
+    /// 少记一条比记错更危险：翻 JSONL 的人会以为所有执行都在沙箱里。
+    #[tokio::test]
+    async fn an_mcp_call_is_recorded_as_unprotected() {
+        let mcp_spec = ToolSpec {
+            name: "mcp__fs__read".to_owned(),
+            description: "外部 Server 的读工具".to_owned(),
+            parameters: json!({"type": "object"}),
+            // 只读注解让它不吃审批，直进执行——本条要验的是证据不是闸门。
+            annotations: ToolAnnotations::new(true, false, true, true),
+        };
+        let invoker = Arc::new(RecordingInvoker::with_boundary(
+            crate::domain::sandbox::ExecutionBoundary::mcp(),
+        ));
+        let mut harness = harness_with_invoker(
+            vec![
+                MockTurn::tool_call("call_1", "mcp__fs__read", json!({})),
+                MockTurn::text("读完了"),
+            ],
+            vec![mcp_spec],
+            PolicyEngine::new(),
+            invoker,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(
+            boundaries(&harness),
+            vec![(
+                crate::domain::sandbox::MCP_BOUNDARY_LABEL.to_owned(),
+                false,
+                false
+            )],
+            "MCP 调用要单独标注它跑在外部进程里"
+        );
+    }
+
+    /// 文件类工具不补边界记录：它们没有子进程这一维。
+    ///
+    /// 路径校验的结果已经在 `ToolObserved` 的 outcome 里（拒绝就是拒绝），
+    /// 再发一条 `SandboxApplied` 只会让"有多少次执行"这个数说不清。
+    #[tokio::test]
+    async fn file_tools_leave_no_boundary_record() {
+        let mut harness = harness(
+            vec![
+                MockTurn::tool_call("call_1", "read_file", json!({"path": "Cargo.toml"})),
+                MockTurn::text("读完了"),
+            ],
+            vec![read_file_spec()],
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert!(boundaries(&harness).is_empty(), "文件工具不该发这条事件");
+    }
+
+    /// 参数错误、未启动或非 git 仓库不生成 `SandboxApplied`：
+    /// 这些路径只有失败观察，没有"跑在什么保护下"这个事实。
+    #[tokio::test]
+    async fn calls_without_a_started_process_leave_no_boundary_record() {
+        for name in ["empty_command", "git_status"] {
+            let spec = ToolSpec {
+                name: name.to_owned(),
+                description: "未启动进程的失败".to_owned(),
+                parameters: json!({"type": "object"}),
+                annotations: ToolAnnotations::new(true, false, true, false),
+            };
+            let mut harness = harness(
+                vec![
+                    MockTurn::tool_call("call_1", name, json!({})),
+                    MockTurn::text("收到失败"),
+                ],
+                vec![spec],
+            );
+
+            harness.runner.run(&Budget::new(20)).await.unwrap();
+            assert!(
+                boundaries(&harness).is_empty(),
+                "{name} 不应凭观察和工具名推断出受保护执行"
+            );
+        }
     }
 
     // ── P8-1：受保护路径经真实工具层的端到端验证 ─────────────────────
