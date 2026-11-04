@@ -25,8 +25,8 @@ use serde_json::Value;
 
 use crate::application::port::{BoxFuture, ToolInvoker};
 use crate::application::tool_registry::ToolEntry;
-use crate::domain::sandbox::{ExecutionBoundary, SandboxPolicy};
-use crate::infrastructure::sandbox::{JobGuard, protect_pid};
+use crate::domain::sandbox::{ExecutionBoundary, PlatformCapabilities, SandboxPolicy};
+use crate::infrastructure::sandbox::JobGuard;
 use crate::domain::tool::{MCP_TOOL_PREFIX, ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 
 /// 连接超时：覆盖子进程启动 + MCP 握手 + 工具发现。
@@ -115,9 +115,9 @@ fn infer_annotations(name: &str, description: &str) -> ToolAnnotations {
 /// 一个 MCP Server 的连接句柄。抽出来是为了测试能注入替身，
 /// 不必真起子进程走完整协议。
 pub(crate) trait McpClientHandle: Send + Sync {
-    /// 这个 Server 的子进程是否真的在宿主进程沙箱内。真实连接在能纳入
-    /// Job Object 时为 true，替身与非纳入场景为 false——边界证据照它写，
-    /// 不再对 MCP 一律谎报或一律写死无保护。
+    /// 这个 Server 的进程是否真的在宿主进程沙箱内。真实连接在握手前就把
+    /// launcher 纳入 Job Object 时为 true，替身、非 Windows、纳入失败为 false
+    /// ——边界证据照它写，既不谎报保护，也不因为"是外部进程"就一律写死无保护。
     fn process_isolation(&self) -> bool;
 
     /// 列出 Server 暴露的工具（原始名，不带 `mcp__` 前缀）。
@@ -138,47 +138,90 @@ pub(crate) trait McpClientHandle: Send + Sync {
 struct RealMcpClient {
     /// 连接的生命周期由它管：drop 即断开并结束子进程。
     service: Arc<RunningService<RoleClient, ()>>,
-    /// Server 子进程所在的 Job；本字段 drop 即 `KILL_ON_JOB_CLOSE` 整树终止，
+    /// Server 进程所在的 Job；本字段 drop 即 `KILL_ON_JOB_CLOSE` 整树终止，
     /// 补上 rmcp 只 `kill()` 直接子进程、孙进程漏网这一段。非 Windows 或纳入
     /// 失败为 `None`，此时回退到 rmcp 原有语义（只收直接子进程）。
+    ///
+    /// 覆盖范围以纳入时刻为界：进程**之后**创建的子孙按 Job 规则继承并在
+    /// 句柄关闭时一并终止，**之前**已存在的子孙不受影响。所以必须在握手
+    /// 前纳入（见 `connect`），否则 `uvx`/`npx` 这类 launcher 拉起的 Server
+    /// 从头就不在这个 Job 里。
     _mcp_job: Option<JobGuard>,
-    /// 子进程是否真的进了沙箱，供 [`McpClientHandle::process_isolation`] 如实上报。
+    /// 进程是否真的进了沙箱，供 [`McpClientHandle::process_isolation`] 如实上报。
     process_isolation: bool,
 }
 
 impl RealMcpClient {
-    /// 启动 Server 子进程、纳入进程沙箱、完成握手。超时由调用方
+    /// 建进程沙箱、启动 Server 进程、纳入沙箱、完成握手。超时由调用方
     /// （[`McpToolSource::connect`]）统一罩住整个连接+发现过程。
     async fn connect(config: &config::McpServerConfig) -> Result<Self, String> {
         let mut command = tokio::process::Command::new(&config.command);
         command.args(&config.args);
 
+        // 先建 Job 再启动进程，取向与 shell 工具同一条线（见 `run_with_policy`）：
+        // Windows 上建不起来就拒绝连接——先把一个没人看管的外部进程拉起来、
+        // 再宣布"它没保护"，等于用假的证据换一次可用性。只有平台本身没实现
+        // 才降级照连。连接失败由 `connect_all` 记成警告并跳过该 Server，
+        // 其余 Server 不受影响，与"MCP 工具不可用"是同一种降级。
+        let job = match JobGuard::create(&SandboxPolicy::default()) {
+            Ok(job) => Some(job),
+            Err(error) if !PlatformCapabilities::detect().has_process_sandbox => {
+                eprintln!("警告：{error}");
+                None
+            }
+            Err(error) => {
+                return Err(format!(
+                    "MCP 沙箱创建失败: {error}（fail-closed：不启动没有进程边界的 Server）"
+                ))
+            }
+        };
+
         let transport = TokioChildProcess::new(command)
             .map_err(|error| format!("启动进程 `{}` 失败: {error}", config.command))?;
-        // serve 会消费 transport，之后再也拿不到 Child；纳入沙箱要的 PID
-        // 必须在此取。取不到（进程已退）则跳过纳入，回退 rmcp 原语义。
-        let child_pid = transport.id();
+        // serve 会消费 transport，之后再也拿不到 Child；纳入要的 PID 必须在此取。
+        // 取不到（进程已退）则跳过纳入，回退 rmcp 原语义。
+        let launcher_pid = transport.id();
+        // 纳入必须赶在握手之前，这是整树保护成不成立的分界（见 `assign_pid`）：
+        // `uvx`/`npx` 这类 launcher 会先把自己的 Server 子进程拉起来，而握手
+        // 成功本身就证明那个子进程已经存在——那时再纳入，进 Job 的只有
+        // launcher，报给证据的 active=true 就是假的。
+        let (_mcp_job, process_isolation) = protect_launcher(job, launcher_pid);
         let service = ()
             .serve(transport)
             .await
             .map_err(|error| format!("MCP 握手失败: {error}"))?;
 
-        // 纳入失败不阻断连接——与 shell 工具的降级口径一致，记 active=false。
-        let mcp_job = child_pid.and_then(|pid| {
-            match protect_pid(pid, &SandboxPolicy::default()) {
-                Ok(job) => Some(job),
-                Err(error) => {
-                    eprintln!("警告：MCP 子进程 (pid={pid}) 未纳入沙箱: {error}");
-                    None
-                }
-            }
-        });
-        let process_isolation = mcp_job.is_some();
         Ok(Self {
             service: Arc::new(service),
-            _mcp_job: mcp_job,
+            _mcp_job,
             process_isolation,
         })
+    }
+}
+
+/// 把 launcher PID 纳入已建好的 Job，交回"要不要继续持有这个 Job"与保护事实。
+///
+/// 单独成函数是为了所有权：纳入成功就把守卫交给 `RealMcpClient` 长期持有
+/// （drop 时整树终止），失败或拿不到 PID 就当场释放一个成员都没有的 Job
+/// 句柄。就地判断会让 `Option<JobGuard>` 的借用和移动打架。
+///
+/// 失败不阻断连接——进程已经在跑，此时唯一诚实的做法是降级并记
+/// `active = false`，与 shell 工具的 assign 失败同一条口径。
+fn protect_launcher(job: Option<JobGuard>, launcher_pid: Option<u32>) -> (Option<JobGuard>, bool) {
+    let Some(guard) = job else {
+        // 平台不支持，创建阶段已经警告过，这里不重复。
+        return (None, false);
+    };
+    let Some(pid) = launcher_pid else {
+        eprintln!("警告：拿不到 MCP 子进程 PID，未纳入沙箱");
+        return (None, false);
+    };
+    match guard.assign_pid(pid) {
+        Ok(()) => (Some(guard), true),
+        Err(error) => {
+            eprintln!("警告：MCP 子进程 (pid={pid}) 未纳入沙箱: {error}");
+            (None, false)
+        }
     }
 }
 
@@ -438,6 +481,28 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
+    /// 断言 MCP 边界的三个字段，而不是拿 `ExecutionBoundary::mcp` 造一个期望
+    /// 值去比：那个构造函数本身就是被测语义的一部分，用它当尺子，"active
+    /// 到底跟着哪个字段"写错了测试也会跟着一起错。
+    fn assert_mcp_boundary(outcome: &ToolOutcome, expected_active: bool) {
+        let boundary = outcome
+            .execution
+            .expect("MCP 调用必须交代执行边界，否则报表与命令行只能猜");
+        assert_eq!(
+            boundary.active, expected_active,
+            "active 要如实反映进程是否真的进了 Job"
+        );
+        assert_eq!(
+            boundary.platform,
+            crate::domain::sandbox::MCP_BOUNDARY_LABEL,
+            "平台标签要能把它与内置工具的进程边界区分开"
+        );
+        assert!(
+            !boundary.boundary_checked,
+            "MCP 调用没做过命令字面路径检查，boundary_checked 必须是 false"
+        );
+    }
+
     /// 固定清单与回复的假连接。
     struct FakeClient {
         tools: Vec<RmcpTool>,
@@ -628,12 +693,9 @@ mod tests {
 
         assert_eq!(outcome.status, crate::domain::tool::OutcomeStatus::Success);
         assert_eq!(outcome.content, "工具结果");
-        assert_eq!(
-            outcome.execution,
-            Some(ExecutionBoundary::mcp(false)),
-            "替身未纳入沙箱，边界如实记 active=false"
-        );
         assert_eq!(client.calls.lock().unwrap().as_slice(), ["get_page"]);
+        // 替身没进任何 Job，边界必须如实记 active=false。
+        assert_mcp_boundary(&outcome, false);
     }
 
     #[tokio::test]
@@ -653,11 +715,8 @@ mod tests {
         assert!(outcome.content.contains("fetch.get_page"));
         assert!(outcome.content.contains("连接已断"));
         assert!(outcome.is_error());
-        assert_eq!(
-            outcome.execution,
-            Some(ExecutionBoundary::mcp(false)),
-            "调用失败的 MCP 尝试也交代边界；此替身未纳入沙箱故 active=false"
-        );
+        // 调用失败的 MCP 尝试也要交代边界；此替身未纳入沙箱故 active=false。
+        assert_mcp_boundary(&outcome, false);
     }
 
     /// 子进程纳入宿主沙箱后，MCP 边界如实记 active=true——不再对 MCP 一律
@@ -675,11 +734,7 @@ mod tests {
         };
         let outcome = entry.invoker.invoke(&call).await;
 
-        assert_eq!(
-            outcome.execution,
-            Some(ExecutionBoundary::mcp(true)),
-            "纳入沙箱的 MCP 调用要记 active=true"
-        );
+        assert_mcp_boundary(&outcome, true);
     }
 
     #[tokio::test]

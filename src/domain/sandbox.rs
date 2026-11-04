@@ -53,10 +53,12 @@ impl ExecutionBoundary {
         }
     }
 
-    /// MCP 调用的边界事实。`process_isolation` 报告这个 Server 的子进程是否
-    /// 真的被纳入了宿主进程沙箱（Windows 上是 Job Object）；纳入失败或非
-    /// Windows 平台为 false。口径与 shell 工具一致：不谎报保护，也不因为
-    /// "是外部进程"就一律写 false——治理后能反映真实边界状态。
+    /// MCP 调用的边界事实。`process_isolation` 报告 Server 进程是否在握手
+    /// **之前**就被纳入了宿主进程沙箱（Windows 上是 Job Object）：纳入只
+    /// 覆盖该进程之后创建的子孙，所以先后顺序决定这个字段是否为真保护。
+    /// 纳入失败、拿不到 PID 或非 Windows 平台为 false。口径与 shell 工具
+    /// 一致：不谎报保护，也不因为"是外部进程"就一律写 false——治理后能
+    /// 反映真实边界状态。
     ///
     /// `platform` 仍是 `MCP subprocess` 而非平台标签：证据要能分辨"这来自
     /// 外部 Server"与"这是内置工具"，而 `active` 单独回答"有没有进程隔离"。

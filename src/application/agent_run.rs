@@ -2544,42 +2544,50 @@ mod tests {
         );
     }
 
-    /// MCP 工具的边界记录写的是"外部进程、无保护"，而不是没有记录。
+    /// MCP 调用无论是否进了 Job 都要留下边界记录，且 `active` 跟着事实走。
     ///
     /// 少记一条比记错更危险：翻 JSONL 的人会以为所有执行都在沙箱里。
+    /// 两个分支都测，是因为报表的 `sandbox_protected_runs` 只认 `active`：
+    /// 纳入成功却写 false 会把保护数压低，纳入失败却写 true 会把它抬高，
+    /// 顺带抹掉命令行上那句"本次执行无进程沙箱保护"。
     #[tokio::test]
-    async fn an_mcp_call_is_recorded_as_unprotected() {
-        let mcp_spec = ToolSpec {
-            name: "mcp__fs__read".to_owned(),
-            description: "外部 Server 的读工具".to_owned(),
-            parameters: json!({"type": "object"}),
-            // 只读注解让它不吃审批，直进执行——本条要验的是证据不是闸门。
-            annotations: ToolAnnotations::new(true, false, true, true),
-        };
-        let invoker = Arc::new(RecordingInvoker::with_boundary(
-            crate::domain::sandbox::ExecutionBoundary::mcp(false),
-        ));
-        let mut harness = harness_with_invoker(
-            vec![
-                MockTurn::tool_call("call_1", "mcp__fs__read", json!({})),
-                MockTurn::text("读完了"),
-            ],
-            vec![mcp_spec],
-            PolicyEngine::new(),
-            invoker,
-        );
+    async fn mcp_boundary_records_follow_process_isolation() {
+        for process_isolation in [false, true] {
+            let mcp_spec = ToolSpec {
+                name: "mcp__fs__read".to_owned(),
+                description: "外部 Server 的读工具".to_owned(),
+                parameters: json!({"type": "object"}),
+                // 只读注解让它不吃审批，直进执行——本条要验的是证据不是闸门。
+                annotations: ToolAnnotations::new(true, false, true, true),
+            };
+            let invoker = Arc::new(RecordingInvoker::with_boundary(
+                crate::domain::sandbox::ExecutionBoundary::mcp(process_isolation),
+            ));
+            let mut harness = harness_with_invoker(
+                vec![
+                    MockTurn::tool_call("call_1", "mcp__fs__read", json!({})),
+                    MockTurn::text("读完了"),
+                ],
+                vec![mcp_spec],
+                PolicyEngine::new(),
+                invoker,
+            );
 
-        harness.runner.run(&Budget::new(20)).await.unwrap();
+            harness.runner.run(&Budget::new(20)).await.unwrap();
 
-        assert_eq!(
-            boundaries(&harness),
-            vec![(
-                crate::domain::sandbox::MCP_BOUNDARY_LABEL.to_owned(),
-                false,
-                false
-            )],
-            "MCP 调用要单独标注它跑在外部进程里"
-        );
+            assert_eq!(
+                boundaries(&harness),
+                vec![
+                    (
+                        crate::domain::sandbox::MCP_BOUNDARY_LABEL.to_owned(),
+                        process_isolation,
+                        false
+                    )
+                ],
+                "MCP 调用要单独标注它跑在外部进程里，active 反映进程是否真进了 \
+                 Job（本次 process_isolation={process_isolation}）"
+            );
+        }
     }
 
     /// 文件类工具不补边界记录：它们没有子进程这一维。
