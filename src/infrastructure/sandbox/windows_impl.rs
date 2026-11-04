@@ -14,6 +14,9 @@ use windows::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+};
 // windows crate 把 windows-core 重导出为 windows::core（句柄所有权
 // 原语 Owned 在这里），不单独声明 windows-core 依赖。
 use windows::core::Owned;
@@ -32,10 +35,15 @@ pub struct JobGuard {
 }
 
 // HANDLE 是裸指针，编译器按"可能非线程安全"处理；但 Job Object 句柄
-// 本身就是跨线程合法的系统对象（TerminateJobObject/CloseHandle 无
-// 线程亲和性），守卫在这里只是被跨 await 携带而不被并发访问。
+// 本身就是跨线程合法的系统对象（TerminateJobObject/AssignProcessToJobObject/
+// CloseHandle 无线程亲和性），守卫在这里只是被跨 await 携带而不被并发访问。
 // 若不补这条，run_in_workspace 的 future 无法满足 ToolInvoker 的 Send。
 unsafe impl Send for JobGuard {}
+
+// MCP 客户端把 JobGuard 放进 `Arc<dyn McpClientHandle>`（要求 Sync）长期持有，
+// 只在 drop 时动句柄、从不并发调用其方法。Job Object 句柄是进程级内核对象，
+// 经 `&` 跨线程共享安全，CloseHandle 由 Arc 的最后一个引用保证只发生一次。
+unsafe impl Sync for JobGuard {}
 
 impl JobGuard {
     /// 创建 Job 并施加策略（内存 / 进程数 / CPU 时间）。
@@ -140,4 +148,88 @@ pub fn assign_child(job: &JobGuard, child: &tokio::process::Child) -> Result<(),
         return Err("子进程句柄不可用（进程可能已退出）".into());
     }
     job.assign(HANDLE(raw_handle))
+}
+
+/// 按 PID 把一个**已经启动**的外部子进程纳入新建的 Job。
+///
+/// 给 MCP 这类"Harness 不亲自 spawn、句柄在别人手里"的进程用：rmcp 的
+/// `TokioChildProcess` 在 `serve()` 后就不再暴露 `Child`，只剩 `id()` 给的
+/// PID，所以只能走 `OpenProcess` 拿句柄再 assign。返回的 `JobGuard` 交给
+/// 调用方长期持有——它的 drop 触发 `KILL_ON_JOB_CLOSE`，把 Server 连同它
+/// 自己拉起的孙进程一并收掉，正是 `child.kill()` 单独做不到的整树终止。
+///
+/// # Errors
+///
+/// Job 创建失败、`OpenProcess` 打不开该 PID（进程已退出或权限不足）、或
+/// assign 失败时返回说明文本；调用方按降级处理（记 `active = false`），
+/// 与 shell 工具口径一致。
+///
+/// # 已知窗口
+///
+/// 从 MCP 子进程 spawn 到本函数 assign 之间，进程短暂不在 Job 内；这与
+/// shell 路径 spawn→assign 的窗口同源，是已接受的取舍。
+pub fn protect_pid(pid: u32, policy: &SandboxPolicy) -> Result<JobGuard, String> {
+    let job = JobGuard::create(policy)?;
+    let handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) }
+        .map_err(|error| format!("打开子进程 (pid={pid}) 失败: {error}"))?;
+    // Owned 保证无论 assign 成败都 CloseHandle：AssignProcessToJobObject 不
+    // 接管进程句柄所有权，漏关就是每连一个 Server 泄漏一个内核句柄。
+    let owned = unsafe { Owned::new(handle) };
+    let assigned = job.assign(*owned);
+    drop(owned);
+    assigned?;
+    Ok(job)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// `protect_pid` 把已在运行的进程纳入 Job：guard drop 后经
+    /// `KILL_ON_JOB_CLOSE` 把它连同后代一起终止。
+    ///
+    /// 这条测的是 MCP 收口依赖的**底层原语本身**：Server 子进程由 rmcp
+    /// spawn、harness 只拿得到 PID，所以必须验证"按 PID 打开→纳入→关句柄
+    /// 整树终止"这条路在真实进程上成立，而不是只验证 `connect` 没报错
+    /// （`connect` 对纳入失败是优雅降级的，光看它通过证明不了纳入成功）。
+    #[tokio::test]
+    async fn protecting_an_existing_pid_terminates_it_when_the_guard_drops() {
+        use std::process::Stdio;
+        // 一个会长跑的子进程：纳入 Job 后 guard 若不能终止它，下面的 wait
+        // 会一直等到 ping 自然结束（约 120 秒）而触发超时断言失败。
+        let mut child = tokio::process::Command::new("cmd")
+            .args(["/C", "ping -n 120 127.0.0.1 >nul"])
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id().expect("运行中的子进程应有 PID");
+
+        // 先确认真的在跑——否则"很快返回"分不清是被杀还是压根没启动。
+        assert!(
+            child.try_wait().expect("try_wait 不应报错").is_none(),
+            "ping 子进程此刻应仍在运行"
+        );
+
+        let guard = protect_pid(pid, &SandboxPolicy::default())
+            .expect("应能把运行中的进程纳入 Job");
+        drop(guard); // 最后一个 Job 句柄关闭 → KILL_ON_JOB_CLOSE 整树终止
+
+        // 约 120 秒的进程在 10 秒内 wait 返回，只能是被 Job 提前终止。
+        // 不断言退出码：Job 关闭经 TerminateProcess 收人，退出码随 Windows
+        // 版本与父子结构而变，"被提前终止"这条不变量由 10 秒内返回已证。
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("guard drop 后子进程应在 10s 内被 Job 终止，而非跑到自然结束");
+        let _ = status;
+    }
+
+    /// 打不开一个不存在/已退出的 PID 时返回错误说明，而不是 panic——
+    /// 调用方（MCP `connect`）正是靠这个 Err 分支走"未纳入、记 active=false"。
+    #[test]
+    fn protecting_an_unknown_pid_is_an_error_not_a_panic() {
+        // PID 0 不是可 OpenProcess 的普通进程句柄目标。
+        let result = protect_pid(0, &SandboxPolicy::default());
+        assert!(result.is_err(), "PID 0 不应被当作可纳入的活进程");
+    }
 }

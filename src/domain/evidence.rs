@@ -193,7 +193,8 @@ pub enum AuditEvent {
     ///
     /// `run_command`、`git_status`、`git_diff` 只在实际启动子进程后记录；
     /// 启动前的拒绝或失败不生成此事件。MCP 工具记录将调用交给外部
-    /// Server 的尝试，不表示服务端已经执行或调用成功。
+    /// Server 的尝试，不表示服务端已经执行或调用成功；其子进程在
+    /// Windows 上被纳入同一个 Job（见 `active`）。
     ///
     /// 与 `ToolObserved` 分开记录：本事件描述进程管理与调用前检查，
     /// 工具结果仍由 `ToolObserved` 表达。两者都不承诺文件系统隔离。
@@ -210,7 +211,8 @@ pub enum AuditEvent {
         ///
         /// Windows 子进程成功纳入 Job 后为 true；启动后 `assign` 失败
         /// 仍记录本事件，但为 false。启动前 Job 创建失败则拒绝执行，
-        /// 不生成本事件。非 Windows 平台与 MCP 调用均为 false。
+        /// 不生成本事件。MCP 调用在 Windows 上纳入 Job 后为 true；
+        /// 非 Windows 平台、以及 PID 已失效或纳入失败时为 false。
         active: bool,
         /// `run_command` 是否做过命令字面路径检查。
         ///

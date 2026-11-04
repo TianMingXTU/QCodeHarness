@@ -53,10 +53,17 @@ impl ExecutionBoundary {
         }
     }
 
-    pub fn mcp() -> Self {
+    /// MCP 调用的边界事实。`process_isolation` 报告这个 Server 的子进程是否
+    /// 真的被纳入了宿主进程沙箱（Windows 上是 Job Object）；纳入失败或非
+    /// Windows 平台为 false。口径与 shell 工具一致：不谎报保护，也不因为
+    /// "是外部进程"就一律写 false——治理后能反映真实边界状态。
+    ///
+    /// `platform` 仍是 `MCP subprocess` 而非平台标签：证据要能分辨"这来自
+    /// 外部 Server"与"这是内置工具"，而 `active` 单独回答"有没有进程隔离"。
+    pub fn mcp(process_isolation: bool) -> Self {
         Self {
             platform: MCP_BOUNDARY_LABEL,
-            active: false,
+            active: process_isolation,
             boundary_checked: false,
         }
     }

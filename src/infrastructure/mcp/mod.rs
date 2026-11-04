@@ -25,7 +25,8 @@ use serde_json::Value;
 
 use crate::application::port::{BoxFuture, ToolInvoker};
 use crate::application::tool_registry::ToolEntry;
-use crate::domain::sandbox::ExecutionBoundary;
+use crate::domain::sandbox::{ExecutionBoundary, SandboxPolicy};
+use crate::infrastructure::sandbox::{JobGuard, protect_pid};
 use crate::domain::tool::{MCP_TOOL_PREFIX, ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 
 /// 连接超时：覆盖子进程启动 + MCP 握手 + 工具发现。
@@ -114,6 +115,11 @@ fn infer_annotations(name: &str, description: &str) -> ToolAnnotations {
 /// 一个 MCP Server 的连接句柄。抽出来是为了测试能注入替身，
 /// 不必真起子进程走完整协议。
 pub(crate) trait McpClientHandle: Send + Sync {
+    /// 这个 Server 的子进程是否真的在宿主进程沙箱内。真实连接在能纳入
+    /// Job Object 时为 true，替身与非纳入场景为 false——边界证据照它写，
+    /// 不再对 MCP 一律谎报或一律写死无保护。
+    fn process_isolation(&self) -> bool;
+
     /// 列出 Server 暴露的工具（原始名，不带 `mcp__` 前缀）。
     fn list_tools(&self) -> BoxFuture<'_, Result<Vec<RmcpTool>, String>>;
 
@@ -132,10 +138,16 @@ pub(crate) trait McpClientHandle: Send + Sync {
 struct RealMcpClient {
     /// 连接的生命周期由它管：drop 即断开并结束子进程。
     service: Arc<RunningService<RoleClient, ()>>,
+    /// Server 子进程所在的 Job；本字段 drop 即 `KILL_ON_JOB_CLOSE` 整树终止，
+    /// 补上 rmcp 只 `kill()` 直接子进程、孙进程漏网这一段。非 Windows 或纳入
+    /// 失败为 `None`，此时回退到 rmcp 原有语义（只收直接子进程）。
+    _mcp_job: Option<JobGuard>,
+    /// 子进程是否真的进了沙箱，供 [`McpClientHandle::process_isolation`] 如实上报。
+    process_isolation: bool,
 }
 
 impl RealMcpClient {
-    /// 启动 Server 子进程并完成握手。超时由调用方
+    /// 启动 Server 子进程、纳入进程沙箱、完成握手。超时由调用方
     /// （[`McpToolSource::connect`]）统一罩住整个连接+发现过程。
     async fn connect(config: &config::McpServerConfig) -> Result<Self, String> {
         let mut command = tokio::process::Command::new(&config.command);
@@ -143,22 +155,38 @@ impl RealMcpClient {
 
         let transport = TokioChildProcess::new(command)
             .map_err(|error| format!("启动进程 `{}` 失败: {error}", config.command))?;
+        // serve 会消费 transport，之后再也拿不到 Child；纳入沙箱要的 PID
+        // 必须在此取。取不到（进程已退）则跳过纳入，回退 rmcp 原语义。
+        let child_pid = transport.id();
         let service = ()
             .serve(transport)
             .await
             .map_err(|error| format!("MCP 握手失败: {error}"))?;
-        Ok(Self::from_service(service))
-    }
 
-    /// 从现成的连接造客户端，把连接生命周期装进 Arc。
-    fn from_service(service: RunningService<RoleClient, ()>) -> Self {
-        Self {
+        // 纳入失败不阻断连接——与 shell 工具的降级口径一致，记 active=false。
+        let mcp_job = child_pid.and_then(|pid| {
+            match protect_pid(pid, &SandboxPolicy::default()) {
+                Ok(job) => Some(job),
+                Err(error) => {
+                    eprintln!("警告：MCP 子进程 (pid={pid}) 未纳入沙箱: {error}");
+                    None
+                }
+            }
+        });
+        let process_isolation = mcp_job.is_some();
+        Ok(Self {
             service: Arc::new(service),
-        }
+            _mcp_job: mcp_job,
+            process_isolation,
+        })
     }
 }
 
 impl McpClientHandle for RealMcpClient {
+    fn process_isolation(&self) -> bool {
+        self.process_isolation
+    }
+
     fn list_tools(&self) -> BoxFuture<'_, Result<Vec<RmcpTool>, String>> {
         Box::pin(async {
             // list_all_tools 自动翻页，拿全量。
@@ -371,12 +399,12 @@ impl ToolInvoker for McpToolInvoker {
                 .await
             {
                 Ok(text) => ToolOutcome::success(text)
-                    .with_execution(ExecutionBoundary::mcp()),
+                    .with_execution(ExecutionBoundary::mcp(self.client.process_isolation())),
                 Err(error) => ToolOutcome::failed(format!(
                     "MCP 工具 `{}.{}` 调用失败: {error}",
                     self.server, self.remote_name
                 ))
-                .with_execution(ExecutionBoundary::mcp()),
+                .with_execution(ExecutionBoundary::mcp(self.client.process_isolation())),
             }
         })
     }
@@ -416,6 +444,8 @@ mod tests {
         reply: Result<String, String>,
         /// 记录收到的调用（原始名），断言转发用了不带前缀的名字。
         calls: Mutex<Vec<String>>,
+        /// 模拟"子进程已纳入宿主沙箱"，驱动边界证据的 active 分支。
+        isolated: bool,
     }
 
     /// 半死 Server 的假连接：握手能成（对 `connect` 而言它已经是
@@ -425,6 +455,10 @@ mod tests {
     struct HalfDeadClient;
 
     impl McpClientHandle for HalfDeadClient {
+        fn process_isolation(&self) -> bool {
+            false
+        }
+
         fn list_tools(&self) -> BoxFuture<'_, Result<Vec<RmcpTool>, String>> {
             Box::pin(std::future::pending())
         }
@@ -444,6 +478,17 @@ mod tests {
                 tools,
                 reply: Ok("工具结果".to_owned()),
                 calls: Mutex::new(Vec::new()),
+                isolated: false,
+            })
+        }
+
+        /// 与 `with_tools` 同，但报告"子进程已进宿主沙箱"。
+        fn protected(tools: Vec<RmcpTool>) -> Arc<Self> {
+            Arc::new(Self {
+                tools,
+                reply: Ok("工具结果".to_owned()),
+                calls: Mutex::new(Vec::new()),
+                isolated: true,
             })
         }
 
@@ -452,11 +497,16 @@ mod tests {
                 tools,
                 reply: Err("连接已断".to_owned()),
                 calls: Mutex::new(Vec::new()),
+                isolated: false,
             })
         }
     }
 
     impl McpClientHandle for FakeClient {
+        fn process_isolation(&self) -> bool {
+            self.isolated
+        }
+
         fn list_tools(&self) -> BoxFuture<'_, Result<Vec<RmcpTool>, String>> {
             Box::pin(async { Ok(self.tools.clone()) })
         }
@@ -580,8 +630,8 @@ mod tests {
         assert_eq!(outcome.content, "工具结果");
         assert_eq!(
             outcome.execution,
-            Some(ExecutionBoundary::mcp()),
-            "MCP 成功调用要显式交代它跑在外部进程"
+            Some(ExecutionBoundary::mcp(false)),
+            "替身未纳入沙箱，边界如实记 active=false"
         );
         assert_eq!(client.calls.lock().unwrap().as_slice(), ["get_page"]);
     }
@@ -605,8 +655,30 @@ mod tests {
         assert!(outcome.is_error());
         assert_eq!(
             outcome.execution,
-            Some(ExecutionBoundary::mcp()),
-            "调用外部 Server 的尝试同样不受本进程沙箱保护"
+            Some(ExecutionBoundary::mcp(false)),
+            "调用失败的 MCP 尝试也交代边界；此替身未纳入沙箱故 active=false"
+        );
+    }
+
+    /// 子进程纳入宿主沙箱后，MCP 边界如实记 active=true——不再对 MCP 一律
+    /// 写死"无保护"。这是 Unit A（MCP 进 Job Object）在证据层的兑现。
+    #[tokio::test]
+    async fn a_job_protected_mcp_call_is_recorded_as_protected() {
+        let client = FakeClient::protected(vec![rmcp_tool("get_page", "Fetches a page")]);
+        let source = McpToolSource::from_client("fetch", client).await.unwrap();
+        let entry = source.entries().remove(0);
+
+        let call = ToolCall {
+            id: crate::domain::ids::CallId::new("call_1"),
+            name: "mcp__fetch__get_page".to_owned(),
+            arguments: json!({}),
+        };
+        let outcome = entry.invoker.invoke(&call).await;
+
+        assert_eq!(
+            outcome.execution,
+            Some(ExecutionBoundary::mcp(true)),
+            "纳入沙箱的 MCP 调用要记 active=true"
         );
     }
 

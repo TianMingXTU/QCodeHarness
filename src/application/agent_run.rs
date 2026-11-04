@@ -2557,7 +2557,7 @@ mod tests {
             annotations: ToolAnnotations::new(true, false, true, true),
         };
         let invoker = Arc::new(RecordingInvoker::with_boundary(
-            crate::domain::sandbox::ExecutionBoundary::mcp(),
+            crate::domain::sandbox::ExecutionBoundary::mcp(false),
         ));
         let mut harness = harness_with_invoker(
             vec![

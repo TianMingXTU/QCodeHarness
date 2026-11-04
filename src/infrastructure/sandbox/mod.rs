@@ -7,9 +7,9 @@
 #[cfg(windows)]
 mod windows_impl;
 #[cfg(windows)]
-pub use windows_impl::{assign_child, JobGuard};
+pub use windows_impl::{assign_child, protect_pid, JobGuard};
 
 #[cfg(not(windows))]
 mod noop_impl;
 #[cfg(not(windows))]
-pub use noop_impl::{assign_child, JobGuard};
+pub use noop_impl::{assign_child, protect_pid, JobGuard};

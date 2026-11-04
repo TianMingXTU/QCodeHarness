@@ -21,3 +21,9 @@ impl JobGuard {
 pub fn assign_child(_job: &JobGuard, _child: &tokio::process::Child) -> Result<(), String> {
     Err(UNSUPPORTED.to_owned())
 }
+
+/// 本平台无进程沙箱，无法把外部 PID 纳入任何边界；返回不支持，调用方按
+/// `active = false` 降级并如实记证据。
+pub fn protect_pid(_pid: u32, _policy: &SandboxPolicy) -> Result<JobGuard, String> {
+    Err(UNSUPPORTED.to_owned())
+}
