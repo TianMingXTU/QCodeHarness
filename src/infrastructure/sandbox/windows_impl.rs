@@ -46,12 +46,17 @@ unsafe impl Send for JobGuard {}
 unsafe impl Sync for JobGuard {}
 
 impl JobGuard {
-    /// 创建 Job 并施加策略（内存 / 进程数 / CPU 时间）。
+    /// 创建 Job 并施加策略（内存上限 / 进程数上限 / 句柄关闭即整树终止）。
+    ///
+    /// `cpu_time` 不在此列：`apply_limits` 明确拒绝它（默认策略也不启用），
+    /// 详见该函数说明。
     ///
     /// # Errors
     ///
-    /// Job 创建或限额设置失败时返回说明文本；调用方降级运行
-    /// （命令照跑，`sandbox_active = false`）而不是中断任务。
+    /// Job 创建或限额设置失败时返回说明文本。**取向由调用方 `run_with_policy`
+    /// 决定**：Windows 上创建失败按 fail-closed 处理——命令不执行、返回
+    /// `RunError::Refused`，一个子进程都不启动；只有平台没实现（非 Windows）
+    /// 或启动后 `assign` 失败才降级执行并记 `sandbox_active = false`。
     pub fn create(policy: &SandboxPolicy) -> Result<Self, String> {
         // 匿名 Job（不设名字）：随句柄走，不留在对象命名空间里。
         let handle = unsafe { CreateJobObjectW(None, None) }
