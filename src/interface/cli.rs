@@ -24,6 +24,7 @@ pub const USAGE: &str = "\
       cargo run -- --benchmark
       cargo run -- --benchmark-long
       cargo run -- --mcp-reconnect <服务器名>
+      cargo run -- --help
 示例: cargo run -- \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
       cargo run -- --yes \"非交互场景下跑同一个任务\"
       cargo run -- --ai-review \"让模型先审一遍，拿不准的再问人\"
@@ -86,6 +87,10 @@ pub struct CliArgs {
     /// 发现，把结果写进连接审计后关闭连接退出。任务中途没有自动重试，
     /// 恢复通信是人明确下令的动作（与"调用超时不自动重放"同一条线）。
     pub mcp_reconnect: Option<String>,
+    /// 打印用法后正常退出（`--help` / `-h`）。
+    ///
+    /// 帮助是纯查询：与其他开关同场时也只看帮助，不跑任务、不做模式校验。
+    pub help: bool,
 }
 
 /// 解析命令行参数。
@@ -112,6 +117,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut benchmark = false;
     let mut benchmark_long = false;
     let mut mcp_reconnect = None;
+    let mut help = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut iter = argv.into_iter();
@@ -124,6 +130,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--json" => json = true,
             "--benchmark" => benchmark = true,
             "--benchmark-long" => benchmark_long = true,
+            "--help" | "-h" => help = true,
             "--report-dir" => match iter.next() {
                 Some(dir) => report_dir = Some(dir),
                 None => {
@@ -162,6 +169,28 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             },
             other => positional.push(other.to_owned()),
         }
+    }
+
+    // 帮助是纯查询：忽略其余开关与位置参数，也不走下面的模式校验。
+    // 让 `--help` 和别的开关同场时报错，只会把"我想看用法"变成一道谜题。
+    if help {
+        return Some(CliArgs {
+            task: None,
+            auto_approve: false,
+            ai_review: false,
+            resume: None,
+            resume_task: None,
+            force_worktree: false,
+            list_sessions: false,
+            kind: None,
+            report: false,
+            report_dir: None,
+            json: false,
+            benchmark: false,
+            benchmark_long: false,
+            mcp_reconnect: None,
+            help: true,
+        });
     }
 
     if positional.len() > 1 {
@@ -262,6 +291,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         benchmark,
         benchmark_long,
         mcp_reconnect,
+        help,
     })
 }
 
@@ -488,6 +518,25 @@ mod tests {
         assert_eq!(args.task.as_deref(), Some("检查这段代码"));
         assert!(args.auto_approve);
         assert_eq!(args.kind.as_deref(), Some("review"));
+    }
+
+    /// `--help` / `-h` 是用法查询，不能被当成任务描述。
+    #[test]
+    fn help_is_recognised_instead_of_becoming_a_task() {
+        for flag in ["--help", "-h"] {
+            let args = parse_from(argv(&[flag])).expect("帮助应解析成功");
+            assert!(args.help, "{flag} 应置 help");
+            assert!(args.task.is_none(), "{flag} 不能变成任务描述");
+        }
+    }
+
+    /// 帮助优先于其他开关：不跑任务，也不因组合不合法而报错。
+    #[test]
+    fn help_wins_over_other_flags() {
+        let args = parse_from(argv(&["--json", "--help", "别跑我"])).expect("帮助应解析成功");
+        assert!(args.help);
+        assert!(args.task.is_none(), "帮助模式不带任务");
+        assert!(!args.json, "帮助之外的模式开关不应生效");
     }
 
     /// `--ai-review` 与 `--yes` 各自独立，也能同时给出。

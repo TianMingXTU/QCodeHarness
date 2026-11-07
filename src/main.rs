@@ -247,6 +247,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     };
 
+    // 帮助是纯查询：不读模型配置、不装工具，打印后正常退出。
+    if args.help {
+        println!("{}", cli::USAGE);
+        return Ok(());
+    }
+
     let workspace = std::env::current_dir()?;
     let store = Arc::new(JsonSessionStore::new(&workspace));
 
