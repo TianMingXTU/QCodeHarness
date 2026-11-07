@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::tool::ToolCall;
 
-/// Agent 角色。P0 只有单一编码助手；P5 起按角色分化行为——
+/// Agent 角色。不同角色按职责分化行为——
 /// 不同角色看到不同的系统提示词、拿到不同的工具子集（见
 /// `domain::agent_profile`），编排器按步骤的角色分派。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(AgentRole::Reviewer.name(), "reviewer");
     }
 
-    // ── P11-3 模型与档位 ───────────────────────────────────────────────
+    // ── 模型与档位 ─────────────────────────────────────────────────────
 
     /// 档位短名能往返解析。
     ///
@@ -180,7 +180,7 @@ mod tests {
 /// prompt——少了一处可能不同步的状态。预算不在其中：它是每次运行
 /// 可调的外部输入，由 `AgentRunner::run` 传入。
 ///
-/// 工具规格也不在这里：P2 起模型可见的工具由 `ToolRegistry` 提供，
+/// 工具规格也不在这里：模型可见的工具由 `ToolRegistry` 提供，
 /// 与执行入口绑在一起（`ModelRequest.tools`），避免"spec 声明了工具
 /// 却没人执行它"的双源头漂移。
 ///

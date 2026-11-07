@@ -5,7 +5,7 @@
 //! 任务目标——步骤说明因此必须自包含（步骤边界是一条独立的用户消息，
 //! 模型是从它知道"现在做第几步"的），不能只写"继续"。
 //!
-//! P4 只有内置模板；用户自定义模板的加载是产品化阶段的事。
+//! 内置模板之外，用户自定义模板的加载留给产品化阶段。
 
 use crate::domain::agent::AgentRole;
 use crate::domain::task::{TaskKind, TaskStep};
@@ -28,7 +28,7 @@ pub struct WorkflowTemplate {
 pub struct StepTemplate {
     /// 步骤说明。
     pub description: String,
-    /// 这一步期望 Agent 扮演的角色。P5 起编排器按它查档案装配
+    /// 这一步期望 Agent 扮演的角色。编排器按它查档案装配
     /// （系统提示词 + 工具子集），不再是统一的 Coder。
     pub role: AgentRole,
     /// 完成判据。
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn builtin_templates_dispatch_roles_per_the_table() {
-        // 角色表是 P5-1e 的验收项：只读分析交给 Planner/Reviewer，
+        // 角色表的分派原则：只读分析交给 Planner/Reviewer，
         // 动手改动交给 Coder，跑命令收集结果交给 Tester。
         let catalog = WorkflowCatalog::builtin();
         let roles_of = |kind: TaskKind| -> Vec<AgentRole> {

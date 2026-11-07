@@ -331,7 +331,7 @@ answer_must_mention = []
         assert!(matches!(error, BenchmarkLoadError::RootIo(_)), "{error}");
     }
 
-    // ── P10 切片 4：套件划分 ──────────────────────────────────────────
+    // ── 套件划分 ──────────────────────────────────────────────────────
 
     /// 套件筛选：default 套件不返回 long 任务，反之亦然。
     #[test]

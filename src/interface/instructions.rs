@@ -21,9 +21,9 @@ const ROOT_INSTRUCTIONS: &str = "QCODEHARNESS.md";
 
 /// 次级位置：harness 自己的目录里。
 ///
-/// 存在的意义是"模型改不了"：P8-1 把 `.qcodeharness` 列为受保护路径，
-/// agent 读写都会被拒，所以放在这里的指令不会被一次失控的 `write_file`
-/// 抹掉。两个位置都存在时根上的赢——它离项目的 README 更近，
+/// 存在的意义是"模型改不了"：`.qcodeharness` 是受保护路径，agent 读写
+/// 都会被拒，所以放在这里的指令不会被一次失控的 `write_file` 抹掉。
+/// 两个位置都存在时根上的赢——它离项目的 README 更近，
 /// 是使用者最先会想到的地方。
 const SECONDARY_INSTRUCTIONS: &str = ".qcodeharness/instructions.md";
 
@@ -42,8 +42,8 @@ pub struct ProjectInstructions {
 
 /// 从 workspace 根加载项目指令。
 ///
-/// 两个位置都没有可读的文件时返回 `None`——此时行为与 P8-4 之前完全
-/// 一致：提示词就是内置档案那一份，不多一行。
+/// 两个位置都没有可读的文件时返回 `None`——此时提示词就是内置档案
+/// 那一份，不多一行。
 pub fn load_project_instructions(root: &Path) -> Option<ProjectInstructions> {
     for relative in [ROOT_INSTRUCTIONS, SECONDARY_INSTRUCTIONS] {
         let path = root.join(relative);
@@ -107,8 +107,8 @@ mod tests {
 
     #[test]
     fn no_instruction_file_means_no_instructions() {
-        // P8-4 的兼容性承诺：文件不存在时加载器什么都不给，
-        // 提示词与 P7 逐字相同。
+        // 兼容性承诺：文件不存在时加载器什么都不给，
+        // 提示词保持与内置档案逐字相同。
         assert_eq!(load_project_instructions(&root("absent")), None);
     }
 

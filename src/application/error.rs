@@ -41,7 +41,7 @@ pub enum ApplicationError {
     },
 
     /// 墙钟超时。与轮数耗尽分开报：两者的对策不同——前者调大时限
-    /// 或拆小任务，后者调大 LLM_MAX_TURNS。P9-3 起一个任务一个会话，
+    /// 或拆小任务，后者调大 LLM_MAX_TURNS。一个任务一个会话，
     /// 编排模式下这里报的是整个任务的耗时。
     #[error("耗时 {elapsed:?} 超过上限 {limit:?}，任务终止；请调大 QCH_MAX_WALL_CLOCK 或拆小任务")]
     WallClockExhausted {
@@ -113,7 +113,7 @@ pub enum ApplicationError {
         step: usize,
         /// 失败原因，含原错误信息。
         message: String,
-        /// 本次任务的会话 ID。P9-3 起一个任务只有一个会话，证据文件与
+        /// 本次任务的会话 ID。一个任务只有一个会话，证据文件与
         /// 快照都按它命名——失败的那一步也在同一个文件里。
         session_id: SessionId,
         /// 本次运行中已完成的步骤数（失败的那步不算）。

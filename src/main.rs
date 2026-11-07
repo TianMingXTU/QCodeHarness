@@ -57,8 +57,8 @@ use qcode_harness::interface::instructions;
 /// `LLM_MAX_TURNS` 未设置时的默认最大轮数。
 const DEFAULT_MAX_TURNS: u32 = 20;
 
-// 系统提示词随角色分发：P5 起各角色的提示词在 `AgentProfile::builtin()`
-// 里（按角色提供"能做什么、不许做什么"），这里不再有全局提示词。
+// 系统提示词随角色分发：各角色的提示词集中在 `AgentProfile::builtin()`
+// 里（按角色提供"能做什么、不许做什么"），这里没有全局提示词。
 
 /// 运行所需的模型服务配置，来自 `.env` 或进程环境变量。
 #[derive(Debug, Clone)]
@@ -75,12 +75,11 @@ struct LlmConfig {
     policy_path: Option<PathBuf>,
     /// 是否跳过人工审批。`--yes` 或 `QCH_AUTO_APPROVE=1` 时为真。
     auto_approve: bool,
-    /// 墙钟上限（秒）。P9-3 起一个任务一个会话，编排模式下它就是
-    /// 整个任务的上限；`--resume` 时是本次恢复运行的上限。
-    /// 未设置时不限时。
+    /// 墙钟上限（秒）。编排模式下一个任务一个会话，它就是整个任务的
+    /// 上限；`--resume` 时是本次恢复运行的上限。未设置时不限时。
     max_wall_clock: Option<Duration>,
-    /// 被裁历史累积到多少轮才生成一次 LLM 摘要。未设置时不做摘要
-    /// （裁剪退回占位说明，P3 行为）。
+    /// 被裁历史累积到多少轮才生成一次 LLM 摘要。未设置时不做摘要，
+    /// 被裁历史一律退回占位说明。
     summarize_min_dropped: Option<usize>,
     /// 各角色专属的模型名。未设置的角色用默认模型。
     role_models: HashMap<AgentRole, String>,
@@ -150,7 +149,7 @@ impl LlmConfig {
 ///
 /// 变量名按 `LLM_MODEL_<角色>` 的规律拼（见
 /// [`AgentRole::model_env_name`]）。没设置的角色不进表——编排器据此
-/// 用运行时的默认模型，行为与 P10 逐字一致。
+/// 用运行时的默认模型，请求里不出现 `model` 字段。
 fn read_role_models() -> HashMap<AgentRole, String> {
     read_role_models_from(|name| std::env::var(name).ok())
 }
@@ -227,8 +226,8 @@ fn read_role_verbosities_from(
 /// 在 [`AgentRoster::builtin`] 里定死，这里不碰——给 Tester 配一个更
 /// 强的模型不等于让它能改文件。
 ///
-/// 没配到的角色保持 `None`，跑起来的请求与 P10 逐字一致（`model` 不
-/// 出现在请求里，档位由 provider 取默认）。
+/// 没配到的角色保持 `None`：请求里不出现 `model` 字段，档位由
+/// provider 取默认。
 fn roster_with_role_models(config: &LlmConfig) -> AgentRoster {
     AgentRoster::builtin().with_role_models(
         &config.role_models,
@@ -425,7 +424,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // 白名单是硬边界，编排与恢复两条路径共用一条滤网（AgentRoster）。
         // 不裁的话，中断的只读步骤恢复后会带着全量注册表上场，
         // 提示词说"你没有写能力"，模型手里却握着 write_file。
-        // 工具给全量：P9-3 起模型看到的工具定义对所有步骤统一（前缀缓存
+        // 工具定义给全量：模型看到的工具定义对所有步骤统一（前缀缓存
         // 才命得中），角色边界由 runner 按花名册在调用层校验——恢复路径
         // 与编排路径走的是同一道校验，不因入口不同而松动。
         let runner = match AgentRunner::resume(
@@ -545,9 +544,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // 项目指令：workspace 根上的 QCODEHARNESS.md（次级位置
-    // .qcodeharness/instructions.md，P8-1 起模型读写都会被拒，所以放那里
-    // 的约定不会被一次失控的 write_file 抹掉）。两个位置都没有时花名册
-    // 就是内置档案，行为与没有这个特性时逐字相同。
+    // .qcodeharness/instructions.md 在受保护路径里，模型读写都会被拒，
+    // 放那里的约定不会被一次失控的 write_file 抹掉）。两个位置都没有
+    // 时花名册就是内置档案，行为与没有这个特性时逐字相同。
     let roster = match instructions::load_project_instructions(&workspace) {
         Some(loaded) => {
             for warning in &loaded.warnings {
@@ -913,9 +912,8 @@ mod tests {
         assert!(!models.contains_key(&AgentRole::Tester));
     }
 
-    /// 一个角色都没配时，表是空的——请求里不会出现 `model` 字段。
-    ///
-    /// 这是 P11 的兼容底线：默认部署的行为必须与 P10 逐字一致。
+    /// 一个角色都没配时，表是空的——请求里不会出现 `model` 字段，
+    /// 默认部署就是全角色共用运行时的默认模型。
     #[test]
     fn without_any_configuration_the_tables_are_empty() {
         assert!(read_role_models_from(&table(&[])).is_empty());

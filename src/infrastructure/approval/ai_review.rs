@@ -119,9 +119,9 @@ impl AiReviewGate {
     /// 参数原文整体给出，不做截断：审查员要看的正是参数里那一段越界路径
     /// 或外传地址，截断了它就什么也判断不出来。
     ///
-    /// `request.reason`（P8-3 的越界写入升级理由）必须一起给：策略之上
+    /// `request.reason`（策略追加复核时给出的理由）必须一起给：策略之上
     /// 追加的复核是"这条被判定疑似越界"的唯一线索，审查员看不到它就把
-    /// 一次升级审当普通调用放行——P8-3 承诺的"每次都要人过目"会在这一层
+    /// 一次升级审当普通调用放行——"每次都要人过目"的承诺会在这一层
     /// 被静默降级成"模型说行就行"。
     fn review_prompt(request: &ApprovalRequest) -> String {
         let escalation = match &request.reason {
@@ -571,7 +571,7 @@ mod tests {
         assert!(prompt.contains("破坏性"), "风险标记必须带上: {prompt}");
     }
 
-    /// P8-3 的升级理由必须进提问。
+    /// 策略追加的升级理由必须进提问。
     ///
     /// 用户验收时发现的文档不诚实：README 写"审查员拿到工具名、参数、
     /// 风险注解与升级理由"，而 `review_prompt` 一次都没用 `request.reason`。

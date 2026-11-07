@@ -21,13 +21,12 @@ use super::agent_run::{PendingRound, RunState};
 
 /// 当前快照格式版本。每次快照结构发生不兼容变化时 +1。
 ///
-/// v2（P5）：`AgentRole` 从单变体扩展为四变体，P4 快照里的角色序列化
-/// 形态随之改变——旧快照被显式拒绝而不是猜着解释。
+/// v2：`AgentRole` 有四个变体，角色的序列化形态比 v1 丰富——v1 快照
+/// 被显式拒绝而不是猜着解释。
 ///
-/// v3（P10）：任务级快照落地。`RunSnapshot` 本身结构未变，但快照从
-/// "只描述一个 runner"扩到"描述一个任务"，两者的兼容前提不同——
-/// 一个 P10 之前写的快照没有任务上下文，恢复时无法回答"这是整个任务的
-/// 哪一步"，因此明确拒绝而不是猜着填。
+/// v3：快照描述的是"整个任务"而不只是"一个 runner"。v2 快照没有任务
+/// 上下文，恢复时无法回答"这是整个任务的哪一步"，因此明确拒绝而不是
+/// 猜着填。
 pub const RUN_FORMAT: u32 = 3;
 
 /// 当前任务快照格式版本。
@@ -295,7 +294,7 @@ mod tests {
 
     #[test]
     fn snapshot_from_previous_format_is_rejected() {
-        // P4 写的 v1 快照：AgentRole 扩展后序列化形态已变，必须明确拒绝
+        // v1 快照：AgentRole 扩展后序列化形态已变，必须明确拒绝
         // 而不是猜着兼容——这是 acceptance 的硬要求，也是静默兼容更危险
         // 的直接体现。
         let mut snapshot = mid_round_snapshot();
@@ -307,7 +306,7 @@ mod tests {
         assert_eq!(expected, RUN_FORMAT);
     }
 
-    /// P10 起旧快照（v2）也要被明确拒绝。
+    /// 旧快照（v2）也要被明确拒绝。
     ///
     /// v2 的快照结构本身还能读，但它只描述一个 runner——没有任务上下文，
     /// 恢复时回答不了"这是整个任务的哪一步"。任务级恢复要的是能回答
@@ -320,11 +319,11 @@ mod tests {
         let StoreError::VersionMismatch { found: 2, expected } = error else {
             panic!("应报版本不匹配，实际 {error}")
         };
-        assert_eq!(expected, 3, "P10 之后当前格式是 v3");
+        assert_eq!(expected, 3, "当前格式是 v3");
         assert!(error.to_string().contains("v2"), "{error}");
     }
 
-    // ── P10 切片 1b：任务快照 ──────────────────────────────────────────
+    // ── 任务快照 ────────────────────────────────────────────────────────
 
     /// 一个三步任务、停在第 2 步、已完成第 1 步的任务快照。
     fn task_snapshot() -> TaskSnapshot {

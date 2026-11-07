@@ -46,8 +46,7 @@ impl ToolAnnotations {
     ///
     /// 判据取 `!read_only` 而不是 `destructive`：破坏性是工具作者的主观声明，
     /// 漏标一个工具就等于开了一个后门；而"不是只读"是客观的——
-    /// 只要可能改动状态就先问一声。P0 的 `AutoApproveGate` 恒放行，
-    /// 行为与现状一致，但接缝已经打通。
+    /// 只要可能改动状态就先问一声，与任何恒放行的实现保持同一接缝。
     pub fn requires_approval(&self) -> bool {
         !self.read_only
     }

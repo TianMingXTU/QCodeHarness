@@ -65,7 +65,7 @@ pub struct CliArgs {
     pub force_worktree: bool,
     /// 只列出可恢复的会话（`--list-sessions`），然后退出。
     pub list_sessions: bool,
-    /// 任务模板名（`--kind <name>`），交给任务编排（P4-2）解析。
+    /// 任务模板名（`--kind <name>`），交给任务编排解析。
     pub kind: Option<String>,
     /// 生成运行报表（`--report`）：读证据统计成功率、工具结局与成本。
     /// 不需要模型配置。

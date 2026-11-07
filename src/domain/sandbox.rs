@@ -118,7 +118,7 @@ impl Default for SandboxPolicy {
 ///
 /// 这是**词法**边界判定，不是隔离，也不是 shell 求值：变量拼接、命令替换、
 /// 编码绕过与链接物理目标仍可绕过；真正的进程边界由基础设施层建立。
-/// 无根（P8-3）与有根（P11）共用同一份解析结果，唯一差别是 `root`：
+/// 无根与有根共用同一份解析结果，唯一差别是 `root`：
 /// 无根时所有绝对路径都算嫌疑，有根时只拒真的不在根下的绝对路径。
 pub fn write_escape_suspect(command: &str) -> Option<String> {
     command_escape_violation(&parse_command(command), None)
@@ -130,10 +130,10 @@ pub fn write_escape_beyond(command: &str, root: &Path) -> Option<String> {
 
 /// 两道防线唯一的裁决器：逐段、逐重定向、逐词元查越界，任一段命中即拒。
 ///
-/// `root` 同时表达 P8/P11 有意保留的口径落差：P8 没有 workspace 根，
-/// 所有盘符绝对路径都升级审批（根内也多问一次）；P11 知道根在哪，
-/// 只硬拒绝真的越界。把 `write_escape_suspect` 改成根感知会动 P8 语义
-/// 与四条验收测试，本切片不消除这层落差，只消除重复切词。
+/// `root` 表达两道防线有意保留的口径落差：无根调用没有根可参照，
+/// 所有盘符绝对路径都升级审批（根内也多问一次）；有根调用知道根在哪，
+/// 只硬拒绝真的越界。升级审批宁可多问，机械防线必须精准，
+/// 两边语义不同，不能合并成一个判据。
 fn command_escape_violation(parsed: &ParsedCommand, root: Option<&Path>) -> Option<String> {
     let multi_segment = parsed.segments.len() > 1;
     for (index, segment) in parsed.segments.iter().enumerate() {
@@ -151,8 +151,8 @@ fn command_escape_violation(parsed: &ParsedCommand, root: Option<&Path>) -> Opti
                 ));
             }
         }
-        // 重定向目标也留在词元流里：P9 起"任何词元提到越界路径即触发"
-        // 是收紧后的口径，不能因为有了 redirect 索引就退回只看重定向。
+        // 重定向目标也留在词元流里："任何词元提到越界路径即触发"
+        // 是现行口径，不能因为有了 redirect 索引就退回只看重定向。
         for word in &segment.words {
             let candidate = word.path_candidate();
             if let Some(reason) = path_escape_reason(candidate, root) {
@@ -190,7 +190,7 @@ fn segment_note(
     format!("{reason}（第 {} 段，程序 `{program}`）", index + 1)
 }
 
-/// 写入型动词只用于生成可读理由；P9 起任何越界路径都会触发，不以动词为门槛。
+/// 写入型动词只用于生成可读理由；任何越界路径都会触发，不以动词为门槛。
 /// 归属按**段**判定：`cargo test && rm D:/outside/x` 的理由应指向 `rm`，
 /// 而不是从整条命令里挑一个恰好出现过的动词。
 fn write_verb(segment: &CommandSegment) -> Option<&'static str> {
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn default_policy_kills_tree_and_sets_generous_ceilings() {
         let policy = SandboxPolicy::default();
-        // kill_tree 是 P7 的核心价值：整树终止必须是默认行为，不能靠
+        // kill_tree 是核心价值：整树终止必须是默认行为，不能靠
         // 调用方记得开。
         assert!(policy.kill_tree);
         // 内存/进程数给天花板不设绊索：宽到正常构建永远够不到。
@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(policy.max_processes, None);
     }
 
-    // ── P8-3 越界写入嫌疑 ──────────────────────────────────────────────
+    // ── 越界写入嫌疑 ──────────────────────────────────────────────
 
     /// 真值表：看得见越界目标的写入要被抓出来，workspace 内的操作不打扰。
     ///
@@ -359,10 +359,10 @@ mod tests {
             r"echo hi >> ..\out.txt",
             // UNC 共享路径。
             r"copy src \\server\share\x",
-            // 不带写入型动词、也不带 `>` 的越界：P9-5 的默认基线放行了
-            // `git diff *` 一族，`--output` 是 git 自己的写文件选项，
-            // 只按动词和重定向判就整个漏掉——而它确实把 workspace 的
-            // 内容写到了外面。本机实测 `git diff --output=D:\x` 会落盘。
+            // 不带写入型动词、也不带 `>` 的越界：默认基线放行了
+            // `git diff *` 一族，而 `--output` 是 git 自己的写文件选项，
+            // 只按动词和重定向判就整个漏掉——本机实测
+            // `git diff --output=D:\x` 会落盘，内容确实写到了外面。
             r"git diff --output=C:\Windows\temp\x",
             // 开关与值之间不写空格是常见写法，值跟在 `=` 后面。
             r"cargo build --target-dir=D:/cache",
@@ -614,16 +614,16 @@ mod tests {
     }
 
     /// 两道防线跑在同一份解析结果上：同一条命令的段号与越界目标一致，
-    /// 差别只在 P8 的"无根一律嫌疑"与 P11 的"根内放行"。
+    /// 差别只在"无根一律嫌疑"与有根的"根内放行"。
     #[test]
     fn both_defenses_share_one_parse_and_keep_the_documented_gap() {
         let parsed = parse_command(r"cargo test && type D:\repo\src\main.rs");
         let root = Path::new(r"D:/repo");
 
         let suspect = write_escape_suspect(r"cargo test && type D:\repo\src\main.rs")
-            .expect("P8 无根：根内绝对路径也要多问一次");
+            .expect("无根：根内绝对路径也要多问一次");
         let beyond = write_escape_beyond(r"cargo test && type D:\repo\src\main.rs", root);
-        assert_eq!(beyond, None, "P11 知道根在哪，同样的路径应放行");
+        assert_eq!(beyond, None, "有根：同样的路径应放行");
         assert!(suspect.contains("第 2 段"), "{suspect}");
         assert_eq!(parsed.segments[1].program(), Some("type"));
         assert_eq!(

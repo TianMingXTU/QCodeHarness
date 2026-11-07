@@ -15,9 +15,10 @@ use crate::domain::policy::PolicyScope;
 
 /// 本会话内的一条信任记录。
 ///
-/// P1 只按工具名记忆，粒度太粗：一句"允许 write_file"会连带放行之后所有
-/// write_file，包括写 `Cargo.toml` 的。P8-2 把信任拆成两档——参数完全
-/// 一致的精确信任，和参数文本命中某个前缀的模式信任。
+/// 信任的粒度跟后果对齐：信任只记一次调用，不按工具名记。一句"允许
+/// write_file"若连带放行之后所有 write_file，就包括写 `Cargo.toml` 的——
+/// 参数不同，后果不同。因此信任分两档：参数完全一致的精确信任，和参数
+/// 文本命中某个前缀的模式信任。
 enum TrustEntry {
     /// `a`：同工具且参数完全一致才放行。
     Exact {
@@ -226,8 +227,8 @@ impl CliApprovalGate {
             return None;
         }
 
-        // P9-5：先算一个候选建议。它只是预填的默认值——用户敲了别的就以
-        // 敲的为准，留空则接受它。给不出建议时行为与从前逐字相同。
+        // 前缀信任的便利不能引入额外询问：先算一个候选建议，作为预填的
+        // 默认值——用户敲了别的就以敲的为准，留空则接受它。
         let suggestion = suggested_prefix(call);
         let accept_hint = match &suggestion {
             Some(candidate) => format!("回车用 `{candidate}`，或输入别的"),
@@ -249,7 +250,7 @@ impl CliApprovalGate {
             Ok(0) | Err(_) => return None,
             Ok(_) => line.trim().to_owned(),
         };
-        // 留空且给得出建议值：接受建议。这是 P9-5 省下的那次打字。
+        // 留空且给得出建议值：接受建议，省下的就是这次打字。
         // 没有建议值时 `?` 直接返回 None，走的仍是"回车取消"老路。
         let input = if input.is_empty() { suggestion? } else { input };
         scope_for(call, &input)
@@ -300,7 +301,7 @@ fn scope_for(call: &crate::domain::tool::ToolCall, input: &str) -> Option<Policy
     }
 }
 
-/// 从一次调用推断一个保守的前缀信任候选，供 `p` 预填（P9-5）。
+/// 从一次调用推断一个保守的前缀信任候选，供 `p` 预填。
 ///
 /// `p` 的全部意义是少敲几次键盘，但候选绝不能比人愿意授的范围更宽，
 /// 所以"词数要够"是硬要求：`cargo` 这种裸程序名会让会话信任膨胀到该
@@ -469,7 +470,7 @@ mod tests {
         }
     }
 
-    /// 策略追加的复核请求（P8-3 的越界写入升级就是这一种）。
+    /// 策略追加的复核请求：策略放行了调用，但对它有额外疑虑，要求人复核。
     fn escalated_request(command: &str) -> ApprovalRequest {
         ApprovalRequest {
             reason: Some(format!(
@@ -556,8 +557,8 @@ mod tests {
 
     /// `a` 记住的是**这一次调用**，不是这个工具。
     ///
-    /// P1 的 `a` 按工具名记忆，于是"允许 write_file"会连带放行之后所有
-    /// write_file——包括写 `Cargo.toml`、写 `.env` 的那些。参数不同，
+    /// 按工具名记忆会让"允许 write_file"连带放行之后所有 write_file——
+    /// 包括写 `Cargo.toml`、写 `.env` 的那些。参数不同，
     /// 后果不同，信任的粒度必须跟后果对齐。
     #[test]
     fn trust_a_remembers_the_exact_call_not_the_tool() {
@@ -624,8 +625,8 @@ mod tests {
     /// 那正是信任机制最不该有的用法。
     ///
     /// 用根目录下的文件：它给不出候选建议，所以留空走的仍是"取消"这条
-    /// 老路。P9-5 之后留空的含义取决于有没有建议值——有建议时留空是
-    /// 接受它（见 `accepting_the_suggestion_with_enter_trusts_the_suggested_prefix`），
+    /// 老路。留空的含义取决于有没有建议值——有建议时留空是接受它（见
+    /// `accepting_the_suggestion_with_enter_trusts_the_suggested_prefix`），
     /// 那条路径上提示框已经把要授的范围原样印出来了。
     #[test]
     fn empty_prefix_answer_re_asks_without_trusting() {
@@ -798,7 +799,7 @@ mod tests {
         assert_eq!(risk_summary(&clean), "仅写操作，无已知风险标记");
     }
 
-    // ── P9-5 前缀候选建议 ──────────────────────────────────────────────
+    // ── 前缀候选建议 ──────────────────────────────────────────────────
 
     fn call_with(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {

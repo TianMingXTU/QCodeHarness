@@ -97,7 +97,9 @@ pub struct WorkspacePath(PathBuf);
 impl WorkspacePath {
     /// 把模型给出的路径解析到 workspace 内。
     ///
-    /// 这是 M1 的词法校验，不解析符号链接；完整的沙箱隔离是后续里程碑的工作。
+    /// 这里只做词法校验，不解析符号链接；符号链接与 junction 的物理
+    /// 目标由 infrastructure 层解析后再问一次 [`is_protected_path`]
+    /// （见 `tool::resolve_in`），两层合起来才是完整的越界防线。
     ///
     /// 受保护路径（见 [`is_protected`]）在这里一并拒绝，而不是留给策略层：
     /// 策略是给使用者调配的调剂，而"agent 不能改版本库元数据和审计证据"
@@ -166,7 +168,7 @@ mod tests {
         assert_eq!(resolved.as_path(), workspace().as_path().join("./README.md"));
     }
 
-    // ── P8-1 受保护路径 ────────────────────────────────────────────────
+    // ── 受保护路径 ────────────────────────────────────────────────────
 
     /// 受保护路径的真值表：`.git`、`.qcodeharness`、`.env*` 一律拒，
     /// 名字相似但不是它们的（`.gitignore`、`.github`、`environments/`）一律放。
@@ -174,8 +176,8 @@ mod tests {
     ///
     /// Windows 与 macOS 的文件系统默认大小写不敏感：`.GIT/config` 与
     /// `.git/config` 指向同一处。`is_protected` 若只做精确比较，模型把
-    /// 路径改写成大写就能读到 `.env`、改写 `.git/config`——而 P8-1 的全部
-    /// 意义就是"这两个位置 agent 碰不得"。用户验收时正是从这里被攻破的。
+    /// 路径改写成大写就能读到 `.env`、改写 `.git/config`——而受保护路径
+    /// 的全部意义就是"这两个位置 agent 碰不得"。
     #[test]
     fn protected_paths_are_matched_case_insensitively() {
         for rejected in [
@@ -234,9 +236,9 @@ mod tests {
     /// 尾随空格和点不能绕过保护。
     ///
     /// NTFS 会剥掉路径组件末尾的空格和点，`.env ` 与 `.env` 落在磁盘上是
-    /// 同一个文件。用户验收时审计拿这条打穿了 P8-1：`read_file(".env ")`
-    /// 成功返回凭据内容，`write_file(".env ", ...)` 成功覆盖了真实的 `.env`。
-    /// 审批界面上显示的路径是 `".env "`，人几乎不可能认出它就是 `.env`。
+    /// 同一个文件。`read_file(".env ")` 若不做归一化就会成功返回凭据内容，
+    /// `write_file(".env ", ...)` 就能覆盖真实的 `.env`；审批界面上显示的
+    /// 路径是 `".env "`，人几乎不可能认出它就是 `.env`。
     #[test]
     fn protected_names_survive_trailing_spaces_and_dots() {
         for rejected in [".env ", ".ENV  ", ".env .", ".env.", ".env..", ".git ", ".GIT ."] {

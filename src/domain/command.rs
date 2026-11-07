@@ -7,7 +7,7 @@
 //! 目标。引号只影响分词，不代表运行时求值结果。
 //!
 //! 取向是保守收紧：宁可把可疑文本也纳入检查，也不让一个真实存在的路径词元
-//! 从模型里消失。重定向目标因此**同时**留在有序词元流里——P9 起"任何词元
+//! 从模型里消失。重定向目标因此**同时**留在有序词元流里——"任何词元
 //! 提到 workspace 外路径即触发"是收紧后的口径，不能因为结构化就倒退。
 
 /// 段与段之间的链接符。它们是词法边界，不是普通词元。
@@ -63,7 +63,8 @@ impl CommandWord {
         }
     }
 
-    /// 路径判据要检查的字面值：有 `=` 时只看等号后的值，与 P9 起口径一致。
+    /// 路径判据要检查的字面值：有 `=` 时只看等号后的值，与"任何词元
+    /// 都查"的口径一致。
     pub fn path_candidate(&self) -> &str {
         self.flag_value.as_deref().unwrap_or(&self.text)
     }
@@ -147,7 +148,8 @@ fn parse_at_depth(command: &str, depth: u8) -> ParsedCommand {
             // 只对"shell 启动器 + 一段引号包住的命令文本"补查一层：
             // `cmd /C "echo x > D:\outside\x"` 是真实绕过形状，而 `git
             // commit -m "提到 C:\Users\x 的说明"` 是普通文本。无差别递归会
-            // 把提交说明里的路径误判成越界，那是收紧过头，不是本切片的目的。
+            // 把提交说明里的路径误判成越界，那是收紧过头，违背本模块
+            // "保守但不误伤普通文本"的目的。
             if depth == 0
                 && draft
                     .words
@@ -200,8 +202,8 @@ fn is_shell_launcher(program: &str) -> bool {
     matches!(stem, "cmd" | "sh" | "bash" | "zsh" | "powershell" | "pwsh")
 }
 
-/// 单遍词法扫描。反斜杠与反引号都是普通字符——引入转义处理会放松 Windows
-/// 路径的现有判据，而本切片的目标恰恰是不放松。
+/// 单遍词法扫描。反斜杠与反引号都是普通字符——引入转义处理会放松
+/// Windows 路径的现有判据，而词法的取向恰恰是不放松。
 fn lex(command: &str) -> Vec<DraftSegment> {
     let mut segments: Vec<DraftSegment> = Vec::new();
     let mut operator_before: Option<ShellOperator> = None;

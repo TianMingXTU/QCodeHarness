@@ -1,6 +1,6 @@
 //! 证据读取器：把 `.qcodeharness/sessions/*.jsonl` 读回成结构化数据。
 //!
-//! P6 统计与报表的全部输入都从这里来。与 [`JsonlEvidenceSink`] 是
+//! 统计与报表的全部输入都从这里来。与 [`JsonlEvidenceSink`] 是
 //! 同一磁盘契约的两端：读回就是 `serde_json::from_str::<Evidence>()`。
 //!
 //! 对坏数据的取向与 sink 的降级哲学一致：**流式日志的尾部损坏是常态**
@@ -352,17 +352,17 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 手写一条 P9 之前的证据行：没有 `format` 键，`recorded_at` 是整秒。
+    /// 手写一条旧版证据行：没有 `format` 键，`recorded_at` 是整秒。
     ///
-    /// 这是 P9-1 最容易踩的坑：把时间戳精度从秒提到毫秒时，如果不在
-    /// 行里留标记，reader 就只能猜。猜错的代价是**所有历史证据的耗时
-    /// 统计变成垃圾**——100 秒被读成 100 毫秒，一分钟的会话算成亚毫秒。
-    /// 所以旧文件必须仍然读得出正确的时刻，一条不漏。
+    /// 把时间戳精度从秒提到毫秒时，如果不在行里留标记，reader 就只能
+    /// 猜。猜错的代价是**所有历史证据的耗时统计变成垃圾**——100 秒被读成
+    /// 100 毫秒，一分钟的会话算成亚毫秒。所以旧文件必须仍然读得出正确的
+    /// 时刻，一条不漏。
     #[test]
     fn legacy_second_precision_lines_still_read_correctly() {
         let dir = temp_dir("legacy-seconds");
         let path = dir.join("session-legacy.jsonl");
-        // 照 P9 之前的落盘格式手写：sequence / recorded_at（秒）/ event。
+        // 照旧版落盘格式手写：sequence / recorded_at（秒）/ event。
         let lines = vec![
             serde_json::json!({
                 "sequence": 1,

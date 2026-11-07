@@ -3,9 +3,8 @@
 //! `AgentRunner` 是应用层的核心，它不直接依赖 rig 或 tokio，
 //! 而是通过端口（trait）与外部世界交互，保证可测试性。
 //!
-//! 行为与重构前的 `main.rs` 循环完全一致（先搬后改）：
-//! 每轮重建请求、无工具调用即给出最终答案、未注册工具生成拒绝观察、
-//! 达到 `max_turns` 报错、空回复报错。
+//! 循环行为：每轮重建请求、无工具调用即给出最终答案、
+//! 未注册工具生成拒绝观察、达到 `max_turns` 报错、空回复报错。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,8 +51,8 @@ pub const REPLAY_REASON: &str = "中断发生在这次调用执行期间，副�
 /// 审批停在 [`RunState::AwaitingApproval`]，把状态序列化后等外部回复；
 /// 恢复就是反序列化状态继续 `step`。
 ///
-/// 可序列化：P4 起快照要把它原样存盘，恢复时从同一个位置继续。
-/// 变体名与语义自 P0 未变，只加了 serde。
+/// 可序列化：快照要把它原样存盘，恢复时从同一个位置继续。
+/// 变体名是落盘契约的一部分，不可随手改名。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RunState {
     /// 准备问模型。
@@ -119,7 +118,7 @@ impl CancelHandle {
 /// 哪个是哪个，加一个依赖还要惊动所有调用点；结构体带字段名，构造点
 /// 自解释。没有 `Default`——没有合理的默认模型，缺依赖就该在构造点写明。
 ///
-/// 可克隆：编排器（P4-2）每步要克隆一份给新的 runner，`Arc` 字段
+/// 可克隆：编排器每步要克隆一份给新的 runner，`Arc` 字段
 /// 克隆只是引用计数 +1。
 #[derive(Clone)]
 pub struct AgentDependencies {
@@ -140,7 +139,7 @@ pub struct AgentDependencies {
     pub policy: PolicyEngine,
     /// 角色花名册：按 `spec.role` 查出这个角色能调哪些工具。
     ///
-    /// P9-3 起工具定义对所有步骤统一（模型看到的永远是全量注册表），
+    /// 工具定义对所有步骤统一（模型看到的永远是全量注册表），
     /// 角色边界从"模型看不见"下沉到"调不动"——花名册就是那道边界的
     /// 唯一真相来源，runner 自己来查，不靠调用方预先过滤。放在依赖里
     /// 而不是构造参数里：`resume()` 同样要按快照里的角色重算一遍。
@@ -449,7 +448,7 @@ impl AgentRunner {
 
     /// 进入下一步：换角色、交代步骤、把上一步的结论落进历史。
     ///
-    /// P9-3 单会话编排的接缝。一个任务只开一个会话，步骤之间不再另起
+    /// 单会话编排的接缝：一个任务只开一个会话，步骤之间不另起
     /// runner——历史、轮数、墙钟与缓存路由键全部延续，下一步的模型因此
     /// 看得见上一步读过的文件和得出的结论，不必把同样的文件再读一遍。
     ///
@@ -514,7 +513,7 @@ impl AgentRunner {
 
     /// 追加一条用户消息到会话历史。
     ///
-    /// P10 任务级恢复用：把已完成步骤的结论交回给模型，让恢复后的
+    /// 任务级恢复用：把已完成步骤的结论交回给模型，让恢复后的
     /// 下一步看得见前面几步查出了什么（见 `application::task_resume`）。
     ///
     /// 与 [`Self::begin_step`] 的分工：`begin_step` 换角色、交代步骤、
@@ -798,7 +797,7 @@ impl AgentRunner {
                     reason: decision.reason.clone(),
                 });
 
-                // P8-3：策略说放行，但命令看着像把写操作伸到 workspace 外时，
+                // 策略说放行，但命令看着像把写操作伸到 workspace 外时，
                 // 升级成要审批。审计里记的仍是策略的原判——策略没改，改的是
                 // 这次调用要不要人过目，两件事不能混在一条事件里。
                 let (decision, escalation) = escalate_out_of_workspace_write(decision, &call);
@@ -895,7 +894,8 @@ impl AgentRunner {
         }
     }
 
-    /// 跑到终局。行为与重构前的 `for turn in 1..=max_turns` 一致。
+    /// 跑到终局：循环调用 [`Self::step`] 直到给出最终答案，或撞上
+    /// 轮数 / 墙钟 / 取消三种终点之一。
     ///
     /// # Errors
     ///
@@ -1245,7 +1245,7 @@ impl AgentRunner {
 
 /// 生成会话 ID。
 ///
-/// 不引 `uuid`：P0 只需要"一次运行内唯一、日志里能认出来"。
+/// 不引 `uuid`：只需要"一次运行内唯一、日志里能认出来"。
 /// 进程号加纳秒时间戳已经够用，且不给依赖树添新东西。
 ///
 /// 公开是因为 `main.rs` 要先知道 ID 才能给证据文件命名——
@@ -1456,7 +1456,7 @@ mod tests {
     #[derive(Default)]
     struct CountingGate {
         requested: std::sync::Mutex<Vec<String>>,
-        /// 收到的完整请求，按顺序。P8-3 的升级测试要断言 `reason`。
+        /// 收到的完整请求，按顺序。越界写入升级测试要断言 `reason`。
         seen: std::sync::Mutex<Vec<ApprovalRequest>>,
     }
 
@@ -1779,11 +1779,11 @@ mod tests {
         );
     }
 
-    // ── 一轮多个调用（P9-4 parallel_tool_calls）────────────────────────
+    // ── 一轮多个调用 ────────────────────────────────────────────────────
 
     /// 一次回复里带多个工具调用时，全部都要执行并各回一条观察。
     ///
-    /// P9-4 起请求显式带 `parallel_tool_calls(true)`（见
+    /// 请求显式带 `parallel_tool_calls(true)`（见
     /// `infrastructure::model::rig_chat::generation_options`），模型于是会
     /// 在一轮里给多个调用。这里守住三件事：一条不漏、顺序不乱、各配各的
     /// 观察——错位配对会让模型把 A 的结果当成 B 的，后面整个任务都建在
@@ -1809,7 +1809,8 @@ mod tests {
         let outcome = harness.runner.run(&Budget::new(20)).await.unwrap();
 
         assert!(outcome.answer.contains("三个都处理完了"));
-        // 三条调用只花一次模型往返：轮数不随调用数上涨，这是 P9-4 要的账。
+        // 三条调用只花一次模型往返：轮数不随调用数上涨，这笔账是这条
+        // 测试要守住的核心。
         assert_eq!(outcome.turns_used, 2);
         assert_eq!(harness.mock.request_count(), 2);
 
@@ -2135,7 +2136,7 @@ mod tests {
         assert_eq!(TokenUsage::default().output_tokens, 0);
     }
 
-    // ── P1：策略引擎接入 ────────────────────────────────────────────────
+    // ── 策略引擎接入 ────────────────────────────────────────────────────
 
     /// 拒绝观察的内容。
     fn refusal_text(mock: &MockCompletionModel, index: usize) -> String {
@@ -2151,7 +2152,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_policy_still_gates_write_file() {
-        // P0 行为不能变：默认策略下 write_file 仍要过闸门。
+        // 基线行为：默认策略下 write_file 仍要过闸门。
         let mut harness = harness(
             vec![
                 MockTurn::tool_call("call_1", "write_file", json!({"path": "a.txt"})),
@@ -2197,12 +2198,12 @@ mod tests {
 
     #[tokio::test]
     async fn default_policy_gates_run_command() {
-        // P2 验收点：新加的最危险工具 run_command（open_world）没有在
-        // 策略引擎里登记任何规则，默认策略按注解自动把它送进闸门——
-        // "加高危工具不需要改策略引擎"正是 P1 接缝设计的验收点。
+        // 最危险工具 run_command（open_world）没有在策略引擎里登记任何
+        // 规则，默认策略按注解自动把它送进闸门——这条守住的就是"加高危
+        // 工具不需要改策略引擎"这层接缝。
         //
-        // 命令刻意避开 P9-5 默认基线放行的那几条（cargo test / build、
-        // git status / diff）：验收点是"基线之外的命令仍要人点头"，
+        // 命令刻意避开默认基线放行的那几条（cargo test / build、
+        // git status / diff）：要验证的是"基线之外的命令仍要人点头"，
         // 拿 `cargo test` 当例子会让它测不到任何东西。
         let run_command_spec = ToolSpec {
             name: "run_command".to_owned(),
@@ -2227,7 +2228,7 @@ mod tests {
         );
     }
 
-    /// 默认基线放行的命令确实不问人——这是 P9-5 省下的那次点击。
+    /// 默认基线放行的命令确实不问人——省下的正是用户的等待成本。
     ///
     /// 与上一条配对：一条守住"高危仍要审"，这一条守住"无害的别再审"。
     /// 只测前者的话，将来有人把基线删了，测试全绿而等待成本悄悄回去。
@@ -2257,7 +2258,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_rule_refuses_without_asking_the_gate() {
-        let policy = policy_with("write_file", PolicyVerdict::Deny, "P1 禁止写文件");
+        let policy = policy_with("write_file", PolicyVerdict::Deny, "测试规则：禁止写文件");
         let mut harness = harness_with_policy(
             vec![
                 MockTurn::tool_call("call_1", "write_file", json!({"path": "a.txt"})),
@@ -2278,7 +2279,7 @@ mod tests {
         let text = refusal_text(&harness.mock, 1);
         assert!(text.contains("write_file"), "应点名工具: {text}");
         assert!(text.contains("策略规则 #0"), "应指明规则序号: {text}");
-        assert!(text.contains("P1 禁止写文件"), "应带上规则理由: {text}");
+        assert!(text.contains("测试规则：禁止写文件"), "应带上规则理由: {text}");
     }
 
     #[tokio::test]
@@ -2322,12 +2323,12 @@ mod tests {
         assert_eq!(evaluated.len(), 1, "每次策略裁决都该留证");
     }
 
-    // ── P8-3：越界写入升级 ─────────────────────────────────────────────
+    // ── 越界写入升级 ────────────────────────────────────────────────────
 
     /// 策略放行了 `run_command`，但命令把输出写到 workspace 外时，
     /// 必须升级成要审批。
     ///
-    /// 这是 P8-3 的核心承诺：策略按"工具名 + 参数文本"放行之后，
+    /// 这是升级检查的核心承诺：策略按"工具名 + 参数文本"放行之后，
     /// 命令内容就不受任何约束了，补的正是这个缺口。
     #[tokio::test]
     async fn allow_rule_still_gates_an_out_of_workspace_write() {
@@ -2394,10 +2395,10 @@ mod tests {
         );
     }
 
-    /// 默认策略（P9-5 的内置基线）放行 `git diff *` 一族，但这条命令
+    /// 默认策略的内置基线放行 `git diff *` 一族，但这条命令
     /// 用 git 自己的 `--output` 选项把 workspace 的内容写到外面。
     ///
-    /// 它既没有写入型动词也没有 `>`，按 P8-3 原来的两个判据整个漏掉；
+    /// 它既没有写入型动词也没有 `>`，两个启发式判据都漏掉它；
     /// 而基线又刚刚把它放行，两道防线同时失守。本机实测
     /// `git diff --output=D:\x` 会真的落盘，所以这不是理论风险。
     #[tokio::test]
@@ -2479,9 +2480,10 @@ mod tests {
         assert_eq!(evaluated, vec![PolicyVerdict::Allow], "证据应记策略原判");
     }
 
-    /// 策略层先升级、人再放行，仍不会让硬边界失效（P8/P11 两道闸门）。
+    /// 策略层先升级、人再放行，仍不会让硬边界失效——审批闸门与
+    /// 执行层边界是两道独立的闸。
     ///
-    /// P8 的升级判据不改：这条测试只把"人点头后执行层仍可拒"的落差钉住，
+    /// 升级判据本身不在本测试的范围内：它只把"人点头后执行层仍可拒"的落差钉住，
     /// 免得后人误以为审批能覆盖机械边界，或把行为改成静默放行。
     #[tokio::test]
     async fn approval_cannot_override_the_tool_level_boundary_refusal() {
@@ -2516,11 +2518,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(decisions, vec![true], "P8 升级后闸门应被问过并获批准");
+        assert_eq!(decisions, vec![true], "升级后闸门应被问过并获批准");
         assert!(boundaries(&harness).is_empty(), "未执行的拒绝调用不能记边界证据");
     }
 
-    // ── P11：执行边界证据 ─────────────────────────────────────────────
+    // ── 执行边界证据 ──────────────────────────────────────────────────
 
     /// 取出证据里全部 `SandboxApplied`，断言时只看这条通道说了什么。
     fn boundaries(harness: &Harness) -> Vec<(String, bool, bool)> {
@@ -2766,7 +2768,7 @@ mod tests {
     /// 没有故障事实的观察不产生 `McpCallFailed`。
     ///
     /// 反推是这里最容易犯的错：看见 `Failed` 观察就补一条故障事件，等于
-    /// 拿输出文本猜分类——本轮要消除的正是这种推断。
+    /// 拿输出文本猜分类——故障分类必须来自执行器的事实。
     #[tokio::test]
     async fn an_ordinary_failure_produces_no_mcp_call_event() {
         let mut harness = harness(
@@ -2833,14 +2835,13 @@ mod tests {
         }
     }
 
-    // ── P8-1：受保护路径经真实工具层的端到端验证 ─────────────────────
+    // ── 受保护路径经真实工具层的端到端验证 ─────────────────────────────
 
     /// 策略放行 `write_file` 也写不进 `.git/config`。
     ///
     /// 单独一条工具层测试只能证明"工具自己会拒"；这一条把策略引擎、runner
     /// 与真实文件工具串起来，证明保护是**结构性的**——不管配置怎么写，
-    /// 调用都到不了文件系统。这是 P8-1"保护不留给配置去放宽"那句话的
-    /// 直接对应物。
+    /// 调用都到不了文件系统，保护不留给配置去放宽。
     #[tokio::test]
     async fn allow_policy_cannot_write_into_a_protected_path() {
         // 造一个真的 .git/config：拒绝必须发生在文件系统之前，
@@ -2912,7 +2913,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── P3：上下文预算与历史裁剪 ────────────────────────────────────────
+    // ── 上下文预算与历史裁剪 ────────────────────────────────────────────
 
     /// 观察内容随调用参数变化的执行器：裁剪测试要能区分"第几轮的观察"。
     struct EchoInvoker;
@@ -2983,7 +2984,7 @@ mod tests {
         );
 
         // Session 是全量真相：6 轮工具调用与观察一个不少
-        // （最终答案走 RunState::Completed，不进历史——P0 起的行为）。
+        // （最终答案走 RunState::Completed，不进历史——历史里只存"调用+观察"）。
         assert_eq!(runner.session().rounds(), 6);
         let observations = runner
             .session()
@@ -3007,7 +3008,7 @@ mod tests {
         assert_eq!(compacted.len(), 1, "超预算的请求各留一条裁剪证据");
     }
 
-    // ── P4-3：历史摘要 ──────────────────────────────────────────────────
+    // ── 历史摘要 ────────────────────────────────────────────────────────
 
     /// 摘要测试的公共装配：3 轮工具调用 + 最终答案，预算只留 2 轮。
     fn summary_test_runner(
@@ -3215,7 +3216,7 @@ mod tests {
         assert!(final_request.contains("已省略"), "占位说明照旧: {final_request}");
     }
 
-    // ── P3：整体超时与取消 ──────────────────────────────────────────────
+    // ── 整体超时与取消 ──────────────────────────────────────────────────
 
     /// 可编排耗时的时钟：`elapsed_since` 返回共享计数器里的值。
     /// 测试用它让"时间"在工具执行时跳跃，而不真 `sleep`——这正是
@@ -3359,7 +3360,7 @@ mod tests {
     #[tokio::test]
     async fn no_wall_clock_means_elapsed_time_never_stops_the_run() {
         // 回归保护：时钟报"已过 1 小时"，但预算没设时限——
-        // max_wall_clock = None 的行为必须与 P2 完全一致。
+        // max_wall_clock = None 时不允许仅凭已耗时中断运行。
         let clock = Arc::new(TimeWarpClock::default());
         clock.advance_ms(3_600_000);
         let mock = MockCompletionModel::from_turns(vec![
@@ -3388,7 +3389,7 @@ mod tests {
         assert_eq!(outcome.turns_used, 2);
     }
 
-    // ── P10-2：有界恢复 ────────────────────────────────────────────────
+    // ── 有界恢复 ────────────────────────────────────────────────────────
     //
     // 恢复的三种半轮状态，三种语义：
     //
@@ -3523,7 +3524,7 @@ mod tests {
 
     /// 恢复时，中断时正在执行的那个调用**不自动重跑**。
     ///
-    /// 切片 2 最要紧的一条：副作用可能已经发生，重跑一次就是把同一次
+    /// 有界恢复里最要紧的一条：副作用可能已经发生，重跑一次就是把同一次
     /// 副作用做两遍。恢复必须把决定权交回模型，而不是替模型决定。
     #[tokio::test]
     async fn resuming_from_dispatching_does_not_rerun_the_interrupted_call() {

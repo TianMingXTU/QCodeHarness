@@ -11,7 +11,7 @@ use crate::domain::policy::{PolicyEngine, PolicyRule, PolicyScope, PolicyVerdict
 
 /// 加载策略配置。
 ///
-/// 路径为 `None` 时返回内置默认策略（P9-5 起带一份基线，见
+/// 路径为 `None` 时返回内置默认策略（自带一份免审基线，见
 /// [`crate::domain::policy::PolicyEngine::new`]）；为 `Some` 时读取并解析
 /// 该文件。
 ///
@@ -184,9 +184,9 @@ mod tests {
     fn no_path_means_default_policy() {
         let engine = load(None).expect("无路径应返回默认策略");
 
-        // P9-5 起默认策略带一份内置基线（cargo test/build、git status/diff
+        // 默认策略带一份内置基线（cargo test/build、git status/diff
         // 免审）。断言它非空而不是空：空规则表意味着"cargo test 每次都要
-        // 人按 y"，那正是 P9-5 要消掉的等待。
+        // 人按 y"，基线存在的意义正是消掉这份等待。
         assert!(!engine.rules.is_empty(), "默认策略应带内置基线");
         assert_eq!(
             engine
@@ -215,7 +215,7 @@ mod tests {
 [[rules]]
 tool = "shell"
 verdict = "deny"
-description = "P1 未实现 shell 工具，先禁掉"
+description = "shell 工具被禁用"
 "#,
         )
         .expect("解析");
@@ -224,7 +224,7 @@ description = "P1 未实现 shell 工具，先禁掉"
         let decision = engine.evaluate(&call("shell"), &spec(false));
         assert_eq!(decision.verdict, PolicyVerdict::Deny);
         assert_eq!(decision.rule_index, Some(0));
-        assert!(decision.reason.contains("P1"));
+        assert!(decision.reason.contains("shell 工具被禁用"));
     }
 
     #[test]
@@ -301,7 +301,7 @@ description = "手滑打错"
         );
     }
 
-    // ── P8-2 作用域（scope）───────────────────────────────────────────
+    // ── 作用域（scope）────────────────────────────────────────────────
 
     /// `scope = { command_prefix = "cargo test *" }` 把一条针对
     /// `run_command` 的放行收窄到 cargo test 一族。
@@ -387,9 +387,9 @@ scope = {}
 
     /// 拼错作用域字段必须报错，不能被静默忽略。
     ///
-    /// 这是 P8-2 新增的安全要求：`command_pretix` 若被当成"没有作用域"，
-    /// 一条本意"只放行 cargo test"的规则会悄悄扩大成"放行所有
-    /// run_command"。配置是手写的，拼错要当场炸出来。
+    /// `command_pretix` 若被当成"没有作用域"，一条本意"只放行 cargo test"
+    /// 的规则会悄悄扩大成"放行所有 run_command"。配置是手写的，拼错要
+    /// 当场炸出来。
     #[test]
     fn misspelled_scope_field_is_rejected() {
         let result = parse(

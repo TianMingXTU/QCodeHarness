@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn no_wall_clock_ignores_elapsed_time() {
-        // 回归保护：不设时限时耗时不参与判断（P2 行为原样保留）。
+        // 回归保护：不设时限时耗时不参与判断。
         let budget = Budget::new(3);
         assert!(!budget.exhausted(&Consumption {
             turns: 0,

@@ -1,15 +1,15 @@
 ﻿//! 任务编排器：按模板把任务拆成步骤，逐步驱动 `AgentRunner`。
 //!
-//! P4 的编排策略刻意简单可预测：任一步失败立即停。P5 起按步骤的角色
-//! 装配 runner：提示词与工具白名单都来自角色档案（`AgentRoster`），
-//! 多 Agent 并行调度留给后续阶段。
+//! 编排策略刻意简单可预测：任一步失败立即停；runner 按步骤的角色装配，
+//! 提示词与工具白名单都来自角色档案（`AgentRoster`）。多 Agent 并行
+//! 调度留给后续阶段。
 //!
-//! P9-3 起**一个任务只开一个会话**。步骤之间不再另起 runner，而是在
-//! 同一个会话里推进一步：换角色、交代步骤、把上一步的结论落进历史。
-//! 换来三件事——历史跨步延续（下一步看得见上一步读过的文件，不必重读）、
-//! 轮数与墙钟按任务累计（不再每步各发一份预算）、缓存路由键跨步稳定
-//! （provider 才可能把前面攒下的前缀缓存读回来）。代价是会话历史会变长，
-//! 由 `ContextBudget` 在步骤边界自然裁掉（见 `domain::context`）。
+//! **一个任务只开一个会话**：步骤之间不另起 runner，而是在同一个会话里
+//! 推进一步——换角色、交代步骤、把上一步的结论落进历史。换来三件事：
+//! 历史跨步延续（下一步看得见上一步读过的文件，不必重读）、轮数与墙钟
+//! 按任务累计（不再每步各发一份预算）、缓存路由键跨步稳定（provider
+//! 才可能把前面攒下的前缀缓存读回来）。代价是会话历史会变长，由
+//! `ContextBudget` 在步骤边界自然裁掉（见 `domain::context`）。
 
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ pub struct TaskOutcome {
     /// 本次运行完成的步数。从 `Running { step }` 续跑时它小于任务总步数
     /// ——任务级进度看 [`Task::progress`]。
     pub steps_completed: usize,
-    /// 本次任务的会话 ID。P9-3 起一个任务只有一个会话：证据文件、快照、
+    /// 本次任务的会话 ID。一个任务只有一个会话：证据文件、快照、
     /// `--resume` 都用它。
     pub session_id: SessionId,
 }
@@ -494,7 +494,7 @@ impl Orchestrator {
             role: step.role,
             system_prompt: profile.system_prompt.clone(),
             // 角色专属的模型与档位：档案里配了就用，没配就用运行时的默认。
-            // P11-3 起这一步是"能力与延迟"的分水岭——规划要强推理，
+            // 这一步是"能力与延迟"的分水岭——规划要强推理，
             // 测试跑命令读输出就行。
             model: profile.model.clone(),
             effort: profile.effort,
@@ -672,8 +672,8 @@ mod tests {
         assert_eq!(outcome.answer, "第4步产出");
         assert_eq!(mock.requests().len(), 4, "一步一问");
         // 一个任务一个会话：四次请求必须带同一个缓存路由键。换键等于换
-        // 一台机器，provider 会把前面攒下的前缀缓存全部作废——那是 P9-3
-        // 最主要的收益来源，这里钉住它。
+        // 一台机器，provider 会把前面攒下的前缀缓存全部作废——这是
+        // 单会话最主要的收益来源，这里钉住它。
         for request in &mock.requests() {
             assert_eq!(
                 request.options.cache_key.as_deref(),
@@ -763,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_definitions_are_identical_across_steps() {
-        // P9-3 的前提：每一步发给模型的工具定义必须逐字相同。不同的话
+        // 每一步发给模型的工具定义必须逐字相同。不同的话
         // 每步的工具数组都不一样，provider 的前缀缓存一步都命不中——
         // 单会话省下来的历史传递全被工具定义的抖动吃回去。
         let mock = MockCompletionModel::from_turns(vec![
@@ -829,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn role_whitelist_is_enforced_at_the_call_layer() {
         // 验收项：角色白名单在调用层生效。评审妄想写文件——工具定义里
-        // 看得见 write_file（P9-3 起对所有步骤统一），但调用在分发前就
+        // 看得见 write_file（对所有步骤统一），但调用在分发前就
         // 被角色边界拒下，文件一个字节都没动。
         let workspace =
             std::env::temp_dir().join(format!("qch-orch-whitelist-{}", std::process::id()));
@@ -1033,7 +1033,7 @@ mod tests {
         assert_eq!(mock.requests().len(), 0, "装配失败不应触发模型调用");
     }
 
-    // ── P8-4：项目指令真的到达模型 ─────────────────────────────────────
+    // ── 项目指令真的到达模型 ───────────────────────────────────────────
 
     /// 端到端验证：注入的项目指令必须出现在模型收到的系统提示词里。
     ///
@@ -1066,7 +1066,7 @@ mod tests {
 
     /// 没注入项目指令时，模型收到的就是内置档案那一份，一字不多。
     ///
-    /// 这是 P8-4 的兼容性承诺：workspace 里没有 QCODEHARNESS.md 时，
+    /// 这是兼容性承诺：workspace 里没有 QCODEHARNESS.md 时，
     /// 行为与加这个特性之前完全一致。
     #[tokio::test]
     async fn without_project_instructions_the_prompt_is_unchanged() {
@@ -1091,7 +1091,7 @@ mod tests {
         assert_eq!(system_prompt_of(&mock, 0), expected);
     }
 
-    // ── P11-3：按角色分配模型与档位 ───────────────────────────────────
+    // ── 按角色分配模型与档位 ───────────────────────────────────────────
 
     /// 四步任务里，每一步都用它自己角色的模型。
     ///
@@ -1175,7 +1175,7 @@ mod tests {
         }
     }
 
-    // ── P9-3：单会话编排的预算与裁剪 ─────────────────────────────────
+    // ── 单会话编排的预算与裁剪 ─────────────────────────────────────────
 
     #[tokio::test]
     async fn one_session_means_one_task_level_turn_budget() {

@@ -9,13 +9,13 @@
 //!   子进程默认全盘继承，不清洗等于任何命令都能 `env | grep KEY`。
 //! - **退出码非 0 也是 failed 但输出照回**：测试失败的线索全在输出里，
 //!   模型要靠它修 bug。
-//! - **Windows 沙箱创建失败 → 拒绝执行**（P11 fail-closed）：JobObject 是
+//! - **Windows 沙箱创建失败 → 拒绝执行**（fail-closed）：JobObject 是
 //!   最后一道机械防线，创建失败说明这道防线没了，让命令裸跑等于把
 //!   "有沙箱"的假设骗过去。降级只在"平台本来没实现"（非 Windows）
 //!   与"纳沙箱失败"（子进程已启动的窄边缘）两处允许。
-//! - **文件系统边界检查**（P11 新增）：命令参数里出现指向 workspace
+//! - **文件系统边界检查**：命令参数里出现指向 workspace
 //!   外的绝对路径 / UNC / `..` 穿越时**直接拒绝**，不再升级审批。
-//!   P8 的升级流程仍保留在策略层作为纵深，这里的拒绝是最后一道。
+//!   升级流程仍保留在策略层作为纵深，这里的拒绝是最后一道。
 
 use serde::Deserialize;
 use serde_json::json;
@@ -188,7 +188,7 @@ fn with_process_boundary(
 /// 命令在进程沙箱（Windows Job Object，见 `infrastructure::sandbox`）
 /// 内执行：整树内存/进程数受限、超时或句柄关闭时整树终止。
 ///
-/// 沙箱拿不到时的取向（P11）：
+/// 沙箱拿不到时的取向：
 /// - **平台没实现**（非 Windows）或 **assign 失败** → 降级不阻断，
 ///   `sandbox_active` 带回 false，由调用方在模型可见文本里声明"未受保护"；
 /// - **Windows 上创建失败** → 命令不执行，返回 [`RunError::Refused`]。
@@ -238,7 +238,7 @@ pub(crate) async fn run_with_policy(
             None
         }
         Err(error) => return Err(RunError::Refused(format!(
-            "沙箱创建失败: {error}（P11 fail-closed：拒绝执行）"
+            "沙箱创建失败: {error}（fail-closed：拒绝执行）"
         ))),
     };
     let mut child = cmd.spawn().map_err(|error| {
@@ -334,17 +334,17 @@ impl ToolInvoker for RunCommand {
             if args.command.trim().is_empty() {
                 return ToolOutcome::failed("command 不能为空");
             }
-            // P11 边界检查：命令参数里出现指向 workspace 外的路径直接拒。
+            // 边界检查：命令参数里出现指向 workspace 外的路径直接拒。
             //
             // 用的是**根感知**判据（`write_escape_beyond` 而不是
             // `write_escape_suspect`）：模型最常写 `type D:\repo\src\main.rs`
             // 这类根内的绝对路径，无根判据会把这些正常命令一起拒掉。
-            // 与策略层的 P8 升级不同——那条给"人再决定"的口子，这条
+            // 与策略层的升级审批不同——那条给"人再决定"的口子，这条
             // 是最后一道机械防线：人审过了、策略放行了，越界仍然被拦。
             if let Some(violation) = write_escape_beyond(&args.command, self.root.as_path()) {
                 return ToolOutcome::refused(format!(
                     "命令越出 workspace 边界：{violation}。当前 workspace 根：{}。\
-                     P11 起这一层是硬拒绝，审批与策略都不能覆盖；\
+                     这一层是硬拒绝，审批与策略都不能覆盖；\
                      需要跨目录操作请把 workspace 换到目标目录。",
                     self.root.as_path().display()
                 ));
@@ -471,11 +471,11 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Windows：沙箱创建失败 → 拒绝执行（P11 fail-closed）。
+    /// Windows：沙箱创建失败 → 拒绝执行（fail-closed）。
     ///
     /// 用明确未实现的 `cpu_time` 限额稳定触发创建失败，不依赖宿主机权限
-    /// 或资源耗尽。P7 的取向是"降级照跑"，P11 改成"跑不了就别跑"：
-    /// 降级裸跑会让模型和策略都以为有沙箱。
+    /// 或资源耗尽。降级裸跑会让模型和策略都以为有沙箱，
+    /// 所以 Windows 上跑不了就别跑，非 Windows 平台没实现才降级。
     #[cfg(windows)]
     #[tokio::test]
     async fn sandbox_creation_failure_refuses_the_command() {
@@ -546,7 +546,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 边界检查（P11）：越出 workspace 的命令在执行层就被拒。
+    /// 边界检查：越出 workspace 的命令在执行层就被拒。
     #[tokio::test]
     async fn command_reaching_outside_the_workspace_is_refused() {
         let root = temp_workspace("boundary");
@@ -596,7 +596,7 @@ mod tests {
             outcome.content
         );
 
-        // P11 第四切片：结构化分段后的收窄与放行。
+        // 结构化分段后的收窄与放行：
         // 越界藏在第二段照样拒，且理由点名那一段——整串扫描也能抓到，
         // 但理由指向的动词/段号必须准确。
         let chained = format!("type inside.txt && echo x > {}", outside_target());

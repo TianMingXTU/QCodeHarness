@@ -120,7 +120,7 @@ fn physical_path(resolved: &Path) -> Option<PathBuf> {
 /// 把路径里的符号链接 / junction 解析掉，再验一次界。
 ///
 /// [`WorkspacePath::resolve`] 是纯词法校验——领域层不许碰文件系统，这是
-/// M1 就定下的边界。词法管不住链接：在 workspace 里给 `.git` 建一个
+/// 项目一直守住的分层边界。词法管不住链接：在 workspace 里给 `.git` 建一个
 /// junction（`mklink /J jgit .git`，不需要管理员权限），词法上
 /// `jgit/config` 完全合法，落盘时却打在真实的 `.git/config` 上。于是
 /// agent 能读到 `.git/config`（常含带令牌的 remote URL），也能改写版本库
@@ -192,7 +192,7 @@ mod tests {
     /// 词法校验管不住 junction：`.git` 的链接建在 workspace 里，
     /// `jgit/config` 这个词法路径完全合法，落盘却打在真实的 `.git/config` 上。
     ///
-    /// 用户验收时审计拿这条打穿了 P8-1：读方向拿到 `.git/config` 的内容
+    /// 审计用这条验证过保护的真实性：读方向能拿到 `.git/config` 的内容
     /// （常含带令牌的 remote URL），写方向能改写版本库元数据。审批界面上
     /// 看到的只是 `jgit/config`，两步都看不出它在动 `.git`。
     #[test]
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(patch, edit + 1, "apply_patch 应紧挨 edit_file: {names:?}");
     }
 
-    /// 工具描述之间互相指路（P9-4 的规矩，P11-1 扩展到 apply_patch）。
+    /// 工具描述之间互相指路。
     ///
     /// 模型对工具分工的全部认识来自描述本身：读工具要告诉它"改代码用
     /// apply_patch"，写工具要告诉它"改多处用 apply_patch"，而 apply_patch

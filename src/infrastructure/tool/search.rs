@@ -37,7 +37,7 @@ const SKIPPED_DIRS: [&str; 4] = [".git", "target", "node_modules", ".qcodeharnes
 
 /// 凭据文件名：遍历时整个跳过，不当成普通文本读。
 ///
-/// P8-1 把 `.env` / `.env.*` 列为受保护路径，`read_file` 直接拒。但搜索走
+/// `.env` / `.env.*` 在 `read_file` 侧是受保护路径，直接拒。但搜索走
 /// 的是"遍历 + 读每行"这条路，`read_file` 的保护够不着它——
 /// `search_text({"pattern":"API_KEY"})` 会把 `.env` 里的凭据行连同行号
 /// 一起打印出来。同一份秘密换条路就能读到，保护就是半套。
@@ -374,7 +374,7 @@ mod tests {
 
     /// 凭据文件不能被全文搜索读到。
     ///
-    /// P8-1 把 `.env` 列为受保护路径，`read_file` 直接拒。但 `search_text`
+    /// `.env` 在 `read_file` 侧是受保护路径，直接拒。但 `search_text`
     /// 走的是另一条路——它按遍历读每行，于是 `search_text({"pattern":"API_KEY"})`
     /// 能把 `.env` 里的凭据行连同行号一起打印出来。同一份秘密，换条路就能
     /// 读到，那保护就是半套。

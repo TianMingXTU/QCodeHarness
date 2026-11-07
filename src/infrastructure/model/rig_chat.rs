@@ -161,8 +161,8 @@ where
 /// 消息顺序必须是 `[System, ...历史, 最后一条]`：`new()` 收下最后一条作为
 /// prompt，`messages()` 把其余历史插到它前面，`preamble()` 再插入系统提示。
 ///
-/// 工具规格从 `ModelRequest.tools` 来（P2 起注册表是唯一清单），
-/// 不再从 `AgentSpec` 取。
+/// 工具规格从 `ModelRequest.tools` 来——注册表是工具的唯一清单，
+/// 不从 `AgentSpec` 取。
 ///
 /// `cache_key` 是会话 ID，见 [`ModelRequest::cache_key`]。
 fn build_request(
@@ -373,8 +373,8 @@ impl From<&Usage> for TokenUsage {
             input_tokens: usage.input_tokens.unwrap_or(0),
             output_tokens: usage.output_tokens.unwrap_or(0),
             // 缓存命中与写入的 token 必须单独平移，不能并进 input_tokens：
-            // 并进去就看不出缓存有没有生效，而"缓存命中率"是 P9 判断
-            // 提速有没有到手的唯一直接证据。provider 不报告时是 0 而不是
+            // 并进去就看不出缓存有没有生效，而"缓存命中率"是判断提速
+            // 有没有到手的唯一直接证据。provider 不报告时是 0 而不是
             // None——"没有缓存"与"没查到"在这里同义，都不影响合计。
             cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
             cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
@@ -527,7 +527,7 @@ mod tests {
     /// 缓存计数器必须原样平移，不能并进 input_tokens。
     ///
     /// 并进去的后果不是精度损失，是**缓存有没有生效直接看不出来**——
-    /// 而命中率是 P9 判断"省下的 prefill 时间有没有到手"的唯一直接证据。
+    /// 而命中率是判断"省下的 prefill 时间有没有到手"的唯一直接证据。
     /// rig 的契约：`cached + cache_creation <= input`，即 input 已含这三类，
     /// 所以命中率的分母用 input、分子用 cached 是自洽的。
     #[test]
@@ -669,7 +669,7 @@ mod tests {
         );
     }
 
-    // ── P11-3 按角色分配模型与档位 ─────────────────────────────────────
+    // ── 按角色分配模型与档位 ──────────────────────────────────────────
 
     /// 规格里配了模型名时，请求的 `model` 字段被覆盖成它。
     ///
@@ -692,12 +692,12 @@ mod tests {
         );
     }
 
-    /// **没有配角色模型时行为与 P10 完全一致**（回归保护）。
+    /// **没有配角色模型时行为保持不变**（回归保护）。
     ///
-    /// P10 的请求不带 `model` 字段，由 provider 用自己配置的默认模型。
-    /// P11 加了按角色选模型之后，最容易出的岔子就是"没配也发一个模型
-    /// 名"——那会让所有部署的默认模型悄悄失效。这条断言把"没配 = 不发"
-    /// 钉住：没配时 `request.model` 必须是 `None`。
+    /// 请求不带 `model` 字段时，由 provider 用自己配置的默认模型。按角色
+    /// 选模型最容易出的岔子就是"没配也发一个模型名"——那会让所有部署的
+    /// 默认模型悄悄失效。这条断言把"没配 = 不发"钉住：没配时
+    /// `request.model` 必须是 `None`。
     #[test]
     fn without_a_configured_model_the_request_carries_none() {
         let session = Session::new(SessionId::new("s1"), "任务");

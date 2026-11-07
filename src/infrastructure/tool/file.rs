@@ -121,10 +121,9 @@ async fn read_one_file(
 
 /// 一次读取多个文本文件。
 ///
-/// P9-4 的吞吐手段：Harness 一轮只执行一条工具调用（见
-/// `application::agent_run` 的 `step()`），所以"读 5 个文件"如果拆成
-/// 5 次 `read_file`，就是 5 轮模型往返。已知路径时一次拿回全部内容，
-/// 轮数直接除以文件数——这是单项收益最大的提速。
+/// Harness 一轮只执行一条工具调用（见 `application::agent_run` 的
+/// `step()`），所以"读 5 个文件"如果拆成 5 次 `read_file`，就是 5 轮模型
+/// 往返。已知路径时一次拿回全部内容，轮数直接除以文件数。
 pub struct ReadFiles {
     root: WorkspaceRoot,
 }
@@ -438,8 +437,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_name_is_refused_by_the_registry() {
-        // P0 时这个兜底在 FileToolSet 的 dispatch 里；P2 起路由收归注册表，
-        // 行为不变：模型指名一个没登记的工具 → refused，不 panic。
+        // 路由收归注册表后，兜底拒绝由注册表给出：模型指名一个没登记的
+        // 工具 → refused，不 panic。
         use std::sync::Arc;
         use crate::application::tool_registry::{ToolEntry, ToolRegistry};
         let registry = ToolRegistry::new(vec![ToolEntry {
@@ -463,7 +462,7 @@ mod tests {
         assert!(outcome.content.starts_with("参数解析失败"));
     }
 
-    // ── read_file 行数截断（P3）────────────────────────────────────────
+    // ── read_file 行数截断 ─────────────────────────────────────────
     //
     // 这些测试用真实临时文件：截断逻辑操作的是读进来的字符串，
     // 只有走完整的 invoke 路径才能验证"读 → 截 → 附说明"串起来没错。
@@ -600,7 +599,7 @@ mod tests {
         assert_eq!(refused.status, OutcomeStatus::Refused);
     }
 
-    // ── read_files 批量读取（P9-4）─────────────────────────────────────
+    // ── read_files 批量读取 ──────────────────────────────────────────
 
     /// 造一个带若干普通文件、一份 `.env` 和一个二进制文件的 workspace。
     ///
@@ -740,8 +739,8 @@ mod tests {
 
     /// 受保护路径在批量读取里同样逐个拒绝，且内容不进观察。
     ///
-    /// 每条路径都独立走 `resolve_in`，所以 junction 变形（P8 用户验收
-    /// 打穿的那两种）在这里和单文件读取一样被拦下。
+    /// 每条路径都独立走 `resolve_in`，所以 junction 变形（词法上合法、
+    /// 物理上落进受保护目录的路径）在这里和单文件读取一样被拦下。
     #[tokio::test]
     async fn read_files_refuses_protected_paths_per_file() {
         let dir = batch_workspace("batch-protected");
@@ -797,7 +796,7 @@ mod tests {
     /// `read_file` 的描述要指路 `read_files`。
     ///
     /// 不指路的后果是模型继续一个个读——那正是这个工具要省掉的往返，
-    /// 而省往返是 P9-4 的全部目的。
+    /// 而省掉这些往返正是批量读取存在的目的。
     #[test]
     fn read_file_description_points_at_the_batch_tool() {
         assert!(
@@ -831,7 +830,7 @@ mod tests {
         dir
     }
 
-    // ── P8-1 受保护路径（工具层）──────────────────────────────────────
+    // ── 受保护路径（工具层）──────────────────────────────────────
 
     /// `write_file(".git/config")` 必须在策略之前就被拒绝。
     ///

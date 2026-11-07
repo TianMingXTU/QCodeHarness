@@ -26,7 +26,7 @@ pub struct McpConfig {
     pub mcp_servers: Vec<McpServerConfig>,
 }
 
-/// 一个 MCP Server 的连接配置（P5 只支持 stdio 传输）。
+/// 一个 MCP Server 的连接配置（当前只支持 stdio 传输）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {

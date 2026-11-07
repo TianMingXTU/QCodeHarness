@@ -866,9 +866,9 @@ mod tests {
 
     /// `apply_patch` 是破坏性工具：默认策略必须对它要审批。
     ///
-    /// P11 明确"不放松任何安全边界"。`apply_patch` 一次能改多个文件，
-    /// 破坏面比 `edit_file` 更大——它必须落进"非只读一律审批"这一档，
-    /// 不能因为它是新工具就漏在默认放行里。
+    /// `apply_patch` 一次能改多个文件，破坏面比 `edit_file` 更大——
+    /// 它必须落进"非只读一律审批"这一档，不能因为是新工具就漏在
+    /// 默认放行里。
     #[test]
     fn the_default_policy_requires_approval_for_a_patch() {
         let engine = crate::domain::policy::PolicyEngine::new();

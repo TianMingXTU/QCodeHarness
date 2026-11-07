@@ -23,16 +23,16 @@ thiserror = "2"
 # JSON 不支持注释，YAML 又多一个缩进地狱。toml 的表格数组正好表达规则列表。
 toml = "0.8"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "time", "process", "io-util"] }
-# MCP（Model Context Protocol）官方 Rust SDK：P5-2 经它接入外部工具。
+# MCP（Model Context Protocol）官方 Rust SDK：经它接入外部工具。
 # 只选 client + stdio 子进程传输 + 通用 async-rw 传输，明确关掉默认
 # features——默认集会拉 reqwest/SSE 一族，进而引入 rustls（Windows 上
 # 需要 CMake/NASM，见上面 rig 的注释）。这三个 feature 不碰 HTTP/TLS，
-# `cargo tree -i rustls` 为空是 P5-2 的验收项之一。
+# `cargo tree -i rustls` 为空是对该选择的验收项。
 rmcp = { version = "3.8.0", default-features = false, features = ["client", "transport-child-process", "transport-async-rw"] }
 ignore = "0.4.34"
 regex = "1.13.1"
 
-# Windows Job Object：进程树的资源限制与整树终止（P7 沙箱）。
+# Windows Job Object：进程树的资源限制与整树终止（沙箱）。
 # 只挑 Win32 的三个子 feature（句柄基础 + Job Objects + 进程/线程），
 # 不碰任何网络/TLS feature；windows crate 不引 rustls，
 # `cargo tree -i rustls` 为空仍是验收项。只在 Windows 目标下生效，
