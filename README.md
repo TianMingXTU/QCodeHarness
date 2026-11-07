@@ -54,6 +54,12 @@ flowchart TB
 | 权限策略与人工审批 | 控制文件访问、命令执行、外部连接及高风险操作。 |
 | 事件记录与评测 | 记录每一步操作、耗时、Token 消耗、错误及任务结果。 |
 
+模块之上是一组**扩展点**：模型提供方（`LlmProvider`）、工具来源（`ToolSource`）、
+工具守卫（`ToolGuard`）、运行挂点（`RunHooks`）、上下文策略（`ContextPolicy`）
+都以 trait 定义在应用层，各有默认实现，装配集中在 `main.rs` 与
+`AgentDependencies`。想加新行为时先找扩展点、不改核心循环；完整落点表与
+"明确不做"的范围见 [docs/architecture.md](docs/architecture.md)。
+
 ## 3. Coding Agent 任务执行流程
 
 ```mermaid
@@ -414,6 +420,24 @@ cargo run -- --kind review "评审最近的改动"
 工具规格与执行入口绑定在同一个注册表里，`read_file` 与 `edit_file` 的分工写在各自描述中：新建或整体重写用 `write_file`，小段修改用 `edit_file`，一次改多处用 `apply_patch`。
 
 **描述之间互相指路。** 模型对工具分工的全部认识来自这几句描述，不会去翻文档——所以"下一步该用哪个"必须写在描述里：`read_file` 指向 `read_files`（已知多个路径时批量读），`list_dir` 接 `read_files`（摸完结构就一次读出），`write_file` 与 `edit_file` 互相点名，读工具与 `edit_file` 都指向 `apply_patch`（要改代码、改多处时用补丁），`apply_patch` 自己指回 `edit_file`（改一处）与 `write_file`（新建/整体重写）。描述各说各话的后果是模型在该用 `read_files` 的时候逐个 `read_file`，那正是这个工具要省掉的往返。这些交叉引用有测试守着，将来改描述改掉了会红。
+
+### 扩展点（自定义模型提供方与工具来源）
+
+核心循环不认具体供应商，也不认工具从哪来：模型提供方实现 `LlmProvider`，
+工具来源实现 `ToolSource`，两者都在装配层登记。两个可运行的示例：
+
+```powershell
+cargo run --example custom-llm-provider   # 自定义 LlmProvider + 固定回复网关
+cargo run --example custom-tool-source    # 内置工具与自定义 ToolSource 合并成注册表
+```
+
+完整的扩展点清单（模型网关、工具守卫、运行挂点、上下文策略、审批闸门、
+证据汇）、每个扩展点该改哪个文件，以及加新行为的判断顺序，见
+[docs/architecture.md](docs/architecture.md)。
+
+**明确不做**：不做 cdylib 动态插件装载，不定义通用插件协议，也不提供多前端
+事件协议——社区扩展以"依赖本 crate 编译、在装配层接线"的方式接入；需要新
+前端时另立协议设计。
 
 ### 结构化补丁（`apply_patch`）
 

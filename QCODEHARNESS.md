@@ -22,6 +22,17 @@ QCodeHarness 是一个 Rust 的 Coding Agent 框架。跑任务的不是它自�
 - 跨层依赖只允许 `interface → application → domain`，
   `infrastructure → application/domain`。
 
+## 扩展点约定
+
+- 新行为优先实现为端口 trait 的实现，并在装配层接线（`main.rs` /
+  `AgentDependencies` / `default_guard_chain`），不改核心循环。
+- 扩展点 trait 住 `src/application/`（`port/`、`tool_guard.rs`、
+  `tool_registry.rs`、`context_policy.rs`），实现住 `src/infrastructure/`。
+  `domain/` 只放被这些 trait 复用的纯数据类型。
+- 不做 cdylib 动态插件装载，不定义通用插件协议：Rust 无稳定 ABI，
+  社区扩展 = 依赖本 crate 编译 + 装配层接线。新增扩展点要同步
+  `docs/architecture.md` 的落点表。
+
 ## 验证命令
 
 改完代码必须跑，不许只写不验：
@@ -30,6 +41,7 @@ QCodeHarness 是一个 Rust 的 Coding Agent 框架。跑任务的不是它自�
 cargo check
 cargo test
 cargo build --release
+cargo build --examples
 cargo tree -i rustls        # 必须为空：本项目不启用 TLS 的 rustls 实现
 ```
 
