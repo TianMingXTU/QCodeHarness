@@ -11,6 +11,7 @@ pub mod agent;
 pub mod agent_profile;
 pub mod benchmark;
 pub mod sandbox;
+pub mod command;
 pub mod session;
 pub mod budget;
 pub mod context;

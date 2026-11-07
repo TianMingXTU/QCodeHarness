@@ -589,8 +589,56 @@ mod tests {
         let outcome = cmd
             .invoke(&call(run_args(&format!("type {}", absolute.display()))))
             .await;
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+
+        // P11 第四切片：结构化分段后的收窄与放行。
+        // 越界藏在第二段照样拒，且理由点名那一段——整串扫描也能抓到，
+        // 但理由指向的动词/段号必须准确。
+        let chained = format!("type inside.txt && echo x > {}", outside_target());
+        let outcome = cmd.invoke(&call(run_args(&chained))).await;
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Refused,
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("第 2 段"),
+            "多段理由要点名越界段: {}",
+            outcome.content
+        );
+        assert!(
+            !std::env::temp_dir()
+                .join("qch-shell-slice4-out.txt")
+                .exists(),
+            "被拒的命令不得在外部落盘"
+        );
+
+        // 两个重定向目标都在根内照常放行；任何一个越界都会被逐段收齐拦下。
+        let outcome = cmd
+            .invoke(&call(run_args("echo hi > out.txt 2> out.err")))
+            .await;
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 通用越界目标（不依赖具体 workspace 根）：落在系统临时目录里，
+    /// 拒绝路径不会真的写它。
+    fn outside_target() -> String {
+        std::env::temp_dir()
+            .join("qch-shell-slice4-out.txt")
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// 拒绝发生在执行之前，不是执行之后：越界命令一个字都不该落盘。

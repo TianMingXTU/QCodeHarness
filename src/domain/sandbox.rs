@@ -1,10 +1,12 @@
-//! 进程沙箱策略、执行边界元数据与命令的字面路径检查。
+//! 进程沙箱策略、执行边界元数据与命令的结构化词法边界裁决。
 //!
 //! 领域层只计算纯数据；资源与生命周期约束由 infrastructure/sandbox
 //! 强制执行。Windows Job Object 不提供文件系统或网络隔离。
 
 use std::path::Path;
 use std::time::Duration;
+
+use super::command::{CommandSegment, ParsedCommand, RedirectOp, parse_command};
 
 /// 当前编译目标具备的隔离能力，不代表某次命令已经成功启用沙箱。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,108 +116,103 @@ impl Default for SandboxPolicy {
 
 /// 判断命令是否可能把写操作伸到 workspace 外；命中后用于升级审批。
 ///
-/// 这是字面路径启发式，不是隔离。变量拼接、编码和链接仍可绕过；真正的
-/// 进程边界由基础设施层建立。
+/// 这是**词法**边界判定，不是隔离，也不是 shell 求值：变量拼接、命令替换、
+/// 编码绕过与链接物理目标仍可绕过；真正的进程边界由基础设施层建立。
+/// 无根（P8-3）与有根（P11）共用同一份解析结果，唯一差别是 `root`：
+/// 无根时所有绝对路径都算嫌疑，有根时只拒真的不在根下的绝对路径。
 pub fn write_escape_suspect(command: &str) -> Option<String> {
-    escape_reason(command, None)
+    command_escape_violation(&parse_command(command), None)
 }
 
 pub fn write_escape_beyond(command: &str, root: &Path) -> Option<String> {
-    escape_reason(command, Some(root))
+    command_escape_violation(&parse_command(command), Some(root))
 }
 
-/// 两个入口共用切词与字面路径判定；无根时按 P8 的保守口径处理。
-fn escape_reason(command: &str, root: Option<&Path>) -> Option<String> {
-    for target in redirect_targets(command) {
-        if let Some(reason) = path_escape_reason(&target, root) {
-            return Some(format!("命令把输出重定向到 workspace 外：{reason}"));
+/// 两道防线唯一的裁决器：逐段、逐重定向、逐词元查越界，任一段命中即拒。
+///
+/// `root` 同时表达 P8/P11 有意保留的口径落差：P8 没有 workspace 根，
+/// 所有盘符绝对路径都升级审批（根内也多问一次）；P11 知道根在哪，
+/// 只硬拒绝真的越界。把 `write_escape_suspect` 改成根感知会动 P8 语义
+/// 与四条验收测试，本切片不消除这层落差，只消除重复切词。
+fn command_escape_violation(parsed: &ParsedCommand, root: Option<&Path>) -> Option<String> {
+    let multi_segment = parsed.segments.len() > 1;
+    for (index, segment) in parsed.segments.iter().enumerate() {
+        for redirect in &segment.redirects {
+            // `<` 是输入，不是"把输出写到外面"；其余形态一视同仁。
+            if redirect.op == RedirectOp::Input {
+                continue;
+            }
+            if let Some(reason) = path_escape_reason(&redirect.target, root) {
+                return Some(segment_note(
+                    format!("命令把输出重定向到 workspace 外：{reason}"),
+                    segment,
+                    index,
+                    multi_segment,
+                ));
+            }
+        }
+        // 重定向目标也留在词元流里：P9 起"任何词元提到越界路径即触发"
+        // 是收紧后的口径，不能因为有了 redirect 索引就退回只看重定向。
+        for word in &segment.words {
+            let candidate = word.path_candidate();
+            if let Some(reason) = path_escape_reason(candidate, root) {
+                // 理由里点名完整词元（旧格式对 --flag= 也是整个词元），
+                // 判据则只看等号后的值——两者不能混为一谈。
+                let text = match write_verb(segment) {
+                    Some(verb) => {
+                        format!(
+                            "命令用 `{verb}` 操作 workspace 外的 `{}`：{reason}",
+                            word.text
+                        )
+                    }
+                    None => format!("命令提到 workspace 外的 `{}`：{reason}", word.text),
+                };
+                return Some(segment_note(text, segment, index, multi_segment));
+            }
         }
     }
-    let target = tokenize(command).find_map(|token| {
-        let candidate = token
-            .split_once('=')
-            .map(|(_, value)| value)
-            .unwrap_or(&token);
-        path_escape_reason(candidate, root).map(|reason| (token, reason))
-    });
-    target.map(|(target, reason)| match write_verb(command) {
-        Some(verb) => format!("命令用 `{verb}` 操作 workspace 外的 `{target}`：{reason}"),
-        None => format!("命令提到 workspace 外的 `{target}`：{reason}"),
-    })
+    None
 }
 
-/// 命令里所有重定向目标；`echo x > a 2> /outside` 不能只看第一个。
-fn redirect_targets(command: &str) -> impl Iterator<Item = String> {
-    let mut tokens = tokenize(command).peekable();
-    std::iter::from_fn(move || {
-        while let Some(token) = tokens.next() {
-            if is_redirect(&token) {
-                let target = tokens.next()?;
-                return Some(unquote(&target).to_owned());
-            }
-        }
-        None
-    })
-}
-
-/// 词法切分：引号内的整段路径保留，shell 链接符单独成词。
-fn tokenize(command: &str) -> impl Iterator<Item = String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut chars = command.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if let Some(q) = quote {
-            if ch == q {
-                quote = None;
-            } else {
-                current.push(ch);
-            }
-            continue;
-        }
-        match ch {
-            '"' | '\'' => quote = Some(ch),
-            c if c.is_whitespace() || matches!(c, '|' | '&' | ';' | '(' | ')') => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-                tokens.push(c.to_string());
-            }
-            '>' | '<' => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-                let mut op = ch.to_string();
-                if ch == '>' && chars.peek() == Some(&'>') {
-                    op.push(chars.next().unwrap());
-                }
-                tokens.push(op);
-            }
-            _ => current.push(ch),
-        }
+/// 多段命令的理由要点名是哪一段、哪个程序；单段沿用三种既有文案模板，
+/// 不追加段号。重定向目标由结构化模型直接收齐，带空格的目标也按
+/// "输出重定向"归类；`<` 是输入，不套输出重定向的理由。
+fn segment_note(
+    reason: String,
+    segment: &CommandSegment,
+    index: usize,
+    multi_segment: bool,
+) -> String {
+    if !multi_segment {
+        return reason;
     }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens.into_iter()
+    let program = segment.program().unwrap_or("");
+    format!("{reason}（第 {} 段，程序 `{program}`）", index + 1)
 }
 
-/// 写入型动词用于生成可读理由；P9 起任何越界路径都会触发，不再以动词为门槛。
-fn write_verb(command: &str) -> Option<&'static str> {
+/// 写入型动词只用于生成可读理由；P9 起任何越界路径都会触发，不以动词为门槛。
+/// 归属按**段**判定：`cargo test && rm D:/outside/x` 的理由应指向 `rm`，
+/// 而不是从整条命令里挑一个恰好出现过的动词。
+fn write_verb(segment: &CommandSegment) -> Option<&'static str> {
     const WRITE_VERBS: [&str; 11] = [
-        "del", "rd", "rmdir", "move", "ren", "copy", "remove-item",
-        "rm", "mv", "cp", "mkdir",
+        "del",
+        "rd",
+        "rmdir",
+        "move",
+        "ren",
+        "copy",
+        "remove-item",
+        "rm",
+        "mv",
+        "cp",
+        "mkdir",
     ];
-    WRITE_VERBS
-        .into_iter()
-        .find(|verb| {
-            tokenize(command).any(|token| token.eq_ignore_ascii_case(verb))
-        })
-}
-
-fn is_redirect(token: &str) -> bool {
-    matches!(token, ">" | ">>" | "1>" | "2>" | "&>")
+    WRITE_VERBS.into_iter().find(|verb| {
+        segment
+            .words
+            .iter()
+            .any(|word| word.text.eq_ignore_ascii_case(verb))
+    })
 }
 
 fn unquote(token: &str) -> &str {
@@ -227,7 +224,10 @@ fn path_escape_reason(token: &str, root: Option<&Path>) -> Option<String> {
     let token = unquote(token);
     if token.is_empty()
         || token.starts_with('-')
-        || matches!(token, "|" | "||" | "&" | "&&" | ";" | "(" | ")" | ">" | ">>" | "<")
+        || matches!(
+            token,
+            "|" | "||" | "&" | "&&" | ";" | "(" | ")" | ">" | ">>" | "<"
+        )
     {
         return None;
     }
@@ -256,14 +256,16 @@ fn escape_shape(token: &str) -> bool {
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && (bytes[2] == b'\\' || bytes[2] == b'/');
-    let drive_relative = bytes.len() >= 2
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':';
-    let unc = token.starts_with("//") || token.starts_with(r"\\")
-        || token.starts_with("/\\") || token.starts_with("\\/");
+    let drive_relative = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let unc = token.starts_with("//")
+        || token.starts_with(r"\\")
+        || token.starts_with("/\\")
+        || token.starts_with("\\/");
     // 裸 `/` 判据区分开关与带目录分隔符的路径：/s 放行，/tmp/out 收紧。
     let posix_absolute = token.starts_with('/') && token[1..].contains(['/', '\\']);
-    unc || drive_absolute || drive_relative || posix_absolute
+    unc || drive_absolute
+        || drive_relative
+        || posix_absolute
         || token.starts_with('\\') && token.len() > 1
 }
 
@@ -305,10 +307,10 @@ fn trim_device_prefix(raw: &str) -> &str {
     text
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::command;
 
     #[test]
     fn default_policy_kills_tree_and_sets_generous_ceilings() {
@@ -461,7 +463,10 @@ mod tests {
     #[test]
     fn posix_absolute_paths_are_compared_against_a_posix_workspace_root() {
         let root = Path::new("/home/user/repo");
-        assert_eq!(write_escape_beyond("cat /home/user/repo/src/main.rs", root), None);
+        assert_eq!(
+            write_escape_beyond("cat /home/user/repo/src/main.rs", root),
+            None
+        );
         assert!(write_escape_beyond("cat /etc/passwd", root).is_some());
         assert!(write_escape_beyond("echo x > /tmp/out", root).is_some());
         assert!(write_escape_beyond("cat /home/user/repo/../secret", root).is_some());
@@ -472,6 +477,159 @@ mod tests {
         let reason = write_escape_suspect(r#"echo x > "D:\repo space\out.txt""#)
             .expect("绝对路径应升级审批");
         assert!(reason.contains(r"D:\repo space\out.txt"), "{reason}");
+    }
+
+    /// 词法裁决的结构化回归表：旧真值表原样保留（不放松、不误杀），
+    /// 新覆盖只增不减。每条都给出"为什么这一条必须这样判"。
+    #[test]
+    fn structured_adjudication_keeps_the_no_loosening_contract() {
+        let root = Path::new(r"D:/repo");
+
+        // 收紧后的新增形态：段、多重定向、--flag= 归属、引号内复合命令。
+        let tightened = [
+            // 越界出现在第 2 段：整串扫词元也碰得到，但理由必须归到 rm 那一段。
+            r"cargo test && rm D:/outside/x",
+            // 越界出现在第 1 段：动词归属不能反过来指向后面的 cargo test。
+            r"rm D:/outside/x && cargo test",
+            // 第二个重定向目标是越界：旧实现只扫到第一个就收工。
+            r"echo x > local.txt 2> /tmp/out",
+            // 分号后的 --flag= 逐段生效，等号后只看值。
+            r"git diff --output=in_root ; git diff --output=D:/outside/x",
+            // cmd /C "…" 的引号内复合命令，补查一层词元后必须看见重定向目标。
+            r#"cmd /C "echo x > D:/outside/x""#,
+            // 管道/换行/|| 的任意一段越界都拒。
+            r"cargo test | copy src \\server\share\x",
+            "cargo test\nrm /tmp/out",
+            r"cargo test || del C:\Windows\temp\x",
+            // 用户点名的既有拒绝形态，重构成结构模型后一个都不许丢。
+            r"cat /etc/passwd",
+            r"echo x > /tmp/out",
+            r"type D:\outside\x",
+            r"copy src \\server\share\x",
+            r"del ..\foo",
+            r"git diff --output=D:\x",
+            // Unicode 空白也必须是词元边界：旧 tokenize 用 is_whitespace，
+            // 新词法若只认 ASCII 空格会把整条命令粘成一个不命中的词元。
+            "type\u{a0}..\\outside",
+            "echo\u{a0}/etc/passwd",
+            // 重定向目标自己带 `=`：目标索引不看等号，但词元流仍按
+            // path_candidate() 取第一个等号后的值，不能只靠 redirect 索引。
+            r"echo x > X=D:/outside",
+            r"echo x > --output=..\outside",
+            // `<` 是输入重定向：不套"输出重定向"理由，但目标词元照常扫描。
+            r"cat < /tmp/out",
+            r"cat < D:\outside\x",
+            // 卷根、盘符相对、设备前缀 UNC：三种形状一个都不许漏。
+            r"type D:\",
+            r"type D:secret.txt",
+            r"type \\?\UNC\server\share\x",
+            r"type //?/D:/outside/x",
+            // fd 前缀的追加形态与 &> 合并输出也要按段收齐。
+            r"echo x 1>>D:/outside/log",
+            r"echo x 2>> /tmp/err",
+            r"echo x &> /tmp/all",
+            // 多段命令只由真段构成：开头链接符不留空段、不加凭空的段号。
+            r"&& rm D:/outside/x",
+            // `&` 只有在 `>&数字` 形态才是 fd 复制；粘住真实越界目标就是放松。
+            r"echo x > local.txt&D:\outside\run.cmd",
+            r"echo x > &C:\Windows\temp\x",
+            r"echo x 2>&C:\Windows\temp\x",
+            // heredoc 正文仍按普通词元扫描，形似外部绝对路径的文字保守拒绝。
+            "cat > notes.txt <<EOF\nD:/outside/x\nEOF",
+        ];
+        for command in tightened {
+            assert!(
+                write_escape_suspect(command).is_some(),
+                "`{command}` 结构词法必须仍判嫌疑"
+            );
+            assert!(
+                write_escape_beyond(command, root).is_some(),
+                "`{command}` 结构词法必须仍被硬拒绝"
+            );
+        }
+
+        // 根内路径与无害命令照旧放行：不能把收紧做成"禁用 run_command"。
+        let clean = [
+            "cargo test",
+            r"echo hi > out.txt",
+            r"echo hi>out.txt",
+            "git status",
+            "git push",
+            "curl -o out.txt https://example.com",
+            "cargo run --bin model.txt",
+            "del scratch.txt",
+            "rd /s /q build",
+            r"echo hi > out.txt 2> out.err",
+            r"echo x > D:\repo\out.txt",
+            r"type D:\repo\src\main.rs",
+            r"cargo build --manifest-path=d:/REPO/Cargo.toml",
+            r#"type "D:\repo\sub dir\main.rs""#,
+            r"echo x > D:\repo\out.txt && cargo test",
+            // 引号里的路径文字是普通参数，不是交给 shell 再解释的命令。
+            r#"git commit -m "fix C:\Users\x\note.txt""#,
+            // 变量展开/命令替换不覆盖，但也不能凭空变成误拒。
+            r"echo x > $OUT",
+            r"echo x > %OUT%",
+            // 已知词法缺口：单级 POSIX 绝对路径与 /s /q 开关用同一个形状，
+            // 为避免误杀 Windows 开关而放行；README 明确记录这个边界。
+            "cat /etc",
+            "type /tmp",
+            // `--flag=` 只看第一个等号后的值；第二个等号后的片段不在判据内。
+            r"git diff --output=a=D:\outside\x",
+        ];
+        for command in clean {
+            assert_eq!(
+                write_escape_beyond(command, root),
+                None,
+                "`{command}` 不应被硬拒绝"
+            );
+        }
+    }
+
+    /// 多段理由点名段号与程序，写动词归属按段而不是按整串；
+    /// 单段沿用旧文案模板，不带段号（审批界面与拒绝理由都钉住了它）。
+    #[test]
+    fn reasons_name_the_offending_segment_but_single_segment_text_stays_verbatim() {
+        let root = Path::new(r"D:/repo");
+        let first = write_escape_suspect(r"rm D:/outside/x && cargo test").expect("第 1 段越界");
+        assert!(first.contains("第 1 段"), "{first}");
+        assert!(first.contains("程序 `rm`"), "{first}");
+        assert!(first.contains("`rm`"), "动词归属应指向 rm: {first}");
+
+        let second =
+            write_escape_beyond(r"cargo test && rm D:/outside/x", root).expect("第 2 段越界");
+        assert!(second.contains("第 2 段"), "{second}");
+        assert!(second.contains("程序 `rm`"), "{second}");
+        assert!(second.contains("`rm` 操作 workspace 外"), "{second}");
+
+        let single = write_escape_suspect(r"echo hi > C:\Windows\temp\x").expect("单段越界");
+        assert_eq!(
+            single,
+            r"命令把输出重定向到 workspace 外：`C:\Windows\temp\x` 指向 workspace 外的绝对路径"
+        );
+        assert!(
+            !single.contains("已覆盖全部"),
+            "理由不得暗示覆盖所有绕过手段: {single}"
+        );
+    }
+
+    /// 两道防线跑在同一份解析结果上：同一条命令的段号与越界目标一致，
+    /// 差别只在 P8 的"无根一律嫌疑"与 P11 的"根内放行"。
+    #[test]
+    fn both_defenses_share_one_parse_and_keep_the_documented_gap() {
+        let parsed = parse_command(r"cargo test && type D:\repo\src\main.rs");
+        let root = Path::new(r"D:/repo");
+
+        let suspect = write_escape_suspect(r"cargo test && type D:\repo\src\main.rs")
+            .expect("P8 无根：根内绝对路径也要多问一次");
+        let beyond = write_escape_beyond(r"cargo test && type D:\repo\src\main.rs", root);
+        assert_eq!(beyond, None, "P11 知道根在哪，同样的路径应放行");
+        assert!(suspect.contains("第 2 段"), "{suspect}");
+        assert_eq!(parsed.segments[1].program(), Some("type"));
+        assert_eq!(
+            parsed.segments[1].operator_before,
+            Some(command::ShellOperator::And)
+        );
     }
 
     /// 返回的原因要能直接进审批理由：用户和模型都得看懂它在说什么。
