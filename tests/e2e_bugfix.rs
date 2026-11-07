@@ -133,6 +133,7 @@ async fn fixes_a_failing_test_in_an_isolated_repo() {
             session_store: None,
             hooks: Arc::new(NoopHooks),
             context_policy: Arc::new(DefaultContextPolicy),
+            additional_guards: Vec::new(),
         },
     );
 

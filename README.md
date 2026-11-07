@@ -56,9 +56,8 @@ flowchart TB
 
 模块之上是一组**扩展点**：模型提供方（`LlmProvider`）、工具来源（`ToolSource`）、
 工具守卫（`ToolGuard`）、运行挂点（`RunHooks`）、上下文策略（`ContextPolicy`）
-都以 trait 定义在应用层，各有默认实现，装配集中在 `main.rs`、
-`AgentDependencies` 与 `AgentRunner` 的装配方法。想加新行为时先找扩展点、
-不改核心循环；完整落点表与
+都以 trait 定义在应用层，各有默认实现，装配集中在 `main.rs` 与
+`AgentDependencies`。想加新行为时先找扩展点、不改核心循环；完整落点表与
 "明确不做"的范围见 [docs/architecture.md](docs/architecture.md)。
 
 ## 3. Coding Agent 任务执行流程

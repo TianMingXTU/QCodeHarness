@@ -54,7 +54,10 @@ impl<'a> GuardContext<'a> {
 /// **自动裁决**（纯函数、无 IO、同步），闸门是**人的决定**（可能
 /// 停下来等输入、异步）。守卫链的结论决定"要不要去问闸门"。
 pub trait ToolGuard: Send + Sync {
-    /// 守卫名，进证据与调试输出。
+    /// 守卫名，供测试与诊断标识。
+    ///
+    /// 不参与裁决合并（合并按链序与严重级），也不用于识别守卫类型：
+    /// Runner 按具体类型判断策略守卫，重名不会改变任何语义。
     fn name(&self) -> &str;
 
     /// 对一次调用给出一票结论。
@@ -140,19 +143,20 @@ impl ToolGuard for BoundaryEscalationGuard {
 /// 合并整条链的一票：**最严格者胜**。
 ///
 /// 顺序遍历、先到先记 `Deny` / `RequireApproval`，但不提前返回——
-/// 返回值还带上"投出这一票的是谁"，而链上后面的守卫仍会被询问
-/// （它们可能还要据此记账）。追求的是与旧内联逻辑逐步一致：
-/// 策略 `Deny` 时旧逻辑连升级检查都不做，但升级守卫对 `Deny` 的
-/// 调用本来就不会再投 `RequireApproval` 之外的票……为避免行为分歧，
-/// 合并**只看最高严重级**，同级的先到者胜。
+/// 返回值还带上"投出这一票的守卫在链上的下标"，供调用方按身份回查
+/// 类型；用下标而不是名字，是因为名字可以重名，不能承担语义判别。
+/// 链上后面的守卫仍会被询问（它们可能还要据此记账）。追求的是与旧
+/// 内联逻辑逐步一致：策略 `Deny` 时旧逻辑连升级检查都不做，但升级
+/// 守卫对 `Deny` 的调用本来就不会再投 `RequireApproval` 之外的票……
+/// 为避免行为分歧，合并**只看最高严重级**，同级的先到者胜。
 pub fn run_guard_chain(
     guards: &[Arc<dyn ToolGuard>],
     call: &ToolCall,
     ctx: &GuardContext<'_>,
-) -> (GuardVerdict, Option<String>) {
+) -> (GuardVerdict, Option<usize>) {
     let mut strictest = GuardVerdict::Pass;
-    let mut strictest_guard: Option<String> = None;
-    for guard in guards {
+    let mut strictest_index: Option<usize> = None;
+    for (index, guard) in guards.iter().enumerate() {
         let verdict = guard.inspect(call, ctx);
         let severity = match &verdict {
             GuardVerdict::Pass => 0,
@@ -166,10 +170,10 @@ pub fn run_guard_chain(
         };
         if severity > current {
             strictest = verdict;
-            strictest_guard = Some(guard.name().to_owned());
+            strictest_index = Some(index);
         }
     }
-    (strictest, strictest_guard)
+    (strictest, strictest_index)
 }
 
 #[cfg(test)]
@@ -292,9 +296,10 @@ mod tests {
         let read = call("read_file", json!({"path": "a.txt"}));
         let spec = read_spec();
 
-        let (verdict, guard_name) = run_guard_chain(&chain, &read, &GuardContext::new(&spec));
+        let (verdict, strictest_index) = run_guard_chain(&chain, &read, &GuardContext::new(&spec));
         assert_eq!(verdict, GuardVerdict::Deny("链上拒绝".to_owned()));
-        assert_eq!(guard_name.as_deref(), Some("deny-all"));
+        assert_eq!(strictest_index, Some(1));
+        assert_eq!(chain[1].name(), "deny-all");
     }
 
     #[test]
@@ -306,9 +311,9 @@ mod tests {
         let read = call("read_file", json!({"path": "a.txt"}));
         let spec = read_spec();
 
-        let (verdict, guard_name) = run_guard_chain(&chain, &read, &GuardContext::new(&spec));
+        let (verdict, strictest_index) = run_guard_chain(&chain, &read, &GuardContext::new(&spec));
         assert_eq!(verdict, GuardVerdict::Pass);
-        assert_eq!(guard_name, None);
+        assert_eq!(strictest_index, None);
     }
 
     #[test]
@@ -322,8 +327,9 @@ mod tests {
         let outside = call("run_command", json!({"command": "echo x > D:/outside/x.txt"}));
         let spec = read_spec();
 
-        let (verdict, guard_name) = run_guard_chain(&chain, &outside, &GuardContext::new(&spec));
+        let (verdict, strictest_index) = run_guard_chain(&chain, &outside, &GuardContext::new(&spec));
         assert!(matches!(verdict, GuardVerdict::Deny(_)));
-        assert_eq!(guard_name.as_deref(), Some("deny-all"));
+        assert_eq!(strictest_index, Some(1));
+        assert_eq!(chain[1].name(), "deny-all");
     }
 }

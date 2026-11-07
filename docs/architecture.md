@@ -41,7 +41,7 @@ IO、`rig`、`toml`、`tokio`、`windows` 与文件操作，这条边界由验�
 | 接入另一家模型服务（地址、凭据、默认模型） | `LlmProvider` | `application/port/mod.rs` | `main.rs` 的 `ProviderRegistry`；首个登记项为默认 | `OpenAiCompatProvider`（`infrastructure/model/openai_compat.rs`） |
 | 换掉一次模型调用的传输实现 | `ModelGateway` | `application/port/mod.rs` | `LlmProvider::gateway()` 交出 | `RigChatGateway`（`infrastructure/model/rig_chat.rs`） |
 | 从别处提供一批工具（第三方工具包、远端目录） | `ToolSource` | `application/tool_registry.rs` | `ToolRegistry::from_sources`；`main.rs` 组装来源列表，同名工具后到的来源胜出 | `BuiltinToolSource`、`McpToolSource` |
-| 在工具执行前拦截、拒绝或升级审批 | `ToolGuard` | `application/tool_guard.rs` | `AgentRunner::with_additional_guards()`（装配期追加；内置链由 `default_guard_chain` 构造），按链序合并、最严格者胜 | `PolicyGuard` + `BoundaryEscalationGuard` |
+| 在工具执行前拦截、拒绝或升级审批 | `ToolGuard` | `application/tool_guard.rs` | `AgentDependencies::additional_guards`（追加到内置链后；内置链由 `default_guard_chain` 构造），按链序合并、最严格者胜 | `PolicyGuard` + `BoundaryEscalationGuard` |
 | 改发给模型的历史视图 | `ContextPolicy` | `application/context_policy.rs` | `AgentDependencies::context_policy` | `DefaultContextPolicy`（预算裁剪） |
 | 观察运行事件（遥测、结构化事件流） | `RunHooks` | `application/port/mod.rs` | `AgentDependencies::hooks` | `NoopHooks` |
 | 换审批方式 | `ApprovalGate` | `application/port/mod.rs` | `AgentDependencies::approvals` | CLI 交互闸门 / 自动放行 / AI 审查 |

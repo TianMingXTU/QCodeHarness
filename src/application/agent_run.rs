@@ -139,6 +139,13 @@ pub struct AgentDependencies {
     /// 它是领域类型而不是端口 trait——它无 IO、无外部依赖，
     /// 直接持有比再开一个端口更简单。
     pub policy: PolicyEngine,
+    /// 追加到内置守卫链之后的工具守卫。
+    ///
+    /// 内置链是策略裁决 + 越界升级（由 `default_guard_chain` 构造）；这里
+    /// 追加的守卫按链序参与"最严格者胜"合并。空表示只用内置链。
+    /// 策略守卫始终在链首——`PolicyEvaluated` 证据与它同源，不会被
+    /// 追加项替换。
+    pub additional_guards: Vec<Arc<dyn ToolGuard>>,
     /// 角色花名册：按 `spec.role` 查出这个角色能调哪些工具。
     ///
     /// 工具定义对所有步骤统一（模型看到的永远是全量注册表），
@@ -255,6 +262,7 @@ impl AgentRunner {
             evidence,
             clock,
             policy,
+            additional_guards,
             roster,
             context_budget,
             context_policy,
@@ -264,6 +272,8 @@ impl AgentRunner {
         let visible_specs = tools.specs();
         let session = Session::new(session_id, task);
         let run_start = clock.now();
+        let mut guards = default_guard_chain(policy);
+        guards.extend(additional_guards);
         let mut runner = Self {
             model,
             tools,
@@ -271,7 +281,7 @@ impl AgentRunner {
             approvals,
             evidence,
             clock,
-            guards: default_guard_chain(policy),
+            guards,
             roster,
             allowed_tools: None,
             context_budget,
@@ -375,6 +385,7 @@ impl AgentRunner {
             evidence,
             clock,
             policy,
+            additional_guards,
             roster,
             context_budget,
             context_policy,
@@ -385,6 +396,8 @@ impl AgentRunner {
         let clock_now = clock.now();
         // 墙钟基数要在 consumption 被移进 runner 之前取出。
         let elapsed_base = snapshot.consumption.elapsed;
+        let mut guards = default_guard_chain(policy);
+        guards.extend(additional_guards);
         let mut runner = Self {
             model,
             tools,
@@ -392,7 +405,7 @@ impl AgentRunner {
             approvals,
             evidence,
             clock,
-            guards: default_guard_chain(policy),
+            guards,
             roster,
             allowed_tools: None,
             context_budget,
@@ -416,23 +429,6 @@ impl AgentRunner {
         runner.apply_resume_semantics();
         runner.save_snapshot();
         Ok(runner)
-    }
-
-    /// 在装配期向守卫链追加自定义守卫。
-    ///
-    /// 自定义守卫排在两个内置守卫之后，按 [`run_guard_chain`] 的
-    /// **最严格者胜**规则参与合并：它能拒绝策略放行的调用，也能要求
-    /// 审批。策略守卫始终在链首——`PolicyEvaluated` 证据与它同源，
-    /// 不允许被替换掉。
-    ///
-    /// 装配方因此不必改 `agent_run.rs`：`AgentRunner::new(..)` 或
-    /// `resume(..)` 之后、运行之前追加即可。
-    pub fn with_additional_guards(
-        mut self,
-        guards: impl IntoIterator<Item = Arc<dyn ToolGuard>>,
-    ) -> Self {
-        self.guards.extend(guards);
-        self
     }
 
     /// 恢复语义：把快照里的半轮状态翻译成"接下来该怎么走"。
@@ -848,7 +844,7 @@ impl AgentRunner {
                     reason: decision.reason.clone(),
                 });
 
-                let (verdict, guard_name) =
+                let (verdict, strictest_index) =
                     run_guard_chain(&self.guards, &call, &GuardContext::new(spec));
 
                 // 恢复时的"重新审批"标记只作用于这一次调用：裁决完就清掉。
@@ -873,9 +869,13 @@ impl AgentRunner {
                     // 过目），常规审批允许 [a]/[p]。给普通策略审批也塞上
                     // 理由，会让信任机制整体失效——那是改造前没有的行为。
                     GuardVerdict::RequireApproval(reason) => {
-                        let escalation =
-                            (guard_name.as_deref() != Some(policy_guard.name()))
-                                .then_some(reason);
+                        // 按守卫身份而不是名字判断这一票是否来自策略守卫：
+                        // 名字可以重名，不能承担"常规审批还是复核"的语义。
+                        let from_policy = strictest_index
+                            .and_then(|index| self.guards.get(index))
+                            .map(|guard| guard.as_policy_guard().is_some())
+                            .unwrap_or(false);
+                        let escalation = (!from_policy).then_some(reason);
                         Ok(self.park_at_approval(call, spec.annotations, escalation, reask))
                     }
                     // 放行：不过闸门，直接进执行。
@@ -1585,16 +1585,24 @@ mod tests {
         policy: PolicyEngine,
         invoker: Arc<dyn ToolInvoker>,
     ) -> Harness {
-        harness_full(turns, tools, policy, invoker, Arc::new(NoopHooks))
+        harness_full(
+            turns,
+            tools,
+            policy,
+            invoker,
+            Arc::new(NoopHooks),
+            Vec::new(),
+        )
     }
 
-    /// 同上，但可指定运行挂点：Hook 用例从这里进。
+    /// 同上，但可指定运行挂点与追加守卫：Hook / 守卫用例从这里进。
     fn harness_full(
         turns: Vec<MockTurn>,
         tools: Vec<ToolSpec>,
         policy: PolicyEngine,
         invoker: Arc<dyn ToolInvoker>,
         hooks: Arc<dyn RunHooks>,
+        additional_guards: Vec<Arc<dyn ToolGuard>>,
     ) -> Harness {
         let mock = MockCompletionModel::from_turns(turns);
         let evidence = Arc::new(MemoryEvidenceSink::new());
@@ -1614,6 +1622,7 @@ mod tests {
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 context_policy: Arc::new(DefaultContextPolicy),
+                additional_guards,
                 session_store: None,
                 hooks,
             },
@@ -1724,6 +1733,7 @@ mod tests {
             PolicyEngine::new(),
             Arc::new(RecordingInvoker::default()),
             hooks.clone(),
+            Vec::new(),
         );
 
         let outcome = harness.runner.run(&Budget::new(20)).await.unwrap();
@@ -1761,7 +1771,7 @@ mod tests {
         }
 
         let invoker = Arc::new(RecordingInvoker::default());
-        let mut harness = harness_with_invoker(
+        let mut harness = harness_full(
             vec![
                 MockTurn::tool_call("call_1", "read_file", json!({"path": "Cargo.toml"})),
                 MockTurn::text("被拒了，换条路。"),
@@ -1769,10 +1779,9 @@ mod tests {
             vec![read_file_spec()],
             PolicyEngine::new(),
             invoker.clone(),
+            Arc::new(NoopHooks),
+            vec![Arc::new(DenyReads) as Arc<dyn ToolGuard>],
         );
-        harness.runner = harness
-            .runner
-            .with_additional_guards([Arc::new(DenyReads) as Arc<dyn ToolGuard>]);
 
         let outcome = harness.runner.run(&Budget::new(20)).await.unwrap();
 
@@ -1784,6 +1793,119 @@ mod tests {
         assert!(
             harness.approvals.requested_tools().is_empty(),
             "直接拒绝不该去问审批闸门"
+        );
+    }
+
+    /// 守卫名可以重名，但不能因此改变审批语义：冒充 `policy` 的自定义
+    /// 守卫投出的 `RequireApproval` 仍按复核处理（理由进 ApprovalRequest）。
+    #[tokio::test]
+    async fn a_guard_named_policy_does_not_get_policy_semantics() {
+        struct Impostor;
+
+        impl ToolGuard for Impostor {
+            fn name(&self) -> &str {
+                "policy"
+            }
+
+            fn inspect(&self, _call: &ToolCall, _ctx: &GuardContext<'_>) -> GuardVerdict {
+                GuardVerdict::RequireApproval("冒充策略的复核".to_owned())
+            }
+        }
+
+        let mut harness = harness_full(
+            vec![
+                MockTurn::tool_call("call_1", "read_file", json!({"path": "Cargo.toml"})),
+                MockTurn::text("等审批。"),
+            ],
+            vec![read_file_spec()],
+            PolicyEngine::new(),
+            Arc::new(RecordingInvoker::default()),
+            Arc::new(NoopHooks),
+            vec![Arc::new(Impostor) as Arc<dyn ToolGuard>],
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(
+            harness.approvals.first_request().reason.as_deref(),
+            Some("冒充策略的复核"),
+            "名字叫 policy 不等于它是策略守卫"
+        );
+    }
+
+    // ── 上下文策略：注入的策略真的被 Runner 使用 ──────────────────────
+
+    #[tokio::test]
+    async fn a_custom_context_policy_is_actually_used_by_the_runner() {
+        struct KeepEverything {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl ContextPolicy for KeepEverything {
+            fn view<'a>(
+                &self,
+                session: &'a Session,
+                _budget: &ContextBudget,
+                _summary: Option<&crate::domain::context::Summary>,
+            ) -> Vec<ContextSlice<'a>> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                session.slices()
+            }
+        }
+
+        let policy = Arc::new(KeepEverything {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mock = MockCompletionModel::from_turns(vec![
+            MockTurn::tool_call("call_1", "read_file", json!({"path": "Cargo.toml"})),
+            MockTurn::text("读完了。"),
+        ]);
+        let evidence = Arc::new(MemoryEvidenceSink::new());
+        let mut runner = AgentRunner::new(
+            spec_with(),
+            SessionId::new("test-session"),
+            "读一下 Cargo.toml",
+            AgentDependencies {
+                model: Arc::new(RigChatGateway::new(mock.clone().erase())),
+                tools: registry_with(
+                    Arc::new(RecordingInvoker::default()),
+                    vec![read_file_spec()],
+                ),
+                approvals: Arc::new(CountingGate::default()),
+                evidence: evidence.clone(),
+                clock: Arc::new(crate::infrastructure::clock::SystemClock),
+                policy: PolicyEngine::new(),
+                additional_guards: Vec::new(),
+                roster: AgentRoster::builtin(),
+                // 紧预算：默认策略会裁掉整轮，自定义策略全量保留。
+                context_budget: ContextBudget {
+                    max_tokens: Some(1),
+                    min_recent_rounds: 0,
+                    keep_task: true,
+                    summarize: None,
+                },
+                context_policy: policy.clone(),
+                session_store: None,
+                hooks: Arc::new(NoopHooks),
+            },
+        );
+
+        let outcome = runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(outcome.turns_used, 2);
+        assert_eq!(
+            policy.calls.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "两次模型往返各调用一次探针视图与一次终稿视图"
+        );
+        let compacted = evidence
+            .events()
+            .into_iter()
+            .any(|entry| matches!(entry.event, AuditEvent::ContextCompacted { .. }));
+        assert!(
+            !compacted,
+            "自定义策略没裁整轮，不该产生 ContextCompacted 证据"
         );
     }
 
@@ -2137,6 +2259,7 @@ mod tests {
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
                 context_policy: Arc::new(DefaultContextPolicy),
+                additional_guards: Vec::new(),
             },
         );
 
@@ -3137,6 +3260,7 @@ mod tests {
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
                 context_policy: Arc::new(DefaultContextPolicy),
+                additional_guards: Vec::new(),
             },
         );
 
@@ -3224,6 +3348,7 @@ mod tests {
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
                 context_policy: Arc::new(DefaultContextPolicy),
+                additional_guards: Vec::new(),
             },
         );
 
@@ -3293,6 +3418,7 @@ mod tests {
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
                 context_policy: Arc::new(DefaultContextPolicy),
+                additional_guards: Vec::new(),
             },
         );
         (runner, evidence)
@@ -3547,6 +3673,7 @@ mod tests {
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
                 context_policy: Arc::new(DefaultContextPolicy),
+                additional_guards: Vec::new(),
             },
         );
 
@@ -3607,6 +3734,7 @@ mod tests {
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
                 context_policy: Arc::new(DefaultContextPolicy),
+                additional_guards: Vec::new(),
             },
         );
         handle_slot
@@ -3650,6 +3778,7 @@ mod tests {
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
                 context_policy: Arc::new(DefaultContextPolicy),
+                additional_guards: Vec::new(),
             },
         );
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
@@ -3696,6 +3825,7 @@ mod tests {
             session_store: None,
             hooks: Arc::new(NoopHooks),
             context_policy: Arc::new(DefaultContextPolicy),
+            additional_guards: Vec::new(),
         }
     }
 

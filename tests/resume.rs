@@ -90,6 +90,7 @@ fn deps_with(
         session_store,
         hooks: Arc::new(NoopHooks),
         context_policy: Arc::new(DefaultContextPolicy),
+        additional_guards: Vec::new(),
     }
 }
 

@@ -330,6 +330,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             session_store: None,
             hooks: Arc::new(NoopHooks),
             context_policy: Arc::new(DefaultContextPolicy),
+            additional_guards: Vec::new(),
         };
         let mut budget = Budget::new(config.max_turns);
         if let Some(limit) = config.max_wall_clock {
@@ -468,6 +469,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 session_store: Some(store.clone()),
                 hooks: Arc::new(NoopHooks),
                 context_policy: Arc::new(DefaultContextPolicy),
+                additional_guards: Vec::new(),
             },
         ) {
             Ok(runner) => runner,
@@ -535,6 +537,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             session_store: Some(store.clone()),
         hooks: Arc::new(NoopHooks),
         context_policy: Arc::new(DefaultContextPolicy),
+        additional_guards: Vec::new(),
     };
         let mut orchestrator =
             Orchestrator::new(deps, budget, evidence_factory).with_task_store(Arc::new(task_store));
@@ -639,6 +642,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         session_store: Some(store.clone()),
         hooks: Arc::new(NoopHooks),
         context_policy: Arc::new(DefaultContextPolicy),
+        additional_guards: Vec::new(),
     };
     let mut orchestrator = Orchestrator::with_roster(deps, budget, evidence_factory, roster)
         .with_task_store(Arc::new(JsonTaskStore::new(&workspace)))

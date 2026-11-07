@@ -93,7 +93,7 @@ pub trait ModelGateway: Send + Sync {
 /// [`ProviderRegistry`](crate::application::provider_registry::ProviderRegistry)
 /// 里选一家，核心循环与网关签名都不感知具体供应商。
 pub trait LlmProvider: Send + Sync {
-    /// 提供方标识，注册表的查找键，也是日志与报错里认人的名字。
+    /// 提供方标识，注册表的查找键与查重键；重复 `id` 的登记会被忽略。
     fn id(&self) -> &str;
 
     /// 该提供方对应的模型网关。

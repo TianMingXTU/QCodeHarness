@@ -72,6 +72,7 @@ fn deps(mock: &MockCompletionModel) -> AgentDependencies {
         session_store: None,
         hooks: Arc::new(NoopHooks),
         context_policy: Arc::new(DefaultContextPolicy),
+        additional_guards: Vec::new(),
     }
 }
 
@@ -1081,6 +1082,7 @@ fn base_deps(mock: &MockCompletionModel) -> AgentDependencies {
         session_store: None,
         hooks: Arc::new(NoopHooks),
         context_policy: Arc::new(DefaultContextPolicy),
+        additional_guards: Vec::new(),
     }
 }
 
