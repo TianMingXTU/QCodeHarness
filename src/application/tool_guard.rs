@@ -106,6 +106,10 @@ impl ToolGuard for PolicyGuard {
 /// 越界写入升级守卫：策略放行了，但命令看着像把写操作伸到 workspace
 /// 外时，追加一票"要人过目"。
 ///
+/// 投票理由是嫌疑文本本身，不加解释性前缀：`ApprovalRequest.reason`
+/// 的 `Some` 就是"这是策略之外的复核"，闸门据此禁用会话信任；理由
+/// 只是给人看的那句话，形状与改造前保持一致。
+///
 /// 与硬拒绝（`write_escape_beyond`）共用同一套词法解析，口径刻意不同：
 /// 这里没有根可看，所有盘符绝对路径都算嫌疑——它是**兜底**，宁可多问；
 /// 硬拒绝是机械边界，必须准。两道防线的落差见 README"安全边界"。
@@ -123,9 +127,7 @@ impl ToolGuard for BoundaryEscalationGuard {
             return GuardVerdict::Pass;
         };
         match write_escape_suspect(command) {
-            Some(suspect) => {
-                GuardVerdict::RequireApproval(format!("策略已放行，但疑似越界写入：{suspect}"))
-            }
+            Some(suspect) => GuardVerdict::RequireApproval(suspect),
             None => GuardVerdict::Pass,
         }
     }
@@ -258,14 +260,16 @@ mod tests {
             GuardVerdict::Pass
         );
 
-        // 越界绝对路径：升级并带嫌疑路径。
-        let outside = call("run_command", json!({"command": "echo x > D:/outside/x.txt"}));
-        match guard.inspect(&outside, &GuardContext::new(&spec)) {
-            GuardVerdict::RequireApproval(reason) => {
-                assert!(reason.contains("疑似越界写入"), "{reason}");
-            }
-            other => panic!("应升级为要审批: {other:?}"),
-        }
+        // 越界绝对路径：升级，理由就是嫌疑文本本身。
+        let command = "echo x > D:/outside/x.txt";
+        let outside = call("run_command", json!({"command": command}));
+        let expected =
+            crate::domain::sandbox::write_escape_suspect(command).expect("应判为嫌疑");
+        assert_eq!(
+            guard.inspect(&outside, &GuardContext::new(&spec)),
+            GuardVerdict::RequireApproval(expected),
+            "复核理由必须原样携带嫌疑文本，不加前缀"
+        );
 
         // 没有 command 参数的调用不进入这个守卫的视野。
         let no_command = call("read_file", json!({"path": "a.txt"}));

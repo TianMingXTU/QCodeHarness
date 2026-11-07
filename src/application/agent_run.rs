@@ -831,7 +831,7 @@ impl AgentRunner {
                     reason: decision.reason.clone(),
                 });
 
-                let (verdict, _guard_name) =
+                let (verdict, guard_name) =
                     run_guard_chain(&self.guards, &call, &GuardContext::new(spec));
 
                 // 恢复时的"重新审批"标记只作用于这一次调用：裁决完就清掉。
@@ -850,10 +850,16 @@ impl AgentRunner {
                         ));
                         self.record_and_advance(call, outcome).await
                     }
-                    // 要审批：停在闸门前，守卫的理由一并带上，
-                    // 让人（或未来的自动闸门）知道是哪条规则要他点头。
+                    // 要审批：策略自身的审批不带复核理由，只有策略之外
+                    // 的守卫（越界升级）才带。闸门用 `reason` 的 Some/None
+                    // 区分复核与常规审批：复核不吃会话信任（每次都要人
+                    // 过目），常规审批允许 [a]/[p]。给普通策略审批也塞上
+                    // 理由，会让信任机制整体失效——那是改造前没有的行为。
                     GuardVerdict::RequireApproval(reason) => {
-                        Ok(self.park_at_approval(call, spec.annotations, Some(reason), reask))
+                        let escalation =
+                            (guard_name.as_deref() != Some(policy_guard.name()))
+                                .then_some(reason);
+                        Ok(self.park_at_approval(call, spec.annotations, escalation, reask))
                     }
                     // 放行：不过闸门，直接进执行。
                     GuardVerdict::Pass => {
@@ -2463,6 +2469,34 @@ mod tests {
         assert_eq!(harness.approvals.requested_tools(), vec!["read_file"]);
     }
 
+    /// 策略自身的审批不带复核理由。
+    ///
+    /// `ApprovalRequest.reason` 的 Some/None 是闸门区分"复核"与"常规
+    /// 审批"的唯一信号：Some 会禁用会话信任（[a]/[p]）。普通策略审批
+    /// 若带上理由，用户就再也无法按一次 a/p 少答几次；改造前不是这样。
+    #[tokio::test]
+    async fn policy_approval_carries_no_review_reason() {
+        let policy = policy_with("write_file", PolicyVerdict::RequireApproval, "写文件要审");
+        let mut harness = harness_with_policy(
+            vec![
+                MockTurn::tool_call("call_1", "write_file", json!({"path": "a.txt"})),
+                MockTurn::text("写完了"),
+            ],
+            vec![read_file_spec(), write_file_spec()],
+            policy,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(harness.approvals.requested_tools(), vec!["write_file"]);
+        let request = harness.approvals.first_request();
+        assert!(
+            request.reason.is_none(),
+            "常规策略审批不得带复核理由（会禁用会话信任），实际: {:?}",
+            request.reason
+        );
+    }
+
     #[tokio::test]
     async fn every_policy_verdict_leaves_an_audit_event() {
         let policy = policy_with("read_file", PolicyVerdict::Deny, "禁读");
@@ -2502,13 +2536,10 @@ mod tests {
             parameters: json!({"type": "object"}),
             annotations: ToolAnnotations::new(false, true, false, true),
         };
+        let command = r"echo hi > C:\Windows\temp\x";
         let mut harness = harness_with_policy(
             vec![
-                MockTurn::tool_call(
-                    "call_1",
-                    "run_command",
-                    json!({"command": r"echo hi > C:\Windows\temp\x"}),
-                ),
+                MockTurn::tool_call("call_1", "run_command", json!({"command": command})),
                 MockTurn::text("跑完了"),
             ],
             vec![run_command_spec],
@@ -2523,9 +2554,16 @@ mod tests {
             "越界写入必须被升级为要审批"
         );
         // 升级理由要递到闸门：用户得知道为什么要他看这一眼。
+        // 理由必须原样等于嫌疑文本——`Some` 本身就是"这是复核"的信号，
+        // 再加解释性前缀会改变审批请求的既有形状。
+        let suspect = crate::domain::sandbox::write_escape_suspect(command)
+            .expect("这条命令应被判为越界嫌疑");
         let request = harness.approvals.first_request();
-        let reason = request.reason.expect("升级请求必须带 reason");
-        assert!(reason.contains(r"C:\Windows\temp\x"), "理由应点名目标: {reason}");
+        assert_eq!(
+            request.reason.as_deref(),
+            Some(suspect.as_str()),
+            "升级理由应原样携带嫌疑文本"
+        );
     }
 
     /// 同样的 Allow 规则下，落在 workspace 内的命令不被升级。
@@ -2572,13 +2610,10 @@ mod tests {
             parameters: json!({"type": "object"}),
             annotations: ToolAnnotations::new(false, true, false, true),
         };
+        let command = r"git diff --output=C:\Windows\temp\x";
         let mut harness = harness_with_policy(
             vec![
-                MockTurn::tool_call(
-                    "call_1",
-                    "run_command",
-                    json!({"command": r"git diff --output=C:\Windows\temp\x"}),
-                ),
+                MockTurn::tool_call("call_1", "run_command", json!({"command": command})),
                 MockTurn::text("跑完了"),
             ],
             vec![run_command_spec],
@@ -2592,14 +2627,12 @@ mod tests {
             vec!["run_command"],
             "基线放行的命令族也不能把内容写到 workspace 外而无人过目"
         );
-        let reason = harness
-            .approvals
-            .first_request()
-            .reason
-            .expect("升级请求必须带 reason");
-        assert!(
-            reason.contains(r"C:\Windows\temp\x"),
-            "理由应点名越界目标: {reason}"
+        let suspect = crate::domain::sandbox::write_escape_suspect(command)
+            .expect("这条命令应被判为越界嫌疑");
+        assert_eq!(
+            harness.approvals.first_request().reason.as_deref(),
+            Some(suspect.as_str()),
+            "理由应原样携带嫌疑文本"
         );
     }
 
