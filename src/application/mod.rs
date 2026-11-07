@@ -16,4 +16,5 @@ pub mod step_prompt;
 pub mod summarizer;
 pub mod task_resume;
 pub mod tool_registry;
+pub mod tool_guard;
 pub mod worktree;

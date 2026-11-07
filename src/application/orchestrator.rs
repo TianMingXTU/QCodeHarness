@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::application::agent_roster::AgentRoster;
 use crate::application::agent_run::{new_session_id, AgentDependencies, AgentRunner};
 use crate::application::error::ApplicationError;
-use crate::application::port::{EvidenceSink, NoopHooks};
+use crate::application::port::EvidenceSink;
 use crate::application::snapshot::{TaskSnapshot, TaskStore, TASK_FORMAT};
 use crate::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
 use crate::application::worktree::WorktreeScanner;
@@ -541,7 +541,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::application::port::{ApprovalGate, EvidenceSink};
+    use crate::application::port::{ApprovalGate, EvidenceSink, NoopHooks};
     use crate::application::tool_registry::ToolRegistry;
     use crate::domain::agent::AgentRole;
     use crate::domain::context::ContextBudget;

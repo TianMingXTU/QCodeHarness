@@ -22,7 +22,7 @@ use std::time::Duration;
 use crate::application::agent_run::AgentDependencies;
 use crate::application::error::ApplicationError;
 use crate::application::orchestrator::{EvidenceFactory, Orchestrator};
-use crate::application::port::{EvidenceSink, NoopHooks};
+use crate::application::port::EvidenceSink;
 use crate::application::report::{cost_label, hit_ratio_label, summarize};
 use crate::application::snapshot::TaskStore;
 use crate::application::tool_registry::ToolRegistry;
@@ -782,7 +782,7 @@ fn walk(root: &Path, dir: &Path, files: &mut HashMap<String, Vec<u8>>) {
 mod tests {
     use super::*;
     use crate::application::agent_roster::AgentRoster;
-    use crate::application::port::ApprovalGate;
+    use crate::application::port::{ApprovalGate, NoopHooks};
     use crate::domain::evidence::AuditEvent;
     use crate::domain::policy::PolicyEngine;
     use crate::domain::tool::{OutcomeStatus, ToolOutcome};

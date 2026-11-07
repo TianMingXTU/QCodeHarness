@@ -12,21 +12,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::application::error::ApplicationError;
 use crate::application::port::{
-    ApprovalGate, ApprovalRequest, Clock, EvidenceSink, ModelGateway, ModelReply,
-    ModelRequest, NoopHooks, RunHooks,
+    ApprovalGate, ApprovalRequest, Clock, EvidenceSink, ModelGateway, ModelReply, ModelRequest,
+    RunHooks,
 };
 use crate::application::agent_roster::AgentRoster;
 use crate::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
 use crate::application::summarizer::{render_slices, SummarizeInput, Summarizer};
 use crate::application::tool_registry::ToolRegistry;
+use crate::application::tool_guard::{
+    run_guard_chain, BoundaryEscalationGuard, GuardContext, GuardVerdict, PolicyGuard, ToolGuard,
+};
 use crate::domain::agent::{AgentSpec, AgentTurn};
 use crate::domain::budget::{Budget, Consumption};
 use crate::domain::context::{compact, ContextBudget};
 use crate::domain::evidence::AuditEvent;
 use crate::domain::ids::SessionId;
-use crate::domain::policy::{PolicyDecision, PolicyEngine, PolicyVerdict};
-use crate::domain::sandbox::write_escape_suspect;
-use serde_json::Value;
+use crate::domain::policy::{PolicyDecision, PolicyEngine};
 use crate::domain::session::{ContextSlice, Session};
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 
@@ -170,11 +171,13 @@ pub struct AgentRunner {
     approvals: Arc<dyn ApprovalGate>,
     evidence: Arc<dyn EvidenceSink>,
     clock: Arc<dyn Clock>,
-    /// 策略引擎：决定每个调用是放行、要审批、还是直接拒绝。
+    /// 工具守卫链：策略裁决与越界升级按序执行，最严格者胜。
     ///
-    /// 它是领域类型而不是端口 trait——它无 IO、无外部依赖，
-    /// 直接持有比再开一个端口更简单。
-    policy: PolicyEngine,
+    /// 内置链是 `PolicyGuard` + `BoundaryEscalationGuard`，与旧内联
+    /// 逻辑逐步一致；守卫是纯函数，没有 IO。策略引擎从链上取（见
+    /// `policy_engine`），保证 `PolicyEvaluated` 证据与守卫用的是
+    /// 同一份裁决。
+    guards: Vec<Arc<dyn ToolGuard>>,
     /// 角色花名册：角色边界的真相来源（见 [`AgentDependencies::roster`]）。
     roster: AgentRoster,
     /// 当前角色可调用的工具名；`None` 表示不限。
@@ -258,7 +261,7 @@ impl AgentRunner {
             approvals,
             evidence,
             clock,
-            policy,
+            guards: default_guard_chain(policy),
             roster,
             allowed_tools: None,
             context_budget,
@@ -377,7 +380,7 @@ impl AgentRunner {
             approvals,
             evidence,
             clock,
-            policy,
+            guards: default_guard_chain(policy),
             roster,
             allowed_tools: None,
             context_budget,
@@ -798,9 +801,15 @@ impl AgentRunner {
                 };
                 let spec = &entry.spec;
 
-                // 策略裁决优先于注解：注解只是默认策略的输入之一，
-                // 配置一条规则就能覆盖它。
-                let decision = self.policy.evaluate(&call, spec);
+                // 守卫链：策略裁决在前，越界升级在后。审计里记的仍是
+                // 策略的原判——策略没改，改的是这次调用要不要人过目，
+                // 两件事不能混在一条事件里。
+                let policy_guard = self
+                    .guards
+                    .iter()
+                    .find_map(|guard| guard.as_policy_guard())
+                    .expect("装配时必须提供策略守卫：PolicyEvaluated 证据与守卫一票同源");
+                let decision = policy_guard.evaluate(&call, spec);
                 self.record(AuditEvent::PolicyEvaluated {
                     turn: self.session.rounds() + 1,
                     tool: call.name.clone(),
@@ -809,40 +818,39 @@ impl AgentRunner {
                     reason: decision.reason.clone(),
                 });
 
-                // 策略说放行，但命令看着像把写操作伸到 workspace 外时，
-                // 升级成要审批。审计里记的仍是策略的原判——策略没改，改的是
-                // 这次调用要不要人过目，两件事不能混在一条事件里。
-                let (decision, escalation) = escalate_out_of_workspace_write(decision, &call);
+                let (verdict, _guard_name) =
+                    run_guard_chain(&self.guards, &call, &GuardContext::new(spec));
 
                 // 恢复时的"重新审批"标记只作用于这一次调用：裁决完就清掉。
                 // 它必须在这里取走而不是留在字段里——否则策略放行时它会
                 // 一直挂着，蹭到下一次审批上去。
                 let reask = std::mem::replace(&mut self.reask_approval, false);
 
-                match decision.verdict {
+                match verdict {
                     // 拒绝：连闸门都不问，直接给模型一条拒绝观察。
                     // 内容里带上命中规则的理由，模型才知道该换哪条路。
-                    PolicyVerdict::Deny => {
-                        let outcome = ToolOutcome::refused(denied_by_policy_message(
+                    GuardVerdict::Deny(reason) => {
+                        let outcome = ToolOutcome::refused(denied_by_chain_message(
                             &call.name,
                             &decision,
+                            &reason,
                         ));
                         self.record_and_advance(call, outcome).await
                     }
-                    // 要审批：停在闸门前，策略理由一并带上，
+                    // 要审批：停在闸门前，守卫的理由一并带上，
                     // 让人（或未来的自动闸门）知道是哪条规则要他点头。
-                    PolicyVerdict::RequireApproval => {
-                        Ok(self.park_at_approval(call, spec.annotations, escalation, reask))
+                    GuardVerdict::RequireApproval(reason) => {
+                        Ok(self.park_at_approval(call, spec.annotations, Some(reason), reask))
                     }
                     // 放行：不过闸门，直接进执行。
-                    PolicyVerdict::Allow => {
+                    GuardVerdict::Pass => {
                         // 恢复路径上的例外：这个请求在中断前已经被判为
                         // "需要人过目"。策略后来放宽了，也不能替人把这个
                         // 判断抹掉——人要再点一次，否则"人没答复"会被
                         // 悄悄读成"人点过了"。
                         if reask {
                             return Ok(
-                                self.park_at_approval(call, spec.annotations, escalation, true)
+                                self.park_at_approval(call, spec.annotations, None, true)
                             );
                         }
                         self.state = RunState::Dispatching(calls.clone());
@@ -1283,18 +1291,28 @@ fn unregistered_tool_message(name: &str, specs: &[ToolSpec]) -> String {
     format!("未注册的工具 `{name}`，可用工具: {}", available.join(", "))
 }
 
-/// 策略拒绝的说明。
+/// 拒绝的说明。
 ///
-/// 必须带上规则理由：只说"被禁止"的话，模型无法判断是换参数、换工具、
-/// 还是这条路根本走不通，只会盲目重试同一个调用。
-fn denied_by_policy_message(name: &str, decision: &PolicyDecision) -> String {
-    match decision.rule_index {
-        Some(index) => format!(
-            "工具 `{name}` 被策略规则 #{index} 拒绝：{}。请换一种方式完成，不要重试同一调用。",
-            decision.reason
-        ),
-        None => format!("工具 `{name}` 被默认策略拒绝：{}", decision.reason),
+/// 拒绝票来自策略守卫时沿用原有模板（区分"规则 #N 拒绝"与"默认策略
+/// 拒绝"）；来自其他守卫时给出守卫自己的理由——只说"被禁止"的话，
+/// 模型无法判断是换参数、换工具、还是这条路根本走不通，只会盲目重试
+/// 同一个调用。
+fn denied_by_chain_message(
+    name: &str,
+    decision: &PolicyDecision,
+    guard_reason: &str,
+) -> String {
+    // 理由与策略原判一致，说明这票是策略投的，按老模板说话。
+    if guard_reason == decision.reason {
+        return match decision.rule_index {
+            Some(index) => format!(
+                "工具 `{name}` 被策略规则 #{index} 拒绝：{}。请换一种方式完成，不要重试同一调用。",
+                decision.reason
+            ),
+            None => format!("工具 `{name}` 被默认策略拒绝：{}", decision.reason),
+        };
     }
+    format!("工具 `{name}` 被拒绝：{guard_reason}。请换一种方式完成，不要重试同一调用。")
 }
 
 /// 恢复时给模型的重放提示。
@@ -1316,47 +1334,23 @@ fn replay_notice(call: &ToolCall, previous: Option<&ToolOutcome>) -> String {
     )
 }
 
-/// 策略放行但调用疑似越界写入时，把裁决升级为要求审批。
+/// 内置守卫链：策略裁决在前，越界升级在后（升级只对放行的调用生效）。
 ///
-/// 返回升级后的裁决，以及要写进 [`ApprovalRequest::reason`] 的理由；
-/// 没有升级时理由为 `None`。
-///
-/// 补的是策略的一个真实缺口：策略按"工具名 + 参数文本"放行 `run_command`
-/// 之后，命令内容就不受任何约束了——模型敲 `echo x > C:\Windows\temp\y`，
-/// 策略看到的是"run_command，已放行"。这道检查让这种调用至少有人过目。
-///
-/// 只升级 `Allow`：本来就要审的（`RequireApproval`）不必再贴一遍理由，
-/// 被拒的（`Deny`）连闸门都到不了。`rule_index` 置回 `None`——放行它的
-/// 规则并没有改主意，改主意的是这次调用本身。
-fn escalate_out_of_workspace_write(
-    decision: PolicyDecision,
-    call: &ToolCall,
-) -> (PolicyDecision, Option<String>) {
-    if decision.verdict != PolicyVerdict::Allow {
-        return (decision, None);
-    }
-    // 只有带 command 参数的调用（即 run_command）走得进这个启发式，
-    // 其他工具没有命令文本可看。
-    let Some(command) = call.arguments.get("command").and_then(Value::as_str) else {
-        return (decision, None);
-    };
-    let Some(suspect) = write_escape_suspect(command) else {
-        return (decision, None);
-    };
-    (
-        PolicyDecision {
-            verdict: PolicyVerdict::RequireApproval,
-            reason: format!("策略已放行，但疑似越界写入：{suspect}"),
-            rule_index: None,
-        },
-        Some(suspect),
-    )
+/// `PolicyGuard` 持有引擎本体，Runner 不再单独存一份——两处各存一份
+/// `PolicyEngine` 虽然是值类型、互不干扰，但配置改一处漏一处的风险
+/// 与注册表拆两半同构，不重复犯。
+fn default_guard_chain(policy: PolicyEngine) -> Vec<Arc<dyn ToolGuard>> {
+    vec![
+        Arc::new(PolicyGuard::new(policy)),
+        Arc::new(BoundaryEscalationGuard),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::port::{BoxFuture, Decision, ToolInvoker};
+    use crate::application::port::{BoxFuture, Decision, NoopHooks, ToolInvoker};
+    use crate::domain::policy::PolicyVerdict;
     use rig::completion::Message;
     use crate::domain::agent::AgentRole;
     use crate::domain::evidence::{AuditEvent, TokenUsage};
