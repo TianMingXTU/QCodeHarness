@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::application::agent_roster::AgentRoster;
 use crate::application::agent_run::{new_session_id, AgentDependencies, AgentRunner};
 use crate::application::error::ApplicationError;
-use crate::application::port::EvidenceSink;
+use crate::application::port::{EvidenceSink, NoopHooks};
 use crate::application::snapshot::{TaskSnapshot, TaskStore, TASK_FORMAT};
 use crate::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
 use crate::application::worktree::WorktreeScanner;
@@ -569,6 +569,7 @@ mod tests {
             roster: AgentRoster::builtin(),
             context_budget: Default::default(),
             session_store: None,
+            hooks: Arc::new(NoopHooks),
         }
     }
 

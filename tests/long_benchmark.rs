@@ -18,7 +18,7 @@ use std::sync::Arc;
 use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::agent_run::AgentDependencies;
 use qcode_harness::application::benchmark::{run_long_benchmark, run_benchmark};
-use qcode_harness::application::port::{ApprovalGate, EvidenceSink};
+use qcode_harness::application::port::{ApprovalGate, EvidenceSink, NoopHooks};
 use qcode_harness::application::tool_registry::ToolRegistry;
 use qcode_harness::domain::budget::Budget;
 use qcode_harness::domain::policy::PolicyEngine;
@@ -50,6 +50,7 @@ fn bench_deps(mock: &MockCompletionModel) -> AgentDependencies {
         roster: AgentRoster::builtin(),
         context_budget: Default::default(),
         session_store: None,
+        hooks: Arc::new(NoopHooks),
     }
 }
 

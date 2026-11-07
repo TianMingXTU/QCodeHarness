@@ -19,7 +19,8 @@ use qcode_harness::application::agent_run::{AgentDependencies, RunState};
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{
-    ApprovalGate, ApprovalRequest, BoxFuture, Decision, EvidenceSink, Timestamp, ToolInvoker,
+    ApprovalGate, ApprovalRequest, BoxFuture, Decision, EvidenceSink, NoopHooks, Timestamp,
+    ToolInvoker,
 };
 use qcode_harness::application::snapshot::{
     SessionStore, StoreError, TaskSnapshot, TaskStore,
@@ -68,6 +69,7 @@ fn deps(mock: &MockCompletionModel) -> AgentDependencies {
         roster: AgentRoster::builtin(),
         context_budget: Default::default(),
         session_store: None,
+        hooks: Arc::new(NoopHooks),
     }
 }
 
@@ -1075,6 +1077,7 @@ fn base_deps(mock: &MockCompletionModel) -> AgentDependencies {
         roster: AgentRoster::builtin(),
         context_budget: Default::default(),
         session_store: None,
+        hooks: Arc::new(NoopHooks),
     }
 }
 

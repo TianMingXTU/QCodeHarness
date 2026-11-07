@@ -24,7 +24,7 @@ use qcode_harness::application::benchmark::{run_benchmark, run_long_benchmark};
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::mcp_lifecycle::McpLifecycleRecorder;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
-use qcode_harness::application::port::{ApprovalGate, EvidenceSink};
+use qcode_harness::application::port::{ApprovalGate, EvidenceSink, NoopHooks};
 use qcode_harness::application::report::{render_json, render_text, BenchmarkReport};
 use qcode_harness::application::snapshot::{RunSnapshot, SessionStore, TaskStore};
 use qcode_harness::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
@@ -310,6 +310,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // 长任务基准的运行器会在每段装配自己的快照存储（恢复是
             // 它流程的一部分），这里的 None 只是装配模板的占位。
             session_store: None,
+            hooks: Arc::new(NoopHooks),
         };
         let mut budget = Budget::new(config.max_turns);
         if let Some(limit) = config.max_wall_clock {
@@ -439,6 +440,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 roster: roster_with_role_models(&config),
                 context_budget,
                 session_store: Some(store.clone()),
+                hooks: Arc::new(NoopHooks),
             },
         ) {
             Ok(runner) => runner,
@@ -504,7 +506,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             context_budget,
             evidence: Arc::new(MemoryEvidenceSink::new()),
             session_store: Some(store.clone()),
-        };
+        hooks: Arc::new(NoopHooks),
+    };
         let mut orchestrator =
             Orchestrator::new(deps, budget, evidence_factory).with_task_store(Arc::new(task_store));
         // 工作区被改动时默认拒绝恢复。用户确认过就加 --force-worktree。
@@ -606,6 +609,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         evidence: Arc::new(MemoryEvidenceSink::new()),
         // 快照落盘随运行自动开启；--resume 可从任一会话恢复。
         session_store: Some(store.clone()),
+        hooks: Arc::new(NoopHooks),
     };
     let mut orchestrator = Orchestrator::with_roster(deps, budget, evidence_factory, roster)
         .with_task_store(Arc::new(JsonTaskStore::new(&workspace)))

@@ -138,6 +138,44 @@ pub trait ApprovalGate: Send + Sync {
     fn request<'a>(&'a self, request: &'a ApprovalRequest) -> BoxFuture<'a, Decision>;
 }
 
+/// 运行挂点：模型调用与工具执行前后的观察者。
+///
+/// 与 [`ApprovalGate`] 的分工：闸门回答"这个调用能不能发生"，只有
+/// `Allow` / `Err` 两种结局；挂点只观察、不改写、不否决，适合证据外发、
+/// 结构化事件流、AI 审查旁路这类"看看发生了什么"的需求。需要拦截能力
+/// 的是策略与闸门的事，不在这里。
+///
+/// 实现方必须把挂点当"旁路"对待：方法返回 `()`，没有错误通道——挂点
+/// 自己的失败（外发超时、下游断连）由实现吞掉并自行降级，绝不能让
+/// 一次遥测失败中断任务。所有方法都有空实现，实现方只挂关心的点。
+pub trait RunHooks: Send + Sync {
+    /// 一次模型调用即将发出。`request.history` 是裁剪后发给模型的历史。
+    fn before_model_call<'a>(&'a self, _request: &'a ModelRequest<'a>) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    /// 模型已回复（含空回复重试后的最终版）。`retried` 表示这次回复
+    /// 是空回复重试拿到的——统计空回复率时要用它。
+    fn after_model_reply<'a>(&'a self, _reply: &'a ModelReply, _retried: bool) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    /// 一次工具调用即将执行（已过角色边界与策略裁决，尚未落执行前快照）。
+    fn before_tool_call<'a>(&'a self, _call: &'a ToolCall) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    /// 一次工具调用已执行完毕，观察即将回填。
+    fn after_tool_result<'a>(&'a self, _call: &'a ToolCall, _outcome: &'a ToolOutcome) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
+
+/// 无操作的挂点：装配方不关心运行事件时的默认实现。
+pub struct NoopHooks;
+
+impl RunHooks for NoopHooks {}
+
 /// 证据汇：记录可审计事件。
 ///
 /// 同步而非异步：证据要求数量少（每轮模型调用与每条工具调用各一条）、

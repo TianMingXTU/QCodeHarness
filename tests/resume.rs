@@ -14,7 +14,9 @@ use qcode_harness::application::agent_run::{
 };
 use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::error::ApplicationError;
-use qcode_harness::application::port::{ApprovalGate, ApprovalRequest, BoxFuture, Decision, ToolInvoker};
+use qcode_harness::application::port::{
+    ApprovalGate, ApprovalRequest, BoxFuture, Decision, NoopHooks, ToolInvoker,
+};
 use qcode_harness::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
 use qcode_harness::application::tool_registry::{ToolEntry, ToolRegistry};
 use qcode_harness::domain::agent::{AgentRole, AgentSpec, AgentTurn};
@@ -85,6 +87,7 @@ fn deps_with(
         roster: AgentRoster::builtin(),
         context_budget: Default::default(),
         session_store,
+        hooks: Arc::new(NoopHooks),
     }
 }
 

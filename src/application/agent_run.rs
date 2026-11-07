@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::application::error::ApplicationError;
 use crate::application::port::{
     ApprovalGate, ApprovalRequest, Clock, EvidenceSink, ModelGateway, ModelReply,
-    ModelRequest,
+    ModelRequest, NoopHooks, RunHooks,
 };
 use crate::application::agent_roster::AgentRoster;
 use crate::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
@@ -151,6 +151,12 @@ pub struct AgentDependencies {
     /// 放在依赖里而不是 `run` 的参数里：保存时机是循环内部的事
     /// （每轮提交后、进审批前），调用方没有更合适的插桩点。
     pub session_store: Option<Arc<dyn SessionStore>>,
+    /// 运行挂点：模型调用与工具执行前后的观察者。
+    ///
+    /// 只观察不干预——拦截是策略与审批闸门的职责。缺省为
+    /// [`NoopHooks`]；`resume()` 同样带着它跑，恢复路径与首次运行
+    /// 看到同一串事件。
+    pub hooks: Arc<dyn RunHooks>,
 }
 
 /// ReAct 循环的编排器。
@@ -211,6 +217,8 @@ pub struct AgentRunner {
     /// 恢复后要**再问一次**闸门，绝不凭快照放行（见
     /// [`AgentRunner::apply_resume_semantics`]）。
     reask_approval: bool,
+    /// 运行挂点：来自依赖。只观察，不参与状态机。
+    hooks: Arc<dyn RunHooks>,
 }
 
 impl AgentRunner {
@@ -238,6 +246,7 @@ impl AgentRunner {
             roster,
             context_budget,
             session_store,
+            hooks,
         } = deps;
         let visible_specs = tools.specs();
         let session = Session::new(session_id, task);
@@ -265,6 +274,7 @@ impl AgentRunner {
             summary_failures: 0,
             replay_pending: None,
             reask_approval: false,
+            hooks,
         };
         runner.refresh_role_boundary();
         runner
@@ -354,6 +364,7 @@ impl AgentRunner {
             roster,
             context_budget,
             session_store,
+            hooks,
         } = deps;
         let visible_specs = tools.specs();
         let clock_now = clock.now();
@@ -382,6 +393,7 @@ impl AgentRunner {
             summary_failures: 0,
             replay_pending: None,
             reask_approval: false,
+            hooks,
         };
         runner.refresh_role_boundary();
         // 半轮状态各有各的恢复语义，翻译成"接下来该怎么走"。
@@ -886,7 +898,9 @@ impl AgentRunner {
                 // 否则快照说"在等模型"，恢复就会当成什么都没发生。
                 self.state = RunState::Dispatching(calls.clone());
                 self.save_snapshot();
+                self.hooks.before_tool_call(&call).await;
                 let outcome = self.tools.invoke(&call).await;
+                self.hooks.after_tool_result(&call, &outcome).await;
                 self.record_and_advance(call, outcome).await
             }
 
@@ -991,14 +1005,18 @@ impl AgentRunner {
             // 否则 provider 把它们路由到不同机器，前缀缓存一次都读不回来。
             cache_key: Some(self.session.id().as_str()),
         };
+        self.hooks.before_model_call(&request).await;
         let reply = model.complete(request.clone()).await?;
         // 空回复是模型端的瞬态故障（实测：偶发"计费了几十个输出 token，
         // 却抽不出任何文本或调用"），不是任务的终点——重试一次同一请求，
         // 仍为空才报错。重试的这一问还没被记为消耗轮，不计入预算。
         let reply = if reply.turn.text.trim().is_empty() && reply.turn.calls.is_empty() {
             eprintln!("警告：模型返回空回复，重试一次");
-            model.complete(request).await?
+            let retried = model.complete(request).await?;
+            self.hooks.after_model_reply(&retried, true).await;
+            retried
         } else {
+            self.hooks.after_model_reply(&reply, false).await;
             reply
         };
         self.consumption.record_turn();
@@ -1528,6 +1546,17 @@ mod tests {
         policy: PolicyEngine,
         invoker: Arc<dyn ToolInvoker>,
     ) -> Harness {
+        harness_full(turns, tools, policy, invoker, Arc::new(NoopHooks))
+    }
+
+    /// 同上，但可指定运行挂点：Hook 用例从这里进。
+    fn harness_full(
+        turns: Vec<MockTurn>,
+        tools: Vec<ToolSpec>,
+        policy: PolicyEngine,
+        invoker: Arc<dyn ToolInvoker>,
+        hooks: Arc<dyn RunHooks>,
+    ) -> Harness {
         let mock = MockCompletionModel::from_turns(turns);
         let evidence = Arc::new(MemoryEvidenceSink::new());
         let approvals = Arc::new(CountingGate::default());
@@ -1546,6 +1575,7 @@ mod tests {
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
+                hooks,
             },
         );
         Harness {
@@ -1575,6 +1605,121 @@ mod tests {
             ToolName::new(name).expect("测试里的工具名应合法"),
             arguments,
         )
+    }
+
+    /// 记录运行挂点被问过什么。按事件顺序存，断言调用时序用。
+    #[derive(Default)]
+    struct RecordingHooks {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingHooks {
+        fn recorded(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl RunHooks for RecordingHooks {
+        fn before_model_call<'a>(&'a self, request: &'a ModelRequest<'a>) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("before_model_call:{}条历史", request.history.len()));
+            })
+        }
+
+        fn after_model_reply<'a>(
+            &'a self,
+            reply: &'a ModelReply,
+            retried: bool,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push(format!(
+                    "after_model_reply:重试={retried},调用数={}",
+                    reply.turn.calls.len()
+                ));
+            })
+        }
+
+        fn before_tool_call<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("before_tool_call:{}", call.name));
+            })
+        }
+
+        fn after_tool_result<'a>(
+            &'a self,
+            call: &'a ToolCall,
+            outcome: &'a ToolOutcome,
+        ) -> BoxFuture<'a, ()> {
+            let status = match outcome.status {
+                OutcomeStatus::Success => "success",
+                OutcomeStatus::Failed => "failed",
+                OutcomeStatus::Refused => "refused",
+            };
+            Box::pin(async move {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("after_tool_result:{}:{status}", call.name));
+            })
+        }
+    }
+
+    // ── 运行挂点：观察点齐全且不打扰状态机 ──────────────────────────────
+
+    #[tokio::test]
+    async fn hooks_observe_every_model_call_and_tool_execution() {
+        let hooks = Arc::new(RecordingHooks::default());
+        let mut harness = harness_full(
+            vec![
+                MockTurn::tool_call("call_1", "read_file", json!({"path": "Cargo.toml"})),
+                MockTurn::text("读完了。"),
+            ],
+            vec![read_file_spec()],
+            PolicyEngine::new(),
+            Arc::new(RecordingInvoker::default()),
+            hooks.clone(),
+        );
+
+        let outcome = harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(outcome.turns_used, 2);
+        assert_eq!(
+            hooks.recorded(),
+            vec![
+                "before_model_call:1条历史",
+                "after_model_reply:重试=false,调用数=1",
+                "before_tool_call:read_file",
+                "after_tool_result:read_file:success",
+                // 第二次往返带任务、上一轮与它的观察。
+                "before_model_call:2条历史",
+                "after_model_reply:重试=false,调用数=0",
+            ],
+            "挂点应按真实顺序覆盖两次模型往返与一次工具执行"
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_hooks_run_a_normal_task_untouched() {
+        // 缺省挂点不改变任何行为：这条与"能连续调用工具"同一剧本，
+        // 只是不喂自定义 hooks。
+        let mut harness = harness(
+            vec![
+                MockTurn::tool_call("call_1", "read_file", json!({"path": "Cargo.toml"})),
+                MockTurn::text("项目用了 rig、serde、tokio。"),
+            ],
+            vec![read_file_spec()],
+        );
+
+        let outcome = harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert!(outcome.answer.contains("rig"));
+        assert_eq!(outcome.turns_used, 2);
     }
 
     // ── 用例 1：能连续调用工具 ──────────────────────────────────────────
@@ -1907,6 +2052,7 @@ mod tests {
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
+                hooks: Arc::new(NoopHooks),
             },
         );
 
@@ -2878,6 +3024,7 @@ mod tests {
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
+                hooks: Arc::new(NoopHooks),
             },
         );
 
@@ -2963,6 +3110,7 @@ mod tests {
                     summarize: None,
                 },
                 session_store: None,
+                hooks: Arc::new(NoopHooks),
             },
         );
 
@@ -3030,6 +3178,7 @@ mod tests {
                 roster: AgentRoster::builtin(),
                 context_budget,
                 session_store: None,
+                hooks: Arc::new(NoopHooks),
             },
         );
         (runner, evidence)
@@ -3282,6 +3431,7 @@ mod tests {
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
+                hooks: Arc::new(NoopHooks),
             },
         );
 
@@ -3340,6 +3490,7 @@ mod tests {
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
+                hooks: Arc::new(NoopHooks),
             },
         );
         handle_slot
@@ -3381,6 +3532,7 @@ mod tests {
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
                 session_store: None,
+                hooks: Arc::new(NoopHooks),
             },
         );
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
@@ -3425,6 +3577,7 @@ mod tests {
             roster: AgentRoster::builtin(),
             context_budget: ContextBudget::default(),
             session_store: None,
+            hooks: Arc::new(NoopHooks),
         }
     }
 
