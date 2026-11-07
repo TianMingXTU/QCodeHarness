@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rig::providers::openai::OpenAIConfig;
 use qcode_harness::application::agent_run::{
     new_session_id, AgentDependencies, AgentRunner, RunState,
 };
@@ -25,6 +24,7 @@ use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::mcp_lifecycle::McpLifecycleRecorder;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{ApprovalGate, EvidenceSink, NoopHooks};
+use qcode_harness::application::provider_registry::ProviderRegistry;
 use qcode_harness::application::report::{render_json, render_text, BenchmarkReport};
 use qcode_harness::application::snapshot::{RunSnapshot, SessionStore, TaskStore};
 use qcode_harness::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
@@ -45,7 +45,7 @@ use qcode_harness::infrastructure::evidence::memory::MemoryEvidenceSink;
 use qcode_harness::infrastructure::evidence::reader;
 use qcode_harness::infrastructure::mcp;
 use qcode_harness::infrastructure::mcp::config::McpConfig;
-use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
+use qcode_harness::infrastructure::model::openai_compat::OpenAiCompatProvider;
 use qcode_harness::infrastructure::policy;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::task_store::JsonTaskStore;
@@ -274,13 +274,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let policy = policy::load(config.policy_path.as_deref())
         .map_err(|error| format!("策略配置加载失败: {error}"))?;
 
-    // OpenAI 兼容端点必须走 chat()（/chat/completions）。
-    // 不要用 completion()：它对 OpenAI 方言默认指向 Responses API（/responses），
-    // DeepSeek 等兼容网关并不支持。
-    let provider = OpenAIConfig::new(config.api_key.as_str())
-        .with_base_url(config.base_url.as_str())
-        .client();
-    let model = provider.chat(config.model.as_str());
+    // 模型接入走提供方注册表：默认（也是唯一）提供方是 OpenAI 兼容
+    // chat 端点。换一家服务商 = 实现 LlmProvider 并在这里登记，
+    // 循环、审批与下面的装配都不感知具体供应商。
+    //
+    // OpenAI 兼容端点必须走 chat()（/chat/completions）。不要用
+    // completion()：它对 OpenAI 方言默认指向 Responses API（/responses），
+    // DeepSeek 等兼容网关并不支持。这条约束封装在
+    // OpenAiCompatProvider::new 里，装配方不需要知道。
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::new(OpenAiCompatProvider::new(
+        config.base_url.as_str(),
+        config.api_key.as_str(),
+        config.model.as_str(),
+    )));
+    let model = providers
+        .default_provider()
+        .expect("内置提供方已登记")
+        .gateway();
 
     // 上下文预算：默认只做确定性裁剪（占位说明）；设了阈值才为被裁
     // 历史花摘要调用——摘要是多花一次模型调用的可选项，默认关。
@@ -297,7 +308,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if args.benchmark || args.benchmark_long {
         // 基准无人值守：交互式审批会把整场运行挂住，强制自动放行。
         let deps = AgentDependencies {
-            model: Arc::new(RigChatGateway::new(model.erase())),
+            model: Arc::clone(&model),
             tools: ToolRegistry::new(vec![]),
             approvals: Arc::new(AutoApproveGate),
             clock: Arc::new(SystemClock),
@@ -384,7 +395,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // 与主循环共用同一个模型实例——审查就是一次普通的模型调用。
         // clone 再 erase：同一个模型实例后面主循环还要用，erase() 会移走它。
         Arc::new(AiReviewGate::new(
-            Box::new(RigChatGateway::new(model.clone().erase())),
+            Arc::clone(&model),
             Box::new(CliApprovalGate::new()),
         ))
     } else {
@@ -431,7 +442,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let runner = match AgentRunner::resume(
             snapshot,
             AgentDependencies {
-                model: Arc::new(RigChatGateway::new(model.erase())),
+                model: Arc::clone(&model),
                 tools: registry,
                 approvals,
                 evidence,
@@ -497,7 +508,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         let evidence_factory = evidence_factory_for(&workspace, config.max_turns);
         let deps = AgentDependencies {
-            model: Arc::new(RigChatGateway::new(model.erase())),
+            model: Arc::clone(&model),
             tools: registry,
             approvals,
             clock,
@@ -597,7 +608,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let task_id = TaskId::new(new_session_id(&*clock).as_str());
 
     let deps = AgentDependencies {
-        model: Arc::new(RigChatGateway::new(model.erase())),
+        model: Arc::clone(&model),
         tools: registry,
         approvals,
         clock,

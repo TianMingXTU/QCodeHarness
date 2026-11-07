@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,24 @@ pub trait ModelGateway: Send + Sync {
         &'a self,
         request: ModelRequest<'a>,
     ) -> BoxFuture<'a, Result<ModelReply, ApplicationError>>;
+}
+
+/// 模型提供方：模型网关的来源。
+///
+/// 与 [`ModelGateway`] 的分工：网关回答"这一次调用怎么发"，提供方回答
+/// "网关从哪来"——服务地址、凭据、默认模型都是提供方的事。装配方按
+/// [`id`](LlmProvider::id) 从
+/// [`ProviderRegistry`](crate::application::provider_registry::ProviderRegistry)
+/// 里选一家，核心循环与网关签名都不感知具体供应商。
+pub trait LlmProvider: Send + Sync {
+    /// 提供方标识，注册表的查找键，也是日志与报错里认人的名字。
+    fn id(&self) -> &str;
+
+    /// 该提供方对应的模型网关。
+    ///
+    /// 网关承载连接与凭据，构造一次后长期复用；按角色覆盖模型名走
+    /// 请求上的 `model` 字段，不需要为每个角色另建网关。
+    fn gateway(&self) -> Arc<dyn ModelGateway>;
 }
 
 /// 工具执行器：按调用意图真正做事。

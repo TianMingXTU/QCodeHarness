@@ -11,6 +11,7 @@ pub mod agent_run;
 pub mod mcp_lifecycle;
 pub mod error;
 pub mod orchestrator;
+pub mod provider_registry;
 pub mod snapshot;
 pub mod step_prompt;
 pub mod summarizer;
