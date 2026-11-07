@@ -20,9 +20,35 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::application::tool_registry::ToolEntry;
+use crate::application::tool_registry::{ToolEntry, ToolSource};
 use crate::domain::tool::ToolOutcome;
 use crate::domain::workspace::{is_protected_path, PathRejected, WorkspacePath, WorkspaceRoot};
+
+/// 内置工具来源：把 [`all_tools`] 包成一个具名来源。
+///
+/// 装配方把它与 MCP 等来源一起交给
+/// [`ToolRegistry::from_sources`](crate::application::tool_registry::ToolRegistry::from_sources)，
+/// 工具从哪来在装配层可见，注册表本身不需要知道。
+pub struct BuiltinToolSource {
+    root: WorkspaceRoot,
+}
+
+impl BuiltinToolSource {
+    /// 用 workspace 根构造：内置工具全部限定在这个根内。
+    pub fn new(root: WorkspaceRoot) -> Self {
+        Self { root }
+    }
+}
+
+impl ToolSource for BuiltinToolSource {
+    fn name(&self) -> &str {
+        "builtin"
+    }
+
+    fn tools(&self) -> Vec<ToolEntry> {
+        all_tools(self.root.clone())
+    }
+}
 
 /// 组装全部内置工具。
 ///

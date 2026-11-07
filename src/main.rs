@@ -28,7 +28,7 @@ use qcode_harness::application::provider_registry::ProviderRegistry;
 use qcode_harness::application::report::{render_json, render_text, BenchmarkReport};
 use qcode_harness::application::snapshot::{RunSnapshot, SessionStore, TaskStore};
 use qcode_harness::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
-use qcode_harness::application::tool_registry::ToolRegistry;
+use qcode_harness::application::tool_registry::{ToolRegistry, ToolSource};
 use qcode_harness::domain::agent::{AgentRole, Effort, Verbosity};
 use qcode_harness::domain::budget::Budget;
 use qcode_harness::domain::context::ContextBudget;
@@ -49,7 +49,7 @@ use qcode_harness::infrastructure::model::openai_compat::OpenAiCompatProvider;
 use qcode_harness::infrastructure::policy;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::task_store::JsonTaskStore;
-use qcode_harness::infrastructure::tool::all_tools;
+use qcode_harness::infrastructure::tool::BuiltinToolSource;
 use qcode_harness::infrastructure::worktree::RootedWorktreeScanner;
 use qcode_harness::interface::cli::{self, ConsoleReporter};
 use qcode_harness::interface::instructions;
@@ -351,10 +351,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // 工具注册表：组装入口一次给出全部内置工具，规格与执行入口已绑定。
-    // MCP 工具随后并入：配置了 QCH_MCP_CONFIG 才连接，缺文件即 MCP 关闭。
+    // 工具注册表按来源装配：内置工具是一个来源，每个接上的 MCP Server
+    // 也是一个来源。配置了 QCH_MCP_CONFIG 才连接，缺文件即 MCP 关闭。
     let workspace_root = WorkspaceRoot::new(workspace.clone());
-    let mut tool_entries = all_tools(workspace_root);
+    let mut tool_sources: Vec<Arc<dyn ToolSource>> =
+        vec![Arc::new(BuiltinToolSource::new(workspace_root))];
     // 连接归拢到这里，三条正常结束路径都要显式关闭它们（见
     // close_mcp_connections）；未配置 MCP 时就是空表。
     let mut mcp_sources: Vec<mcp::McpToolSource> = Vec::new();
@@ -375,12 +376,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     source.server(),
                     source.tool_count()
                 );
-                tool_entries.extend(source.entries());
             }
             mcp_sources = sources;
         }
     }
-    let registry = ToolRegistry::new(tool_entries);
+    // 来源顺序即工具顺序：内置在前，MCP 在后；同名工具后到的来源胜出
+    // （MCP 前缀 `mcp__<server>__` 保证正常运行时不与内置撞名）。
+    tool_sources.extend(
+        mcp_sources
+            .iter()
+            .map(|source| Arc::new(source.clone()) as Arc<dyn ToolSource>),
+    );
+    let registry = ToolRegistry::from_sources(&tool_sources);
 
     // 审批闸门三选一，优先级从高到低：
     //   --yes                恒放行（基准与脚本化场景）

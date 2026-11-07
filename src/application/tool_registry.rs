@@ -25,6 +25,20 @@ pub struct ToolEntry {
     pub invoker: Arc<dyn ToolInvoker>,
 }
 
+/// 工具来源：一批登记项加一个来源名。
+///
+/// 注册表只关心"有哪些工具"；来源把"这批工具从哪来"（内置、某个 MCP
+/// Server、后续的第三方工具包）保留在装配层，排查工具清单时能说清出处。
+/// 实现方返回的登记项必须 spec 与执行入口成对——那是 [`ToolEntry`] 的
+/// 不变量，来源只是批量提供它。
+pub trait ToolSource: Send + Sync {
+    /// 来源名，进日志与冲突诊断。
+    fn name(&self) -> &str;
+
+    /// 这个来源提供的全部登记项。
+    fn tools(&self) -> Vec<ToolEntry>;
+}
+
 /// 工具注册表。
 ///
 /// 用 `Vec` 而不是 `HashMap`：工具数量是个位数到十几个，线性查找没有
@@ -55,6 +69,18 @@ impl ToolRegistry {
             }
         }
         registry
+    }
+
+    /// 从多个来源装配注册表。
+    ///
+    /// 按来源顺序合并；同名工具沿用 [`new`](Self::new) 的覆盖语义——
+    /// 后到的来源胜出。顺序由装配方决定，注册表只如实执行。
+    pub fn from_sources(sources: &[Arc<dyn ToolSource>]) -> Self {
+        let entries: Vec<ToolEntry> = sources
+            .iter()
+            .flat_map(|source| source.tools())
+            .collect();
+        Self::new(entries)
     }
 
     /// 模型可见的全部规格。
@@ -196,6 +222,51 @@ mod tests {
         ]);
 
         assert_eq!(registry.specs().len(), 1, "同名去重后只剩一个规格");
+    }
+
+    /// 按来源装配：顺序保留，同名时后到的来源胜出。
+    struct FixedSource {
+        name: &'static str,
+        tools: Vec<ToolEntry>,
+    }
+
+    impl ToolSource for FixedSource {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn tools(&self) -> Vec<ToolEntry> {
+            self.tools.clone()
+        }
+    }
+
+    fn entry(name: &str, reply: &'static str) -> ToolEntry {
+        ToolEntry {
+            spec: spec(name),
+            invoker: Arc::new(RecordingInvoker::new(reply)),
+        }
+    }
+
+    #[tokio::test]
+    async fn from_sources_merges_in_order_and_later_sources_win() {
+        let sources: Vec<Arc<dyn ToolSource>> = vec![
+            Arc::new(FixedSource {
+                name: "builtin",
+                tools: vec![entry("read_file", "内置读"), entry("write_file", "内置写")],
+            }),
+            Arc::new(FixedSource {
+                name: "remote",
+                tools: vec![entry("write_file", "远端写"), entry("fetch", "远端取")],
+            }),
+        ];
+
+        let registry = ToolRegistry::from_sources(&sources);
+
+        // 顺序：先内置、后远端；同名 write_file 只剩远端那份。
+        let names: Vec<String> = registry.specs().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, vec!["read_file", "write_file", "fetch"]);
+        let hit = registry.invoke(&call("write_file")).await;
+        assert_eq!(hit.content, "远端写", "同名工具应以后到的来源为准");
     }
 
     /// 证据台账的分类表要与真实注册表对得上。

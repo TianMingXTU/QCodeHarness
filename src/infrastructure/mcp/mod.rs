@@ -551,6 +551,10 @@ impl Connector for TokioConnector {
 ///
 /// 本体只是 [`ManagedServer`] 的外壳：规格与执行入口从同一棵状态树上取，
 /// "先注册、再鉴权、再审批、后执行"因此作用在同一份定义上。
+///
+/// 可克隆：克隆出的外壳共享同一个状态机（内部是 `Arc`），注册表与
+/// 收尾清单各持一份，关闭对两边同时生效。
+#[derive(Clone)]
 pub struct McpToolSource {
     managed: Arc<ManagedServer>,
 }
@@ -644,6 +648,20 @@ impl McpToolSource {
                 }
             })
             .collect()
+    }
+}
+
+/// 一个 MCP Server 就是一个工具来源：来源名取 Server 名。
+///
+/// 注册表按来源装配时不需要认识 MCP；MCP 的工具清单与执行入口已经由
+/// [`McpToolSource::entries`] 绑好，这里只做接口对接。
+impl crate::application::tool_registry::ToolSource for McpToolSource {
+    fn name(&self) -> &str {
+        self.server()
+    }
+
+    fn tools(&self) -> Vec<ToolEntry> {
+        self.entries()
     }
 }
 
@@ -984,6 +1002,13 @@ mod tests {
         assert!(entries[0].spec.annotations.read_only);
         assert_eq!(entries[1].spec.name, "mcp__fetch__submit_form");
         assert!(!entries[1].spec.annotations.read_only);
+
+        // 来源接口与本体走同一份清单：装配成注册表时不会多也不会少。
+        use crate::application::tool_registry::ToolSource;
+        assert_eq!(source.name(), "fetch");
+        let from_source = source.tools();
+        assert_eq!(from_source.len(), entries.len());
+        assert_eq!(from_source[0].spec.name, entries[0].spec.name);
         // 来源要写进描述，模型才知道这是外部能力。
         assert!(
             entries[0]
