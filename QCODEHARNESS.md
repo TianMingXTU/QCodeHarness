@@ -16,8 +16,9 @@ QCodeHarness 是一个 Rust 的 Coding Agent 框架。跑任务的不是它自�
 
 - `src/domain/` 是纯领域层：**禁止**任何 IO、`rig`、`toml`、`windows`、`tokio`。
   验收会 grep，写进去就是破坏架构边界。
-- `src/application/` 只放端口 trait 与编排逻辑，不碰具体实现。
-- `src/infrastructure/` 是唯一允许碰文件、进程、网络的地方。
+- `src/application/` 只放端口 trait、编排逻辑与不碰 IO 的默认实现。
+- `src/infrastructure/` 是新代码唯一允许碰文件、进程、网络的地方
+  （既有越层见 `docs/architecture.md`，不要仿效）。
 - `src/interface/` 只做 CLI 解析与控制台播报。
 - 跨层依赖只允许 `interface → application → domain`，
   `infrastructure → application/domain`。
@@ -27,7 +28,8 @@ QCodeHarness 是一个 Rust 的 Coding Agent 框架。跑任务的不是它自�
 - 新行为优先实现为端口 trait 的实现，并在装配层接线（`main.rs` /
   `AgentDependencies` / `default_guard_chain`），不改核心循环。
 - 扩展点 trait 住 `src/application/`（`port/`、`tool_guard.rs`、
-  `tool_registry.rs`、`context_policy.rs`），实现住 `src/infrastructure/`。
+  `tool_registry.rs`、`context_policy.rs`）；需要 IO 的实现住
+  `src/infrastructure/`，不碰 IO 的默认实现可以与 trait 同层。
   `domain/` 只放被这些 trait 复用的纯数据类型。
 - 不做 cdylib 动态插件装载，不定义通用插件协议：Rust 无稳定 ABI，
   社区扩展 = 依赖本 crate 编译 + 装配层接线。新增扩展点要同步

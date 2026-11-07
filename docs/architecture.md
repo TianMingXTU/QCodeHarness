@@ -20,8 +20,14 @@ flowchart TB
 
 依赖方向只有两条：`interface → application → domain` 与
 `infrastructure → application/domain`。`domain/` 是纯领域层，**禁止**任何
-IO、`rig`、`toml`、`tokio`、`windows` 与文件操作；需要读文件系统或起进程
-的逻辑只能留在 `infrastructure/`。这条边界由验收 grep 守着。
+IO、`rig`、`toml`、`tokio`、`windows` 与文件操作，这条边界由验收 grep 守着。
+`application/` 的新增代码只依赖 domain 与端口 trait；需要读文件系统或起进程
+的逻辑放 `infrastructure/`。
+
+仓库里还有三处**既有越层**，是待偿的债，新代码不要仿效：`application/error.rs`
+直接引用 rig 的 `ProviderError`、`application/benchmark.rs` 做基准 fixture 的
+文件拷贝、`interface/instructions.rs` 读项目指令文件。它们先于扩展点改造存在，
+本轮的五个扩展点没有新增越层。
 
 ## 扩展点
 
