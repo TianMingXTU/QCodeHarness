@@ -22,6 +22,7 @@ use qcode_harness::application::agent_run::{
 use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::benchmark::{run_benchmark, run_long_benchmark};
 use qcode_harness::application::error::ApplicationError;
+use qcode_harness::application::mcp_lifecycle::McpLifecycleRecorder;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{ApprovalGate, EvidenceSink};
 use qcode_harness::application::report::{render_json, render_text, BenchmarkReport};
@@ -259,6 +260,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return render_report(&workspace, args.report_dir.as_deref(), args.json);
     }
 
+    // 恢复探测同样不需要模型配置：它只回答"这个 MCP Server 现在能不能
+    // 说上话"，不跑任务、不碰审批、不读会话历史。
+    if let Some(server) = &args.mcp_reconnect {
+        return mcp_probe(&workspace, server).await;
+    }
+
     let config = LlmConfig::from_env()?;
 
     // 命令行开关优先于环境变量：显式敲 --yes 的意图比配置文件里的默认值更强。
@@ -337,13 +344,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // MCP 工具随后并入：配置了 QCH_MCP_CONFIG 才连接，缺文件即 MCP 关闭。
     let workspace_root = WorkspaceRoot::new(workspace.clone());
     let mut tool_entries = all_tools(workspace_root);
+    // 连接归拢到这里，三条正常结束路径都要显式关闭它们（见
+    // close_mcp_connections）；未配置 MCP 时就是空表。
+    let mut mcp_sources: Vec<mcp::McpToolSource> = Vec::new();
     if let Some(config_path) = std::env::var_os("QCH_MCP_CONFIG").map(PathBuf::from) {
         // 配置文件存在但非法要让进程停下来：用户明确想接 MCP，静默跳过
         // 会让模型拿着残缺的工具清单跑任务（与策略配置同一哲学）。
         let mcp_config = McpConfig::load(&config_path)
             .map_err(|error| format!("{error}（文件: {}）", config_path.display()))?;
         if let Some(mcp_config) = mcp_config {
-            let (sources, warnings) = mcp::connect_all(&mcp_config).await;
+            let recorder = mcp_lifecycle_recorder(&workspace);
+            let (sources, warnings) = mcp::connect_all(&mcp_config, recorder).await;
             for warning in &warnings {
                 eprintln!("警告：{warning}");
             }
@@ -355,6 +366,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 );
                 tool_entries.extend(source.entries());
             }
+            mcp_sources = sources;
         }
     }
     let registry = ToolRegistry::new(tool_entries);
@@ -437,6 +449,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         };
         run_and_report(runner, &budget, &evidence_path).await;
+        close_mcp_connections(&mcp_sources).await;
         return Ok(());
     }
 
@@ -518,6 +531,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             outcome.steps_completed,
             outcome.session_id.as_str()
         );
+        close_mcp_connections(&mcp_sources).await;
         return Ok(());
     }
 
@@ -627,6 +641,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         total,
         outcome.session_id.as_str()
     );
+    close_mcp_connections(&mcp_sources).await;
     Ok(())
 }
 
@@ -746,6 +761,84 @@ async fn run_and_report(mut runner: AgentRunner, budget: &Budget, evidence_path:
         outcome.turns_used,
         evidence_path.display()
     );
+}
+
+/// MCP 连接事件专用审计汇：`.qcodeharness/sessions/mcp-lifecycle.jsonl`。
+///
+/// 连接事件与工具事件分账：启动失败、断连、恢复尝试都不是工具调用，
+/// 混进会话日志会让"成功/失败会话数"失真。报表侧按"整份日志只有连接
+/// 事件"识别它并单列统计（application::report 的 mcp_summary）。
+/// 固定文件名、跨运行追加——序号从文件里最后一条接着走（与恢复运行
+/// 同一份证据文件的做法一致）。打开失败只警告不阻断：没有连接审计的
+/// 运行仍然是一次诚实的运行，只是复盘时少一本账。
+fn mcp_lifecycle_recorder(workspace: &Path) -> Option<Arc<McpLifecycleRecorder>> {
+    let path = session_path(workspace, "mcp-lifecycle");
+    match JsonlEvidenceSink::open(&path) {
+        Ok(sink) => Some(Arc::new(McpLifecycleRecorder::new(
+            Arc::new(sink),
+            Arc::new(SystemClock),
+        ))),
+        Err(error) => {
+            eprintln!(
+                "警告：MCP 连接审计无法写入 {}（{error}），本次运行的连接事件不落盘",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// 收尾：正常结束的三条路径共用，显式关闭所有 MCP 连接。
+///
+/// 失败路径靠 `std::process::exit` 离开，不经过这里——那时清理由
+/// 操作系统与 Job Object 兜底（子进程已纳入 Job，随父进程终止）。
+/// 这里走的是温和的一条：transport 先优雅收尾，再释放进程组兜底，
+/// 两侧都留下可查的证据。
+async fn close_mcp_connections(sources: &[mcp::McpToolSource]) {
+    for source in sources {
+        source.close().await;
+    }
+}
+
+/// `--mcp-reconnect <服务器名>`：独立探测模式。
+///
+/// 只回答"这个 Server 现在能不能说上话"：按配置启动、握手、发现工具，
+/// 把事实写进连接审计，然后显式关闭退出。有界一次，不接任务、不重放
+/// 历史调用、不进任何会话；恢复出来的工具也不注入当前进程——工具要
+/// 进任务，照常带任务描述启动，走完整的注册、授权与审批。
+async fn mcp_probe(workspace: &Path, server: &str) -> Result<(), Box<dyn Error>> {
+    let Some(config_path) = std::env::var_os("QCH_MCP_CONFIG").map(PathBuf::from) else {
+        return Err("未设置 QCH_MCP_CONFIG，没有可探测的 MCP 配置".into());
+    };
+    let mcp_config = McpConfig::load(&config_path)
+        .map_err(|error| format!("{error}（文件: {}）", config_path.display()))?;
+    let Some(server_config) = mcp_config
+        .as_ref()
+        .and_then(|config| config.mcp_servers.iter().find(|item| item.name == server))
+    else {
+        let names = mcp_config.as_ref().map_or_else(String::new, |config| {
+            config
+                .mcp_servers
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        return Err(format!("MCP 配置里没有名为 `{server}` 的 Server（已配置: {names}）").into());
+    };
+    println!("MCP 恢复探测: server `{server}`");
+    let source = mcp::McpToolSource::connect(server_config, mcp_lifecycle_recorder(workspace))
+        .await
+        .map_err(|error| {
+            // 失败要原样带出分类：这是这个模式存在的意义——用户看到的
+            // 应该就是"哪类故障、结果可知否"，不是一个被改写过的结论。
+            format!("MCP Server `{server}` 恢复失败: {error}")
+        })?;
+    let count = source.tool_count();
+    source.close().await;
+    println!("MCP Server `{server}` 通信正常：发现 {count} 个工具（探测连接已关闭）");
+    println!("要让工具进入任务，请照常带任务描述启动。");
+    Ok(())
 }
 
 /// 把同一条事件分发给多个证据汇。

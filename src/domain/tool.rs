@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::ids::CallId;
+use super::mcp::McpCallFailure;
 use super::sandbox::ExecutionBoundary;
 
 /// MCP 工具注册名的前缀：`mcp__<server>__<tool>`。
@@ -102,6 +103,12 @@ pub struct ToolOutcome {
     /// 不写入 `ToolObserved` 或快照，保持既有 JSON 字段形状兼容。
     #[serde(skip)]
     pub execution: Option<ExecutionBoundary>,
+    /// MCP 执行器给出的调用故障事实；应用层取走后单独记入 `McpCallFailed`。
+    ///
+    /// 与 `execution` 一样只作进程内交接：不写入 `ToolObserved`、快照或
+    /// 历史，避免执行器错误文本成为判断故障类别的依据。
+    #[serde(skip)]
+    pub mcp_failure: Option<McpCallFailure>,
 }
 
 impl ToolOutcome {
@@ -111,6 +118,7 @@ impl ToolOutcome {
             content: content.into(),
             status: OutcomeStatus::Success,
             execution: None,
+            mcp_failure: None,
         }
     }
 
@@ -120,6 +128,7 @@ impl ToolOutcome {
             content: content.into(),
             status: OutcomeStatus::Failed,
             execution: None,
+            mcp_failure: None,
         }
     }
 
@@ -129,12 +138,19 @@ impl ToolOutcome {
             content: content.into(),
             status: OutcomeStatus::Refused,
             execution: None,
+            mcp_failure: None,
         }
     }
 
     /// 附加已执行操作的边界事实，由执行器在启动进程或调用外部工具后填写。
     pub fn with_execution(mut self, boundary: ExecutionBoundary) -> Self {
         self.execution = Some(boundary);
+        self
+    }
+
+    /// 附加 MCP 调用故障的分类事实，由执行器在调用失败时填写。
+    pub fn with_mcp_failure(mut self, failure: McpCallFailure) -> Self {
+        self.mcp_failure = Some(failure);
         self
     }
 
@@ -148,7 +164,39 @@ impl ToolOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::mcp::{McpCallFailure, McpFaultKind};
     use serde_json::json;
+
+    fn failure() -> McpCallFailure {
+        McpCallFailure {
+            server: "demo".to_owned(),
+            generation: 2,
+            kind: McpFaultKind::CallTimeout,
+            result_unknown: true,
+            process_isolation: true,
+        }
+    }
+
+    #[test]
+    fn mcp_failure_metadata_never_reaches_persisted_outcomes() {
+        let outcome = ToolOutcome::failed("调用超时").with_mcp_failure(failure());
+        let old_shape = json!({"content": "调用超时", "status": "Failed"});
+        assert_eq!(serde_json::to_value(&outcome).unwrap(), old_shape);
+        let restored: ToolOutcome = serde_json::from_value(old_shape).unwrap();
+        assert_eq!(restored, ToolOutcome::failed("调用超时"));
+        assert!(restored.mcp_failure.is_none());
+    }
+
+    #[test]
+    fn constructors_start_with_no_mcp_failure() {
+        for outcome in [
+            ToolOutcome::success("好"),
+            ToolOutcome::failed("坏"),
+            ToolOutcome::refused("不"),
+        ] {
+            assert!(outcome.mcp_failure.is_none());
+        }
+    }
 
     #[test]
     fn execution_metadata_does_not_change_persisted_outcomes() {

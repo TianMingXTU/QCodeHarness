@@ -173,6 +173,24 @@ pub struct SessionSummary {
     /// 同一个文件读两遍，说明上一条观察没能让模型满意，或者它忘了
     /// 自己已经读过——两者都指向提示词与工具描述可以改进的地方。
     pub repeated_calls: Vec<String>,
+    /// MCP 连接建立失败次数。
+    #[serde(default)]
+    pub mcp_connect_failures: usize,
+    /// MCP 连接意外断开次数（一次连接只记一次）。
+    #[serde(default)]
+    pub mcp_disconnects: usize,
+    /// MCP 恢复成功次数。
+    #[serde(default)]
+    pub mcp_recoveries: usize,
+    /// MCP 恢复失败次数。
+    #[serde(default)]
+    pub mcp_recovery_failures: usize,
+    /// MCP 工具调用超时次数。
+    #[serde(default)]
+    pub mcp_call_timeouts: usize,
+    /// MCP 调用已发出但结果未知的次数（超时或断连，不能当作已取消）。
+    #[serde(default)]
+    pub mcp_unknown_results: usize,
 }
 
 /// 多个会话的汇总。
@@ -211,6 +229,14 @@ pub struct BenchmarkReport {
     pub succeeded: usize,
     /// 失败会话数（未以 `Thought` 收尾）。
     pub failed: usize,
+    /// 只含 MCP 连接事件的日志份数。
+    ///
+    /// 这类日志不是一次任务运行：没有模型调用、没有工具调用，成本与墙钟
+    /// 都无从谈起。它按事件内容识别（不看文件名），从 [`Self::succeeded`]、
+    /// [`Self::failed`] 与总成本/总墙钟里排除，只贡献 MCP 统计——否则
+    /// "MCP Server 没起来"会被读成"任务失败"，而启动次数会被读成调用次数。
+    #[serde(default)]
+    pub mcp_lifecycle_logs: usize,
 }
 
 impl BenchmarkReport {
@@ -227,7 +253,17 @@ impl BenchmarkReport {
         // 每有一个已知成本就累加，遇到未知即整体转未知。
         let mut total_cost = None;
         let mut succeeded = 0usize;
+        let mut lifecycle_logs = 0usize;
         for (log, summary) in logs.iter().zip(&sessions) {
+            // 只含连接事件的日志：它没有模型调用、没有工具调用，成本必然
+            // "未知"、墙钟只是 Server 的存活时长。计进任何一项合计都会让
+            // 报表说谎——把"MCP 没起来"说成"这轮基准又失败了一个任务"，
+            // 把启动次数说成调用次数。它的价值只在 MCP 统计里，而那份统计
+            // 在 `sessions` 中已经算好。
+            if is_lifecycle_only(log) {
+                lifecycle_logs += 1;
+                continue;
+            }
             total_input += summary.input_tokens;
             total_output += summary.output_tokens;
             total_cached += summary.cached_input_tokens;
@@ -246,7 +282,7 @@ impl BenchmarkReport {
         }
         Self {
             succeeded,
-            failed: sessions.len() - succeeded,
+            failed: sessions.len() - lifecycle_logs - succeeded,
             sessions,
             total_input_tokens: total_input,
             total_output_tokens: total_output,
@@ -255,19 +291,45 @@ impl BenchmarkReport {
             total_approvals,
             total_approval_wait_ms: total_approval_wait,
             total_cost_usd: total_cost,
+            mcp_lifecycle_logs: lifecycle_logs,
         }
     }
 }
 
-/// 会话是否以最终答案收尾：最后一条事件是 `Thought`。
+/// 这份日志是不是只有 MCP 连接事件。
+///
+/// 判据只看事件内容，不看文件名：日志落在哪个文件里是装配层的选择，而
+/// "这份日志算不算一次任务运行"是证据自己说明的事。按名字认，改名或多写
+/// 一条普通事件就会悄悄改变统计口径。
+///
+/// 空日志不算：一条事件都没有意味着读到了一个空文件或坏文件，那正是
+/// 原有"会话失败"判据要暴露的情况，不该被这条规则吸收。
+pub fn is_lifecycle_only(log: &SessionLog) -> bool {
+    !log.events.is_empty()
+        && log
+            .events
+            .iter()
+            .all(|evidence| matches!(evidence.event, AuditEvent::McpLifecycle { .. }))
+}
+
+/// 会话是否以最终答案收尾：最后一条**任务**事件是 `Thought`。
 ///
 /// ReAct 循环只有交付最终答案（模型回复不带工具调用）时才以思考
 /// 收尾；被预算、超时或取消打断的会话停在工具观察或审批上。
 /// 这是"成功"的机器可查代理判据——它回答的是"有没有交付答案"，
 /// 不是"答案对不对"，后者只有基准任务的判据（P6-3）能回答。
+///
+/// 连接事件被跳过：生命周期日志与任务日志混写时，收尾的那条 `Closed`
+/// 是进程退出前关 Server 留下的，模型早就交付过答案了。把它当成"最后
+/// 一条事件"会把成功会话判成失败——成败判据要回答的是任务做到哪一步，
+/// 而连接什么时候断的不在这个问题的范围里。
 fn ends_with_answer(log: &SessionLog) -> bool {
     matches!(
-        log.events.last().map(|evidence| &evidence.event),
+        log.events
+            .iter()
+            .rev()
+            .map(|evidence| &evidence.event)
+            .find(|event| !matches!(event, AuditEvent::McpLifecycle { .. })),
         Some(AuditEvent::Thought { .. })
     )
 }
@@ -313,6 +375,12 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
         turn_latencies_ms: Vec::new(),
         cache_hit_ratio: None,
         repeated_calls: Vec::new(),
+        mcp_connect_failures: 0,
+        mcp_disconnects: 0,
+        mcp_recoveries: 0,
+        mcp_recovery_failures: 0,
+        mcp_call_timeouts: 0,
+        mcp_unknown_results: 0,
     };
 
     // 上一轮思考事件的时刻。用它算本轮延迟：模型调用发生在两个思考
@@ -429,6 +497,33 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
             }
             // StepStarted 不计任何业务计数器，但它算事件总数的一员。
             AuditEvent::StepStarted { .. } => {}
+            // 连接级与调用级 MCP 故障：只进各自的 MCP 计数，不冒充工具
+            // 结局（succeeded/failed）或沙箱执行次数——一次启动失败没有
+            // 工具调用，把启动次数混进调用次数会让报表自相矛盾。
+            AuditEvent::McpLifecycle { fact, .. } => match fact.kind {
+                crate::domain::mcp::McpLifecycleKind::ConnectFailed => {
+                    summary.mcp_connect_failures += 1;
+                }
+                crate::domain::mcp::McpLifecycleKind::Disconnected => {
+                    summary.mcp_disconnects += 1;
+                }
+                crate::domain::mcp::McpLifecycleKind::Recovered => {
+                    summary.mcp_recoveries += 1;
+                }
+                crate::domain::mcp::McpLifecycleKind::RecoveryFailed => {
+                    summary.mcp_recovery_failures += 1;
+                }
+                crate::domain::mcp::McpLifecycleKind::Connected
+                | crate::domain::mcp::McpLifecycleKind::Closed => {}
+            },
+            AuditEvent::McpCallFailed { failure, .. } => {
+                if failure.kind == crate::domain::mcp::McpFaultKind::CallTimeout {
+                    summary.mcp_call_timeouts += 1;
+                }
+                if failure.result_unknown {
+                    summary.mcp_unknown_results += 1;
+                }
+            }
         }
     }
     summary.repeated_calls = repeated;
@@ -623,6 +718,14 @@ pub fn render_text(report: &BenchmarkReport) -> String {
     ];
     out.push_str(&render_row(&total));
 
+    // MCP 生命周期单独一段：连接事件与工具调用是两本账。把它们塞进上面
+    // 的表格列，读者会把"Server 没起来"读成"又一次工具调用失败"。
+    if let Some(line) = mcp_summary(report) {
+        out.push_str("\nMCP 生命周期\n");
+        out.push_str(&line);
+        out.push('\n');
+    }
+
     // 台账不进表格：它每一项都是列表，表格装不下。单独按会话列在表后
     // ——"这个任务到底动过什么"是用户跑完长任务最想看的一句。
     let ledgers: Vec<&SessionSummary> = report
@@ -642,6 +745,53 @@ pub fn render_text(report: &BenchmarkReport) -> String {
     out
 }
 
+/// MCP 故障与恢复的一行汇总；一个数都没有时返回 `None`。
+///
+/// 只报有实际用途的六个数，不报连接建立次数和主动关闭次数：那两个数
+/// 每次正常运行都会变，把"启了几次 Server"摆在故障旁边，读的人会把
+/// 正常流水当成问题。`结果未知`单列是因为它最容易被误读成"已经取消"，
+/// 而这正是本阶段不能承诺的事。
+fn mcp_summary(report: &BenchmarkReport) -> Option<String> {
+    let sum = |pick: fn(&SessionSummary) -> usize| report.sessions.iter().map(pick).sum::<usize>();
+    let (
+        connect_failures,
+        disconnects,
+        recoveries,
+        recovery_failures,
+        call_timeouts,
+        unknown_results,
+    ) = (
+        sum(|s| s.mcp_connect_failures),
+        sum(|s| s.mcp_disconnects),
+        sum(|s| s.mcp_recoveries),
+        sum(|s| s.mcp_recovery_failures),
+        sum(|s| s.mcp_call_timeouts),
+        sum(|s| s.mcp_unknown_results),
+    );
+    if connect_failures
+        + disconnects
+        + recoveries
+        + recovery_failures
+        + call_timeouts
+        + unknown_results
+        == 0
+        && report.mcp_lifecycle_logs == 0
+    {
+        return None;
+    }
+    let mut out = format!(
+        "  连接失败 {connect_failures} 次，断连 {disconnects} 次；恢复成功 {recoveries} 次，恢复失败 {recovery_failures} 次\n  \
+            调用超时 {call_timeouts} 次，结果未知 {unknown_results} 次（超时与断连都不等于远端已取消，原调用不会自动重放）"
+    );
+    if report.mcp_lifecycle_logs > 0 {
+        out.push_str(&format!(
+            "\n  另有 {} 份只有连接事件的日志，不计入会话成败与总成本/墙钟",
+            report.mcp_lifecycle_logs
+        ));
+    }
+    Some(out)
+}
+
 /// 渲染成机器可读的 JSON。
 ///
 /// # Errors
@@ -657,6 +807,7 @@ mod tests {
     use crate::domain::agent::AgentRole;
     use crate::domain::evidence::TokenUsage;
     use crate::domain::ids::CallId;
+    use crate::domain::mcp::{McpCallFailure, McpFaultKind, McpLifecycleFact, McpLifecycleKind};
     use crate::domain::tool::{ToolCall, ToolOutcome};
     use serde_json::json;
     use std::time::{Duration, UNIX_EPOCH};
@@ -1478,5 +1629,196 @@ mod tests {
         let report = BenchmarkReport::from_sessions(&[log]);
         let text = render_text(&report);
         assert!(text.contains("$1.2500"), "{text}");
+    }
+
+    // ── P11 切片 3：MCP 生命周期统计 ──────────────────────────────────
+
+    fn lifecycle(sequence: u64, kind: McpLifecycleKind) -> Evidence {
+        evidence(
+            sequence,
+            AuditEvent::McpLifecycle {
+                turn: 0,
+                fact: McpLifecycleFact {
+                    server: "demo".to_owned(),
+                    generation: 1,
+                    kind,
+                    fault: None,
+                    call_id: None,
+                    process_isolation: true,
+                    tools_changed: false,
+                },
+            },
+        )
+    }
+
+    fn call_failure(sequence: u64, kind: McpFaultKind, result_unknown: bool) -> Evidence {
+        evidence(
+            sequence,
+            AuditEvent::McpCallFailed {
+                turn: 1,
+                call_id: CallId::new("call_1"),
+                tool: "mcp__demo__send_message".to_owned(),
+                failure: McpCallFailure {
+                    server: "demo".to_owned(),
+                    generation: 1,
+                    kind,
+                    result_unknown,
+                    process_isolation: true,
+                },
+            },
+        )
+    }
+
+    /// 连接事件与调用故障各进各自的账，不冒充工具结局或沙箱执行次数。
+    ///
+    /// 这条守的是报表的可信度：一次启动失败压根没有工具调用，把它算成
+    /// "工具失败 +1"会让人以为模型试过了；把一次断连按共享连接的每个工具
+    /// 各算一次退出，会凭空造出好几次故障。
+    #[test]
+    fn mcp_lifecycle_events_count_as_connection_facts_not_tool_outcomes() {
+        let mut log = synthetic_log(Some(0.25));
+        log.events.extend([
+            lifecycle(14, McpLifecycleKind::ConnectFailed),
+            lifecycle(15, McpLifecycleKind::Disconnected),
+            lifecycle(16, McpLifecycleKind::Recovered),
+            lifecycle(17, McpLifecycleKind::RecoveryFailed),
+            lifecycle(18, McpLifecycleKind::Connected),
+            lifecycle(19, McpLifecycleKind::Closed),
+            call_failure(20, McpFaultKind::CallTimeout, true),
+            call_failure(21, McpFaultKind::ServerError, false),
+        ]);
+
+        let summary = summarize(&log);
+        assert_eq!(summary.mcp_connect_failures, 1);
+        assert_eq!(summary.mcp_disconnects, 1);
+        assert_eq!(summary.mcp_recoveries, 1);
+        assert_eq!(summary.mcp_recovery_failures, 1);
+        assert_eq!(summary.mcp_call_timeouts, 1);
+        assert_eq!(
+            summary.mcp_unknown_results, 1,
+            "只有 result_unknown 的那次算未知结果"
+        );
+        // 连接事件不碰工具与沙箱两本账。
+        assert_eq!(summary.tool_calls, 2, "工具调用数只该来自 ToolRequested");
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.sandbox_protected_runs, 0);
+        assert_eq!(summary.sandbox_unprotected_runs, 0);
+    }
+
+    /// 只有连接事件的日志不是一次任务运行。
+    ///
+    /// 它没有模型调用，`cost_usd` 必然是"未知"；按原有合计规则，一条这样的
+    /// 日志会把整轮基准的成本拖成未知，还会被记成一个失败会话。用户看到的
+    /// 结果就是"3 个任务里失败 1 个、成本未知"，而真相是"MCP 没起来，任务
+    /// 全都跑完了"。
+    #[test]
+    fn lifecycle_only_log_is_not_counted_as_a_session_run() {
+        let task_log = with_final_answer(synthetic_log(Some(0.25)), Some(0.5));
+        let task_wall_clock = summarize(&task_log).wall_clock_ms;
+        let mut connection_log = synthetic_log(Some(0.25));
+        connection_log.session_id = SessionId::new("mcp-demo");
+        connection_log.events = vec![
+            lifecycle(1, McpLifecycleKind::ConnectFailed),
+            lifecycle(2, McpLifecycleKind::Disconnected),
+        ];
+
+        let report = BenchmarkReport::from_sessions(&[task_log.clone(), connection_log.clone()]);
+        assert!(is_lifecycle_only(&connection_log));
+        assert!(!is_lifecycle_only(&task_log));
+        assert_eq!(report.mcp_lifecycle_logs, 1);
+        assert_eq!(report.succeeded, 1, "连接日志不该算失败会话");
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            report.total_wall_clock_ms, task_wall_clock,
+            "墙钟合计只能来自真正的任务会话"
+        );
+        assert!(
+            report.total_cost_usd.is_some(),
+            "连接日志没有成本数据，不该把已知成本拖成未知"
+        );
+        // 两份日志的 MCP 统计都还在：排除的是"会话成败"，不是事实本身。
+        assert_eq!(report.sessions[1].mcp_connect_failures, 1);
+        assert_eq!(report.sessions[1].mcp_disconnects, 1);
+        assert_eq!(report.sessions[1].events, 2);
+    }
+
+    /// 末尾那条 `Closed` 不该把交付过答案的会话判成失败。
+    #[test]
+    fn trailing_lifecycle_close_does_not_undo_a_delivered_answer() {
+        // `with_final_answer` 以 Thought 收尾；再补一条关闭事件模拟进程退出。
+        let mut log = with_final_answer(synthetic_log(Some(0.25)), Some(0.5));
+        let last = log.events.len() as u64 + 1;
+        log.events.push(lifecycle(last, McpLifecycleKind::Closed));
+
+        let report = BenchmarkReport::from_sessions(&[log]);
+        assert_eq!(report.succeeded, 1, "答案已交付，关闭事件只是收尾");
+        assert_eq!(report.failed, 0);
+    }
+
+    /// 空的连接文件不能被这条规则吸收：一条事件都没有是坏文件，不是连接日志。
+    #[test]
+    fn empty_log_is_not_a_lifecycle_log() {
+        let log = SessionLog {
+            session_id: SessionId::new("empty"),
+            events: Vec::new(),
+            skipped_lines: 0,
+        };
+        assert!(!is_lifecycle_only(&log));
+    }
+
+    /// 旧 JSON 报表缺这些字段要能读，且读成 0。
+    #[test]
+    fn legacy_json_report_defaults_missing_mcp_counts_to_zero() {
+        let report = BenchmarkReport::from_sessions(&[synthetic_log(Some(0.25))]);
+        let text = render_json(&report).expect("序列化");
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("JSON 报表");
+        let session = value["sessions"][0].as_object_mut().expect("会话摘要");
+        for field in [
+            "mcp_connect_failures",
+            "mcp_disconnects",
+            "mcp_recoveries",
+            "mcp_recovery_failures",
+            "mcp_call_timeouts",
+            "mcp_unknown_results",
+        ] {
+            session.remove(field).expect("新增字段必须在");
+        }
+        value
+            .as_object_mut()
+            .expect("报表")
+            .remove("mcp_lifecycle_logs")
+            .expect("新增报表字段必须在");
+
+        let back: BenchmarkReport = serde_json::from_value(value).expect("旧报表必须能读");
+        assert_eq!(back.sessions[0].mcp_connect_failures, 0);
+        assert_eq!(back.sessions[0].mcp_unknown_results, 0);
+        assert_eq!(back.mcp_lifecycle_logs, 0);
+        assert_eq!(back, report);
+    }
+
+    /// 文本报表要能把故障与恢复说清楚，包括"结果未知不等于已取消"。
+    #[test]
+    fn text_report_summarizes_mcp_faults_and_recovery() {
+        let mut log = synthetic_log(Some(0.25));
+        log.events
+            .push(lifecycle(14, McpLifecycleKind::Disconnected));
+        log.events
+            .push(call_failure(15, McpFaultKind::CallTimeout, true));
+        let report = BenchmarkReport::from_sessions(&[log]);
+        let text = render_text(&report);
+
+        assert!(text.contains("MCP 生命周期"), "{text}");
+        assert!(text.contains("断连 1 次"), "{text}");
+        assert!(text.contains("结果未知 1 次"), "{text}");
+        assert!(text.contains("不会自动重放"), "{text}");
+    }
+
+    /// 没碰过 MCP 的报表不该多出这一段：没有信息就占位是噪音。
+    #[test]
+    fn text_report_omits_the_mcp_section_when_unused() {
+        let report = BenchmarkReport::from_sessions(&[synthetic_log(Some(0.25))]);
+        let text = render_text(&report);
+        assert!(!text.contains("MCP 生命周期"), "{text}");
     }
 }

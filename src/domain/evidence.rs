@@ -8,6 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::ids::CallId;
+use super::mcp::{McpCallFailure, McpLifecycleFact};
 use super::tool::{ToolCall, ToolOutcome};
 
 /// 一次模型调用的 token 用量与成本。
@@ -233,6 +235,31 @@ pub enum AuditEvent {
         /// 失败原因。
         reason: String,
     },
+    /// MCP Server 的一次连接级事实（建立、断开、恢复或关闭）。
+    ///
+    /// 与 `ToolObserved`、`SandboxApplied` 分开：一次启动失败没有工具调用，
+    /// 不该伪造观察或执行边界；同一连接的多个工具共享一个 generation，
+    /// 断连只记一次。连接事件用 `turn: 0` 表示它不属于任何模型轮次。
+    McpLifecycle {
+        /// 恒为 0，见变体说明。
+        turn: u32,
+        /// 连接事实，只含 Server 标识、故障分类与真实进程保护状态。
+        fact: McpLifecycleFact,
+    },
+    /// 一次 MCP 工具调用的结构化失败事实。
+    ///
+    /// 观察文本仍由 `ToolObserved` 承载；这条只给审计和报表提供分类，
+    /// 包括"请求已发出、远端结果未知"这一不能自动重放的状态。
+    McpCallFailed {
+        /// 轮次号。
+        turn: u32,
+        /// 触发故障的调用 ID，用于和 `ToolRequested` 关联。
+        call_id: CallId,
+        /// 被调工具名。
+        tool: String,
+        /// 执行层提供的故障事实。
+        failure: McpCallFailure,
+    },
 }
 
 impl AuditEvent {
@@ -251,7 +278,9 @@ impl AuditEvent {
             | Self::ContextCompacted { turn, .. }
             | Self::ContextBudgeted { turn, .. }
             | Self::SummaryGenerated { turn, .. }
-            | Self::SummaryFailed { turn, .. } => *turn,
+            | Self::SummaryFailed { turn, .. }
+            | Self::McpLifecycle { turn, .. }
+            | Self::McpCallFailed { turn, .. } => *turn,
         }
     }
 }

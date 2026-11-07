@@ -23,6 +23,7 @@ pub const USAGE: &str = "\
       cargo run -- --report [--report-dir <目录>] [--json]
       cargo run -- --benchmark
       cargo run -- --benchmark-long
+      cargo run -- --mcp-reconnect <服务器名>
 示例: cargo run -- \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
       cargo run -- --yes \"非交互场景下跑同一个任务\"
       cargo run -- --ai-review \"让模型先审一遍，拿不准的再问人\"
@@ -33,7 +34,8 @@ pub const USAGE: &str = "\
       cargo run -- --report
       cargo run -- --report --json
       cargo run -- --benchmark
-      cargo run -- --benchmark-long";
+      cargo run -- --benchmark-long
+      cargo run -- --mcp-reconnect fetch";
 
 /// 解析出的命令行参数。
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +80,12 @@ pub struct CliArgs {
     /// 跑长任务基准集（`--benchmark-long`）：两段式跑法——先故意耗尽
     /// 预算制造中断，再从任务快照恢复着跑完。
     pub benchmark_long: bool,
+    /// 显式尝试重连一个 MCP Server（`--mcp-reconnect <服务器名>`）。
+    ///
+    /// 独立模式：不跑任务、不需要模型配置——只做一次有界的握手与工具
+    /// 发现，把结果写进连接审计后关闭连接退出。任务中途没有自动重试，
+    /// 恢复通信是人明确下令的动作（与"调用超时不自动重放"同一条线）。
+    pub mcp_reconnect: Option<String>,
 }
 
 /// 解析命令行参数。
@@ -103,6 +111,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut json = false;
     let mut benchmark = false;
     let mut benchmark_long = false;
+    let mut mcp_reconnect = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut iter = argv.into_iter();
@@ -141,6 +150,13 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
                 Some(name) => kind = Some(name),
                 None => {
                     eprintln!("--kind 需要一个模板名：--kind <模板名>");
+                    return None;
+                }
+            },
+            "--mcp-reconnect" => match iter.next() {
+                Some(name) => mcp_reconnect = Some(name),
+                None => {
+                    eprintln!("--mcp-reconnect 需要一个服务器名：--mcp-reconnect <服务器名>");
                     return None;
                 }
             },
@@ -202,8 +218,32 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         eprintln!("--force-worktree 只对 --resume-task 有意义");
         return None;
     }
-    if task.is_none() && resume.is_none() && resume_task.is_none() && !list_sessions && !report && !benchmark && !benchmark_long {
-        eprintln!("缺少任务描述；恢复请用 --resume <id> 或 --resume-task <id>，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long\n\n{USAGE}");
+    // `--mcp-reconnect` 是独立模式：探测完就退出。与它同场出现的其他
+    // 意图（跑任务、恢复、报表、基准）都会被跳过——静默丢掉其中一半
+    // 等于悄悄吃掉用户的指令，所以直接拒。
+    if mcp_reconnect.is_some()
+        && (task.is_some()
+            || resume.is_some()
+            || resume_task.is_some()
+            || kind.is_some()
+            || list_sessions
+            || report
+            || benchmark
+            || benchmark_long)
+    {
+        eprintln!("--mcp-reconnect 是独立模式，不接任务描述，也不与其他模式同场使用");
+        return None;
+    }
+    if task.is_none()
+        && resume.is_none()
+        && resume_task.is_none()
+        && !list_sessions
+        && !report
+        && !benchmark
+        && !benchmark_long
+        && mcp_reconnect.is_none()
+    {
+        eprintln!("缺少任务描述；恢复请用 --resume <id> 或 --resume-task <id>，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long，MCP 恢复探测请用 --mcp-reconnect <服务器名>\n\n{USAGE}");
         return None;
     }
 
@@ -221,6 +261,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         json,
         benchmark,
         benchmark_long,
+        mcp_reconnect,
     })
 }
 
@@ -236,6 +277,24 @@ pub struct ConsoleReporter {
     announced_turn: Mutex<u32>,
     /// 同一份事件同时在内存里留痕，供运行结束后汇总或转存。
     trail: MemoryEvidenceSink,
+}
+
+/// 进程保护状态的后缀：未受保护时提醒读者，别让"无保护"悄悄混过控制台。
+fn isolation_note(fact: &crate::domain::mcp::McpLifecycleFact) -> &'static str {
+    if fact.process_isolation {
+        ""
+    } else {
+        "（无进程沙箱保护）"
+    }
+}
+
+/// 故障类别后缀：连接没起来或没救回来时，只说"失败"读者无从下手——
+/// 启动进程失败、握手超时和工具发现超时是三个不同的修法。
+fn fault_note(fact: &crate::domain::mcp::McpLifecycleFact) -> String {
+    match fact.fault {
+        Some(kind) => format!("（{kind}）"),
+        None => String::new(),
+    }
 }
 
 impl ConsoleReporter {
@@ -328,6 +387,45 @@ impl ConsoleReporter {
                 // 每步开始时报出角色：读者要知道接下来是"谁"在干活，
                 // 尤其是编排把不同角色串起来的时候。
                 println!("[角色] {} 开始执行", role.name());
+            }
+            AuditEvent::McpLifecycle { fact, .. } => match fact.kind {
+                crate::domain::mcp::McpLifecycleKind::Connected => {
+                    println!(
+                        "[MCP] `{}` 已连接{}（第 {} 代）",
+                        fact.server,
+                        isolation_note(fact),
+                        fact.generation
+                    );
+                }
+                crate::domain::mcp::McpLifecycleKind::Disconnected => {
+                    println!("[MCP] `{}` 连接断开{}", fact.server, isolation_note(fact));
+                }
+                crate::domain::mcp::McpLifecycleKind::Recovered => {
+                    let changed = if fact.tools_changed {
+                        "；工具清单有变化"
+                    } else {
+                        ""
+                    };
+                    println!("[MCP] `{}` 已恢复{}", fact.server, changed);
+                }
+                crate::domain::mcp::McpLifecycleKind::RecoveryFailed => {
+                    println!("[MCP] `{}` 恢复失败{}", fact.server, fault_note(fact));
+                }
+                crate::domain::mcp::McpLifecycleKind::ConnectFailed => {
+                    println!("[MCP] `{}` 连接失败{}", fact.server, fault_note(fact));
+                }
+                crate::domain::mcp::McpLifecycleKind::Closed => {
+                    println!("[MCP] `{}` 已关闭", fact.server);
+                }
+            },
+            AuditEvent::McpCallFailed { failure, .. } => {
+                if failure.result_unknown {
+                    // "结果未知"必须让人看见：远端可能已经产生了副作用。
+                    println!(
+                        "[MCP] `{}` 调用故障（{}），远端结果未知，未自动重放",
+                        failure.server, failure.kind
+                    );
+                }
             }
             // 审批与 token 用量暂不进控制台，避免淹没主要流程。
             AuditEvent::ApprovalDecided { .. } => {}
@@ -527,6 +625,30 @@ mod tests {
         assert!(parse_from(argv(&["--benchmark", "--resume", "s1"])).is_none());
     }
 
+    /// `--mcp-reconnect` 是独立模式：单独可解析，与其他意图同场即拒。
+    #[test]
+    fn mcp_reconnect_stands_alone_and_rejects_company() {
+        let args = parse_from(argv(&["--mcp-reconnect", "demo"])).unwrap();
+        assert_eq!(args.mcp_reconnect.as_deref(), Some("demo"));
+        assert!(args.task.is_none());
+
+        assert!(
+            parse_from(argv(&["--mcp-reconnect", "demo", "修个 bug"])).is_none(),
+            "探测模式不接任务描述"
+        );
+        assert!(parse_from(argv(&["--mcp-reconnect", "demo", "--resume", "s1"])).is_none());
+        assert!(parse_from(argv(&["--mcp-reconnect", "demo", "--report"])).is_none());
+        assert!(parse_from(argv(&["--mcp-reconnect", "demo", "--benchmark"])).is_none());
+
+        // 缺值必须拒：否则下一个参数会被当成任务描述，探测悄悄变成跑任务。
+        assert!(parse_from(argv(&["--mcp-reconnect"])).is_none());
+
+        // 审批类开关不改探测语义：共存放行但无作用，静默吃掉反而更糟。
+        let yes = parse_from(argv(&["--mcp-reconnect", "demo", "--yes"])).unwrap();
+        assert!(yes.auto_approve);
+        assert_eq!(yes.mcp_reconnect.as_deref(), Some("demo"));
+    }
+
     fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
             id: CallId::new("call_1"),
@@ -576,6 +698,7 @@ mod tests {
                     content: "内容".to_owned(),
                     status: OutcomeStatus::Success,
                     execution: None,
+                    mcp_failure: None,
                 },
             },
         );
@@ -589,5 +712,93 @@ mod tests {
         );
 
         assert_eq!(*reporter.announced_turn.lock().unwrap(), 2);
+    }
+
+    /// 连接事件不播报轮次：它没有模型轮次，`turn: 0` 也不是"第 0 轮"。
+    ///
+    /// 报表按 `is_lifecycle_only` 把它认成连接日志，控制台同样不该为它
+    /// 画一条"第 0/N 轮"的分隔线——那条线会让读者去找一个不存在的轮次。
+    #[test]
+    fn lifecycle_events_announce_no_turn() {
+        let reporter = ConsoleReporter::new(20);
+        reporter.record(
+            Timestamp::UNIX_EPOCH,
+            AuditEvent::McpLifecycle {
+                turn: 0,
+                fact: crate::domain::mcp::McpLifecycleFact {
+                    server: "demo".to_owned(),
+                    generation: 1,
+                    kind: crate::domain::mcp::McpLifecycleKind::Disconnected,
+                    fault: Some(crate::domain::mcp::McpFaultKind::Disconnected),
+                    call_id: Some(crate::domain::ids::CallId::new("call_1")),
+                    process_isolation: false,
+                    tools_changed: false,
+                },
+            },
+        );
+
+        assert_eq!(
+            *reporter.announced_turn.lock().unwrap(),
+            0,
+            "连接事件不能把轮次推进到 0 之后"
+        );
+        // 事件本身仍留在留痕里，供事后汇总或转存。
+        let events = reporter.trail.events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event,
+            AuditEvent::McpLifecycle { turn: 0, .. }
+        ));
+    }
+
+    /// 一次调用故障只播一条"结果未知"，不播成功。
+    #[test]
+    fn call_failure_with_unknown_result_is_announced_on_its_own_turn() {
+        let reporter = ConsoleReporter::new(20);
+        reporter.record(
+            Timestamp::UNIX_EPOCH,
+            AuditEvent::McpCallFailed {
+                turn: 3,
+                call_id: crate::domain::ids::CallId::new("call_9"),
+                tool: "mcp__demo__send_message".to_owned(),
+                failure: crate::domain::mcp::McpCallFailure {
+                    server: "demo".to_owned(),
+                    generation: 2,
+                    kind: crate::domain::mcp::McpFaultKind::Disconnected,
+                    result_unknown: true,
+                    process_isolation: true,
+                },
+            },
+        );
+
+        assert_eq!(*reporter.announced_turn.lock().unwrap(), 3);
+        assert_eq!(reporter.trail.events().len(), 1);
+    }
+
+    /// 两个提示后缀都只认执行层给的事实，不认输出文本。
+    ///
+    /// 控制台上"连接失败"后面跟的是哪一类故障，决定读者去查启动参数、
+    /// 握手还是 Server 的 list_tools；把这三者压成一句"失败"就等于让人猜。
+    #[test]
+    fn mcp_note_suffixes_come_from_structured_facts() {
+        let fact = crate::domain::mcp::McpLifecycleFact {
+            server: "demo".to_owned(),
+            generation: 1,
+            kind: crate::domain::mcp::McpLifecycleKind::ConnectFailed,
+            fault: Some(crate::domain::mcp::McpFaultKind::Spawn),
+            call_id: None,
+            process_isolation: false,
+            tools_changed: false,
+        };
+        assert_eq!(fault_note(&fact), "（启动进程失败）");
+        assert_eq!(isolation_note(&fact), "（无进程沙箱保护）");
+
+        let protected = crate::domain::mcp::McpLifecycleFact {
+            fault: None,
+            process_isolation: true,
+            ..fact.clone()
+        };
+        assert_eq!(fault_note(&protected), "", "没有故障事实就不编一个类别");
+        assert_eq!(isolation_note(&protected), "");
     }
 }

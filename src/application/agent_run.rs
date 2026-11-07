@@ -1142,11 +1142,22 @@ impl AgentRunner {
         let mut outcome = outcome;
         // 执行器报告边界事实，应用层只负责转成证据；观察文本不再当判据用。
         let boundary = outcome.execution.take();
+        // MCP 故障事实同样在进程内交接：取走后才落 `ToolObserved`，
+        // 观察与快照里不会留下一份第二真相。
+        let mcp_failure = outcome.mcp_failure.take();
         self.record(AuditEvent::ToolObserved {
             turn,
             call: call.clone(),
             outcome: outcome.clone(),
         });
+        if let Some(failure) = mcp_failure {
+            self.record(AuditEvent::McpCallFailed {
+                turn,
+                call_id: call.id.clone(),
+                tool: call.name.clone(),
+                failure,
+            });
+        }
         if let Some(boundary) = boundary {
             self.record(AuditEvent::SandboxApplied {
                 turn,
@@ -1386,11 +1397,28 @@ mod tests {
     struct RecordingInvoker {
         calls: std::sync::Mutex<Vec<String>>,
         boundary: Option<crate::domain::sandbox::ExecutionBoundary>,
+        /// 附加到观察上的 MCP 故障事实，验证应用层只转述、不反推。
+        mcp_failure: Option<crate::domain::mcp::McpCallFailure>,
     }
 
     impl RecordingInvoker {
         fn with_boundary(boundary: crate::domain::sandbox::ExecutionBoundary) -> Self {
-            Self { calls: Default::default(), boundary: Some(boundary) }
+            Self {
+                calls: Default::default(),
+                boundary: Some(boundary),
+                mcp_failure: None,
+            }
+        }
+
+        fn with_mcp_failure(
+            boundary: crate::domain::sandbox::ExecutionBoundary,
+            failure: crate::domain::mcp::McpCallFailure,
+        ) -> Self {
+            Self {
+                calls: Default::default(),
+                boundary: Some(boundary),
+                mcp_failure: Some(failure),
+            }
         }
     }
 
@@ -1407,9 +1435,17 @@ mod tests {
                     "empty_command" | "git_status" => OutcomeStatus::Failed,
                     _ => OutcomeStatus::Success,
                 };
-                let mut outcome = ToolOutcome { content, status, execution: None };
+                let mut outcome = ToolOutcome {
+                    content,
+                    status,
+                    execution: None,
+                    mcp_failure: None,
+                };
                 if let Some(boundary) = self.boundary {
                     outcome = outcome.with_execution(boundary);
+                }
+                if let Some(failure) = self.mcp_failure.clone() {
+                    outcome = outcome.with_mcp_failure(failure);
                 }
                 outcome
             })
@@ -2588,6 +2624,167 @@ mod tests {
                  Job（本次 process_isolation={process_isolation}）"
             );
         }
+    }
+
+    /// 取出全部 `McpCallFailed` 的 (轮次, 调用 ID, 工具名, 结果未知, 进程保护)。
+    fn mcp_call_failures(harness: &Harness) -> Vec<(u32, String, String, bool, bool)> {
+        harness
+            .evidence
+            .events()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                AuditEvent::McpCallFailed {
+                    turn,
+                    call_id,
+                    tool,
+                    failure,
+                } => Some((
+                    turn,
+                    call_id.as_str().to_owned(),
+                    tool,
+                    failure.result_unknown,
+                    failure.process_isolation,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// MCP 调用故障落成自己的审计事件，字段照执行器给的事实写。
+    ///
+    /// 报表与命令行都靠这条区分"超时（结果未知）"与"Server 报错（结果已知）"：
+    /// 前者不能重放，后者可以照普通失败处理。折叠成一个字符串就都没了。
+    #[tokio::test]
+    async fn mcp_call_failure_becomes_its_own_audit_event() {
+        let mcp_spec = ToolSpec {
+            name: "mcp__demo__send_message".to_owned(),
+            description: "外部 Server 的写工具".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(false, false, false, true),
+        };
+        let invoker = Arc::new(RecordingInvoker::with_mcp_failure(
+            crate::domain::sandbox::ExecutionBoundary::mcp(true),
+            crate::domain::mcp::McpCallFailure {
+                server: "demo".to_owned(),
+                generation: 3,
+                kind: crate::domain::mcp::McpFaultKind::CallTimeout,
+                result_unknown: true,
+                process_isolation: true,
+            },
+        ));
+        let mut harness = harness_with_invoker(
+            vec![
+                MockTurn::tool_call(
+                    "call_9",
+                    "mcp__demo__send_message",
+                    json!({"message": "hi"}),
+                ),
+                MockTurn::text("看到超时"),
+            ],
+            vec![mcp_spec],
+            PolicyEngine::new(),
+            invoker,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(
+            mcp_call_failures(&harness),
+            vec![(
+                1,
+                "call_9".to_owned(),
+                "mcp__demo__send_message".to_owned(),
+                true,
+                true
+            )],
+            "故障事件要带上轮次、调用 ID、工具名与两个事实"
+        );
+        // 同一次调用仍留一条边界记录：连接事件不代替它，也不重复它。
+        assert_eq!(boundaries(&harness).len(), 1);
+    }
+
+    /// 故障事实只在审计里出现，不进观察、不进快照。
+    ///
+    /// `ToolObserved` 与快照的 JSON 形状是既有契约（历史证据文件、恢复路径
+    /// 都按它读）；把 `mcp_failure` 漏进去会让旧 reader 读不懂新快照，
+    /// 也让同一件事在两处各说一遍、可能说得不一样。
+    #[tokio::test]
+    async fn mcp_failure_metadata_stays_out_of_observations_and_snapshots() {
+        let mcp_spec = ToolSpec {
+            name: "mcp__demo__fetch".to_owned(),
+            description: "外部 Server 的读工具".to_owned(),
+            parameters: json!({"type": "object"}),
+            annotations: ToolAnnotations::new(true, false, true, true),
+        };
+        let invoker = Arc::new(RecordingInvoker::with_mcp_failure(
+            crate::domain::sandbox::ExecutionBoundary::mcp(false),
+            crate::domain::mcp::McpCallFailure {
+                server: "demo".to_owned(),
+                generation: 1,
+                kind: crate::domain::mcp::McpFaultKind::Disconnected,
+                result_unknown: true,
+                process_isolation: false,
+            },
+        ));
+        let mut harness = harness_with_invoker(
+            vec![
+                MockTurn::tool_call("call_1", "mcp__demo__fetch", json!({})),
+                MockTurn::text("读完了"),
+            ],
+            vec![mcp_spec],
+            PolicyEngine::new(),
+            invoker,
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        let observed: Vec<_> = harness
+            .evidence
+            .events()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                AuditEvent::ToolObserved { outcome, .. } => {
+                    Some(serde_json::to_value(outcome).expect("观察可序列化"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![json!({"content": "文件内容", "status": "Success"})],
+            "观察里只剩旧的两字段形状"
+        );
+        let snapshot = serde_json::to_value(harness.runner.snapshot()).expect("快照可序列化");
+        let text = snapshot.to_string();
+        assert!(
+            !text.contains("mcp_failure"),
+            "快照不该带上故障事实: {text}"
+        );
+        assert!(!text.contains("process_isolation"), "快照不该带上连接事实");
+    }
+
+    /// 没有故障事实的观察不产生 `McpCallFailed`。
+    ///
+    /// 反推是这里最容易犯的错：看见 `Failed` 观察就补一条故障事件，等于
+    /// 拿输出文本猜分类——本轮要消除的正是这种推断。
+    #[tokio::test]
+    async fn an_ordinary_failure_produces_no_mcp_call_event() {
+        let mut harness = harness(
+            vec![
+                MockTurn::tool_call("call_1", "empty_command", json!({"command": ""})),
+                MockTurn::text("看到失败"),
+            ],
+            vec![ToolSpec {
+                name: "empty_command".to_owned(),
+                description: "空命令".to_owned(),
+                parameters: json!({"type": "object"}),
+                annotations: ToolAnnotations::new(true, false, true, false),
+            }],
+        );
+
+        harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert!(mcp_call_failures(&harness).is_empty());
     }
 
     /// 文件类工具不补边界记录：它们没有子进程这一维。

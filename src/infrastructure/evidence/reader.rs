@@ -14,9 +14,8 @@ use crate::application::report::SessionLog;
 use crate::domain::evidence::Evidence;
 use crate::domain::ids::SessionId;
 
-/// 一次运行（一个会话）的证据汇总（[`SessionLog`]）定义在
-/// `application::report`——统计是它的消费方，且 infrastructure 依赖
-/// application 是本仓库既定的方向。
+// SessionLog 定义在 `application::report`——统计是它的消费方，且
+// infrastructure 依赖 application 是本仓库既定的方向。
 
 /// 证据读取失败。
 #[derive(Debug)]
@@ -144,6 +143,7 @@ mod tests {
     use crate::domain::agent::AgentRole;
     use crate::domain::evidence::{AuditEvent, TokenUsage};
     use crate::domain::ids::CallId;
+    use crate::domain::mcp::{McpCallFailure, McpFaultKind, McpLifecycleFact, McpLifecycleKind};
     use crate::domain::policy::PolicyVerdict;
     use crate::domain::tool::{ToolCall, ToolOutcome};
     use std::fs;
@@ -160,7 +160,7 @@ mod tests {
         fs::write(path, lines.join("\n")).expect("写合成 JSONL");
     }
 
-    /// 当前 13 种 `AuditEvent` 变体各一条，验证这些样本的读回契约。
+    /// 当前 15 种 `AuditEvent` 变体各一条，验证这些样本的读回契约。
     /// 样本需在新增变体时手动维护；测试不会自动发现遗漏的变体。
     fn every_variant() -> Vec<Evidence> {
         let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
@@ -292,6 +292,38 @@ mod tests {
                     reason: "模型超时".to_owned(),
                 },
             ),
+            Evidence::new(
+                14,
+                at(108),
+                AuditEvent::McpLifecycle {
+                    turn: 0,
+                    fact: McpLifecycleFact {
+                        server: "fetch".to_owned(),
+                        generation: 1,
+                        kind: McpLifecycleKind::Disconnected,
+                        fault: Some(McpFaultKind::Disconnected),
+                        call_id: Some(CallId::new("call_1")),
+                        process_isolation: true,
+                        tools_changed: false,
+                    },
+                },
+            ),
+            Evidence::new(
+                15,
+                at(108),
+                AuditEvent::McpCallFailed {
+                    turn: 6,
+                    call_id: CallId::new("call_1"),
+                    tool: "mcp__fetch__get_page".to_owned(),
+                    failure: McpCallFailure {
+                        server: "fetch".to_owned(),
+                        generation: 1,
+                        kind: McpFaultKind::CallTimeout,
+                        result_unknown: true,
+                        process_isolation: true,
+                    },
+                },
+            ),
         ]
     }
 
@@ -306,14 +338,11 @@ mod tests {
         let dir = temp_dir("all-variants");
         let path = dir.join("session-1.jsonl");
         let events = every_variant();
-        write_lines(
-            &path,
-            &events.iter().map(evidence_line).collect::<Vec<_>>(),
-        );
+        write_lines(&path, &events.iter().map(evidence_line).collect::<Vec<_>>());
 
         let log = read_session(&path).unwrap().expect("文件存在");
         assert_eq!(log.session_id.as_str(), "session-1");
-        assert_eq!(log.events.len(), 13);
+        assert_eq!(log.events.len(), 15);
         assert_eq!(log.skipped_lines, 0);
         assert!(log.is_sequential());
         // 深度相等：事件类型、字段、轮次号全部还原。
