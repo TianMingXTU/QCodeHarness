@@ -418,6 +418,23 @@ impl AgentRunner {
         Ok(runner)
     }
 
+    /// 在装配期向守卫链追加自定义守卫。
+    ///
+    /// 自定义守卫排在两个内置守卫之后，按 [`run_guard_chain`] 的
+    /// **最严格者胜**规则参与合并：它能拒绝策略放行的调用，也能要求
+    /// 审批。策略守卫始终在链首——`PolicyEvaluated` 证据与它同源，
+    /// 不允许被替换掉。
+    ///
+    /// 装配方因此不必改 `agent_run.rs`：`AgentRunner::new(..)` 或
+    /// `resume(..)` 之后、运行之前追加即可。
+    pub fn with_additional_guards(
+        mut self,
+        guards: impl IntoIterator<Item = Arc<dyn ToolGuard>>,
+    ) -> Self {
+        self.guards.extend(guards);
+        self
+    }
+
     /// 恢复语义：把快照里的半轮状态翻译成"接下来该怎么走"。
     ///
     /// 三种半轮状态，三种语义：
@@ -1011,7 +1028,8 @@ impl AgentRunner {
         }
         // 裁剪是发给模型前的视图变换：请求里只放模型真正看到的东西。
         // 丢了历史就留一条证据，事后翻 JSONL 能对出"第 N 轮模型看到了什么"。
-        // 报告按"实际视图 vs 完整历史"现测，换一种策略也照样如实。
+        // 报告按"实际视图 vs 完整历史"现测，换一种策略也照样如实；证据
+        // 事件沿用既有口径——只有整轮被裁掉才记，按片裁剪的策略不记事件。
         let history =
             self.context_policy
                 .view(&self.session, &self.context_budget, self.session.summary());
@@ -1723,6 +1741,49 @@ mod tests {
                 "after_model_reply:重试=false,调用数=0",
             ],
             "挂点应按真实顺序覆盖两次模型往返与一次工具执行"
+        );
+    }
+
+    // ── 守卫链：装配期追加的守卫真的参与裁决 ──────────────────────────
+
+    #[tokio::test]
+    async fn assembly_can_append_a_custom_guard_that_changes_the_verdict() {
+        struct DenyReads;
+
+        impl ToolGuard for DenyReads {
+            fn name(&self) -> &str {
+                "deny-reads"
+            }
+
+            fn inspect(&self, call: &ToolCall, _ctx: &GuardContext<'_>) -> GuardVerdict {
+                GuardVerdict::Deny(format!("测试守卫拒绝 {}", call.name))
+            }
+        }
+
+        let invoker = Arc::new(RecordingInvoker::default());
+        let mut harness = harness_with_invoker(
+            vec![
+                MockTurn::tool_call("call_1", "read_file", json!({"path": "Cargo.toml"})),
+                MockTurn::text("被拒了，换条路。"),
+            ],
+            vec![read_file_spec()],
+            PolicyEngine::new(),
+            invoker.clone(),
+        );
+        harness.runner = harness
+            .runner
+            .with_additional_guards([Arc::new(DenyReads) as Arc<dyn ToolGuard>]);
+
+        let outcome = harness.runner.run(&Budget::new(20)).await.unwrap();
+
+        assert_eq!(outcome.turns_used, 2, "拒绝观察应回填给模型再走一轮");
+        assert!(
+            invoker.calls.lock().unwrap().is_empty(),
+            "被守卫拒绝的调用不得落到执行器"
+        );
+        assert!(
+            harness.approvals.requested_tools().is_empty(),
+            "直接拒绝不该去问审批闸门"
         );
     }
 

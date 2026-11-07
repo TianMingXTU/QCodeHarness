@@ -179,7 +179,7 @@ pub trait RunHooks: Send + Sync {
         Box::pin(async {})
     }
 
-    /// 一次工具调用即将执行（已过角色边界与策略裁决，尚未落执行前快照）。
+    /// 一次工具调用即将执行（已过角色边界与策略裁决，执行前快照已落盘）。
     fn before_tool_call<'a>(&'a self, _call: &'a ToolCall) -> BoxFuture<'a, ()> {
         Box::pin(async {})
     }

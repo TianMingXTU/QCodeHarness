@@ -26,7 +26,7 @@ QCodeHarness 是一个 Rust 的 Coding Agent 框架。跑任务的不是它自�
 ## 扩展点约定
 
 - 新行为优先实现为端口 trait 的实现，并在装配层接线（`main.rs` /
-  `AgentDependencies` / `default_guard_chain`），不改核心循环。
+  `AgentDependencies` / `AgentRunner` 的装配方法），不改核心循环。
 - 扩展点 trait 住 `src/application/`（`port/`、`tool_guard.rs`、
   `tool_registry.rs`、`context_policy.rs`）；需要 IO 的实现住
   `src/infrastructure/`，不碰 IO 的默认实现可以与 trait 同层。

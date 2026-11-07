@@ -6,8 +6,9 @@
 //!
 //! 裁剪报告不放进 trait：策略只交视图，"裁了几轮、省了多少 token"由
 //! [`CompactionReport::measure`](crate::domain::context::CompactionReport::measure)
-//! 按"实际视图 vs 完整历史"现测。这样自定义策略下的证据仍然描述真正
-//! 发出的内容，而不是某一套固定算法的假设。
+//! 按"实际视图 vs 完整历史"现测。自定义策略下，报告仍然描述真正发出的
+//! 内容，而不是某一套固定算法的假设；是否落审计事件由循环按"有没有整轮
+//! 被裁"决定（沿用既有口径）。
 
 use crate::domain::context::{compact_with_summary, ContextBudget, Summary};
 use crate::domain::session::{ContextSlice, Session};

@@ -25,7 +25,11 @@ pub enum GuardVerdict {
     Pass,
     /// 直接拒绝，理由会原样进拒绝观察——连审批闸门都不问。
     Deny(String),
-    /// 要求人工审批，理由会进 [`crate::application::port::ApprovalRequest`]。
+    /// 要求人工审批。理由的去向由投出这一票的守卫决定：越界升级这类
+    /// **复核**会把嫌疑文本放进
+    /// [`ApprovalRequest::reason`](crate::application::port::ApprovalRequest)，
+    /// 从而禁用会话信任；策略守卫的常规审批理由只落在 `PolicyEvaluated`
+    /// 审计事件里，不进 `reason`——否则普通审批会被当成升级复核。
     RequireApproval(String),
 }
 

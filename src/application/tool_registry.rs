@@ -32,7 +32,10 @@ pub struct ToolEntry {
 /// 实现方返回的登记项必须 spec 与执行入口成对——那是 [`ToolEntry`] 的
 /// 不变量，来源只是批量提供它。
 pub trait ToolSource: Send + Sync {
-    /// 来源名，进日志与冲突诊断。
+    /// 来源名，供装配方与诊断识别来源。
+    ///
+    /// 合并时**不看名字**：按装配顺序展开，同名工具后到的来源胜出
+    /// （见 [`ToolRegistry::from_sources`]）。
     fn name(&self) -> &str;
 
     /// 这个来源提供的全部登记项。
