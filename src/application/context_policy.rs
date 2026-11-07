@@ -16,6 +16,9 @@ use crate::domain::session::{ContextSlice, Session};
 ///
 /// 实现方只读会话、不改会话：返回的片段借用 `session`，需要新增文本
 /// （摘要、占位说明、台账）时自己持有 `Cow::Owned`。
+///
+/// `view` 在一轮内可能被调用两次（先探测哪些轮次会被裁掉、补摘要后再
+/// 生成正式视图），实现必须是纯函数，不依赖调用次数、不产生副作用。
 pub trait ContextPolicy: Send + Sync {
     /// 生成本次要发给模型的历史视图。
     ///
