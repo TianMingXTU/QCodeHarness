@@ -541,6 +541,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::application::context_policy::DefaultContextPolicy;
     use crate::application::port::{ApprovalGate, EvidenceSink, NoopHooks};
     use crate::application::tool_registry::ToolRegistry;
     use crate::domain::agent::AgentRole;
@@ -570,6 +571,7 @@ mod tests {
             context_budget: Default::default(),
             session_store: None,
             hooks: Arc::new(NoopHooks),
+            context_policy: Arc::new(DefaultContextPolicy),
         }
     }
 

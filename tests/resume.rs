@@ -13,6 +13,7 @@ use qcode_harness::application::agent_run::{
     AgentDependencies, AgentRunner, PendingRound, RunState,
 };
 use qcode_harness::application::agent_roster::AgentRoster;
+use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::port::{
     ApprovalGate, ApprovalRequest, BoxFuture, Decision, NoopHooks, ToolInvoker,
@@ -88,6 +89,7 @@ fn deps_with(
         context_budget: Default::default(),
         session_store,
         hooks: Arc::new(NoopHooks),
+        context_policy: Arc::new(DefaultContextPolicy),
     }
 }
 

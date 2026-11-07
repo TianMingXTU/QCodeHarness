@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::agent_run::{AgentDependencies, RunState};
+use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{
@@ -70,6 +71,7 @@ fn deps(mock: &MockCompletionModel) -> AgentDependencies {
         context_budget: Default::default(),
         session_store: None,
         hooks: Arc::new(NoopHooks),
+        context_policy: Arc::new(DefaultContextPolicy),
     }
 }
 
@@ -1078,6 +1080,7 @@ fn base_deps(mock: &MockCompletionModel) -> AgentDependencies {
         context_budget: Default::default(),
         session_store: None,
         hooks: Arc::new(NoopHooks),
+        context_policy: Arc::new(DefaultContextPolicy),
     }
 }
 

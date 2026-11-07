@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use qcode_harness::application::agent_run::{AgentDependencies, AgentRunner};
 use qcode_harness::application::agent_roster::AgentRoster;
+use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::port::NoopHooks;
 use qcode_harness::application::tool_registry::ToolRegistry;
 use qcode_harness::domain::agent::{AgentRole, AgentSpec};
@@ -131,6 +132,7 @@ async fn fixes_a_failing_test_in_an_isolated_repo() {
             context_budget: Default::default(),
             session_store: None,
             hooks: Arc::new(NoopHooks),
+            context_policy: Arc::new(DefaultContextPolicy),
         },
     );
 

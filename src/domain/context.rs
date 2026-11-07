@@ -442,6 +442,35 @@ pub struct CompactionReport {
     pub dropped_tokens: usize,
 }
 
+impl CompactionReport {
+    /// 对照完整历史与实际视图，测出这次裁剪丢掉了什么。
+    ///
+    /// 上下文策略只交出"要发什么"，不交报告；证据里"裁了几轮、省了多少
+    /// token"由这里按视图重新测一遍。对默认策略，结果与 [`compact`] 的
+    /// 报告逐字段相同；换一种视图生成方式时，测到的仍是实际发出的内容
+    /// 与完整历史之差，证据不会说谎。
+    pub fn measure(session: &Session, view: &[ContextSlice<'_>]) -> Self {
+        let all = session.slices();
+        let tokens_before: usize = all.iter().map(slice_tokens).sum();
+        let tokens_after: usize = view.iter().map(slice_tokens).sum();
+        let rounds_before = all.iter().filter_map(round_number).count();
+        let kept_rounds: HashSet<u32> = view.iter().filter_map(round_number).collect();
+        let dropped: Vec<u32> = all
+            .iter()
+            .filter_map(round_number)
+            .filter(|number| !kept_rounds.contains(number))
+            .collect();
+        Self {
+            rounds_before,
+            rounds_after: rounds_before - dropped.len(),
+            dropped,
+            tokens_before,
+            tokens_after,
+            dropped_tokens: tokens_before.saturating_sub(tokens_after),
+        }
+    }
+}
+
 /// 把会话历史裁剪到预算内，返回保留的片段与裁剪报告。
 ///
 /// 纯函数：不读时钟、不做 IO、不改 `session`。裁剪以"轮"为最小单位——
@@ -458,6 +487,18 @@ pub struct CompactionReport {
 pub fn compact<'a>(
     session: &'a Session,
     budget: &ContextBudget,
+) -> (Vec<ContextSlice<'a>>, CompactionReport) {
+    compact_with_summary(session, budget, session.summary())
+}
+
+/// 同 [`compact`]，但摘要由调用方显式给出。
+///
+/// 拆开是为了让上层的上下文策略能带着它刚生成的摘要来裁，而不必先把
+/// 摘要写回会话；`None` 表示没有可用摘要，被裁位置退回占位说明。
+pub fn compact_with_summary<'a>(
+    session: &'a Session,
+    budget: &ContextBudget,
+    summary: Option<&Summary>,
 ) -> (Vec<ContextSlice<'a>>, CompactionReport) {
     let slices = session.slices();
     let costs: Vec<usize> = slices.iter().map(slice_tokens).collect();
@@ -527,7 +568,7 @@ pub fn compact<'a>(
             kept.push(ContextSlice::User(task.clone()));
         }
     }
-    kept.push(ContextSlice::User(Cow::Owned(omitted_text(session, &dropped))));
+    kept.push(ContextSlice::User(Cow::Owned(omitted_text(summary, &dropped))));
     // 台账：上下文被裁了，"做过什么"不能跟着没。
     let index = EvidenceIndex::from_session(session);
     if !index.is_empty() {
@@ -572,8 +613,8 @@ fn round_number(slice: &ContextSlice<'_>) -> Option<u32> {
 /// 被省略历史处显示的文本：有覆盖全部被裁轮次的摘要就用摘要，否则用
 /// 占位说明。摘要没覆盖全时宁可保守——把没被摘要的那几轮说成"已概括"
 /// 会诱导模型把没看过的内容当成看过的。
-fn omitted_text(session: &Session, dropped: &[u32]) -> String {
-    match session.summary() {
+fn omitted_text(summary: Option<&Summary>, dropped: &[u32]) -> String {
+    match summary {
         Some(summary) if summary.covers_all(dropped) => summary.text.clone(),
         _ => omitted_notice(dropped),
     }
@@ -698,6 +739,23 @@ mod tests {
         assert_eq!(report.dropped, vec![1, 2, 3, 4]);
         assert_eq!(report.rounds_before, 6);
         assert_eq!(report.rounds_after, 2);
+    }
+
+    /// 按实际视图测出的报告与裁剪自带的报告逐字段一致。
+    ///
+    /// 上层策略只交视图；证据靠 `measure` 重新测。这条测试钉住两条路径
+    /// 不会各说各话——默认策略下它们必须完全等价。
+    #[test]
+    fn measuring_a_view_matches_the_compaction_report() {
+        // 超预算：真的裁掉几轮。
+        let session = session_with_rounds(6);
+        let (view, report) = compact(&session, &budget(1));
+        assert!(!report.dropped.is_empty(), "前提：这一档预算要真的裁人");
+        assert_eq!(CompactionReport::measure(&session, &view), report);
+
+        // 不超预算：视图就是完整历史，报告应是空裁剪。
+        let (view, report) = compact(&session, &budget(100_000));
+        assert_eq!(CompactionReport::measure(&session, &view), report);
     }
 
     #[test]
@@ -896,6 +954,25 @@ mod tests {
         let text = second_slice_text(&slices);
         assert!(text.contains("已省略第 1-6 轮"), "{text}");
         assert!(!text.contains("摘要"), "部分覆盖时不得把没摘要的轮次说成已概括: {text}");
+    }
+
+    /// 显式传入的摘要不必先写回会话，也能顶替占位说明。
+    ///
+    /// 上层的上下文策略就是这样用的：刚生成的摘要直接带进裁剪，
+    /// 会话本身保持只读。
+    #[test]
+    fn an_explicit_summary_is_used_without_writing_it_into_the_session() {
+        let session = session_with_rounds(6);
+        let summary = Summary {
+            covers: (1, 6),
+            text: "外部摘要：全部六轮".to_owned(),
+            steps: Vec::new(),
+        };
+        let (slices, _) = compact_with_summary(&session, &budget(1), Some(&summary));
+
+        let text = second_slice_text(&slices);
+        assert!(text.contains("外部摘要"), "{text}");
+        assert_eq!(session.summary(), None, "显式摘要不得写回会话");
     }
 
     #[test]

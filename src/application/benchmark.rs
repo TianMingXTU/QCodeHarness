@@ -782,6 +782,7 @@ fn walk(root: &Path, dir: &Path, files: &mut HashMap<String, Vec<u8>>) {
 mod tests {
     use super::*;
     use crate::application::agent_roster::AgentRoster;
+    use crate::application::context_policy::DefaultContextPolicy;
     use crate::application::port::{ApprovalGate, NoopHooks};
     use crate::domain::evidence::AuditEvent;
     use crate::domain::policy::PolicyEngine;
@@ -834,6 +835,7 @@ mod tests {
             context_budget: Default::default(),
             session_store: None,
             hooks: Arc::new(NoopHooks),
+            context_policy: Arc::new(DefaultContextPolicy),
         }
     }
 

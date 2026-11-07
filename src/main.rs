@@ -20,6 +20,7 @@ use qcode_harness::application::agent_run::{
 };
 use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::benchmark::{run_benchmark, run_long_benchmark};
+use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::mcp_lifecycle::McpLifecycleRecorder;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
@@ -322,6 +323,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // 它流程的一部分），这里的 None 只是装配模板的占位。
             session_store: None,
             hooks: Arc::new(NoopHooks),
+            context_policy: Arc::new(DefaultContextPolicy),
         };
         let mut budget = Budget::new(config.max_turns);
         if let Some(limit) = config.max_wall_clock {
@@ -459,6 +461,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 context_budget,
                 session_store: Some(store.clone()),
                 hooks: Arc::new(NoopHooks),
+                context_policy: Arc::new(DefaultContextPolicy),
             },
         ) {
             Ok(runner) => runner,
@@ -525,6 +528,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             evidence: Arc::new(MemoryEvidenceSink::new()),
             session_store: Some(store.clone()),
         hooks: Arc::new(NoopHooks),
+        context_policy: Arc::new(DefaultContextPolicy),
     };
         let mut orchestrator =
             Orchestrator::new(deps, budget, evidence_factory).with_task_store(Arc::new(task_store));
@@ -628,6 +632,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // 快照落盘随运行自动开启；--resume 可从任一会话恢复。
         session_store: Some(store.clone()),
         hooks: Arc::new(NoopHooks),
+        context_policy: Arc::new(DefaultContextPolicy),
     };
     let mut orchestrator = Orchestrator::with_roster(deps, budget, evidence_factory, roster)
         .with_task_store(Arc::new(JsonTaskStore::new(&workspace)))

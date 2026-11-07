@@ -8,6 +8,7 @@ pub mod agent_roster;
 pub mod report;
 pub mod benchmark;
 pub mod agent_run;
+pub mod context_policy;
 pub mod mcp_lifecycle;
 pub mod error;
 pub mod orchestrator;

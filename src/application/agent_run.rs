@@ -16,6 +16,7 @@ use crate::application::port::{
     RunHooks,
 };
 use crate::application::agent_roster::AgentRoster;
+use crate::application::context_policy::ContextPolicy;
 use crate::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
 use crate::application::summarizer::{render_slices, SummarizeInput, Summarizer};
 use crate::application::tool_registry::ToolRegistry;
@@ -24,7 +25,7 @@ use crate::application::tool_guard::{
 };
 use crate::domain::agent::{AgentSpec, AgentTurn};
 use crate::domain::budget::{Budget, Consumption};
-use crate::domain::context::{compact, ContextBudget};
+use crate::domain::context::{CompactionReport, ContextBudget};
 use crate::domain::evidence::AuditEvent;
 use crate::domain::ids::SessionId;
 use crate::domain::policy::{PolicyDecision, PolicyEngine};
@@ -147,6 +148,12 @@ pub struct AgentDependencies {
     pub roster: AgentRoster,
     /// 上下文预算：发给模型前按它裁剪历史。
     pub context_budget: ContextBudget,
+    /// 上下文策略：决定发给模型的历史视图。
+    ///
+    /// 预算只给上限，怎么裁归策略；缺省用
+    /// [`DefaultContextPolicy`](crate::application::context_policy::DefaultContextPolicy)，
+    /// 行为与既有裁剪一致。
+    pub context_policy: Arc<dyn ContextPolicy>,
     /// 快照存储。`None` 表示不做自动保存（单测、不需要恢复的场景）。
     ///
     /// 放在依赖里而不是 `run` 的参数里：保存时机是循环内部的事
@@ -191,6 +198,8 @@ pub struct AgentRunner {
     /// 裁剪只改"发给模型时怎么看"，不改 `session` 本身——
     /// 证据、审计与将来的恢复都要完整历史。
     context_budget: ContextBudget,
+    /// 上下文策略：把预算变成实际视图（见 [`AgentDependencies::context_policy`]）。
+    context_policy: Arc<dyn ContextPolicy>,
     /// 快照存储的克隆。`None` 表示不自动保存。
     session_store: Option<Arc<dyn SessionStore>>,
     /// 取消开关，克隆给外部。
@@ -248,6 +257,7 @@ impl AgentRunner {
             policy,
             roster,
             context_budget,
+            context_policy,
             session_store,
             hooks,
         } = deps;
@@ -265,6 +275,7 @@ impl AgentRunner {
             roster,
             allowed_tools: None,
             context_budget,
+            context_policy,
             session_store,
             cancel: CancelHandle::default(),
             spec,
@@ -366,6 +377,7 @@ impl AgentRunner {
             policy,
             roster,
             context_budget,
+            context_policy,
             session_store,
             hooks,
         } = deps;
@@ -384,6 +396,7 @@ impl AgentRunner {
             roster,
             allowed_tools: None,
             context_budget,
+            context_policy,
             session_store,
             spec: snapshot.spec,
             session,
@@ -981,15 +994,22 @@ impl AgentRunner {
     async fn ask_model(&mut self) -> Result<ModelReply, ApplicationError> {
         // 先克隆 Arc：否则请求借着 self 的字段，而它们紧接着就要被改写。
         let model = self.model.clone();
-        // 先探测一次裁剪：被裁轮次值得摘要且现有摘要没覆盖时，
-        // 先补摘要再正式裁——摘要是挂点，补完后下面的 compact 会带上它。
-        let (_, probe) = compact(&self.session, &self.context_budget);
+        // 先按策略探测一次视图：被裁轮次值得摘要且现有摘要没覆盖时，
+        // 先补摘要再正式问——摘要补完后，下面重新生成的视图会带上它。
+        let probe_view =
+            self.context_policy
+                .view(&self.session, &self.context_budget, self.session.summary());
+        let probe = CompactionReport::measure(&self.session, &probe_view);
         if !probe.dropped.is_empty() && self.should_summarize(&probe.dropped) {
             self.refresh_summary(&probe.dropped).await;
         }
         // 裁剪是发给模型前的视图变换：请求里只放模型真正看到的东西。
         // 丢了历史就留一条证据，事后翻 JSONL 能对出"第 N 轮模型看到了什么"。
-        let (history, report) = compact(&self.session, &self.context_budget);
+        // 报告按"实际视图 vs 完整历史"现测，换一种策略也照样如实。
+        let history =
+            self.context_policy
+                .view(&self.session, &self.context_budget, self.session.summary());
+        let report = CompactionReport::measure(&self.session, &history);
         if !report.dropped.is_empty() {
             self.record(AuditEvent::ContextCompacted {
                 turn: self.session.rounds() + 1,
@@ -1349,6 +1369,7 @@ fn default_guard_chain(policy: PolicyEngine) -> Vec<Arc<dyn ToolGuard>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::context_policy::DefaultContextPolicy;
     use crate::application::port::{BoxFuture, Decision, NoopHooks, ToolInvoker};
     use crate::domain::policy::PolicyVerdict;
     use rig::completion::Message;
@@ -1568,6 +1589,7 @@ mod tests {
                 policy,
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget::default(),
+                context_policy: Arc::new(DefaultContextPolicy),
                 session_store: None,
                 hooks,
             },
@@ -2047,6 +2069,7 @@ mod tests {
                 context_budget: ContextBudget::default(),
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
+                context_policy: Arc::new(DefaultContextPolicy),
             },
         );
 
@@ -3019,6 +3042,7 @@ mod tests {
                 context_budget: ContextBudget::default(),
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
+                context_policy: Arc::new(DefaultContextPolicy),
             },
         );
 
@@ -3105,6 +3129,7 @@ mod tests {
                 },
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
+                context_policy: Arc::new(DefaultContextPolicy),
             },
         );
 
@@ -3173,6 +3198,7 @@ mod tests {
                 context_budget,
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
+                context_policy: Arc::new(DefaultContextPolicy),
             },
         );
         (runner, evidence)
@@ -3426,6 +3452,7 @@ mod tests {
                 context_budget: ContextBudget::default(),
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
+                context_policy: Arc::new(DefaultContextPolicy),
             },
         );
 
@@ -3485,6 +3512,7 @@ mod tests {
                 context_budget: ContextBudget::default(),
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
+                context_policy: Arc::new(DefaultContextPolicy),
             },
         );
         handle_slot
@@ -3527,6 +3555,7 @@ mod tests {
                 context_budget: ContextBudget::default(),
                 session_store: None,
                 hooks: Arc::new(NoopHooks),
+                context_policy: Arc::new(DefaultContextPolicy),
             },
         );
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
@@ -3572,6 +3601,7 @@ mod tests {
             context_budget: ContextBudget::default(),
             session_store: None,
             hooks: Arc::new(NoopHooks),
+            context_policy: Arc::new(DefaultContextPolicy),
         }
     }
 
