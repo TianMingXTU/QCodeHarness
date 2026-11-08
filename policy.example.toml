@@ -2,6 +2,7 @@
 #
 # 用法：复制为任意名字，然后设环境变量 QCH_POLICY 指向它：
 #   PowerShell:  Copy-Item policy.example.toml my-policy.toml; $env:QCH_POLICY="my-policy.toml"
+#   bash / zsh:  cp policy.example.toml my-policy.toml; export QCH_POLICY="my-policy.toml"
 #
 # 规则按数组顺序匹配，第一条命中的生效；都不命中走默认策略
 # （只读工具放行、非只读工具要求审批）。想让某条 deny 优先，把它写在前面。

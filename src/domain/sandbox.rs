@@ -1,35 +1,88 @@
 //! 进程沙箱策略、执行边界元数据与命令的结构化词法边界裁决。
 //!
 //! 领域层只计算纯数据；资源与生命周期约束由 infrastructure/sandbox
-//! 强制执行。Windows Job Object 不提供文件系统或网络隔离。
+//! 强制执行。目前只有 Windows 的 Job Object 提供进程沙箱，且它不提供
+//! 文件系统或网络隔离；其他平台没有进程沙箱。平台能力见
+//! [`PlatformCapabilities::detect`]。
 
 use std::path::Path;
 use std::time::Duration;
 
 use super::command::{CommandSegment, ParsedCommand, RedirectOp, parse_command};
+use super::platform::Platform;
 
 /// 当前编译目标具备的隔离能力，不代表某次命令已经成功启用沙箱。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlatformCapabilities {
+    /// 当前运行的平台。
+    pub platform: Platform,
+    /// 是否有进程沙箱。Windows 上是 Job Object。
     pub has_process_sandbox: bool,
+    /// 超时能否终止整棵进程树（不只是直接子进程）。
+    ///
+    /// 与 `has_process_sandbox` 分开是因为两者不是一回事：进程沙箱管
+    /// 资源上限，整树终止管超时后的清理。平台只提供前者时，超时仍会
+    /// 留下继续运行的后代进程。
+    pub has_tree_kill: bool,
     pub has_filesystem_isolation: bool,
     pub has_network_isolation: bool,
 }
 
 impl PlatformCapabilities {
+    /// 检测当前运行的平台具备哪些隔离能力。
+    ///
+    /// 能力由平台决定，不由配置决定：进程沙箱与整树终止目前只有 Windows
+    /// 的 Job Object 实现，其余平台没有对应机制。文件系统与网络隔离任何
+    /// 平台都没有实现，因此恒为 false。
     pub fn detect() -> Self {
+        let platform = Platform::current();
+        let has_process_sandbox = platform == Platform::Windows;
         Self {
-            has_process_sandbox: cfg!(windows),
+            platform,
+            has_process_sandbox,
+            has_tree_kill: has_process_sandbox,
             has_filesystem_isolation: false,
             has_network_isolation: false,
         }
     }
 
+    /// 平台标签。写进证据的边界字段，说明这条边界由哪个平台产生。
+    ///
+    /// Windows 上标注具体机制（Job Object），其余平台只标平台名，因为
+    /// 它们没有进程沙箱可标。标签不说明保护是否生效：生效与否由
+    /// `active` 单独表示，两个字段合起来才是完整事实。
     pub fn label(&self) -> &'static str {
+        match self.platform {
+            Platform::Windows => "Windows JobObject",
+            Platform::Linux => "Linux",
+            Platform::MacOs => "macOS",
+            Platform::Other => "其他系统",
+        }
+    }
+
+    /// 当前平台对命令进程的保护范围，写给模型看。
+    ///
+    /// 这句话必须按平台生成。整树终止与资源上限是 Windows Job Object
+    /// 的能力，其他平台没有对应机制；把它们写成无条件事实，模型会以为
+    /// 超时一定收得干净，后台进程一定被杀。
+    pub fn process_guard_summary(&self) -> String {
         if self.has_process_sandbox {
-            "Windows JobObject"
+            format!(
+                "命令在进程沙箱内执行：整树内存与进程数受限，{}。\
+                 不要依赖超限资源或遗留后台进程。",
+                if self.has_tree_kill {
+                    "超时终止全部后代进程（不只是直接子进程）"
+                } else {
+                    "超时只终止直接子进程，后代进程可能继续运行"
+                }
+            )
         } else {
-            "Unsupported"
+            format!(
+                "当前平台（{}）没有进程沙箱：命令不受内存与进程数限制，\
+                 超时只终止直接子进程，后代进程可能继续运行。\
+                 长任务请拆小或调大 timeout_seconds，不要留下你不再等待的后台进程。",
+                self.platform.label()
+            )
         }
     }
 }
@@ -77,9 +130,12 @@ impl ExecutionBoundary {
 pub struct SandboxPolicy {
     /// 超时或结束时终止整个进程树（含孙进程）。
     ///
-    /// `child.kill()` 只终止直接子进程，`cmd /C "start /b ..."` 拉起的
-    /// 孙进程会运行到自然结束。仅杀子进程会让模型误以为任务已停止，
-    /// 孤儿进程继续占用宿主机资源。
+    /// `child.kill()` 只终止直接子进程，由它拉起的孙进程（如 Windows 的
+    /// `cmd /C "start /b ..."`、POSIX shell 的后台任务）会运行到自然结束。
+    /// 仅杀子进程会让模型误以为任务已停止，孤儿进程继续占用宿主机资源。
+    ///
+    /// 该开关只在有进程沙箱的平台（Windows Job Object）上生效。其他平台
+    /// 没有整树终止能力，超时只终止直接子进程，后代进程不在清理边界内。
     pub kill_tree: bool,
     /// 树内单个进程的内存提交上限（字节）。None = 不限。
     pub per_process_memory: Option<u64>,
@@ -97,8 +153,8 @@ impl Default for SandboxPolicy {
     ///
     /// 本项目的测试和基准都在沙箱内运行 `cargo test`（编译 fixture
     /// crate），限额过紧会杀掉自身工作流。沙箱提供机械兜底，不做精细
-    /// 配额：kill_tree 修复孙进程失控这一确凿缺陷，内存与进程数设置
-    /// 宽裕上限，正常编译用不到，失控时起限制作用。
+    /// 配额：kill_tree 在有进程沙箱的平台上修复孙进程失控这一确凿缺陷，
+    /// 内存与进程数设置宽裕上限，正常编译用不到，失控时起限制作用。
     fn default() -> Self {
         Self {
             kill_tree: true,
@@ -274,9 +330,10 @@ fn is_absolute_path(token: &str) -> bool {
 }
 
 /// 纯词法规范化：统一分隔符、剥离设备/UNC 前缀、抵消 `.` 与 `..`，
-/// 按目标平台决定是否忽略大小写。不访问文件系统。
+/// 按当前平台的文件系统语义决定是否忽略大小写。不访问文件系统。
 fn normalize_path(raw: &str) -> Vec<String> {
     let trimmed = trim_device_prefix(raw);
+    let case_insensitive = Platform::current().has_case_insensitive_paths();
     let mut parts: Vec<String> = Vec::new();
     for part in trimmed.split(['\\', '/']) {
         match part {
@@ -284,7 +341,7 @@ fn normalize_path(raw: &str) -> Vec<String> {
             ".." => {
                 parts.pop();
             }
-            name => parts.push(if cfg!(windows) {
+            name => parts.push(if case_insensitive {
                 name.to_ascii_lowercase()
             } else {
                 name.to_owned()
@@ -311,6 +368,50 @@ fn trim_device_prefix(raw: &str) -> &str {
 mod tests {
     use super::*;
     use crate::domain::command;
+
+    /// 检测到的能力必须与当前平台一致。
+    ///
+    /// 平台能力是平台事实，不是配置项：Windows 有 Job Object，其余平台
+    /// 没有。断言按平台分支，两个平台都真跑。
+    #[test]
+    fn detected_capabilities_follow_the_current_platform() {
+        let capabilities = PlatformCapabilities::detect();
+        assert_eq!(capabilities.platform, Platform::current());
+        assert_eq!(
+            capabilities.has_process_sandbox,
+            capabilities.platform == Platform::Windows,
+            "进程沙箱目前只有 Windows 的 Job Object 实现"
+        );
+        // 文件系统与网络隔离任何平台都没有实现。
+        assert!(!capabilities.has_filesystem_isolation);
+        assert!(!capabilities.has_network_isolation);
+    }
+
+    /// 给模型的保护说明必须与能力一致，不能声称平台做不到的事。
+    ///
+    /// 无进程沙箱的平台若读到"超时终止全部后代进程"，会放心地留下后台
+    /// 进程。有进程沙箱的平台则必须说明资源上限。
+    #[test]
+    fn the_guard_summary_never_claims_more_than_the_platform_can_do() {
+        let capabilities = PlatformCapabilities::detect();
+        let summary = capabilities.process_guard_summary();
+
+        if capabilities.has_process_sandbox {
+            assert!(summary.contains("进程沙箱"), "应说明有沙箱: {summary}");
+            if capabilities.has_tree_kill {
+                assert!(summary.contains("终止全部后代进程"), "{summary}");
+            } else {
+                assert!(summary.contains("只终止直接子进程"), "{summary}");
+            }
+        } else {
+            assert!(summary.contains("没有进程沙箱"), "{summary}");
+            assert!(summary.contains("只终止直接子进程"), "{summary}");
+            assert!(
+                !summary.contains("终止全部后代进程"),
+                "不能声称本平台做不到的事: {summary}"
+            );
+        }
+    }
 
     #[test]
     fn default_policy_kills_tree_and_sets_generous_ceilings() {
@@ -423,9 +524,16 @@ mod tests {
     #[test]
     fn write_escape_beyond_allows_only_paths_under_the_exact_root() {
         let root = Path::new(r"D:/repo/src/..");
+        // 大小写变体只在不敏感大小写的平台上算"同一个路径"。敏感大小写的
+        // 平台上 `D:/REPO` 与 `D:/repo` 是两个位置，后者落在根外。
+        let case_variant = if Platform::current().has_case_insensitive_paths() {
+            r"cargo build --manifest-path=d:/REPO/Cargo.toml"
+        } else {
+            r"cargo build --manifest-path=d:/repo/Cargo.toml"
+        };
         let allowed = [
             r"type D:\repo\src\main.rs",
-            r"cargo build --manifest-path=d:/REPO/Cargo.toml",
+            case_variant,
             r#"type "D:\repo\sub dir\main.rs""#,
             r"echo x > D:\repo\out.txt",
             "cargo test",
@@ -436,6 +544,14 @@ mod tests {
                 write_escape_beyond(command, root),
                 None,
                 "`{command}` 应视为 workspace 内路径"
+            );
+        }
+        // 大小写变体在敏感大小写的平台上落在根外，必须被拒。
+        if !Platform::current().has_case_insensitive_paths() {
+            assert!(
+                write_escape_beyond(r"cargo build --manifest-path=d:/REPO/Cargo.toml", root)
+                    .is_some(),
+                "大小写敏感的平台上 `d:/REPO` 与 `d:/repo` 是两个位置，必须拒绝"
             );
         }
         let refused = [
@@ -560,7 +676,12 @@ mod tests {
             r"echo hi > out.txt 2> out.err",
             r"echo x > D:\repo\out.txt",
             r"type D:\repo\src\main.rs",
-            r"cargo build --manifest-path=d:/REPO/Cargo.toml",
+            // 大小写变体只在不敏感大小写的平台上算同一个路径。
+            if Platform::current().has_case_insensitive_paths() {
+                r"cargo build --manifest-path=d:/REPO/Cargo.toml"
+            } else {
+                r"cargo build --manifest-path=d:/repo/Cargo.toml"
+            },
             r#"type "D:\repo\sub dir\main.rs""#,
             r"echo x > D:\repo\out.txt && cargo test",
             // 引号里的路径文字是普通参数，不是交给 shell 再解释的命令。

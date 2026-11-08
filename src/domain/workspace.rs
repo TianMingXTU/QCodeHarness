@@ -52,6 +52,10 @@ pub enum PathRejected {
 /// `.env` 指向同一文件。不归一化时，模型写成 `.env ` 即可读到凭据
 /// 文件或覆盖 `.env`，而审批界面显示的仍是 `.env `，用户难以辨认。
 /// 这是 Windows 路径解析的既有行为，实际可利用。
+///
+/// 剥离在所有平台都执行，口径与下面的大小写折叠一致：Windows 是风险
+/// 的实际来源，Linux 上剥离只是多拒几个形似 `.env` 的路径，代价是一次
+/// 误拒。
 fn is_protected_name(name: &str) -> bool {
     let name = name.trim_end_matches([' ', '.']).to_ascii_lowercase();
     matches!(name.as_str(), ".git" | ".qcodeharness" | ".env") || name.starts_with(".env.")
@@ -73,6 +77,10 @@ fn is_protected_name(name: &str) -> bool {
 /// `.git/config` 指向同一位置。按字节精确比较时，改写大小写即可访问
 /// `.env` 或 `.git/config`。比较前统一转小写（ASCII 小写化不改变字节
 /// 长度，只需一次分配）。
+///
+/// 所有平台都按不敏感比较，不只 Windows 与 macOS：Linux 上多拒掉几个
+/// 形似 `.GIT` 的路径，代价是一次误拒；少拒掉一个则可能泄露凭据。
+/// 方向不对称时取保守的一边。
 ///
 /// 单独公开供 infrastructure 层使用：解析符号链接后需要拿物理路径再
 /// 检查一次（见 `tool::resolve_in`）。
@@ -174,8 +182,8 @@ mod tests {
     /// 大小写变形不能绕过保护。
     ///
     /// Windows 与 macOS 的文件系统默认大小写不敏感，`.GIT/config` 与
-    /// `.git/config` 指向同一位置。若只做精确比较，改写大小写即可访问
-    /// `.env` 或 `.git/config`。
+    /// `.git/config` 指向同一位置。Linux 上两者是不同的文件，但保护按
+    /// 同一口径比对：宁可多拒，不能给大小写绕过留口子。
     #[test]
     fn protected_paths_are_matched_case_insensitively() {
         for rejected in [

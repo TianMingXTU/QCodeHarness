@@ -451,6 +451,38 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// CRLF 文件要能被 LF 补丁改到，且写回时保持 CRLF。
+    ///
+    /// Windows 上 git 默认把文本检出成 CRLF，模型写出的补丁是 LF。比较前
+    /// 不统一行尾，补丁在 Windows 工作区一行也落不下去；写回时不还原
+    /// 行尾，整文件会在 git 里变成满屏 diff。
+    #[tokio::test]
+    async fn updates_a_crlf_file_and_keeps_its_line_endings() {
+        let root = temp_workspace("crlf-update");
+        fs::write(root.join("lib.rs"), "fn main() {\r\n    let x = 1;\r\n}\r\n").unwrap();
+        let file = tool(&root);
+
+        let outcome = file
+            .invoke(&call(concat!(
+                "*** Begin Patch\n",
+                "*** Update File: lib.rs\n",
+                "@@ fn main()\n",
+                " fn main() {\n",
+                "-    let x = 1;\n",
+                "+    let x = 2;\n",
+                " }\n",
+                "*** End Patch",
+            )))
+            .await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            fs::read_to_string(root.join("lib.rs")).unwrap(),
+            "fn main() {\r\n    let x = 2;\r\n}\r\n"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// 新建文件。
     #[tokio::test]
     async fn adds_a_file() {

@@ -222,9 +222,9 @@ P10 按以下四个切片交付，每片都有独立测试；能力与边界见"
 
 系统处理真实代码仓库和可执行命令，必须明确以下约束：
 
-- 模型与 Agent 不直接获得无限制宿主机访问权：agent 经 **run_command / git_status / git_diff / 基准判据**发起的子进程都运行在**进程沙箱**内（Windows Job Object）——整树内存上限（单进程 4 GiB）、进程数上限（256）、超时或结束时**终止整个进程树**（含孙进程；`cmd /C "start /b ..."` 拉起的后代不再失控）。沙箱默认强制生效、**不可关闭**（没有 `--disable-sandbox` 之类的开关）。失败时的取向按平台分开：**Windows 上沙箱创建失败 → 创建阶段直接拒绝，一个子进程都不启动**（fail-closed）；平台没实现（非 Windows）或子进程纳入失败时降级执行，模型会在工具结果开头看到"进程沙箱未生效"的提示，且这次执行会另发一条 `AuditEvent::SandboxApplied` 证据记下"未生效"。**范围外**：无——MCP Server 进程由 `QCH_MCP_CONFIG` 里的用户命令直接拉起，不走 `run_command` 那条执行路径，但适用同一套沙箱取向：Windows 在**启动进程之前**建 Job（建不起来就让该 Server 连接失败，与命令侧的 fail-closed 同一条线），并在**握手之前**按 PID 把启动它的那个进程纳入同一个 Job Object（限额与整树终止见"可执行边界"一节）。纳入只能覆盖该进程**之后**创建的子孙，所以先后顺序不是细节而是前提：握手成功本身就证明 `uvx`/`npx` 拉起的 Server 子进程已经存在，那时才纳入，进 Job 的只有 launcher。纳入失败、拿不到 PID 或非 Windows 平台时回退为无保护并如实记 `active=false`。文件系统与网络仍不受 Job 约束，环境变量也不脱敏（见下方已知边界）。
+- 模型与 Agent 不直接获得无限制宿主机访问权：agent 经 **run_command / git_status / git_diff / 基准判据**发起的子进程，在**有进程沙箱的平台**（当前是 Windows Job Object）上运行在**进程沙箱**内——整树内存上限（单进程 4 GiB）、进程数上限（256）、超时或结束时**终止整个进程树**（含孙进程；`cmd /C "start /b ..."` 拉起的后代不再失控）。其他平台没有进程沙箱，降级执行：没有资源限额，超时只终止直接子进程，后代进程可能继续运行。沙箱默认强制生效、**不可关闭**（没有 `--disable-sandbox` 之类的开关）。失败时的取向按平台分开：**Windows 上沙箱创建失败 → 创建阶段直接拒绝，一个子进程都不启动**（fail-closed）；平台没实现（Linux、macOS 等）或子进程纳入失败时降级执行，模型会在工具结果开头看到"进程沙箱未生效"的提示，且这次执行会另发一条 `AuditEvent::SandboxApplied` 证据记下"未生效"。**范围外**：无——MCP Server 进程由 `QCH_MCP_CONFIG` 里的用户命令直接拉起，不走 `run_command` 那条执行路径，但适用同一套沙箱取向：Windows 在**启动进程之前**建 Job（建不起来就让该 Server 连接失败，与命令侧的 fail-closed 同一条线），并在**握手之前**按 PID 把启动它的那个进程纳入同一个 Job Object（限额与整树终止见"可执行边界"一节）。纳入只能覆盖该进程**之后**创建的子孙，所以先后顺序不是细节而是前提：握手成功本身就证明 `uvx`/`npx` 拉起的 Server 子进程已经存在，那时才纳入，进 Job 的只有 launcher。纳入失败、拿不到 PID 或非 Windows 平台时回退为无保护并如实记 `active=false`。文件系统与网络仍不受 Job 约束，环境变量也不脱敏（见下方已知边界）。
 - **命令级越界是硬拒绝**：`run_command` 在 spawn 之前按结构化 shell 词法模型逐段检查命令（见"可执行边界"），出现指向 **workspace 外**的盘符绝对路径、UNC 路径、`..` 成分，或把输出重定向 / 用 `--flag=` 指向 workspace 外——任何一段命中都直接拒绝，**策略放行和人工审批都覆盖不了**。判据是根感知的：根内的绝对路径（`type D:\repo\src\main.rs`）照常放行。这与"越界写入必审"是两道防线：那条给人一次复核机会，这条是最后一道机械边界（详见"可执行边界"一节）。
-- **受保护路径，agent 读写都被拒**：`.git`、`.qcodeharness`、以及根下的 `.env` / `.env.*`。这几个前缀命中的路径，`read_file` / `write_file` / `edit_file` / `list_dir` 直接在**路径解析**阶段拒绝，**不看策略配置**——策略能把一条规则放宽到 `allow`，但放不宽这一层。这样设计是因为"保护不留给自己去申请的许可"：历史、会话快照与凭据一旦被 agent 读到或改写，破坏是不可逆的，而任何"配置项忘了写"都会让它裸奔。`.gitignore`、`.github` 这类同样以 `.git` 开头的名字不受影响（只精确匹配 `.git`）。判定按**文件系统的实际语义**归一化，三种变形都堵：**大小写**不敏感（Windows 与 macOS 默认如此，`.ENV`、`.Git/` 与 `.env`、`.git/` 是同一处）；**尾随空格和点**先剥掉再比（NTFS 本就会剥，`.env ` 落在磁盘上就是 `.env`——不归一化，把路径写成 `.env ` 就能读到凭据，而审批界面上显示的还是 `.env `）；**符号链接 / junction** 解析后再查一遍（在 workspace 里 `mklink /J jgit .git`，词法上 `jgit/config` 完全合法，落盘却打在真实的 `.git/config` 上）。
+- **受保护路径，agent 读写都被拒**：`.git`、`.qcodeharness`、以及根下的 `.env` / `.env.*`。这几个前缀命中的路径，`read_file` / `write_file` / `edit_file` / `list_dir` 直接在**路径解析**阶段拒绝，**不看策略配置**——策略能把一条规则放宽到 `allow`，但放不宽这一层。这样设计是因为"保护不留给自己去申请的许可"：历史、会话快照与凭据一旦被 agent 读到或改写，破坏是不可逆的，而任何"配置项忘了写"都会让它裸奔。`.gitignore`、`.github` 这类同样以 `.git` 开头的名字不受影响（只精确匹配 `.git`）。判定按下列口径归一化，三种变形都堵：**大小写**不敏感（所有平台都按不敏感比较。Windows 与 macOS 是文件系统语义使然，`.ENV`、`.Git/` 与 `.env`、`.git/` 是同一处；Linux 上是主动多拒几个形似路径的保守取舍，代价是一次误拒，漏拒的代价是泄露凭据）；**尾随空格和点**先剥掉再比（NTFS 本就会剥，`.env ` 落在磁盘上就是 `.env`——不归一化，把路径写成 `.env ` 就能读到凭据，而审批界面上显示的还是 `.env `）；**符号链接 / junction** 解析后再查一遍（在 workspace 里 `mklink /J jgit .git`，词法上 `jgit/config` 完全合法，落盘却打在真实的 `.git/config` 上）。
 - **越界写入必审**：策略判 `allow` 的命令，若看起来在 workspace 之外写东西——`del`/`rd`/`rmdir`/`move`/`ren`/`copy`/`rm`/`mv`/`cp`/`mkdir`/`Remove-Item` 这类动词配上盘符绝对路径、UNC 路径或含 `..` 的参数，或 `>` / `>>` 重定向到外部——会被**追加升级为 `require_approval`**，理由是升级的触发点。这类请求**不吃会话信任**——`a` / `p` 存下的信任对它们无效，每次都要重新问。**不限写入型动词**：任何提到 workspace 外路径的参数都触发升级，`--flag=value` 形态连等号后面的值一起看。原因是 `git diff --output=C:\x` 这类命令既没有写入动词也没有 `>`，却真的把 workspace 的内容写到外面（本机实测会落盘）——而默认基线恰好放行 `git diff *` 一族，只按动词判会让两道防线同时失守。
 - 文件操作限制在指定 Workspace 内，防范路径越界。
 - Shell、MCP 和外部连接遵循最小权限原则；高风险操作必须审批。
@@ -268,7 +268,7 @@ P10 按以下四个切片交付，每片都有独立测试；能力与边界见"
 
 ### 环境变量
 
-复制 `.env.example` 为 `.env` 并填入真实值（PowerShell：`Copy-Item .env.example .env`）：
+复制 `.env.example` 为 `.env` 并填入真实值（PowerShell：`Copy-Item .env.example .env`；bash / zsh：`cp .env.example .env`）：
 
 | 变量 | 必需 | 说明 |
 |------|------|------|
@@ -295,6 +295,14 @@ P10 按以下四个切片交付，每片都有独立测试；能力与边界见"
 $env:LLM_MODEL_CODER   = "qwen3-coder"    # 编码者换模型
 $env:LLM_EFFORT_TESTER = "low"            # 测试者用低推理档
 $env:LLM_VERBOSITY_CODER = "low"          # 编码者少说废话
+```
+
+Linux 与 macOS 上用 `export`：
+
+```bash
+export LLM_MODEL_CODER="qwen3-coder"      # 编码者换模型
+export LLM_EFFORT_TESTER="low"            # 测试者用低推理档
+export LLM_VERBOSITY_CODER="low"          # 编码者少说废话
 ```
 
 **模型与档位只影响"用哪个模型"，不影响"能干什么"。** 角色工具白名单是硬边界：给测试者配一个更强的模型，不等于让它能改文件。`apply_patch` 仍不在任何受限角色的白名单里。
@@ -327,7 +335,7 @@ $env:LLM_VERBOSITY_CODER = "low"          # 编码者少说废话
 
 **快照格式版本当前为 3**。旧版本的快照恢复时会被明确拒绝并报出版本差异，不做静默兼容——旧会话无法用 `--resume` 续跑，涉及旧会话的任务请重新执行。拒绝是刻意的：拿旧快照猜着跑比直接说"不支持"危险。
 
-```powershell
+```bash
 cargo run -- --list-sessions              # 列出可恢复的会话（ID、轮数、停在哪）
 cargo run -- --resume <会话ID>            # 从断点继续，沿用快照里的原任务与系统提示词
 ```
@@ -340,7 +348,7 @@ cargo run -- --resume <会话ID>            # 从断点继续，沿用快照里�
 
 会话快照恢复的是一次 ReAct 循环；**任务快照**（`.qcodeharness/tasks/<任务ID>.json`）恢复的是整个任务：原目标、工作流、步骤账（每步的角色与起止轮次）、已完成步骤的结论、消耗账与会话 ID。每个会话保存点都会顺带落任务快照，预算耗尽、出错停下的任务用 `--resume-task <任务ID>` 从**完整步骤边界**继续：
 
-```powershell
+```bash
 cargo run -- --list-sessions              # 会话快照：ReAct 循环断点
 cargo run -- --resume <会话ID>            # 从轮次断点继续（半轮状态）
 cargo run -- --resume-task <任务ID>       # 从任务快照继续：已完成步骤不重跑
@@ -361,7 +369,7 @@ cargo run -- --force-worktree --resume-task <任务ID>   # 工作区被动过仍
 
 任务默认按**工作流模板**拆成有序步骤逐步执行，`--kind` 选择模板（默认 `bug-fix`）：
 
-```powershell
+```bash
 cargo run -- "修复 greet 测试失败"                    # 默认走 bug-fix 模板
 cargo run -- --kind review "评审最近的改动"
 ```
@@ -415,9 +423,11 @@ cargo run -- --kind review "评审最近的改动"
 | `write_file` | 破坏性 | 创建新文件或整体覆盖 |
 | `edit_file` | 破坏性 | 查找替换式修改；`old_string` 必须在文件中恰好出现一次，否则拒绝执行 |
 | `apply_patch` | 破坏性 | 结构化补丁一次改一处或多处；全部操作要么成功要么一个文件都不改（原子性），中途失败不留半个改动 |
-| `run_command` | 破坏性·开放世界 | 在 workspace 根下执行 shell 命令，运行在进程沙箱内（整树内存/进程数受限，超时终止全部后代进程）；沙箱创建失败时**拒绝执行**（Windows，fail-closed），未生效时结果开头会显式声明。命令文本里出现指向 workspace 外的路径（绝对/UNC/`..`/重定向/`--flag=`）直接拒绝，审批也不能覆盖。超时默认 30s 上限 300s；疑似密钥的环境变量（名字含 key/token/secret/password/credential）不会传入子进程；输出超过 8000 字符截断 |
+| `run_command` | 破坏性·开放世界 | 在 workspace 根下执行 shell 命令，运行在进程沙箱内（整树内存/进程数受限，超时终止全部后代进程，仅限有进程沙箱的平台）；沙箱创建失败时**拒绝执行**（Windows，fail-closed），平台没有进程沙箱或沙箱未生效时降级执行并在结果开头显式声明。命令文本里出现指向 workspace 外的路径（绝对/UNC/`..`/重定向/`--flag=`）直接拒绝，审批也不能覆盖。超时默认 30s 上限 300s；疑似密钥的环境变量（名字含 key/token/secret/password/credential）不会传入子进程；输出超过 8000 字符截断 |
 
 工具规格与执行入口绑定在同一个注册表里，`read_file` 与 `edit_file` 的分工写在各自描述中：新建或整体重写用 `write_file`，小段修改用 `edit_file`，一次改多处用 `apply_patch`。
+
+**行尾按文件原样保留。** Windows 上 git 默认把文本检出成 CRLF，Linux 与 macOS 上是 LF，同一份代码在两个平台上的磁盘内容逐字节不同。`edit_file` 与 `apply_patch` 比较前把文件内容与模型给出的原文统一成 LF，写回时还原成文件原来的风格：模型给的 `old_string` 用 LF 就行，不必带 `\r`；反过来，一次补丁也不会把整文件换成另一种行尾——那会让 git 里出现满屏与改动无关的 diff。`read_file` 原样返回磁盘内容，模型看到什么就是磁盘上有什么。
 
 **描述之间互相指路。** 模型对工具分工的全部认识来自这几句描述，不会去翻文档——所以"下一步该用哪个"必须写在描述里：`read_file` 指向 `read_files`（已知多个路径时批量读），`list_dir` 接 `read_files`（摸完结构就一次读出），`write_file` 与 `edit_file` 互相点名，读工具与 `edit_file` 都指向 `apply_patch`（要改代码、改多处时用补丁），`apply_patch` 自己指回 `edit_file`（改一处）与 `write_file`（新建/整体重写）。描述各说各话的后果是模型在该用 `read_files` 的时候逐个 `read_file`，那正是这个工具要省掉的往返。这些交叉引用有测试守着，将来改描述改掉了会红。
 
@@ -426,7 +436,7 @@ cargo run -- --kind review "评审最近的改动"
 核心循环不认具体供应商，也不认工具从哪来：模型提供方实现 `LlmProvider`，
 工具来源实现 `ToolSource`，两者都在装配层登记。两个可运行的示例：
 
-```powershell
+```bash
 cargo run --example custom-llm-provider   # 自定义 LlmProvider + 固定回复网关
 cargo run --example custom-tool-source    # 内置工具与自定义 ToolSource 合并成注册表
 ```
@@ -476,13 +486,15 @@ cargo run --example custom-tool-source    # 内置工具与自定义 ToolSource 
 
 "审批闸门决定能不能跑，沙箱决定跑起来之后最多祸害多少"。这一节讲三件事：命令级的硬拒绝、沙箱创建失败时 fail-closed、每次执行的边界证据。
 
-**命令越界是硬拒绝，不是再问一次。** `run_command` 在 spawn 之前先过 `write_escape_beyond`（判据知道 workspace 根在哪）：命令里出现指向 **workspace 外**的盘符绝对路径、UNC 路径（`\\server`）、`..` 成分，或把输出重定向到 workspace 外、用 `--flag=<外路径>` 指向外面，直接返回拒绝观察，**审批与策略都覆盖不了**。它与"越界写入必审"是两道防线而不是一道：那条把可疑调用升级成"人再决定"，这一条连人都不能放行。**根内的绝对路径照常放行**——模型常写 `type D:\repo\src\main.rs` 这种命令，判据逐组件比较，分隔符不敏感，Windows 编译目标下大小写也不敏感（非 Windows 平台按字节比较，尚未按平台文件系统语义适配）；想跑合法的跨目录操作（`cargo build --target-dir=D:/cache`）就把 workspace 根换到那个目录，或改用 `write_file`。
+**命令越界是硬拒绝，不是再问一次。** `run_command` 在 spawn 之前先过 `write_escape_beyond`（判据知道 workspace 根在哪）：命令里出现指向 **workspace 外**的盘符绝对路径、UNC 路径（`\\server`）、`..` 成分，或把输出重定向到 workspace 外、用 `--flag=<外路径>` 指向外面，直接返回拒绝观察，**审批与策略都覆盖不了**。它与"越界写入必审"是两道防线而不是一道：那条把可疑调用升级成"人再决定"，这一条连人都不能放行。**根内的绝对路径照常放行**——模型常写 `type D:\repo\src\main.rs` 这种命令，判据逐组件比较，分隔符不敏感，大小写按当前平台的文件系统语义比较（Windows 与 macOS 不敏感，Linux 敏感）；想跑合法的跨目录操作（`cargo build --target-dir=D:/cache`）就把 workspace 根换到那个目录，或改用 `write_file`。
 
 **判定是结构化 shell 词法，不是整串字符串匹配**。命令先按 `&&` `||` `;` `|` `&` 换行切成有序段，每段解析出程序、参数词元、全部重定向目标（`>` `>>` `1>` `2>` `&>` `<`）与 `--flag=` 的值；越界升级检查与硬拒绝跑在**同一份解析结果**上，差别只有"有没有 workspace 根"这一个参数（落差见"安全边界"）。裁决逐段、逐目标、逐词元：`cargo test && rm D:/outside/x` 的理由点名第 2 段与 `rm`，`echo x > in_root 2> /outside` 的第二个目标同样被查到，`cmd /C "echo x > D:\outside\x"` 这类引号内复合命令对 shell 启动器（cmd/sh/powershell 等）补查一层词元，普通程序引号里的路径文字（`git commit -m "提到 C:\x"`）不做补查，避免把提交说明误判成越界。它仍不是 shell 求值：变量展开（`$OUT`/`%OUT%`）、命令替换（`` `…` ``/`$(…)`）、编码绕过、别名、解释器 `-c` / `-EncodedCommand` 载荷、符号链接与 junction 的物理目标，以及裸 `/` 与单级 POSIX 绝对路径（`/etc`、`/tmp`，为避免把 `/s` `/q` 开关误判成路径）都不在本层——这些必须继续依赖进程沙箱与文件工具的 `resolve_in`。`<<` 只合成一个输入重定向，heredoc 正文仍按普通词元扫描，正文里形似外部绝对路径的文字会被保守拒绝（不解析正文语义）；`--flag=` 只看第一个等号后的值。拒绝理由只点名看见了什么，不宣称覆盖了全部绕过手段。
 
-**Windows 上沙箱创建失败时直接拒绝。** 沙箱（Job Object）在 spawn **之前**创建：创建失败就直接返回拒绝，一个子进程也不会启动，不会出现"杀了父进程、孙进程还在裸跑"。仍允许降级的只有两种：平台本来没实现（非 Windows，由编译期的 `PlatformCapabilities::detect()` 判定，不去匹配错误文本——措辞一改就会把失败误读成降级），以及 `assign_child` 失败（子进程已经起来了，杀它撤不回已发生的副作用）。两种降级都会让模型在结果的第一个字看到"进程沙箱未生效"。spawn 到纳入 Job 之间的窄窗口仍是已知边界（见下）。
+**Windows 上沙箱创建失败时直接拒绝。** 沙箱（Job Object）在 spawn **之前**创建：创建失败就直接返回拒绝，一个子进程也不会启动，不会出现"杀了父进程、孙进程还在裸跑"。仍允许降级的只有两种：平台本来没实现（Linux、macOS 等，由 `PlatformCapabilities::detect()` 判定，不去匹配错误文本——措辞一改就会把失败误读成降级），以及 `assign_child` 失败（子进程已经起来了，杀它撤不回已发生的副作用）。两种降级都会让模型在结果的第一个字看到"进程沙箱未生效"。spawn 到纳入 Job 之间的窄窗口仍是已知边界（见下）。
 
-**每次真实启动进程（或发给外部 Server）的调用都留一条边界证据。** `AuditEvent::SandboxApplied` 记平台标签（`Windows JobObject` / `Unsupported` / `MCP subprocess`）、沙箱是否真的生效、以及这次有没有做越界检查。执行层把边界事实作为进程内字段随 `ToolOutcome` 交给应用层（不写进既有 JSONL 的 `ToolObserved`，旧证据格式不变），应用层只照抄成事件——**不从观察文本或工具名反推"跑没跑、有没有保护"**。参数解析失败、空命令、非 git 仓库、进程启动失败，以及 Windows fail-closed 拒绝，都没有真实执行，不发这条事件；超时与降级执行会带 `active = false` 的事实。`run_command` 的结构化词法检查记 `boundary_checked = true`，`git_status` / `git_diff` 的命令写死、记 false；`mcp__*` 调用标 `MCP subprocess`，其 `active` 如实反映 Server 进程有没有在**握手之前**被纳入 Job（Windows 纳入后为 true，此后它创建的子孙一并受管；非 Windows、拿不到 PID 或纳入失败为 false），`boundary_checked` 恒 false。降级时控制台另打印一行 `[边界] <平台>：本次执行无进程沙箱保护`；`--report` 汇总成"受沙箱保护的执行 / 无沙箱保护的执行"两个计数。
+**每次真实启动进程（或发给外部 Server）的调用都留一条边界证据。** `AuditEvent::SandboxApplied` 记平台标签（`Windows JobObject` / `Linux` / `macOS` / `其他系统` / `MCP subprocess`）、沙箱是否真的生效、以及这次有没有做越界检查。执行层把边界事实作为进程内字段随 `ToolOutcome` 交给应用层（不写进既有 JSONL 的 `ToolObserved`，旧证据格式不变），应用层只照抄成事件——**不从观察文本或工具名反推"跑没跑、有没有保护"**。参数解析失败、空命令、非 git 仓库、进程启动失败，以及 Windows fail-closed 拒绝，都没有真实执行，不发这条事件；超时与降级执行会带 `active = false` 的事实。`run_command` 的结构化词法检查记 `boundary_checked = true`，`git_status` / `git_diff` 的命令写死、记 false；`mcp__*` 调用标 `MCP subprocess`，其 `active` 如实反映 Server 进程有没有在**握手之前**被纳入 Job（Windows 纳入后为 true，此后它创建的子孙一并受管；非 Windows、拿不到 PID 或纳入失败为 false），`boundary_checked` 恒 false。降级时控制台另打印一行 `[边界] <平台>：本次执行无进程沙箱保护`；`--report` 汇总成"受沙箱保护的执行 / 无沙箱保护的执行"两个计数。
+
+**平台差异按检测结果处理，不写死在各处。** 当前平台由 `domain::platform::Platform::current()` 判定，它给出系统名、跑命令用的 shell（Windows 用 `cmd /C`，其余平台用 POSIX `sh -c`）、文件系统是否默认不区分大小写（Windows 与 macOS 不敏感，Linux 敏感）。上层不再散落 `cfg!(windows)` 分支：路径比较按该口径归一化，`run_command` 给模型看的工具描述按平台生成——有进程沙箱的平台说"整树内存与进程数受限，超时终止全部后代进程"，没有的平台如实说"超时只终止直接子进程，后代进程可能继续运行"，让模型知道自己的后台进程会不会被收掉。测试同理：原先用 `#[cfg(windows)]` 整条门控的用例改成按检测到的能力分支，每个平台都真的跑一遍，不会因为平台不同而静默少测。
 
 **没有"关掉边界"的开关。** 不提供 `--disable-sandbox` 或任何等价配置项：这道边界的存在意义就是"配置写错时它还在"，任何开关都会把机械防线降级成自觉遵守。需要更大权限时正确的做法是把 workspace 根设到目标目录，而不是把边界关掉。
 
@@ -502,7 +514,7 @@ cargo run --example custom-tool-source    # 内置工具与自定义 ToolSource 
 
 ### 运行
 
-```powershell
+```bash
 cargo run -- "阅读 Cargo.toml，说明本项目用了哪些依赖"
 ```
 
@@ -517,6 +529,15 @@ Copy-Item -Recurse tests/fixtures/broken-repo $env:TEMP\qch-demo
 Copy-Item policy.example.toml $env:TEMP\qch-demo\policy.toml
 $env:QCH_POLICY = "$env:TEMP\qch-demo\policy.toml"
 cargo run --manifest-path <主项目路径>\Cargo.toml -- "修复 broken-repo 里失败的测试"
+```
+
+Linux 与 macOS 上换成等价的 POSIX 写法（`cp -r`、正斜杠路径、`QCH_POLICY` 用 `export`）：
+
+```bash
+cp -r tests/fixtures/broken-repo /tmp/qch-demo
+cp policy.example.toml /tmp/qch-demo/policy.toml
+export QCH_POLICY=/tmp/qch-demo/policy.toml
+cargo run --manifest-path <主项目路径>/Cargo.toml -- "修复 broken-repo 里失败的测试"
 ```
 
 过程中的典型节奏：`read_file` 看代码（免审）→ `edit_file` 改一行（要审批）→ `run_command cargo test`（要审批）→ 输出 `test result: ok` 后给出最终答案。
@@ -550,7 +571,7 @@ cargo run --manifest-path <主项目路径>\Cargo.toml -- "修复 broken-repo �
 
 ### AI 审批审查员（--ai-review）
 
-```powershell
+```bash
 cargo run -- --ai-review "在 workspace 里新建 out.txt，内容是 OK"
 ```
 
@@ -653,7 +674,7 @@ args = ["mcp-server-fetch"]
 - **超时与断连都只放弃请求，不承诺取消。** 请求一旦发出，超时或断连都证明不了远端没执行：这类失败一律标 `result_unknown`，观察文本里写"原调用已发出，远端可能仍在执行，结果未知"，并**绝不自动重放**（副作用可能已发生）。恢复也只重建通信、不发送任何 `tools/call`。当前不提供"恰好一次执行"的保证。单次调用超时也不中断 Server。
 - **连接与调用分账审计。** 连接级事件（连上、连接失败、断开、恢复成功/失败、主动关闭）进 `AuditEvent::McpLifecycle`，落到固定追加文件 `.qcodeharness/sessions/mcp-lifecycle.jsonl`；工具调用的失败事实进 `AuditEvent::McpCallFailed`，与工具观察分开记，含 Server、代际（generation）、故障类别、结果未知标志与**真实进程保护状态**。启动失败时没有工具调用，就**不伪造** `ToolObserved`/`SandboxApplied`；一次共享连接的断开只记一次，不按工具复读。审计不含凭据、环境变量或完整参数。这份只有连接事件的日志在 `--report` 里被单列成 MCP 计数（连接失败/断开/恢复/恢复失败/调用超时/结果未知），不计入会话成败、成本与墙钟，老证据文件照常读。
 - **恢复是显式的、有界的运维动作，不是模型手里的按钮。** 唯一入口是命令行 `cargo run -- --mcp-reconnect <服务器名>`：独立探测模式，按配置**有界一次**地启动 + 握手 + 发现工具，把结果写进连接审计，然后显式关闭退出——不接任务描述、不与其他模式同场、不把恢复出的工具注入当前进程。运行中的会话**没有自动重试**，也没有给模型的 reconnect 工具（给了它每次超时就点一下）。要让恢复出的工具进任务，照常带任务描述启动，走完整的注册、授权与审批。状态机里的单次有界恢复（并发请求共享一次结果、失败后连接留在断开态、重连后工具清单变化按旧定义拒调）已由替身与真实进程测试覆盖，只是当前没有生产调用点——CLI 探测走的是"新建连接"这条已覆盖路径。
-- **正常收尾显式关连接。** 三条正常结束路径（`--resume`、`--resume-task`、新任务）在返回前逐一显式关闭 MCP 连接：transport 先优雅收尾（关 stdin、最多等 3 秒），再释放 Job（顺序反了 `KILL_ON_JOB_CLOSE` 会抢杀优雅关闭中的进程）。失败与探测退出靠操作系统与 Job Object 整树终止兜底。断开通知监视器只持通知句柄，不引用 service/transport/Job，不留旧连接或 Job 句柄的滞留。
+- **正常收尾显式关连接。** 三条正常结束路径（`--resume`、`--resume-task`、新任务）在返回前逐一显式关闭 MCP 连接：transport 先优雅收尾（关 stdin、最多等 3 秒），再释放 Job（顺序反了 `KILL_ON_JOB_CLOSE` 会抢杀优雅关闭中的进程）。失败与探测退出按平台分述：Windows 上由 Job Object 整树终止兜底；其他平台没有进程沙箱，异常退出会留下 MCP 子进程，需要手工清理。断开通知监视器只持通知句柄，不引用 service/transport/Job，不留旧连接或 Job 句柄的滞留。
 
 ### 证据文件
 
@@ -663,7 +684,7 @@ args = ["mcp-server-fetch"]
 
 ### 运行报表（--report）
 
-```powershell
+```bash
 cargo run -- --report                        # 统计当前工作区
 cargo run -- --report --report-dir <目录>    # 统计别的证据根目录
 cargo run -- --report --json                 # 机器可读输出
@@ -681,7 +702,7 @@ cargo run -- --report --json                 # 机器可读输出
 
 ### 基准评测（--benchmark / --benchmark-long）
 
-```powershell
+```bash
 cargo run -- --benchmark          # 短任务套件：一遍跑完
 cargo run -- --benchmark-long     # 长任务套件：先故意耗尽预算，再从任务快照恢复
 ```

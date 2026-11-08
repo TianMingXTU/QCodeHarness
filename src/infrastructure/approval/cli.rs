@@ -10,7 +10,9 @@
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
-use crate::application::port::{ApprovalGate, ApprovalRequest, BoxFuture, Decision};
+use crate::application::port::{
+    ApprovalGate, ApprovalRequest, BoxFuture, CancelHandle, Decision,
+};
 use crate::domain::policy::PolicyScope;
 
 /// 本会话内的一条信任记录。
@@ -58,6 +60,12 @@ pub struct CliApprovalGate {
     /// 用 `Vec`，不用集合：前缀信任可以重叠，同一工具可能有多个前缀。
     /// 查询是线性扫描，长度等于已授予的信任条数。
     trusted: Mutex<Vec<TrustEntry>>,
+    /// 用户按下 `q` 时请求取消运行。
+    ///
+    /// `None` 表示没有取消通道：闸门只否决当前调用，用户要中止运行得由
+    /// 调用方自己处理。用 `Mutex` 是因为通道由 runner 在构造后绑定，而
+    /// 闸门本身要放进 `Arc` 共享。
+    cancel: Mutex<Option<CancelHandle>>,
 }
 
 impl CliApprovalGate {
@@ -65,6 +73,7 @@ impl CliApprovalGate {
     pub fn new() -> Self {
         Self {
             trusted: Mutex::new(Vec::new()),
+            cancel: Mutex::new(None),
         }
     }
 
@@ -160,7 +169,23 @@ impl CliApprovalGate {
                     continue;
                 }
                 Some(Answer::Deny) => return Err(ask_reason(reader, writer)),
-                Some(Answer::Abort) => return Err("用户中止了本次运行".to_owned()),
+                Some(Answer::Abort) => {
+                    // 中止整个运行，不是只否决这次调用。
+                    //
+                    // 有取消通道时请求取消，模型不会看到拒绝观察，运行在
+                    // 下一个安全点停下。没有通道时只能否决这次调用：把它
+                    // 说成"已中止运行"是骗用户，运行还会继续。
+                    let cancel = self
+                        .cancel
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(cancel) = cancel {
+                        cancel.cancel();
+                        return Err("用户中止了运行".to_owned());
+                    }
+                    return Err("用户中止了本次调用（未绑定取消通道，运行继续）".to_owned());
+                }
                 // fail-closed：空行、无法识别或 EOF 都走这里。
                 None => return Err("未给出有效答复，按策略视为否决".to_owned()),
             }
@@ -366,6 +391,11 @@ impl ApprovalGate for CliApprovalGate {
             self.decide_from(&mut reader, &mut writer, request)
         })
     }
+
+    /// 绑定取消通道，之后用户按 `q` 能真正中止整个运行。
+    fn bind_cancel(&self, cancel: CancelHandle) {
+        *self.cancel.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cancel);
+    }
 }
 
 /// 用户对审批的五种答复。
@@ -380,6 +410,9 @@ enum Answer {
     /// `n`：否决，并追问原因。
     Deny,
     /// `q`：中止整个运行。
+    ///
+    /// 绑定取消通道时请求取消，运行在下一个安全点停下；未绑定时只否决
+    /// 当前调用，提示语会如实说明这一点。
     Abort,
 }
 
@@ -541,13 +574,39 @@ mod tests {
         assert!(reason.contains("视为否决"), "原因应说明是 fail-closed: {reason}");
     }
 
+    /// `q` 在绑定了取消通道时真正中止运行。
+    ///
+    /// 提示语写的是"中止运行"，行为必须对得上：只否决当前调用却让运行
+    /// 继续，是骗用户。绑定通道后按 `q` 会请求取消，运行在下一个安全点
+    /// 停下。
     #[test]
-    fn abort_reports_that_the_user_stopped_the_run() {
+    fn abort_requests_cancellation_when_a_cancel_channel_is_bound() {
+        let gate = CliApprovalGate::new();
+        let cancel = CancelHandle::default();
+        gate.bind_cancel(cancel.clone());
+
+        let decision = decide(&gate, "q\n", &request("write_file"));
+
+        let reason = decision.expect_err("q 应否决");
+        assert!(reason.contains("中止"), "原因应说明是用户主动中止: {reason}");
+        assert!(
+            cancel.is_cancelled(),
+            "绑定取消通道后，q 必须真正请求中止运行"
+        );
+    }
+
+    /// 没有取消通道时，`q` 只能否决当前调用，并如实说明运行会继续。
+    #[test]
+    fn abort_without_a_cancel_channel_denies_only_this_call() {
         let gate = CliApprovalGate::new();
         let decision = decide(&gate, "q\n", &request("write_file"));
 
         let reason = decision.expect_err("q 应否决");
         assert!(reason.contains("中止"), "原因应说明是用户主动中止: {reason}");
+        assert!(
+            reason.contains("运行继续"),
+            "无法中止运行时要如实说明: {reason}"
+        );
     }
 
     /// `a` 记录的是**这一次调用**，不是整个工具。

@@ -26,8 +26,8 @@ pub struct JsonlEvidenceSink {
     path: PathBuf,
     /// 下一条事件的序号。
     ///
-    /// 使用原子类型，不放进 `Mutex`：序号自增是独立操作，不需要与文件
-    /// 句柄共用一把锁。
+    /// 只在写锁内读写。用原子类型是为了让锁外的读者（测试、诊断）能安全
+    /// 地看到当前值而不必拿锁，并发控制仍由写锁负责。
     next_sequence: AtomicU64,
     /// 写入器。用 `Option` 包住，写失败后可降级，见 `write`。
     writer: Mutex<Option<BufWriter<File>>>,
@@ -84,15 +84,26 @@ impl JsonlEvidenceSink {
 
     /// 把一条记录写入文件。
     ///
+    /// 序号在持锁期间分配，写盘也在同一把锁内。这样"取号、写盘、推进"
+    /// 是一个整体：并发写入者不会拿到同一个序号。
+    ///
     /// `Ok(true)` 表示已落盘；`Ok(false)` 表示 sink 已降级，本条丢弃；
     /// `Err` 表示本次写入失败并转入降级。调用方据此决定是否推进序号。
-    fn write(&self, record: &Record<'_>) -> std::io::Result<bool> {
+    fn write(&self, event: &AuditEvent, at: Timestamp) -> std::io::Result<bool> {
         let mut guard = self.lock();
         let Some(writer) = guard.as_mut() else {
             // 之前已经失败过并降级，本条丢弃。
             return Ok(false);
         };
-        let line = serde_json::to_string(record).map_err(std::io::Error::other)?;
+        // 取号与写盘在同一临界区内，序号与落盘顺序严格对应。
+        let sequence = self.next_sequence.load(Ordering::Relaxed);
+        let record = Record {
+            sequence,
+            format: EVIDENCE_FORMAT_MILLIS,
+            recorded_at: unix_millis(at),
+            event,
+        };
+        let line = serde_json::to_string(&record).map_err(std::io::Error::other)?;
         if let Err(error) = writeln!(writer, "{line}") {
             // 丢弃句柄，后续写入全部走降级路径。
             *guard = None;
@@ -103,6 +114,8 @@ impl JsonlEvidenceSink {
             *guard = None;
             return Err(error);
         }
+        // 真正落盘了才推进序号，否则日志里会出现跳号。
+        self.next_sequence.store(sequence + 1, Ordering::Relaxed);
         Ok(true)
     }
 
@@ -112,32 +125,21 @@ impl JsonlEvidenceSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-
-    /// 取下一条序号并自增。写成功后调用，序号与落盘内容严格对应。
-    fn advance_sequence(&self) {
-        self.next_sequence.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 impl EvidenceSink for JsonlEvidenceSink {
     fn record(&self, at: Timestamp, event: AuditEvent) {
-        let sequence = self.next_sequence.load(Ordering::Relaxed);
-        let record = Record {
-            sequence,
-            format: EVIDENCE_FORMAT_MILLIS,
-            recorded_at: unix_millis(at),
-            event: &event,
-        };
-        match self.write(&record) {
-            // 真正落盘了才推进序号，否则日志里会出现跳号。
-            Ok(true) => self.advance_sequence(),
+        match self.write(&event, at) {
+            // 真正落盘了才推进序号，否则日志里会出现跳号。推进在写锁内
+            // 完成，见 `write`。
+            Ok(true) => {}
             // 已降级丢弃：不推进序号，不重复告警。
             Ok(false) => {}
             Err(error) => {
                 // 审计写入失败不能中断任务。丢弃本条并向 stderr 输出警告，
                 // 避免整个 ReAct 循环失败。
                 eprintln!(
-                    "警告：证据写入 {} 失败（第 {sequence} 条已丢弃）: {error}",
+                    "警告：证据写入 {} 失败（本条已丢弃）: {error}",
                     self.path.display(),
                 );
             }
@@ -215,6 +217,7 @@ mod tests {
     use crate::domain::tool::ToolOutcome;
     use serde_json::json;
     use std::io::Read;
+    use std::sync::Arc;
 
     /// 每次测试用独立的临时目录，避免并行测试互相踩。
     fn temp_dir(name: &str) -> PathBuf {
@@ -371,7 +374,60 @@ mod tests {
 
         // 只有第一条写成功，序号停在 2。
         assert_eq!(sink.next_sequence.load(Ordering::Relaxed), 2);
-        let _ = std::fs::remove_dir_all(&dir);    }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 并发写入时序号不得重复。
+    ///
+    /// 取号与写盘在写锁内完成，序号与落盘顺序严格对应。取号在锁外时，
+    /// 两个线程会读到同一个序号，文件里出现两条相同编号的记录，而
+    /// "序号连续"是发现证据被截断或改写的手段。
+    #[test]
+    fn concurrent_writers_get_distinct_sequences() {
+        let dir = temp_dir("concurrent");
+        let path = dir.join("s.jsonl");
+        let sink = Arc::new(JsonlEvidenceSink::open(&path).expect("打开"));
+
+        let writers = 4;
+        let per_writer = 25;
+        let handles: Vec<_> = (0..writers)
+            .map(|writer| {
+                let sink = Arc::clone(&sink);
+                std::thread::spawn(move || {
+                    for index in 0..per_writer {
+                        sink.record(
+                            SystemTime::UNIX_EPOCH,
+                            thought_event(writer as u32 + 1, &format!("{writer}-{index}")),
+                        );
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("写入线程不应 panic");
+        }
+
+        let content = std::fs::read_to_string(&path).expect("读回");
+        let sequences: Vec<u64> = content
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .expect("行是合法 JSON")
+                    .get("sequence")
+                    .and_then(|value| value.as_u64())
+                    .expect("有 sequence 字段")
+            })
+            .collect();
+
+        assert_eq!(sequences.len(), writers * per_writer, "每条事件都要落盘");
+        let mut sorted = sequences.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), sequences.len(), "序号不得重复");
+        assert_eq!(sorted.first(), Some(&1));
+        assert_eq!(sorted.last(), Some(&((writers * per_writer) as u64)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn unopenable_path_reports_an_error_instead_of_panicking() {

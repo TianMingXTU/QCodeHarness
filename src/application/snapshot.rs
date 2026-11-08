@@ -22,8 +22,8 @@ use super::agent_run::{PendingRound, RunState};
 ///
 /// v2：`AgentRole` 增加到四个变体，序列化形态比 v1 丰富，v1 快照被显式拒绝。
 ///
-/// v3：快照描述整个任务，不再只是单个 runner。v2 快照没有任务上下文，
-/// 恢复时无法判断当前进度，因此拒绝加载。
+/// v3：任务上下文从"只有单个 runner"扩到"整个任务"，快照多出任务进度与
+/// 各步结论。v2 快照没有任务上下文，恢复时无法判断当前进度，因此拒绝加载。
 pub const RUN_FORMAT: u32 = 3;
 
 /// 当前任务快照格式版本。
@@ -212,7 +212,10 @@ mod tests {
     use serde_json::json;
 
     /// 构造半轮状态的快照：调用已给出，观察只收到一半。
-    /// 恢复语义在此最挑剔，往返必须无损。
+    ///
+    /// 恢复语义在此最挑剔，往返必须无损。夹具必须自洽：状态机记录的调用
+    /// 清单与待配平轮次的调用清单要一致（`AgentRunner::resume` 会校验），
+    /// 观察数少于调用数表示本轮还没跑完。
     fn mid_round_snapshot() -> RunSnapshot {
         let mut session = Session::new(SessionId::new("s1"), "任务");
         session
@@ -224,6 +227,18 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
+        let calls = vec![
+            ToolCall {
+                id: CallId::new("call_1"),
+                name: "read_file".to_owned(),
+                arguments: json!({"path": "a"}),
+            },
+            ToolCall {
+                id: CallId::new("call_2"),
+                name: "list_dir".to_owned(),
+                arguments: json!({}),
+            },
+        ];
         RunSnapshot {
             format_version: RUN_FORMAT,
             session_id: SessionId::new("s1"),
@@ -235,11 +250,7 @@ mod tests {
                 verbosity: None,
             },
             session: session.snapshot(),
-            state: RunState::Dispatching(vec![ToolCall {
-                id: CallId::new("call_1"),
-                name: "read_file".to_owned(),
-                arguments: json!({"path": "a"}),
-            }]),
+            state: RunState::Dispatching(calls.clone()),
             consumption: Consumption {
                 turns: 1,
                 elapsed: std::time::Duration::from_millis(1500),
@@ -247,18 +258,7 @@ mod tests {
             pending: Some(PendingRound {
                 turn: AgentTurn {
                     text: "想一下".to_owned(),
-                    calls: vec![
-                        ToolCall {
-                            id: CallId::new("call_1"),
-                            name: "read_file".to_owned(),
-                            arguments: json!({"path": "a"}),
-                        },
-                        ToolCall {
-                            id: CallId::new("call_2"),
-                            name: "list_dir".to_owned(),
-                            arguments: json!({}),
-                        },
-                    ],
+                    calls,
                 },
                 outcomes: vec![ToolOutcome::success("第一条观察")],
             }),

@@ -21,6 +21,8 @@
 //! 三种行前缀（`+` / `-` / 空格）决定该行进入旧片段还是新片段：
 //! 上下文行进入两边，删除行只进旧片段，新增行只进新片段。
 
+use super::line_ending::LineEnding;
+
 /// 补丁文本的起止标记。
 const BEGIN_MARKER: &str = "*** Begin Patch";
 const END_MARKER: &str = "*** End Patch";
@@ -267,16 +269,27 @@ fn parse_added_lines(body: &[&str]) -> Result<(Vec<String>, usize), String> {
 /// 每个改动块都在上一个块应用后的内容上查找匹配。块之间可能改变行号，
 /// 顺序应用才能对应正确。
 ///
+/// 行尾按被改文件的原样保留。比较前把文件内容统一成 LF，写回时还原成
+/// 原风格：补丁文本经 `str::lines()` 逐行取，行尾已被去掉，与带 `\r`
+/// 的文件行逐字相比永远失配。Windows 上 git 默认检出 CRLF，不统一口径
+/// 的话补丁在 Windows 工作区一行也落不下去。
+///
 /// 失败时给出可操作的说明，并附上文件相关片段供模型纠正。
 pub fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
-    let ends_with_newline = content.ends_with('\n');
-    let mut lines: Vec<String> = content.split('\n').map(str::to_owned).collect();
+    let ending = LineEnding::detect(content);
+    let normalized = LineEnding::to_lf(content);
+    let ends_with_newline = normalized.ends_with('\n');
+    let mut lines: Vec<String> = normalized.split('\n').map(str::to_owned).collect();
     if ends_with_newline {
         // 内容以换行结尾时 `split` 会多出一个空字符串。
         lines.pop();
     }
 
     for (number, hunk) in hunks.iter().enumerate() {
+        // 补丁片段也统一成 LF。比较在 LF 空间里做，写回时统一还原成文件
+        // 的风格，片段里混进来的 `\r` 不会漏到结果里。
+        let old: Vec<String> = hunk.old.iter().map(|line| LineEnding::to_lf(line)).collect();
+        let new: Vec<String> = hunk.new.iter().map(|line| LineEnding::to_lf(line)).collect();
         let start = match &hunk.anchor {
             Some(anchor) => match lines.iter().position(|line| line.contains(anchor.as_str())) {
                 Some(position) => position,
@@ -289,21 +302,21 @@ pub fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
             },
             None => 0,
         };
-        let position = find_unique(&lines, &hunk.old, start).map_err(|reason| {
+        let position = find_unique(&lines, &old, start).map_err(|reason| {
             format!(
                 "第 {} 个改动块{reason}\n文件当前内容：\n{}",
                 number + 1,
                 excerpt(&lines, start)
             )
         })?;
-        lines.splice(position..position + hunk.old.len(), hunk.new.iter().cloned());
+        lines.splice(position..position + old.len(), new);
     }
 
     let mut result = lines.join("\n");
     if ends_with_newline && !result.is_empty() {
         result.push('\n');
     }
-    Ok(result)
+    Ok(LineEnding::restore(&result, ending))
 }
 
 /// 在 `lines` 中查找 `old` 片段的唯一匹配位置。
@@ -630,6 +643,79 @@ mod tests {
 
         assert_eq!(apply_hunks(with_newline, &hunks).unwrap(), "A\nb\n");
         assert_eq!(apply_hunks(without_newline, &hunks).unwrap(), "A\nb");
+    }
+
+    /// CRLF 文件要能被打上 LF 补丁。
+    ///
+    /// Windows 上 git 默认把文本检出成 CRLF，模型写出的补丁却是 LF。
+    /// 比较前不统一行尾，CRLF 文件的每一行都多一个 `\r`，逐字比对必然
+    /// 失配，补丁在 Windows 工作区一行也落不下去。
+    #[test]
+    fn a_crlf_file_accepts_an_lf_patch() {
+        let content = "fn main() {\r\n    let x = 1;\r\n}\r\n";
+        let hunks = vec![Hunk {
+            anchor: None,
+            old: vec!["    let x = 1;".to_owned()],
+            new: vec!["    let x = 2;".to_owned()],
+        }];
+
+        let updated = apply_hunks(content, &hunks).unwrap();
+
+        assert_eq!(updated, "fn main() {\r\n    let x = 2;\r\n}\r\n");
+    }
+
+    /// 打补丁不能改掉文件原来的行尾风格。
+    ///
+    /// 没被改动块碰到的行必须保持原样：若按补丁文本的 LF 写回，Windows
+    /// 上每改一行都会让整文件产生行尾 diff。
+    #[test]
+    fn a_crlf_file_stays_crlf_after_a_patch() {
+        let content = "第一行\r\n第二行\r\n第三行\r\n";
+        let hunks = vec![Hunk {
+            anchor: None,
+            old: vec!["第二行".to_owned()],
+            new: vec!["改过的第二行".to_owned()],
+        }];
+
+        let updated = apply_hunks(content, &hunks).unwrap();
+
+        assert_eq!(updated, "第一行\r\n改过的第二行\r\n第三行\r\n");
+        assert!(
+            !updated.contains('\n') || updated.matches("\r\n").count() == 3,
+            "每一行都该是 CRLF: {updated:?}"
+        );
+    }
+
+    /// LF 文件不该被补丁改成 CRLF。
+    #[test]
+    fn an_lf_file_stays_lf_after_a_patch() {
+        let content = "a\nb\nc\n";
+        let hunks = vec![Hunk {
+            anchor: None,
+            old: vec!["b".to_owned()],
+            new: vec!["B".to_owned()],
+        }];
+
+        let updated = apply_hunks(content, &hunks).unwrap();
+
+        assert_eq!(updated, "a\nB\nc\n");
+        assert!(!updated.contains('\r'), "不该混进 CRLF: {updated:?}");
+    }
+
+    /// 行尾不统一时，模型给的原文不必带 `\r`。
+    ///
+    /// 补丁文本本身带 CRLF 也要能匹配：模型可能从 `read_file` 的输出里
+    /// 复制原文，而 `read_file` 原样保留 CRLF。
+    #[test]
+    fn a_crlf_patch_matches_a_crlf_file() {
+        let content = "a\r\nb\r\n";
+        let hunks = vec![Hunk {
+            anchor: None,
+            old: vec!["b".to_owned()],
+            new: vec!["B".to_owned()],
+        }];
+
+        assert_eq!(apply_hunks(content, &hunks).unwrap(), "a\r\nB\r\n");
     }
 
     /// 新旧内容相同的改动块直接拒绝。

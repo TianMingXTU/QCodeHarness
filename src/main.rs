@@ -823,8 +823,9 @@ fn mcp_lifecycle_recorder(workspace: &Path) -> Option<Arc<McpLifecycleRecorder>>
 
 /// 收尾：正常结束的三条路径共用，显式关闭所有 MCP 连接。
 ///
-/// 失败路径通过 `std::process::exit` 离开，不经过这里。此时清理由
-/// 操作系统与 Job Object 处理（子进程已纳入 Job，随父进程终止）。
+/// 失败路径通过 `std::process::exit` 离开，不经过这里。失败路径的清理
+/// 取决于平台：Windows 上子进程已纳入 Job Object，随父进程终止；其他平台
+/// 没有进程沙箱，异常退出后 MCP 子进程会残留，需要手工清理。
 /// 正常路径先优雅关闭 transport，再释放进程组兜底，两侧都留下记录。
 async fn close_mcp_connections(sources: &[mcp::McpToolSource]) {
     for source in sources {

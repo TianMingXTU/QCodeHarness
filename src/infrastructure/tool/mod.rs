@@ -9,6 +9,7 @@ pub mod apply_patch;
 pub mod edit;
 pub mod file;
 pub mod git;
+pub mod line_ending;
 pub mod patch_format;
 pub mod search;
 pub mod shell;
@@ -148,10 +149,11 @@ fn physical_path(resolved: &Path) -> Option<PathBuf> {
 ///
 /// [`WorkspacePath::resolve`] 是纯词法校验：领域层不碰文件系统，这是项目
 /// 的分层边界。词法校验管不住链接。在 workspace 里给 `.git` 建一个
-/// junction（`mklink /J jgit .git`，不需要管理员权限），词法上
-/// `jgit/config` 完全合法，落盘时却写在真实的 `.git/config` 上。agent
-/// 因此能读到 `.git/config`（常含带令牌的 remote URL），也能改写版本库
-/// 元数据和自己的审计证据，而审批界面只显示 `jgit/config`。
+/// 目录链接（Windows 用 `mklink /J jgit .git`，不需要管理员权限；其他
+/// 平台用符号链接），词法上 `jgit/config` 完全合法，落盘时却写在真实的
+/// `.git/config` 上。agent 因此能读到 `.git/config`（常含带令牌的 remote
+/// URL），也能改写版本库元数据和自己的审计证据，而审批界面只显示
+/// `jgit/config`。
 ///
 /// 链接只能在这一层解析，因为 canonicalize 需要读文件系统。
 ///
@@ -179,7 +181,6 @@ fn reject_links_out_of_scope(resolved: &Path, root: &Path, raw: &str) -> Result<
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
 
     /// 建一个真实 workspace：包含 `.git`、`.env`、`.qcodeharness`，各放
     /// 一份可识别的内容。这些测试依赖真实文件系统，mock 路径没有意义。
@@ -201,19 +202,36 @@ mod tests {
         (dir, root)
     }
 
-    /// junction 是这类攻击的载体：`mklink /J` 即可创建，不需要管理员权限。
+    /// 建一个指向 `target` 的目录链接。
+    ///
+    /// Windows 用 junction（`mklink /J`，不需要管理员权限），其他平台用
+    /// 符号链接。两者的共同点是词法上看着像普通目录，物理上落到别处，
+    /// 正是被测的越界形态。
+    ///
+    /// 链接机制按平台选择，不写死：Windows 上 `mklink` 不存在，Linux
+    /// 上 `cmd` 不存在，两边用同一个助手才能让这组测试在每个平台上都
+    /// 真跑一遍。`canonicalize` 在两个平台上都解析链接，下面的物理路径
+    /// 复查因此同样成立。
     fn link_dir(workspace: &Path, link: &str, target: &Path) {
-        let output = Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(workspace.join(link))
-            .arg(target)
-            .output()
-            .expect("调起 cmd 建 junction");
-        assert!(
-            output.status.success(),
-            "建 junction 失败: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let link_path = workspace.join(link);
+        #[cfg(windows)]
+        {
+            use std::process::Command;
+
+            let output = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link_path)
+                .arg(target)
+                .output()
+                .expect("调起 cmd 建 junction");
+            assert!(
+                output.status.success(),
+                "建 junction 失败: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        #[cfg(not(windows))]
+        std::os::unix::fs::symlink(target, &link_path).expect("建符号链接");
     }
 
     /// 词法校验管不住 junction：`.git` 的链接建在 workspace 里，

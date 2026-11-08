@@ -10,6 +10,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,30 @@ use crate::application::error::ApplicationError;
 /// 必须以 `Arc<dyn ...>` 注入才能换成测试替身。也不引入 `async-trait` 宏：
 /// 手写装盒同样清楚，还少一层宏展开，报错信息更直白。
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// 协作式取消开关，运行在每轮调用模型前检查。
+///
+/// 放在端口层而不是 runner 里：闸门等基础设施也要用它表达"用户要求
+/// 中止运行"，放在 runner 会让基础设施反向依赖应用层的具体类型。
+///
+/// 取消不会打断正在执行的工具（run_command 有自己的超时），从下一个安全
+/// 点（下一轮模型调用前）生效。
+#[derive(Debug, Clone, Default)]
+pub struct CancelHandle {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancelHandle {
+    /// 请求取消当前运行。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// 是否已被请求取消。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
 
 /// 时间戳，直接复用 `std` 的类型，领域层不再另造。
 pub type Timestamp = SystemTime;
@@ -151,7 +176,25 @@ pub type Decision = Result<(), String>;
 /// 审批闸门：副作用操作执行前的拦截点。
 pub trait ApprovalGate: Send + Sync {
     /// 请求批准一次工具执行。
+    ///
+    /// # 结局
+    ///
+    /// `Ok(())` 放行；`Err(reason)` 否决本次调用，原因回填给模型，
+    /// 模型可以换一条路径继续。否决不等于终止运行。
+    ///
+    /// 用户要中止整个运行时，闸门不靠这个错误通道表达：它先记录中止
+    /// 请求，再通过 [`CancelHandle`] 请求取消。取消是协作式的，在下一个
+    /// 安全点生效。
     fn request<'a>(&'a self, request: &'a ApprovalRequest) -> BoxFuture<'a, Decision>;
+
+    /// 绑定取消通道。
+    ///
+    /// runner 在构造时调用一次，把自己持有的 [`CancelHandle`] 交给闸门。
+    /// 闸门需要"中止整个运行"这个能力时，通过它请求取消。
+    ///
+    /// 默认实现不做任何事：多数闸门（自动放行、AI 审查）没有中止需求，
+    /// 让它们实现这个方法是徒增样板。
+    fn bind_cancel(&self, _cancel: CancelHandle) {}
 }
 
 /// 运行挂点：模型调用与工具执行前后的观察者。

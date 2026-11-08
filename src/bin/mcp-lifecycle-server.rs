@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
+use qcode_harness::domain::platform::Platform;
 fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "ok".to_owned());
@@ -39,9 +40,10 @@ fn main() {
         std::process::exit(9);
     }
     if mode == "with-child" {
-        // 整树清理的验证点：Job 中的进程创建的子进程自动继承成员资格。
-        // 这里拉起长命的 `ping` 并写入其 PID，测试据此判断关闭后它是否
-        // 仍然存活。
+        // 整树清理的验证点：有进程沙箱的平台（Windows Job Object）上，
+        // Job 中进程创建的子进程自动继承成员资格；其他平台没有这种边界，
+        // 孙进程会继续存活。这里拉起长命的 `ping` 并写入其 PID，测试据此
+        // 判断关闭后它是否仍然存活。
         spawn_grandchild(&counter_path);
     }
     // "no-init-reply"：收帧但对 initialize 永不回应，触发握手超时。
@@ -63,11 +65,16 @@ fn main() {
 
 fn spawn_grandchild(counter_path: &Option<PathBuf>) {
     let Some(path) = counter_path else { return };
-    // `ping -n` 是 Windows 的次数参数（Linux iputils 里 `-n` 表示数值
-    // 输出）。这条测试只在 Windows 跑，代码保持跨平台可编译。孙进程只需
-    // 活得比一次测试长，120 次足够。
+    // 长命进程用 `ping` 保持：Windows 的 `-n` 是次数参数，Linux iputils 的
+    // `-n` 是"只输出数字"，语义相反。按平台选参数，子进程只需活得比一次
+    // 测试长，120 次足够。
+    let count_flag = if Platform::current() == Platform::Windows {
+        "-n"
+    } else {
+        "-c"
+    };
     let Ok(child) = std::process::Command::new("ping")
-        .args(["-n", "120", "127.0.0.1"])
+        .args([count_flag, "120", "127.0.0.1"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -79,8 +86,8 @@ fn spawn_grandchild(counter_path: &Option<PathBuf>) {
     if let Err(error) = std::fs::write(&pid_path, child.id().to_string()) {
         eprintln!("helper 写孙进程 PID 失败: {error}");
     }
-    // 故意不 wait，也不持有句柄：孙进程必须活过夹具退出，才能证明
-    // 父进程退出不会带走整棵树，Job 才是清理边界。
+    // 故意不 wait，也不持有句柄：孙进程必须活过夹具退出，才能证明父进程
+    // 退出本身不会带走整棵树，进程沙箱才是清理边界。
     std::mem::forget(child);
 }
 

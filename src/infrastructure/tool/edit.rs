@@ -2,6 +2,10 @@
 //!
 //! 核心是唯一性校验。`old_string` 匹配多处时，替换第一处会产生难以发现
 //! 的错误。此时应返回失败并说明匹配数量，让模型补充更长的上下文后重试。
+//!
+//! 比较前把文件内容与模型给出的原文统一成 LF，写回时还原成文件原来的
+//! 行尾风格。Windows 上 git 默认检出 CRLF，不统一口径的话模型给的
+//! `old_string` 与磁盘内容永远对不上。
 
 use serde::Deserialize;
 use serde_json::json;
@@ -10,6 +14,7 @@ use crate::application::port::{BoxFuture, ToolInvoker};
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 use crate::domain::workspace::WorkspaceRoot;
 
+use super::line_ending::LineEnding;
 use super::{parse_args, resolve_in};
 
 const EDIT_FILE: &str = "edit_file";
@@ -82,14 +87,23 @@ impl ToolInvoker for EditFile {
                 }
             };
 
-            let occurrences = occurrence_count(&content, &args.old_string);
+            // 行尾统一成 LF 再比较，写回时还原成原风格。模型给出的
+            // `old_string` 用 LF，Windows 上 git 检出的文件是 CRLF，两边
+            // 逐字比对会永远找不到。统一口径后，模型给的原文不必带 `\r`。
+            let ending = LineEnding::detect(&content);
+            let normalized = LineEnding::to_lf(&content);
+            let old_string = LineEnding::to_lf(&args.old_string);
+            let new_string = LineEnding::to_lf(&args.new_string);
+
+            let occurrences = occurrence_count(&normalized, &old_string);
             match occurrences {
                 0 => ToolOutcome::failed(format!(
                     "在 `{}` 中找不到要替换的文本（old_string 与文件内容不一致）",
                     args.path
                 )),
                 1 => {
-                    let updated = content.replacen(&args.old_string, &args.new_string, 1);
+                    let replaced = normalized.replacen(&old_string, &new_string, 1);
+                    let updated = LineEnding::restore(&replaced, ending);
                     match tokio::fs::write(path.as_path(), updated.as_bytes()).await {
                         Ok(()) => ToolOutcome::success(format!(
                             "已替换 `{}` 中的 1 处文本（{} → {} 字节）",
@@ -271,6 +285,51 @@ mod tests {
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
         assert!(outcome.content.contains("读取"), "{}", outcome.content);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// CRLF 文件要能被模型给的 LF 原文改到。
+    ///
+    /// Windows 上 git 默认把文本检出成 CRLF，模型从 `read_file` 看到的内容
+    /// 与给出的 `old_string` 未必带 `\r`。比较前不统一行尾，两者永远对不上。
+    #[tokio::test]
+    async fn replaces_in_a_crlf_file_with_lf_text() {
+        let root = temp_workspace("crlf");
+        fs::write(root.join("lib.rs"), "fn a() {}\r\nfn b() {}\r\n").unwrap();
+        let file = tool(&root);
+
+        let outcome = file
+            .invoke(&call(edit_args("lib.rs", "fn b() {}", "fn renamed() {}")))
+            .await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            fs::read_to_string(root.join("lib.rs")).unwrap(),
+            "fn a() {}\r\nfn renamed() {}\r\n",
+            "写回时不能把 CRLF 改成 LF"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 改一处不能动别的行的行尾。
+    ///
+    /// 整文件换行尾会在 git 里变成满屏 diff：改一行却让每个未改动的行
+    /// 都变了一遍。
+    #[tokio::test]
+    async fn a_crlf_file_keeps_its_line_endings_untouched() {
+        let root = temp_workspace("crlf-mixed");
+        fs::write(root.join("lib.rs"), "a\r\nb\r\nc\r\n").unwrap();
+        let file = tool(&root);
+
+        let outcome = file
+            .invoke(&call(edit_args("lib.rs", "b", "B")))
+            .await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            fs::read_to_string(root.join("lib.rs")).unwrap(),
+            "a\r\nB\r\nc\r\n"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

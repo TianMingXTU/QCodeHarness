@@ -4,6 +4,7 @@
 //! 网络、数据库）通过 `application/port` 中的 trait 抽象。
 
 pub mod ids;
+pub mod platform;
 pub mod workspace;
 pub mod tool;
 pub mod mcp;

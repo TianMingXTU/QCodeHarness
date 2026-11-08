@@ -152,8 +152,8 @@ pub enum AuditEvent {
     },
     /// 恢复时提示模型：某个调用在中断前可能已经执行过。
     ///
-    /// 与 `ToolObserved` 互补：后者记录已完成的调用与结果 X，这条表示
-    /// 调用**可能**已执行、结果未知。
+    /// 与 `ToolObserved` 互补：后者记录已完成的调用与结果，这条表示
+    /// 调用**是否**已执行无法确认、结果未知。
     ///
     /// 中断发生在调用发起之后、观察记录之前，副作用可能已经发生
     /// （文件已写入、命令已执行）且无法确认。恢复路径**不自动重跑**，
@@ -162,7 +162,7 @@ pub enum AuditEvent {
     ToolCallReplayed {
         /// 轮次号。
         turn: u32,
-        /// 可能已经执行过的工具名。
+        /// 是否执行过无法确认的工具名。
         tool: String,
         /// 为什么会有这条提示。
         reason: String,
@@ -189,9 +189,11 @@ pub enum AuditEvent {
     ///
     /// `run_command`、`git_status`、`git_diff` 只在实际启动子进程后记录，
     /// 启动前的拒绝或失败不生成事件。MCP 工具记录将调用交给外部 Server
-    /// 的尝试，不表示服务端已执行或调用成功；该进程在 Windows 上于握手
-    /// 前被纳入同一个 Job（见 `active`）。Job 创建失败时连接被拒绝，
-    /// 不生成此事件。
+    /// 的尝试，不表示服务端已执行或调用成功；有进程沙箱的平台（Windows）
+    /// 在握手前把该进程纳入同一个 Job（见 `active`）。
+    ///
+    /// 有进程沙箱的平台在 Job 创建失败时拒绝连接，不生成此事件。其他平台
+    /// 没有进程沙箱，连接照常建立，本事件照发，`active` 为 false。
     ///
     /// 与 `ToolObserved` 分开记录：本条描述进程管理与调用前检查，工具
     /// 结果仍由 `ToolObserved` 表达。两者都不承诺文件系统隔离。
@@ -200,17 +202,20 @@ pub enum AuditEvent {
         turn: u32,
         /// 本次执行或尝试交给外部 Server 的调用。
         call: ToolCall,
-        /// 执行边界标记：`"Windows JobObject"` / `"Unsupported"` / `"MCP subprocess"`。
+        /// 执行边界标记：`"Windows JobObject"` / `"Linux"` / `"macOS"` /
+        /// `"其他系统"` / `"MCP subprocess"`。
         ///
         /// 同一会话可以同时包含本地子进程与外部 MCP 调用，标签按调用记录。
         platform: String,
         /// 本 harness 的进程限额与进程树管理是否实际生效。
         ///
-        /// Windows 子进程成功纳入 Job 后为 true。启动后 `assign` 失败
-        /// 仍记录本事件，值为 false；启动前 Job 创建失败则拒绝执行，
-        /// 不生成事件。MCP 调用在 Windows 上于握手前纳入 Job 后为 true，
-        /// 此后该进程创建的子孙一并受管；非 Windows 平台、PID 已失效或
-        /// 纳入失败时为 false。
+        /// 有进程沙箱的平台（Windows）：子进程成功纳入 Job 后为 true。
+        /// 启动后 `assign` 失败仍记录本事件，值为 false；启动前 Job 创建
+        /// 失败则拒绝执行，不生成事件。MCP 调用在握手前纳入 Job 后为
+        /// true，此后该进程创建的子孙一并受管。
+        ///
+        /// 其他平台没有进程沙箱：命令照跑、事件照发，值恒为 false。PID
+        /// 已失效或纳入失败时也是 false。
         active: bool,
         /// `run_command` 是否执行过命令字面路径检查。
         ///

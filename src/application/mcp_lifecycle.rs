@@ -20,9 +20,13 @@ use crate::domain::mcp::McpLifecycleFact;
 
 /// 连接事件写入器。
 ///
-/// 一个进程只应构造一个实例并在所有 Server 间共享。`JsonlEvidenceSink` 的
-/// "读序号、写盘、推进序号"不是原子操作，两个 Server 同时写入会拿到同一个
-/// 序号。这里串行化整个写入过程，保证序号严格递增。
+/// 一个进程只应构造一个实例并在所有 Server 间共享。这里串行化整个写入
+/// 过程，让并发上报的事件在文件里按时间戳先后排列：多个 Server 会同时
+/// 上报（握手超时、断连监视器、显式恢复），不串行化时事件顺序会与
+/// 发生顺序错位。
+///
+/// 序号由 sink 在写锁内分配，本身已经保证唯一；这里的锁管的是**顺序**，
+/// 不是序号。
 pub struct McpLifecycleRecorder {
     evidence: Arc<dyn EvidenceSink>,
     clock: Arc<dyn Clock>,
@@ -120,12 +124,11 @@ mod tests {
         );
     }
 
-    /// 多个 Server 同时上报时序号不得重复。
+    /// 多个 Server 同时上报时，序号必须各不相同。
     ///
-    /// 替身复刻 `JsonlEvidenceSink` 的行为：先读序号，再在写锁内落盘，
-    /// 最后推进序号。三步不是原子操作，两个线程可能读到同一个序号。
-    /// `tests/mcp_lifecycle_evidence.rs` 用真实 JSONL 文件验证同一行为；
-    /// 这里用替身，让序号冲突在单元测试中即可复现。
+    /// 替身复刻 `JsonlEvidenceSink` 的行为：在写锁内分配序号并落盘。
+    /// 这里用替身，让序号冲突在单元测试中即可复现；
+    /// `tests/mcp_lifecycle_evidence.rs` 用真实 JSONL 文件验证同一行为。
     #[derive(Default)]
     struct SplitSequenceSink {
         next: std::sync::atomic::AtomicU64,
@@ -134,20 +137,24 @@ mod tests {
 
     impl EvidenceSink for SplitSequenceSink {
         fn record(&self, _at: crate::application::port::Timestamp, event: AuditEvent) {
-            let sequence = self.next.load(std::sync::atomic::Ordering::Relaxed);
-            self.written
+            // 与真实 sink 同构：取号与落盘都在同一把锁内。
+            let mut written = self
+                .written
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push((sequence, event));
-            // 落盘与推进之间让出线程：没有写入串行锁时，另一个线程会在
-            // 这里读到同一个序号。
-            std::thread::yield_now();
-            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let sequence = self.next.load(std::sync::atomic::Ordering::Relaxed);
+            written.push((sequence, event));
+            self.next
+                .store(sequence + 1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
+    /// 多个 Server 同时上报时，序号必须各不相同。
+    ///
+    /// recorder 的锁把取号与落盘串成一个整体，序号由 sink 在自己的写锁内
+    /// 分配。两把锁叠加后并发写入者不会拿到同一个序号。
     #[test]
-    fn concurrent_servers_get_distinct_increasing_sequences() {
+    fn concurrent_servers_get_distinct_sequences() {
         let evidence = Arc::new(SplitSequenceSink::default());
         let recorder = Arc::new(McpLifecycleRecorder::new(
             evidence.clone(),

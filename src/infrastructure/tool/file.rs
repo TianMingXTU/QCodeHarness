@@ -14,6 +14,7 @@ use crate::application::port::{BoxFuture, ToolInvoker};
 use crate::domain::tool::{OutcomeStatus, ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 use crate::domain::workspace::WorkspaceRoot;
 
+use super::line_ending::LineEnding;
 use super::{parse_args, resolve_in};
 
 const READ_FILE: &str = "read_file";
@@ -386,10 +387,19 @@ impl ToolInvoker for WriteFile {
                 Ok(path) => path,
                 Err(outcome) => return outcome,
             };
-            match tokio::fs::write(path.as_path(), args.content.as_bytes()).await {
+            // 覆盖已有文件时沿用它的行尾风格。Windows 上 git 检出的文本是
+            // CRLF，模型写出的内容是 LF，直接落盘会让整文件在 git 里变成
+            // 一行行改动的假 diff。新建文件没有原风格可循，用模型给的内容。
+            let ending = LineEnding::detect_in_file(path.as_path()).await;
+            let content = if ending == LineEnding::CrLf {
+                LineEnding::restore(&LineEnding::to_lf(&args.content), ending)
+            } else {
+                args.content.clone()
+            };
+            match tokio::fs::write(path.as_path(), content.as_bytes()).await {
                 Ok(()) => ToolOutcome::success(format!(
                     "已写入 {} 字节到 `{}`",
-                    args.content.len(),
+                    content.len(),
                     args.path
                 )),
                 Err(error) => ToolOutcome::failed(format!("写入 `{}` 失败: {error}", args.path)),
@@ -816,6 +826,58 @@ mod tests {
             "{}",
             ListDir::spec().description
         );
+    }
+
+    /// 覆盖已有文件时沿用它的行尾风格。
+    ///
+    /// Windows 上 git 检出的文本是 CRLF，模型写出的内容是 LF。直接落盘
+    /// 会让整文件在 git 里变成一行行改动的假 diff，实际改动却只有一处。
+    #[tokio::test]
+    async fn write_file_keeps_the_existing_line_endings() {
+        let dir = protected_dir("write-crlf");
+        std::fs::write(dir.join("crlf.txt"), "old\r\nlines\r\n").expect("写 CRLF 文件");
+        let tools = WriteFile::new(WorkspaceRoot::new(&dir));
+
+        let outcome = tools
+            .invoke(&call(
+                WRITE_FILE,
+                json!({"path": "crlf.txt", "content": "new\nlines\n"}),
+            ))
+            .await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("crlf.txt")).unwrap(),
+            "new\r\nlines\r\n"
+        );
+        // 字节数要报实际落盘的大小：CRLF 比 LF 每行多一个字节。
+        assert!(
+            outcome.content.contains("已写入 12 字节"),
+            "字节数应是落盘后的大小: {}",
+            outcome.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新建文件没有原风格可循，用模型给的内容。
+    #[tokio::test]
+    async fn write_file_creates_a_new_file_with_the_given_content() {
+        let dir = protected_dir("write-new");
+        let tools = WriteFile::new(WorkspaceRoot::new(&dir));
+
+        let outcome = tools
+            .invoke(&call(
+                WRITE_FILE,
+                json!({"path": "fresh.txt", "content": "a\nb\n"}),
+            ))
+            .await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fresh.txt")).unwrap(),
+            "a\nb\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 受保护路径测试专用的临时目录。

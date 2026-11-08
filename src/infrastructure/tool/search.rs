@@ -48,7 +48,9 @@ const SKIPPED_DIRS: [&str; 4] = [".git", "target", "node_modules", ".qcodeharnes
 /// 凭据检查。`.env` 通常不被 git 跟踪，常落在 ignore 名单之外，凭据
 /// 保护依靠文件名本身。
 ///
-/// 大小写不敏感：Windows 上 `.ENV` 与 `.env` 是同一个文件。
+/// 大小写不敏感：所有平台都按不敏感比较。Windows 与 macOS 是文件系统
+/// 语义使然，Linux 上是主动多拒几个形似 `.env` 的路径（代价是一次误拒，
+/// 漏拒的代价是泄露凭据）。
 fn is_credential_file(name: &str) -> bool {
     let lowered = name.to_ascii_lowercase();
     lowered == ".env" || lowered.starts_with(".env.")
@@ -378,7 +380,9 @@ mod tests {
     /// 每行，`search_text({"pattern":"API_KEY"})` 会输出 `.env` 中的凭据
     /// 行连同其行号。保护必须覆盖这条路径。
     ///
-    /// 大小写不敏感：Windows 上 `.ENV` 与 `.env` 是同一个文件。
+    /// 大小写不敏感：所有平台都按不敏感比较。Windows 与 macOS 是文件系统
+    /// 语义使然，Linux 上是主动多拒几个形似 `.env` 的路径（代价是一次误拒，
+    /// 漏拒的代价是泄露凭据）。
     #[tokio::test]
     async fn search_never_reads_credential_files() {
         let root = temp_workspace("env");

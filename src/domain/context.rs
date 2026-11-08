@@ -527,13 +527,16 @@ pub fn compact_with_summary<'a>(
         .filter_map(|(index, slice)| round_number(slice).map(|number| (number, index)))
         .collect();
 
-    // 所有用户消息的代价先从预算里扣掉。步骤边界与交接消息不会被裁；
-    // 任务消息的去留由 keep_task 决定，代价同样计入。
+    // 一定会留在视图里的用户消息，其代价先从预算里扣掉。步骤边界与交接
+    // 消息不会被裁；最初的任务消息由 keep_task 决定，它被裁掉时不占预算。
     let mandatory_tokens: usize = slices
         .iter()
         .zip(&costs)
-        .filter(|(slice, _)| matches!(slice, ContextSlice::User(_)))
-        .map(|(_, cost)| cost)
+        .enumerate()
+        .filter(|(position, (slice, _))| {
+            matches!(slice, ContextSlice::User(_)) && (*position > 0 || budget.keep_task)
+        })
+        .map(|(_, (_, cost))| cost)
         .sum();
     // 最近几轮一定留着：模型至少要有近期上下文。
     let floor = budget.min_recent_rounds.min(rounds.len());
@@ -691,15 +694,19 @@ mod tests {
             .collect()
     }
 
-    /// 用户消息（任务交代、步骤交代）的 token 代价。
+    /// 一定会留在视图里的用户消息的 token 代价。
     ///
-    /// 计算上限时要把它们算进去，否则会挤掉一轮。
-    fn mandatory_tokens(session: &Session) -> usize {
+    /// 计算上限时要把它们算进去，否则会挤掉一轮。`keep_task` 为 false 时
+    /// 任务消息会被裁掉，不占预算。
+    fn mandatory_tokens(session: &Session, keep_task: bool) -> usize {
         session
             .slices()
             .iter()
-            .filter(|slice| matches!(slice, ContextSlice::User(_)))
-            .map(slice_tokens)
+            .enumerate()
+            .filter(|(position, slice)| {
+                matches!(slice, ContextSlice::User(_)) && (*position > 0 || keep_task)
+            })
+            .map(|(_, slice)| slice_tokens(slice))
             .sum()
     }
 
@@ -731,7 +738,7 @@ mod tests {
         // 只够装两轮：把上限压到刚好容纳两轮的量。任务消息也占 token，
         // 上限要把它算进去，否则会挤掉一轮。
         let one_round = slice_tokens(&session.slices()[2]);
-        let limit = one_round * 2 + mandatory_tokens(&session);
+        let limit = one_round * 2 + mandatory_tokens(&session, true);
         let (slices, report) = compact(&session, &budget(limit));
 
         let numbers: Vec<u32> = slices.iter().filter_map(round_number).collect();
@@ -782,6 +789,36 @@ mod tests {
             panic!("第一位应当是用户消息");
         };
         assert_ne!(first.as_ref(), "任务", "keep_task=false 时任务消息不应保留");
+    }
+
+    /// `keep_task=false` 时任务消息不占预算。
+    ///
+    /// 任务消息会被裁掉，它的 token 就不该从预算里扣。仍计入时，一个
+    /// 上限刚好够装三轮的会话会因为多扣了任务的代价而少留一轮，模型
+    /// 看到的历史比它应得的少。
+    #[test]
+    fn a_dropped_task_message_does_not_consume_the_budget() {
+        let session = session_with_rounds(6);
+        let costs = round_costs(&session);
+        // 上限只够装最后两轮。任务消息的代价不计入，否则装不下。
+        let limit = costs[4] + costs[5];
+        let no_task = ContextBudget {
+            max_tokens: Some(limit),
+            min_recent_rounds: 0,
+            keep_task: false,
+            summarize: None,
+        };
+
+        let (slices, report) = compact(&session, &no_task);
+
+        let numbers: Vec<u32> = slices.iter().filter_map(round_number).collect();
+        assert_eq!(
+            numbers,
+            vec![5, 6],
+            "任务消息被裁掉时不占预算，应留下两轮"
+        );
+        assert_eq!(report.dropped, vec![1, 2, 3, 4]);
+        assert_eq!(report.rounds_after, 2);
     }
 
     /// 超预算但没有可裁轮次时，不写占位说明，也不写证据台账。
@@ -903,7 +940,7 @@ mod tests {
         // 都不能丢。步骤交代是用户消息，永远保留，也占 token，计算上限
         // 时要算进去。
         let costs = round_costs(&session);
-        let limit = costs[4] + costs[5] + mandatory_tokens(&session);
+        let limit = costs[4] + costs[5] + mandatory_tokens(&session, true);
         let (slices, report) = compact(&session, &budget(limit));
 
         assert_eq!(report.dropped, vec![1, 2, 3, 4], "裁掉前四轮");
@@ -1122,7 +1159,7 @@ mod tests {
 
         // 同一个 token 上限：够装下 plain 的三轮，装不下 fat 的三轮。
         // 若按轮数计算，两个会话都会留下三轮。
-        let limit = round_costs(&plain)[0] * 3 + mandatory_tokens(&plain);
+        let limit = round_costs(&plain)[0] * 3 + mandatory_tokens(&plain, true);
         let (_, plain_report) = compact(&plain, &budget(limit));
         let (_, fat_report) = compact(&fat, &budget(limit));
 

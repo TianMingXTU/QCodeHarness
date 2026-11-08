@@ -198,6 +198,7 @@ fn git_outcome(
 mod tests {
     use super::*;
     use crate::domain::ids::CallId;
+    use crate::domain::sandbox::PlatformCapabilities;
     use crate::domain::tool::OutcomeStatus;
     use serde_json::json;
     use std::path::PathBuf;
@@ -433,22 +434,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(windows)]
+    /// 沙箱创建失败时 git 工具的结局按平台能力决定。
+    ///
+    /// - 平台有进程沙箱（Windows）：创建失败时拒绝执行（fail-closed），
+    ///   一个子进程也不启动。
+    /// - 平台没有进程沙箱（Linux、macOS 等）：降级执行，命令照跑，只是
+    ///   没有保护，边界证据里 `active` 为 false。
+    ///
+    /// 降级分支要真跑一次 git 才说得清，用真实仓库而不是空 `.git`
+    /// 目录：后者会让 git 自己先报错，看不出沙箱策略的结论。
+    ///
+    /// 两条断言按检测到的能力分支，不靠编译期门控跳过。本用例需要 git 在
+    /// PATH 中，默认 `cargo test` 不执行，需 `cargo test -- --ignored`。
+    #[ignore = "需要 git 在 PATH 中"]
     #[tokio::test]
-    async fn git_tools_refuse_when_the_sandbox_cannot_be_created() {
-        let dir = std::env::temp_dir().join(format!("qch-git-failclosed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("建临时目录");
-        std::fs::create_dir_all(dir.join(".git")).expect("造仓库根标记");
+    async fn git_tools_follow_the_platform_sandbox_policy() {
+        let dir = temp_repo("failclosed");
         let mut status = GitStatus::new(WorkspaceRoot::new(&dir));
         let mut diff = GitDiff::new(WorkspaceRoot::new(&dir));
+        // 用明确未实现的 cpu_time 限额稳定触发沙箱创建失败，不依赖宿主机
+        // 权限或资源耗尽。
         status.policy.cpu_time = Some(Duration::from_secs(1));
         diff.policy.cpu_time = Some(Duration::from_secs(1));
 
+        let capabilities = PlatformCapabilities::detect();
         for outcome in [status.run().await, diff.run(false).await] {
-            assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
-            assert!(outcome.content.contains("沙箱创建失败"), "{}", outcome.content);
-            assert!(outcome.execution.is_none(), "命令没跑不能记边界证据");
+            if capabilities.has_process_sandbox {
+                assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
+                assert!(outcome.content.contains("沙箱创建失败"), "{}", outcome.content);
+                assert!(outcome.execution.is_none(), "命令没跑不能记边界证据");
+            } else {
+                // 降级执行：命令真的跑了，边界证据如实记 active=false。
+                assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+                let boundary = outcome
+                    .execution
+                    .expect("跑过的命令必须留下执行边界");
+                assert!(!boundary.active, "没有进程沙箱的平台不得声称有保护");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

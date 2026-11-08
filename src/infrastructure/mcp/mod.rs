@@ -260,6 +260,9 @@ struct RealMcpClient {
     /// 进程沙箱句柄。声明在 service 之后，字段按声明序析构，Job 必须等
     /// transport 收尾后才释放；否则 KILL_ON_JOB_CLOSE 会在优雅关闭前
     /// 杀进程树。close 超时未收尾时，这里是最后的兜底。
+    ///
+    /// 没有进程沙箱的平台上该字段为 `None`：只 kill 直接子进程，后代
+    /// 进程不在清理边界内。
     _job: Option<JobGuard>,
     /// 进程是否真正进入沙箱，供 [`McpClientHandle::process_isolation`] 上报。
     process_isolation: bool,
@@ -269,9 +272,10 @@ impl RealMcpClient {
     /// 建进程沙箱、启动 Server 进程、纳入沙箱并完成握手。
     ///
     /// 握手超时只包住 `serve`，不包整个连接过程。取消 serve 的 future
-    /// 会 drop transport，rmcp 的 ChildWithCleanup 在 drop 时 kill 子进程，
-    /// `_job` 也随返回路径释放并整树兜底，"启动后握手未成"的清理无需
-    /// 额外代码。超时预算由调用方给出。
+    /// 会 drop transport，rmcp 的 ChildWithCleanup 在 drop 时 kill 子进程。
+    /// 有进程沙箱的平台（Windows）上 `_job` 也随返回路径释放并整树兜底，
+    /// "启动后握手未成"的清理无需额外代码；其他平台没有进程沙箱，只 kill
+    /// 直接子进程。超时预算由调用方给出。
     async fn connect(config: &config::McpServerConfig, handshake: Duration) -> Result<Self, McpError> {
         let mut command = tokio::process::Command::new(&config.command);
         command.args(&config.args);
@@ -519,9 +523,10 @@ fn tool_specs(server: &str, remote_tools: Vec<RmcpTool>) -> Vec<ToolSpec> {
 /// [`Connector`] 的真实实现：启动子进程、纳入沙箱、有界握手。
 ///
 /// 握手超时由 [`RealMcpClient::connect`] 处理。超时取消 `serve` 这一段，
-/// transport 随之 drop，rmcp 的 ChildWithCleanup 在 drop 时 kill 子进程，
-/// Job 句柄同时释放并整树兜底。清理无需额外代码，故障也能带上当时是否
-/// 进入 Job 的真实保护状态。
+/// transport 随之 drop，rmcp 的 ChildWithCleanup 在 drop 时 kill 子进程。
+/// 有进程沙箱的平台（Windows）上 Job 句柄同时释放并整树兜底；其他平台
+/// 没有进程沙箱，只 kill 直接子进程，后代进程需另行清理。清理无需额外
+/// 代码，故障也能带上当时是否进入 Job 的真实保护状态。
 struct TokioConnector {
     config: config::McpServerConfig,
 }
@@ -703,6 +708,7 @@ mod tests {
     use super::*;
     use crate::domain::evidence::AuditEvent;
     use crate::domain::mcp::{McpFaultKind, McpLifecycleKind};
+    use crate::domain::platform::Platform;
     use crate::domain::tool::OutcomeStatus;
     use crate::domain::workspace::WorkspaceRoot;
     use crate::application::memory_evidence::MemoryEvidenceSink;
@@ -1397,17 +1403,35 @@ mod tests {
         }
     }
 
-    /// Windows 下按 PID 查询进程是否存活。只看输出中的 PID 数字：tasklist
-    /// 的"没有匹配进程"提示随系统语言变化，数字不变。
-    #[cfg(windows)]
+    /// 按 PID 查询进程是否存活。只看输出中的 PID 数字：tasklist 的"没有
+    /// 匹配进程"提示随系统语言变化，数字不变。
+    ///
+    /// 非 Windows 用 `kill -0`：向进程发信号 0 只做存在性检查，不影响它。
+    /// 该调用在本进程内执行，命令本身不带副作用。
     fn process_alive(pid: &str) -> bool {
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
-            .expect("tasklist 应可运行");
-        String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .any(|token| token == pid)
+        let pid: i32 = pid.parse().unwrap_or(-1);
+        if pid <= 0 {
+            return false;
+        }
+        if Platform::current() == Platform::Windows {
+            let output = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+                .output()
+                .expect("tasklist 应可运行");
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .any(|token| token == pid.to_string())
+        } else {
+            // 信号 0 不投递信号，只检查进程是否存在与是否可发信号。
+            // 进程已退出或属于别的用户时返回非 0。
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
     }
 
     fn test_recorder() -> (Arc<McpLifecycleRecorder>, Arc<MemoryEvidenceSink>) {
@@ -1480,17 +1504,13 @@ mod tests {
             elapsed = started.elapsed()
         );
         // 超时取消 serve 会 drop transport，rmcp 的 ChildWithCleanup 在 drop
-        // 时 kill 子进程；Windows 上 Job 句柄同时释放并整树兜底。非 Windows
-        // 环境不执行这条，不做未经验证的假设。
-        #[cfg(windows)]
-        {
-            let pid = read_pid(&suffixed(&dir.join("counter.txt"), ".pid"));
-            assert!(
-                wait_until("子进程退出", Duration::from_secs(10), || !process_alive(&pid))
-                    .await,
-                "握手超时后子进程必须被清理，pid {pid} 仍存活"
-            );
-        }
+        // 时 kill 子进程；Windows 上 Job 句柄同时释放并整树兜底。子进程
+        // 是否真的退出用 PID 查证，各平台都能查，不做未经验证的假设。
+        let pid = read_pid(&suffixed(&dir.join("counter.txt"), ".pid"));
+        assert!(
+            wait_until("子进程退出", Duration::from_secs(10), || !process_alive(&pid)).await,
+            "握手超时后子进程必须被清理，pid {pid} 仍存活"
+        );
     }
 
     /// 应答握手但从第 1 次调用起沉默的 Server：调用超时记为结果未知，
@@ -1659,11 +1679,16 @@ mod tests {
         assert_eq!(counter_lines(&counter), 1, "关闭后的调用不许到达 Server");
     }
 
-    /// Windows Job Object：关闭连接时整树终止，孙进程（非 Harness 直接子
-    /// 进程）也会退出。这条进程语义无法用 mock 验证。
-    #[cfg(windows)]
+    /// 关闭连接时是否终止整棵进程树，按平台能力判定。
+    ///
+    /// 有进程沙箱的平台（Windows）必须把孙进程一并收掉：孙进程不是
+    /// Harness 的直接子进程，只有沙箱的整树终止能处理它。这条进程语义
+    /// 无法用 mock 验证。
+    ///
+    /// 没有进程沙箱的平台不声称保护：连接的边界 `active` 必须是 false。
+    /// 声称有保护而实际没有，比不声称更危险。
     #[tokio::test]
-    async fn closing_a_job_protected_server_terminates_the_whole_process_tree() {
+    async fn connection_termination_follows_the_detected_platform() {
         let dir = fixture_dir("tree-kill");
         let config = fixture_config(&dir, "with-child");
         let source = McpToolSource::connect_with(
@@ -1674,12 +1699,8 @@ mod tests {
         )
         .await
         .expect("夹具应能握手与发现");
-        // 这条测试以进程进入 Job 为前提，前提不成立就明确失败，不让整树
-        // 断言承担错误信号。
-        assert!(
-            source.managed().process_isolation().await,
-            "夹具进程应已纳入 Job（Windows 沙箱可用）"
-        );
+
+        let isolated = source.managed().process_isolation().await;
         let child_path = suffixed(&dir.join("counter.txt"), ".child");
         assert!(
             wait_until("孙进程 PID 文件", Duration::from_secs(5), || child_path.exists()).await
@@ -1687,34 +1708,23 @@ mod tests {
         let grandchild = read_pid(&child_path);
         assert!(process_alive(&grandchild), "关闭前孙进程应还活着");
 
-        source.managed().close().await;
-        assert!(
-            wait_until("孙进程退出", Duration::from_secs(10), || !process_alive(&grandchild))
-                .await,
-            "KILL_ON_JOB_CLOSE 必须把孙进程一并收掉，pid {grandchild} 仍存活说明整树终止失败"
-        );
-    }
-
-    /// 非 Windows 平台不声称进程保护：连接后边界的 active 必须为 false
-    /// （Windows 上应为 true，见树杀测试的前提断言）。
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn non_windows_connections_never_claim_protection() {
-        let dir = fixture_dir("no-claim");
-        let config = fixture_config(&dir, "ok");
-        let source = McpToolSource::connect_with(
-            &config,
-            Arc::new(TokioConnector { config: config.clone() }),
-            None,
-            subprocess_timeouts(),
-        )
-        .await
-        .expect("夹具应能握手与发现");
-        assert!(
-            !source.managed().process_isolation().await,
-            "没有进程沙箱的平台必须报无保护"
-        );
-        source.managed().close().await;
+        if PlatformCapabilities::detect().has_process_sandbox {
+            // 这条测试以进程进入沙箱为前提，前提不成立就明确失败，不让整树
+            // 断言承担错误信号。
+            assert!(isolated, "夹具进程应已纳入沙箱");
+            source.managed().close().await;
+            assert!(
+                wait_until("孙进程退出", Duration::from_secs(10), || !process_alive(&grandchild))
+                    .await,
+                "沙箱关闭必须把孙进程一并收掉，pid {grandchild} 仍存活说明整树终止失败"
+            );
+        } else {
+            assert!(
+                !isolated,
+                "没有进程沙箱的平台必须报无保护"
+            );
+            source.managed().close().await;
+        }
     }
 
     /// 脚本化连接源：状态机每次 `connect` 消费一个预置替身并计数。

@@ -4,15 +4,19 @@
 //! - **超时必须终止子进程**：否则 `cargo build` 等长命令会留下孤儿进程
 //!   继续占用 CPU，超时只让模型以为进程已停止。
 //! - **并发读取 stdout / stderr**：先读完一个再读另一个时，另一个的管道
-//!   缓冲区（Windows 上约 4KB）写满会导致子进程永久阻塞。
+//!   缓冲区写满会导致子进程永久阻塞。缓冲区大小因平台而异（Windows
+//!   上约 4KB，POSIX 上默认 64 KiB），两个都得防。
 //! - **环境脱敏**：dotenvy 把 `.env` 中的密钥放进了本进程环境，子进程
 //!   默认继承全部变量；不清洗时任何命令都能通过 `env | grep KEY` 读取。
 //! - **退出码非 0 记为 failed，但输出照常返回**：测试失败的线索在输出中，
 //!   模型需要依靠它修复问题。
 //! - **Windows 沙箱创建失败时拒绝执行**（fail-closed）：JobObject 是最后
 //!   一道机械防线，创建失败后让命令裸跑会掩盖"有沙箱"的错误假设。只有
-//!   平台本来未实现沙箱（非 Windows）和纳沙箱失败（子进程已启动的边界
-//!   情况）允许降级。
+//!   平台本来未实现沙箱（Linux、macOS 等）和纳沙箱失败（子进程已启动的
+//!   边界情况）允许降级。
+//! - **平台差异集中检测**：当前平台由 [`Platform::current`] 判定，shell
+//!   选择、进程沙箱是否存在、给模型看的保护范围说明都跟着它走。不同系统
+//!   的处理方式不同，写死在各自逻辑里必然漏一处。
 //! - **文件系统边界检查**：命令参数中出现指向 workspace 外的绝对路径、
 //!   UNC 路径或 `..` 穿越时**直接拒绝**，不进入审批升级。策略层的升级
 //!   流程仍作为纵深保留，这里的拒绝是最后一道。
@@ -25,6 +29,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 use crate::application::port::{BoxFuture, ToolInvoker};
+use crate::domain::platform::Platform;
 use crate::domain::sandbox::{
     write_escape_beyond, ExecutionBoundary, PlatformCapabilities, SandboxPolicy,
     SANDBOX_DOWNGRADE_NOTICE,
@@ -58,15 +63,22 @@ impl RunCommand {
     }
 
     /// 工具规格。
+    ///
+    /// 描述按当前平台生成：整树终止与资源上限是 Windows Job Object 的
+    /// 能力，写成无条件事实会让模型误以为其他平台也有。
     pub fn spec() -> ToolSpec {
+        let capabilities = PlatformCapabilities::detect();
+        let (shell, args) = capabilities.platform.shell();
+        let shell_args = args.join(" ");
         ToolSpec {
             name: RUN_COMMAND.to_owned(),
-            description: "在 workspace 根目录下用系统 shell（Windows: cmd，其他: sh）执行一条命令，\
-                          返回退出码、stdout 与 stderr。命令在受控进程组内执行：整树内存与进程数受限，\
-                          超时终止全部后代进程（不只是直接子进程），不要依赖超限资源或遗留后台进程。\
-                          超时默认 30 秒、上限 300 秒。环境变量中疑似密钥的条目\
-                          （名字含 key/token/secret/password/credential）不会传入子进程。"
-                .to_owned(),
+            description: format!(
+                "在 workspace 根目录下用系统 shell（{shell} {shell_args}）执行一条命令，\
+                 返回退出码、stdout 与 stderr。{}\
+                 超时默认 30 秒、上限 300 秒。环境变量中疑似密钥的条目\
+                 （名字含 key/token/secret/password/credential）不会传入子进程。",
+                capabilities.process_guard_summary()
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -123,17 +135,15 @@ fn looks_like_secret(name_lowercase: &str) -> bool {
         .any(|needle| name_lowercase.contains(needle))
 }
 
-/// 组装命令：Windows 使用 cmd /C，其他平台使用 sh -c。
+/// 组装命令：按当前平台选 shell。
 ///
-/// `cfg!` 是编译期判断，目标平台在构建时已确定，无需运行时探测。
+/// shell 的选择由 [`Platform::shell`] 给出，与二进制编译目标一致。
 fn shell_program(command: &str) -> (String, Vec<String>) {
-    if cfg!(windows) {
-        ("cmd".to_owned(), vec!["/C".to_owned(), command.to_owned()])
-    } else {
-        ("sh".to_owned(), vec!["-c".to_owned(), command.to_owned()])
-    }
+    let (program, args) = Platform::current().shell();
+    let mut full = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    full.push(command.to_owned());
+    (program.to_owned(), full)
 }
-
 /// 区分启动前拒绝、启动失败和启动后失败，供进程工具共用。
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RunError {
@@ -183,13 +193,18 @@ fn with_process_boundary(
     outcome.with_execution(ExecutionBoundary::process(sandbox_active, boundary_checked))
 }
 
-/// 在 `root` 下执行命令并捕获输出，供命令工具与 git 工具复用。
+/// 在 `root` 下执行命令并捕获输出。
 ///
-/// 命令在进程沙箱（Windows Job Object，见 `infrastructure::sandbox`）中
-/// 执行：整树内存与进程数受限，超时或句柄关闭时终止整树。
+/// 供基准运行器与本模块的测试复用；命令工具与 git 工具走
+/// [`run_with_policy`]，各自带自己的策略。
+///
+/// 命令在进程沙箱中执行。沙箱能力按当前平台判定（见
+/// [`PlatformCapabilities::detect`]）：Windows 上是 Job Object，整树内存
+/// 与进程数受限，超时或句柄关闭时终止整树；其余平台没有进程沙箱，
+/// 超时只终止直接子进程。
 ///
 /// 沙箱不可用时的处理：
-/// - 平台未实现（非 Windows）或 assign 失败：降级执行，不阻断命令。
+/// - 平台未实现（Linux、macOS 等）或 assign 失败：降级执行，不阻断命令。
 ///   `sandbox_active` 返回 false，调用方在模型可见文本中声明未受保护。
 /// - Windows 上创建失败：不执行命令，返回 [`RunError::Refused`]。
 ///
@@ -302,9 +317,16 @@ pub(crate) async fn run_with_policy(
             let _ = child.kill().await;
             let _ = child.wait().await;
             drop(sandbox);
+            // 收口范围按平台能力措辞。没有整树终止能力时说"已终止进程"
+            // 会让模型以为后台进程也被收掉了。
+            let killed = if PlatformCapabilities::detect().has_tree_kill {
+                "已终止整个进程树"
+            } else {
+                "已终止直接子进程，后代进程可能仍在运行，需要的话请自行清理"
+            };
             Err(RunError::Failed {
                 message: format!(
-                    "命令超时：{} 秒内未结束，已请求终止进程。长任务请拆小，或调大 timeout_seconds（上限 {} 秒）",
+                    "命令超时：{} 秒内未结束，{killed}。长任务请拆小，或调大 timeout_seconds（上限 {} 秒）",
                     timeout.as_secs(),
                     HARD_MAX_TIMEOUT_SECS
                 ),
@@ -397,12 +419,17 @@ mod tests {
         json!({"command": command})
     }
 
+    /// 正常命令必须成功，沙箱状态与当前平台一致。
+    ///
+    /// 沙箱是否生效由平台决定：Windows 上 Job Object 可用，其他平台没有
+    /// 进程沙箱，命令仍要跑通，只是没有保护。
     #[tokio::test]
-    async fn successful_command_runs_with_the_sandbox_active() {
-        // 回归保护：沙箱接入不能破坏正常命令，成功路径必须返回沙箱已生效
-        // 的事实，且不带未生效说明。
+    async fn successful_command_runs_and_reports_the_platform_sandbox_state() {
+        // 回归保护：沙箱接入不能破坏正常命令，成功路径必须返回真实的
+        // 边界事实，且不带未生效说明（生效时）。
         let root = temp_workspace("sandbox-ok");
         let cmd = tool(&root);
+        let capabilities = PlatformCapabilities::detect();
 
         let outcome = cmd.invoke(&call(run_args("echo ok"))).await;
 
@@ -410,21 +437,45 @@ mod tests {
         let raw = run_in_workspace(&WorkspaceRoot::new(root.clone()), "echo ok", Duration::from_secs(30))
             .await
             .expect("执行成功");
-        assert!(raw.sandbox_active, "Windows 上沙箱应实际生效");
-        assert!(
-            !outcome.content.contains("进程沙箱未生效"),
-            "沙箱生效时不应带未生效说明: {}",
-            outcome.content
+        assert_eq!(
+            raw.sandbox_active,
+            capabilities.has_process_sandbox,
+            "沙箱状态必须与平台能力一致"
         );
+        if capabilities.has_process_sandbox {
+            assert!(
+                !outcome.content.contains("进程沙箱未生效"),
+                "沙箱生效时不应带未生效说明: {}",
+                outcome.content
+            );
+        } else {
+            assert!(
+                outcome.content.starts_with("⚠️ 进程沙箱未生效"),
+                "没有进程沙箱的平台必须声明未受保护: {}",
+                outcome.content
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 超时必须终止整棵进程树。
+    ///
+    /// 受害进程 parent 再创建 child，两代各写各的日志：`<日志>.parent` 是
+    /// shell 的直接子进程，`<日志>.child` 是孙进程。1.5 秒超时后：
+    ///
+    /// - parent 日志必须停止增长。直接子进程在任何平台都要被收住，这是
+    ///   超时处理的底线。
+    /// - 有整树终止能力的平台，child 日志也必须停止增长。
+    /// - 没有整树终止能力的平台，child 会成为孤儿继续写。这是已知边界，
+    ///   不断言它停止，但要记在案里。
+    ///
+    /// 两代必须分文件：混在一个文件里，"直接子进程已死、孙进程还活着"
+    /// 与"两代都活着"看不出区别，断言会退化成恒真。
+    ///
+    /// 探针为 examples/sandbox-victim.rs。整树终止依赖平台能力，由
+    /// [`PlatformCapabilities::detect`] 判定。
     #[tokio::test]
     async fn timeout_kills_the_whole_process_tree() {
-        // 核心验收：整树终止。受害进程 parent 再创建 child，两代都写
-        // 日志；1.5 秒超时后日志必须停止增长。没有 Job 时 child 会成为
-        // 孤儿继续写，这是旧实现的缺陷。
-        // 探针为 examples/sandbox-victim.rs（无参数表示 parent 加 child）。
         let root = temp_workspace("killtree");
         let log = root.join("victim.log");
 
@@ -441,14 +492,32 @@ mod tests {
 
         // 给未被终止的进程留出两轮写入时间，再验证日志停止增长。
         tokio::time::sleep(Duration::from_millis(700)).await;
-        let lines_after_kill = count_lines(&log);
-        assert!(lines_after_kill > 0, "超时前 victim 应已写过日志");
+        let parent_after_kill = count_lines(&suffixed(&log, ".parent"));
+        let child_after_kill = count_lines(&suffixed(&log, ".child"));
+        assert!(parent_after_kill > 0, "超时前 victim 应已写过日志");
+        assert!(child_after_kill > 0, "孙进程应已建立自己的日志");
         tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let parent_now = count_lines(&suffixed(&log, ".parent"));
         assert_eq!(
-            count_lines(&log),
-            lines_after_kill,
-            "超时后日志必须停止增长：父与孙进程都被整树终止"
+            parent_now, parent_after_kill,
+            "直接子进程必须已终止，否则连它都没收住"
         );
+
+        let child_now = count_lines(&suffixed(&log, ".child"));
+        if PlatformCapabilities::detect().has_tree_kill {
+            assert_eq!(
+                child_now, child_after_kill,
+                "有整树终止能力时孙进程也必须停止写入"
+            );
+        } else {
+            // 没有整树终止能力时，孙进程成为孤儿继续写是已知边界。不断言
+            // 它停止，但要确认它确实还活着，否则这条分支就退化成恒真。
+            assert!(
+                child_now > child_after_kill,
+                "没有整树终止能力的平台上，孙进程应当继续写入（已知边界）"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -459,7 +528,10 @@ mod tests {
             .expect("测试进程路径")
             .parent()
             .and_then(|p| p.parent())
-            .map(|p| p.join("examples").join("sandbox-victim.exe"))
+            .map(|p| {
+                p.join("examples")
+                    .join(format!("sandbox-victim{}", std::env::consts::EXE_SUFFIX))
+            })
             .expect("定位探针");
         assert!(path.exists(), "探针未编译（cargo test 会编 examples）: {}", path.display());
         path
@@ -471,77 +543,80 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Windows：沙箱创建失败时拒绝执行（fail-closed）。
+    /// 给路径追加后缀，与受害探针的分日志约定保持一致。
+    fn suffixed(path: &std::path::Path, suffix: &str) -> PathBuf {
+        let mut text = path.as_os_str().to_owned();
+        text.push(suffix);
+        PathBuf::from(text)
+    }
+
+    /// 沙箱不可用时的两条路径由平台能力决定，走不同结局。
     ///
-    /// 使用明确未实现的 `cpu_time` 限额稳定触发创建失败，不依赖宿主机
-    /// 权限或资源耗尽。降级裸跑会让模型和策略误以为有沙箱，因此 Windows
-    /// 上无法创建沙箱就不执行；非 Windows 平台未实现时才降级。
-    #[cfg(windows)]
+    /// - 平台有进程沙箱（Windows）：创建失败时拒绝执行（fail-closed）。
+    ///   用明确未实现的 `cpu_time` 限额稳定触发创建失败，不依赖宿主机权限
+    ///   或资源耗尽。降级裸跑会让模型和策略误以为有沙箱，因此无法创建
+    ///   沙箱就不执行。
+    /// - 平台没有进程沙箱（Linux、macOS 等）：降级执行，并在输出开头
+    ///   说明。"平台本来没有能力"与"有能力但创建失败"必须走不同分支。
+    ///   前者若拒绝执行，该平台将完全无法运行命令；后者拒绝执行才是
+    ///   正确行为。
+    ///
+    /// 两条断言都在每个平台真实执行，不靠编译期门控跳过。
     #[tokio::test]
-    async fn sandbox_creation_failure_refuses_the_command() {
-        let root = temp_workspace("sandbox-failclosed");
+    async fn sandbox_availability_follows_the_detected_platform() {
+        let root = temp_workspace("sandbox-policy");
         let mut cmd = tool(&root);
         cmd.policy.cpu_time = Some(Duration::from_secs(1));
 
-        let outcome = cmd
-            .invoke(&call(run_args("echo should_not_run > ran.txt")))
-            .await;
+        if PlatformCapabilities::detect().has_process_sandbox {
+            let outcome = cmd
+                .invoke(&call(run_args("echo should_not_run > ran.txt")))
+                .await;
 
-        // 拒绝与失败是两种结局：命令没有运行，失败表示跑过但未成功。
-        // 证据必须能分辨；`SandboxApplied` 只为实际执行的命令记录。
-        assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
-        assert!(outcome.content.contains("沙箱创建失败"), "{}", outcome.content);
-        assert!(outcome.content.contains("fail-closed"), "{}", outcome.content);
-        assert!(outcome.execution.is_none(), "没启动进程就不能发边界证据");
-        assert!(!root.join("ran.txt").exists(), "创建失败时命令不得执行");
-        // 拒绝执行与降级执行不能同时出现：前者表示没跑，后者表示跑过但无保护。
-        assert!(
-            !outcome.content.contains("进程沙箱未生效"),
-            "拒绝执行时不该再给降级说明: {}",
-            outcome.content
-        );
+            // 拒绝与失败是两种结局：命令没有运行，失败表示跑过但未成功。
+            // 证据必须能分辨；`SandboxApplied` 只为实际执行的命令记录。
+            assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
+            assert!(outcome.content.contains("沙箱创建失败"), "{}", outcome.content);
+            assert!(outcome.content.contains("fail-closed"), "{}", outcome.content);
+            assert!(outcome.execution.is_none(), "没启动进程就不能发边界证据");
+            assert!(!root.join("ran.txt").exists(), "创建失败时命令不得执行");
+            // 拒绝执行与降级执行不能同时出现：前者表示没跑，后者表示跑过但无保护。
+            assert!(
+                !outcome.content.contains("进程沙箱未生效"),
+                "拒绝执行时不该再给降级说明: {}",
+                outcome.content
+            );
 
-        let error = match run_with_policy(&cmd.root, "echo ok", Duration::from_secs(30), &cmd.policy)
-            .await
-        {
-            Ok(_) => panic!("沙箱创建失败必须向上传播错误而不是降级"),
-            Err(RunError::Refused(message)) => message,
-            Err(other) => panic!("创建失败必须是拒绝: {other}"),
-        };
-        assert!(error.contains("沙箱创建失败"), "{error}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
+            let error = match run_with_policy(&cmd.root, "echo ok", Duration::from_secs(30), &cmd.policy)
+                .await
+            {
+                Ok(_) => panic!("沙箱创建失败必须向上传播错误而不是降级"),
+                Err(RunError::Refused(message)) => message,
+                Err(other) => panic!("创建失败必须是拒绝: {other}"),
+            };
+            assert!(error.contains("沙箱创建失败"), "{error}");
+        } else {
+            let outcome = cmd
+                .invoke(&call(run_args("echo downgrade_ok > ran.txt")))
+                .await;
 
-    /// 非 Windows：平台未实现进程沙箱时降级执行，并在输出开头说明。
-    ///
-    /// "平台本来没有能力"与"有能力但创建失败"必须走不同分支。前者若拒绝
-    /// 执行，该平台将完全无法运行命令；后者拒绝执行才是正确行为。
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn unsupported_platform_degrades_with_a_visible_notice() {
-        let root = temp_workspace("sandbox-downgrade");
-        let cmd = tool(&root);
+            assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+            assert!(
+                outcome.content.starts_with("⚠️ 进程沙箱未生效"),
+                "{}",
+                outcome.content
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("ran.txt")).unwrap().trim(),
+                "downgrade_ok"
+            );
 
-        let outcome = cmd
-            .invoke(&call(run_args("echo downgrade_ok > ran.txt")))
-            .await;
-
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        assert!(
-            outcome.content.starts_with("⚠️ 进程沙箱未生效"),
-            "{}",
-            outcome.content
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("ran.txt")).unwrap().trim(),
-            "downgrade_ok"
-        );
-
-        let raw = run_in_workspace(&cmd.root, "echo ok", Duration::from_secs(30))
-            .await
-            .expect("不支持沙箱不该阻断命令");
-        assert!(!raw.sandbox_active);
-        assert_eq!(raw.code, 0);
+            let raw = run_in_workspace(&cmd.root, "echo ok", Duration::from_secs(30))
+                .await
+                .expect("不支持沙箱不该阻断命令");
+            assert!(!raw.sandbox_active);
+            assert_eq!(raw.code, 0);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -578,16 +653,26 @@ mod tests {
         }
 
         // 对照：workspace 内的读写照旧放行，否则这条检查就成了禁用 run_command。
-        let outcome = cmd.invoke(&call(run_args("type inside.txt"))).await;
+        // `type` 是 cmd 的内置命令，POSIX 的 `type` 语义不同（查命令而非
+        // 读文件），读文件用 `cat`。
+        let read_file = if Platform::current() == Platform::Windows {
+            "type inside.txt"
+        } else {
+            "cat inside.txt"
+        };
+        let outcome = cmd.invoke(&call(run_args(read_file))).await;
         assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
         assert!(outcome.execution.is_some(), "真启动的命令要带边界事实");
 
         // 根内绝对路径同样放行。模型常写 `type D:\repo\src\main.rs`，
         // 硬拒绝必须识别出该路径位于根内。
         let absolute = root.join("inside.txt");
-        let outcome = cmd
-            .invoke(&call(run_args(&format!("type {}", absolute.display()))))
-            .await;
+        let read_absolute = if Platform::current() == Platform::Windows {
+            format!("type {}", absolute.display())
+        } else {
+            format!("cat {}", absolute.display())
+        };
+        let outcome = cmd.invoke(&call(run_args(&read_absolute))).await;
         assert_eq!(
             outcome.status,
             OutcomeStatus::Success,
@@ -597,7 +682,12 @@ mod tests {
 
         // 分段后的收窄与放行：越界藏在第二段仍会被拒绝，且理由要点名
         // 该段。整串扫描也能发现越界，但理由中的动词与段号必须准确。
-        let chained = format!("type inside.txt && echo x > {}", outside_target());
+        let first_segment = if Platform::current() == Platform::Windows {
+            "type inside.txt"
+        } else {
+            "cat inside.txt"
+        };
+        let chained = format!("{first_segment} && echo x > {}", outside_target());
         let outcome = cmd.invoke(&call(run_args(&chained))).await;
         assert_eq!(
             outcome.status,
@@ -669,9 +759,8 @@ mod tests {
         let root = temp_workspace("ok");
         let cmd = tool(&root);
 
-        // Windows 与 Unix 各用一句最朴素的 echo。
-        let command = if cfg!(windows) { "echo hello_from_shell" } else { "echo hello_from_shell" };
-        let outcome = cmd.invoke(&call(run_args(command))).await;
+        // echo 在 cmd 与 sh 下都是同一条命令，无需分平台。
+        let outcome = cmd.invoke(&call(run_args("echo hello_from_shell"))).await;
 
         assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
         assert!(outcome.content.contains("退出码: 0"), "{}", outcome.content);
@@ -683,24 +772,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 给模型看的描述必须与当前平台的实际能力一致。
+    ///
+    /// 描述是模型唯一的平台信息来源：它据此判断超时会不会留下后台进程。
+    /// 平台没有进程沙箱却声称"超时终止全部后代进程"，模型会放心地留下
+    /// 不再等待的进程，孤儿进程在宿主机上继续跑。
+    #[test]
+    fn the_model_facing_description_matches_the_platform_capabilities() {
+        let capabilities = PlatformCapabilities::detect();
+        let description = RunCommand::spec().description;
+
+        let (shell, args) = capabilities.platform.shell();
+        assert!(
+            description.contains(&format!("{shell} {}", args.join(" "))),
+            "描述必须写明本平台用的 shell: {description}"
+        );
+        if capabilities.has_process_sandbox {
+            assert!(
+                description.contains("整树内存与进程数受限"),
+                "有进程沙箱的平台应说明资源上限: {description}"
+            );
+            assert!(
+                description.contains("超时终止全部后代进程"),
+                "有整树终止能力时应说明超时收得干净: {description}"
+            );
+        } else {
+            assert!(
+                description.contains("没有进程沙箱"),
+                "没有进程沙箱的平台必须说明这一点: {description}"
+            );
+            assert!(
+                description.contains("超时只终止直接子进程"),
+                "没有整树终止能力时必须说明残留风险: {description}"
+            );
+            assert!(
+                !description.contains("超时终止全部后代进程"),
+                "不能声称本平台做不到的事: {description}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn command_runs_in_the_workspace_root() {
         let root = temp_workspace("cwd");
         let cmd = tool(&root);
 
         // 打印当前目录，确认子进程的 cwd 是 workspace 根。
-        let command = if cfg!(windows) { "cd" } else { "pwd" };
+        let command = if Platform::current() == Platform::Windows {
+            "cd"
+        } else {
+            "pwd"
+        };
         let outcome = cmd.invoke(&call(run_args(command))).await;
 
         assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
         let canonical_root = root.canonicalize().unwrap().to_string_lossy().into_owned();
-        let canonical_result = {
-            // 输出里可能带引号或换行，宽松匹配路径的核心段。
-            let lowered = outcome.content.to_lowercase();
-            let root_lower = canonical_root.to_lowercase();
-            root_lower.is_empty() || lowered.contains(&root_lower.replace("\\\\?\\", ""))
+        // 比较口径跟平台的文件系统语义走：Windows 与 macOS 不区分大小写，
+        // Linux 区分。全平台都折小写会让 Linux 上的断言变松。
+        let expected = if Platform::current().has_case_insensitive_paths() {
+            canonical_root.to_lowercase()
+        } else {
+            canonical_root.clone()
         };
-        assert!(canonical_result, "输出应包含 workspace 路径: {}\nroot: {canonical_root}", outcome.content);
+        let actual = if Platform::current().has_case_insensitive_paths() {
+            outcome.content.to_lowercase()
+        } else {
+            outcome.content.clone()
+        };
+        // 输出里可能带引号或换行，宽松匹配路径的核心段。
+        assert!(
+            expected.is_empty() || actual.contains(&expected.replace("\\\\?\\", "")),
+            "输出应包含 workspace 路径: {}\nroot: {canonical_root}",
+            outcome.content
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -710,7 +854,7 @@ mod tests {
         let cmd = tool(&root);
 
         // 用一条退出码非 0 且带输出的命令。
-        let command = if cfg!(windows) {
+        let command = if Platform::current() == Platform::Windows {
             "echo before_fail & exit /b 7"
         } else {
             "echo before_fail; exit 7"
@@ -752,10 +896,17 @@ mod tests {
             .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
-        // Windows 上 cmd /C 执行不存在的命令时，cmd 本身启动成功，
-        // 错误以非 0 退出码和 stderr 文本返回。这符合"非 0 记为 failed
-        // 但必须返回输出"的约定，模型能读到原因。
-        assert!(outcome.content.contains("退出码: 1"), "{}", outcome.content);
+        // shell 本身启动成功，报错以非 0 退出码和 stderr 文本返回。这符合
+        // "非 0 记为 failed 但必须返回输出"的约定，模型能读到原因。
+        //
+        // 退出码按 shell 而定：`cmd /C` 找不到命令返回 1，`sh -c` 返回
+        // 127。这里断言"非 0"而不是某个具体数字，否则测试在另一个平台上
+        // 必红。
+        assert!(
+            outcome.content.contains("退出码: 1") || outcome.content.contains("退出码: 127"),
+            "{}",
+            outcome.content
+        );
         assert!(!outcome.content.trim().ends_with("── stderr ──"), "stderr 应有报错文本");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -767,7 +918,7 @@ mod tests {
 
         // 命令休眠 3 秒后写标记文件。若超时只返回错误而进程仍存活，
         // 标记会在 3 秒后写出；进程被终止时标记不会出现。
-        let command = if cfg!(windows) {
+        let command = if Platform::current() == Platform::Windows {
             "ping -n 3 127.0.0.1 >nul & echo done > killed_marker.txt"
         } else {
             "sleep 3 && echo done > killed_marker.txt"
@@ -799,7 +950,7 @@ mod tests {
 
         // 对照组：同样休眠后写标记，但给足超时。这证明标记机制本身可靠，
         // 上一个测试中标记缺席是因为进程被终止；命令已经启动。
-        let command = if cfg!(windows) {
+        let command = if Platform::current() == Platform::Windows {
             "ping -n 2 127.0.0.1 >nul & echo done > alive_marker.txt"
         } else {
             "sleep 1 && echo done > alive_marker.txt"
@@ -826,7 +977,7 @@ mod tests {
         }
 
         // 一条命令同时回显两个变量。
-        let command = if cfg!(windows) {
+        let command = if Platform::current() == Platform::Windows {
             "echo KEY=%LLM_API_KEY% PLAIN=%QCH_PLAIN_VAR%"
         } else {
             "echo KEY=$LLM_API_KEY PLAIN=$QCH_PLAIN_VAR"
@@ -869,15 +1020,22 @@ mod tests {
         assert_eq!(clamp_output(short, 8000), "短文本");
     }
 
+    /// shell 的选择必须与平台检测一致。
+    ///
+    /// 判据不重复 `Platform::current` 的实现，直接比对该平台给出的 shell，
+    /// 否则实现写错时测试会跟着错。
     #[test]
     fn shell_program_picks_per_platform() {
         let (program, args) = shell_program("cargo test");
-        if cfg!(windows) {
-            assert_eq!(program, "cmd");
-            assert_eq!(args, vec!["/C", "cargo test"]);
-        } else {
-            assert_eq!(program, "sh");
-            assert_eq!(args, vec!["-c", "cargo test"]);
-        }
+        let (expected_program, expected_args) = Platform::current().shell();
+        assert_eq!(program, expected_program);
+        assert_eq!(
+            args,
+            expected_args
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .chain(std::iter::once("cargo test".to_owned()))
+                .collect::<Vec<_>>()
+        );
     }
 }

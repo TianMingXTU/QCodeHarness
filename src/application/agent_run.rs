@@ -7,13 +7,12 @@
 //! 生成拒绝观察；达到 `max_turns` 或收到空回复时报错。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::application::error::ApplicationError;
 use crate::application::port::{
-    ApprovalGate, ApprovalRequest, Clock, EvidenceSink, ModelGateway, ModelReply, ModelRequest,
-    RunHooks,
+    ApprovalGate, ApprovalRequest, CancelHandle, Clock, EvidenceSink, ModelGateway, ModelReply,
+    ModelRequest, RunHooks,
 };
 use crate::application::agent_roster::AgentRoster;
 use crate::application::context_policy::ContextPolicy;
@@ -43,7 +42,11 @@ pub const APPROVAL_REASK_REASON: &str =
     "这个审批请求之前就问过，那时没答复；恢复后需要你重新决定一次。";
 
 /// 重放提示中给出的原因。
-pub const REPLAY_REASON: &str = "中断发生在这次调用执行期间，副作用可能已经发生，结果未知";
+///
+/// 快照在调用发起**之前**落盘，因此无法确认该调用到底有没有真正开始
+/// 执行。措辞按这个不确定度写：既不能说"已执行"，也不能说"未执行"。
+pub const REPLAY_REASON: &str =
+    "中断发生在这次调用执行期间，无法确认它是否真的执行过，副作用可能已经发生，结果未知";
 
 /// 运行状态机。
 ///
@@ -89,28 +92,6 @@ pub struct PendingRound {
     pub turn: AgentTurn,
     /// 与 `turn.calls` 同下标一一对应。
     pub outcomes: Vec<ToolOutcome>,
-}
-
-/// 协作式取消开关，`run()` 在每轮调用模型前检查。
-///
-/// 通过 [`AgentRunner::cancel_handle`] 交给外部。取消不会打断正在执行的
-/// 工具（run_command 有自己的超时），从下一个安全点（下一轮模型调用前）
-/// 生效。
-#[derive(Debug, Clone, Default)]
-pub struct CancelHandle {
-    cancelled: Arc<AtomicBool>,
-}
-
-impl CancelHandle {
-    /// 请求取消当前运行。
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-    }
-
-    /// 是否已被请求取消。
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
-    }
 }
 
 /// `AgentRunner` 的全部外部依赖。
@@ -294,6 +275,7 @@ impl AgentRunner {
             hooks,
         };
         runner.refresh_role_boundary();
+        runner.bind_cancel_to_gate();
         runner
     }
 
@@ -413,10 +395,19 @@ impl AgentRunner {
             hooks,
         };
         runner.refresh_role_boundary();
+        runner.bind_cancel_to_gate();
         // 半轮状态各有各的恢复语义，翻译成"接下来该怎么走"。
         runner.apply_resume_semantics();
         runner.save_snapshot();
         Ok(runner)
+    }
+
+    /// 把取消通道交给审批闸门。
+    ///
+    /// 闸门要能表达"中止整个运行"，就得有请求取消的手段。runner 持有
+    /// [`CancelHandle`]，闸门拿到的是它的副本：两边看到同一个开关。
+    fn bind_cancel_to_gate(&self) {
+        self.approvals.bind_cancel(self.cancel.clone());
     }
 
     /// 把快照里的半轮状态转换为后续执行路径。
@@ -599,8 +590,9 @@ impl AgentRunner {
     /// 会把写工具放行。
     ///
     /// `in_flight` 表示该调用为中断时正在执行的调用。越权时需额外说明
-    /// "它可能已经执行过"：角色边界只约束**当前**能否调用，而该调用可能在
-    /// 中断前已经执行。只说"不允许调用"会让模型误以为从未执行，从而原样重提。
+    /// "它是否执行过无法确认"：角色边界只约束**当前**能否调用，而该调用
+    /// 可能在中断前已经执行过。只说"不允许调用"会让模型误以为从未执行，
+    /// 从而原样重提。
     async fn refuse_out_of_role(
         &mut self,
         call: &ToolCall,
@@ -611,7 +603,7 @@ impl AgentRunner {
         };
         let reason = if in_flight {
             format!(
-                "{reason}（另注：这次调用在中断前已经发起，可能已经执行过；\
+                "{reason}（另注：这次调用在中断前可能已经发起，无法确认是否执行过；\
                  上面这条拒绝只说明现在不能执行它。）"
             )
         } else {
@@ -624,8 +616,8 @@ impl AgentRunner {
 
     /// 判断调用是否为中断时正在执行的调用。
     ///
-    /// 若是，它可能已产生副作用。恢复时不自动重跑，将决定权交回模型
-    /// （见 [`AgentRunner::replay_interrupted_call`]）。
+    /// 若是，它是否产生过副作用无法确认。恢复时不自动重跑，将决定权交回
+    /// 模型（见 [`AgentRunner::replay_interrupted_call`]）。
     fn is_in_flight(&self, call: &ToolCall) -> bool {
         self.replay_pending
             .as_ref()
@@ -673,8 +665,8 @@ impl AgentRunner {
     /// 会让同一次副作用执行两遍，当作没发生过则可能漏掉关键输出。处理方式：
     ///
     /// 1. 记录一条 [`AuditEvent::ToolCallReplayed`] 证据；
-    /// 2. 向模型返回观察，说明该调用此前已执行、结果是什么、是否重试由模型
-    ///    决定；
+    /// 2. 向模型返回观察，说明该调用是否执行过无法确认、已知结果是什么、
+    ///    是否重试由模型决定；
     /// 3. 本轮照常配平，模型下一轮能看到提示并自行决定。
     async fn replay_interrupted_call(
         &mut self,
@@ -781,8 +773,8 @@ impl AgentRunner {
                     }
                     return Ok(state);
                 }
-                // 恢复路径：该调用在中断前已发起，可能已产生副作用。不自动
-                // 重跑，把执行事实告诉模型，由它决定是否重试。
+                // 恢复路径：该调用在中断前可能已发起，无法确认是否执行过。
+                // 不自动重跑，把这个不确定度告诉模型，由它决定是否重试。
                 if in_flight {
                     return self.replay_interrupted_call(call).await;
                 }
@@ -1332,8 +1324,8 @@ fn replay_notice(call: &ToolCall, previous: Option<&ToolOutcome>) -> String {
         None => "这次执行的结果未知（中断就发生在它执行期间）。".to_owned(),
     };
     format!(
-        "【中断恢复】工具 `{}` 在中断前已经发起执行，可能已经产生了副作用，\
-         因此**没有自动再跑一次**。{known}\
+        "【中断恢复】工具 `{}` 在中断前可能已经发起执行，是否真的执行过无法确认，\
+         副作用也可能已经产生，因此**没有自动再跑一次**。{known}\
          要不要再执行一次由你判断：需要就重新发起同一个调用，\
          不需要就用现有信息继续。",
         call.name
@@ -3875,6 +3867,37 @@ mod tests {
             panic!("应当是 tool 结果内容");
         };
         result.content[0].as_text().unwrap().to_owned()
+    }
+
+    /// 半轮快照的调用清单必须与待配平轮次一致。
+    ///
+    /// 不一致时恢复入口会拒绝加载，这份快照永远用不了。夹具若对不上，
+    /// 只做 JSON 往返的测试照样通过，问题会藏到真正的恢复路径上。
+    #[test]
+    fn a_half_round_snapshot_whose_call_lists_disagree_cannot_be_resumed() {
+        let mut snapshot = dispatching_snapshot(write_call("call_1"));
+        // 状态机只记了一条调用，待配平轮次里有两条：两者对不上。
+        let pending = snapshot.pending.as_mut().expect("夹具带 pending");
+        pending.turn.calls.push(write_call("call_2"));
+
+        let mock = MockCompletionModel::from_turns(vec![MockTurn::text("不会用到")]);
+        let error = AgentRunner::resume(
+            snapshot,
+            resume_deps(
+                &mock,
+                Arc::new(RecordingInvoker::default()),
+                Arc::new(MemoryEvidenceSink::new()),
+                Arc::new(CountingGate::default()),
+                PolicyEngine::new(),
+            ),
+        )
+        .err()
+        .expect("调用清单不一致的快照必须被拒绝");
+
+        assert!(
+            error.to_string().contains("调用清单"),
+            "拒绝理由要指出是哪一处不一致: {error}"
+        );
     }
 
     /// 恢复时，中断时正在执行的调用**不自动重跑**。
