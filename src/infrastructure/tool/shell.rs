@@ -394,13 +394,28 @@ mod tests {
     use crate::domain::ids::CallId;
     use crate::domain::tool::OutcomeStatus;
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn temp_workspace(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("qch-shell-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时目录");
         dir
+    }
+
+    /// 从渲染后的观察文本里取出 stdout 段。
+    ///
+    /// 输出是"退出码 / ── stdout ── / 内容 / ── stderr ── / 内容"四段，
+    /// 整段拿去当路径用会把格式噪声一起比进去。
+    fn stdout_section(content: &str) -> &str {
+        const MARKER: &str = "── stdout ──";
+        let start = content
+            .find(MARKER)
+            .map(|index| index + MARKER.len())
+            .unwrap_or(0);
+        let rest = &content[start..];
+        let end = rest.find("\n── stderr ──").unwrap_or(rest.len());
+        rest[..end].trim()
     }
 
     fn tool(root: &PathBuf) -> RunCommand {
@@ -461,13 +476,18 @@ mod tests {
     /// 超时必须终止整棵进程树。
     ///
     /// 受害进程 parent 再创建 child，两代各写各的日志：`<日志>.parent` 是
-    /// shell 的直接子进程，`<日志>.child` 是孙进程。1.5 秒超时后：
+    /// harness 直接子进程写的，`<日志>.child` 是孙进程写的。1.5 秒超时后：
     ///
     /// - parent 日志必须停止增长。直接子进程在任何平台都要被收住，这是
     ///   超时处理的底线。
     /// - 有整树终止能力的平台，child 日志也必须停止增长。
     /// - 没有整树终止能力的平台，child 会成为孤儿继续写。这是已知边界，
     ///   不断言它停止，但要记在案里。
+    ///
+    /// POSIX 上命令带 `exec`：shell 顶替成受害进程，它才是 harness 的直接
+    /// 子进程，超时收住直接子进程时必然跟着死。不带 exec 时 shell 会
+    /// fork，受害进程成了后代，只有整树终止能力才能收住它——那是
+    /// Windows 的语义，不是 POSIX 的。
     ///
     /// 两代必须分文件：混在一个文件里，"直接子进程已死、孙进程还活着"
     /// 与"两代都活着"看不出区别，断言会退化成恒真。
@@ -479,9 +499,14 @@ mod tests {
         let root = temp_workspace("killtree");
         let log = root.join("victim.log");
 
+        let command = if Platform::current() == Platform::Windows {
+            format!("{} {}", victim_exe().display(), log.display())
+        } else {
+            format!("exec {} {}", victim_exe().display(), log.display())
+        };
         let outcome = run_in_workspace(
             &WorkspaceRoot::new(root.clone()),
-            &format!("{} {}", victim_exe().display(), log.display()),
+            &command,
             Duration::from_millis(1500),
         )
         .await;
@@ -826,23 +851,33 @@ mod tests {
         let outcome = cmd.invoke(&call(run_args(command))).await;
 
         assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        let canonical_root = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        // 比的是"两条路径指向同一个目录"，不是两串文本：Windows 上 `cd`
+        // 可能打印 8.3 短名（RUNNER~1），macOS 上 /tmp 是 /private/tmp 的
+        // 软链。两侧都 canonicalize 之后才是同一串可比的路径。
+        let printed = stdout_section(&outcome.content);
+        let actual = Path::new(printed)
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("输出应是可解析的当前目录: {printed} ({error})"))
+            .to_string_lossy()
+            .into_owned();
+        let expected = root
+            .canonicalize()
+            .expect("workspace 根应存在")
+            .to_string_lossy()
+            .into_owned();
         // 比较口径跟平台的文件系统语义走：Windows 与 macOS 不区分大小写，
         // Linux 区分。全平台都折小写会让 Linux 上的断言变松。
-        let expected = if Platform::current().has_case_insensitive_paths() {
-            canonical_root.to_lowercase()
-        } else {
-            canonical_root.clone()
+        let fold = |text: &str| {
+            if Platform::current().has_case_insensitive_paths() {
+                text.to_lowercase()
+            } else {
+                text.to_owned()
+            }
         };
-        let actual = if Platform::current().has_case_insensitive_paths() {
-            outcome.content.to_lowercase()
-        } else {
-            outcome.content.clone()
-        };
-        // 输出里可能带引号或换行，宽松匹配路径的核心段。
-        assert!(
-            expected.is_empty() || actual.contains(&expected.replace("\\\\?\\", "")),
-            "输出应包含 workspace 路径: {}\nroot: {canonical_root}",
+        assert_eq!(
+            fold(&actual),
+            fold(&expected),
+            "输出应指向 workspace 根: {}\nroot: {expected}",
             outcome.content
         );
         let _ = std::fs::remove_dir_all(&root);

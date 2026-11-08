@@ -1,0 +1,54 @@
+name: 缺陷报告
+description: 报告一个可复现的问题
+title: "[缺陷] "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: platform
+    attributes:
+      label: 平台与版本
+      description: 操作系统、`cargo -V` 的 Rust 版本、QCodeHarness 版本。平台直接决定沙箱行为——Windows 才有 Job Object 进程沙箱与整树终止，其他平台没有进程沙箱，只做降级执行。
+      placeholder: |
+        操作系统：Windows 11
+        Rust：rustc 1.99.1
+        QCodeHarness：0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: model
+    attributes:
+      label: 模型配置
+      description: LLM_BASE_URL 与模型名。**不要粘贴 LLM_API_KEY，也不要粘贴 .env 全文。**
+      placeholder: |
+        LLM_BASE_URL: https://api.deepseek.com/v1
+        LLM_MODEL: deepseek-chat
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 任务怎么发起的（自定义任务，还是 benchmarks 里的任务 id）、完整命令行、工作目录。
+      placeholder: |
+        工作目录：D:\Code\demo
+        命令：cargo run -- "修复失败的测试"
+        任务：benchmarks/off-by-one
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据
+      description: .qcodeharness/sessions/<session_id>.jsonl 的相关片段，或 cargo run -- --report 的输出。审计事件不含凭据与环境变量，但含模型输出文本与工具输出——贴之前删掉密钥与业务数据。
+      placeholder: |
+        <session_id>.jsonl 的相关几行，或 --report 的输出
+    validations:
+      required: false
+  - type: textarea
+    id: expectation
+    attributes:
+      label: 期望与实际
+      description: 期望是什么，实际是什么。如果有报错，原样贴出来。
+    validations:
+      required: true

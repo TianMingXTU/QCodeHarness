@@ -144,6 +144,7 @@ impl WorkspacePath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::platform::Platform;
 
     /// 词法校验不要求 workspace 真实存在。
     fn workspace() -> WorkspaceRoot {
@@ -158,9 +159,24 @@ mod tests {
 
     #[test]
     fn rejects_absolute_paths() {
-        assert!(WorkspacePath::resolve(&workspace(), "C:/Windows/system32").is_err());
-        // `/etc/passwd` 在 Windows 上不是 is_absolute，但含 RootDir，同样要拒绝。
-        assert!(WorkspacePath::resolve(&workspace(), "/etc/passwd").is_err());
+        // 带根分量的路径在任何平台上都是绝对路径，必须被拒绝。
+        assert!(
+            WorkspacePath::resolve(&workspace(), "/etc/passwd").is_err(),
+            "带根分量的路径必须被拒绝"
+        );
+        // 盘符路径只在 Windows 上算绝对路径。POSIX 上 `C:/Windows/system32`
+        // 是普通相对路径，落在 workspace 内，不是越界——判据跟着平台语义走。
+        let drive_path = "C:/Windows/system32";
+        if Platform::current() == Platform::Windows {
+            assert!(
+                WorkspacePath::resolve(&workspace(), drive_path).is_err(),
+                "Windows 上盘符路径是绝对路径，必须被拒绝"
+            );
+        } else {
+            let resolved = WorkspacePath::resolve(&workspace(), drive_path)
+                .expect("POSIX 上盘符路径是相对路径，落在 workspace 内");
+            assert_eq!(resolved.as_path(), workspace().as_path().join(drive_path));
+        }
     }
 
     #[test]

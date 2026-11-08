@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/TianMingXTU/QCodeHarness/security/advisories/new
+    about: 漏洞走私密通道，不要开公开 issue——本项目会读到模型凭据并写入用户工作区。
