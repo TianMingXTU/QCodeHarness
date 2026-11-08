@@ -258,6 +258,11 @@ cargo run --example custom-tool-source    # 内置工具与自定义 ToolSource 
 cargo run -- "阅读 Cargo.toml，说明本项目用了哪些依赖"
 ```
 
+也可以直接用发行包里的可执行文件，不必装 Rust 工具链：
+[Releases 页面](https://github.com/TianMingXTU/QCodeHarness/releases)
+有 Windows、Linux、macOS 的压缩包，解压后运行 `QCodeHarness`（Windows 下是
+`QCodeHarness.exe`），用法与 `cargo run --` 一致。
+
 任务按模板编排执行（默认 `bug-fix`，见[任务编排](#任务编排)一节）：控制台先打印任务、模板与审批模式，然后在同一个会话里依次跑完各步骤的 ReAct 循环（轮次号跨步连续，分隔线、`[思考]`、`[行动]`、`[观察]`），结束是 `──── 最终答案 ────` 与一行汇总（任务 ID、完成步数、会话 ID）。
 
 ## 缺陷修复演练（隔离仓库）

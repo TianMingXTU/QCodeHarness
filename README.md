@@ -56,6 +56,10 @@ cargo run -- "阅读 Cargo.toml，说明本项目用了哪些依赖"
 `.qcodeharness/sessions/*.jsonl`。第 3 步才需要你自己的模型服务，
 完整环境变量表见[运行方式](docs/usage.md)。
 
+不想装 Rust 工具链的话，[Releases 页面](https://github.com/TianMingXTU/QCodeHarness/releases)
+有 Windows、Linux、macOS 的压缩包，解压后直接运行 `QCodeHarness`，
+用法与上面一致。
+
 > 仓库里**没有**免密钥就能看到完整 ReAct 循环的入口：第 1 步展示工具与注册表，
 > 第 3 步才展示模型驱动的完整循环。
 
