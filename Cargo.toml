@@ -3,6 +3,13 @@ name = "QCodeHarness"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
+description = "Rust 实现的 AI 编程执行框架：工具调用、权限审批、MCP 接入、跨平台沙箱与可审计证据"
+license = "MIT"
+repository = "https://github.com/TianMingXTU/QCodeHarness"
+homepage = "https://github.com/TianMingXTU/QCodeHarness"
+readme = "README.md"
+keywords = ["ai-agent", "coding-agent", "llm", "mcp", "harness"]
+categories = ["development-tools", "command-line-utilities"]
 
 # 库目标：集成测试（tests/）与其他前端通过它复用全部逻辑，
 # main.rs 只是薄壳。

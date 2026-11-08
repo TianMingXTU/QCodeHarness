@@ -1,0 +1,154 @@
+name: Release
+
+# 推送 v 开头的 tag 时构建各平台二进制并挂到 GitHub Release 上。
+# 生成的 Release 说明在 release 任务里内联，改版本时同步改这一份。
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 stable 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      - name: 缓存构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: 编译发布版
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: 打包 (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 -E '^version = "' Cargo.toml | cut -d'"' -f2)"
+          stage="QCodeHarness-v${version}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/QCodeHarness" "$stage/"
+          cp "target/${{ matrix.target }}/release/mcp-lifecycle-server" "$stage/"
+          cp LICENSE README.md "$stage/"
+          tar -czf "${stage}.tar.gz" "$stage"
+          rm -rf "$stage"
+          ls -l "${stage}.tar.gz"
+
+      - name: 打包 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          $stage = "QCodeHarness-v$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\QCodeHarness.exe" $stage
+          Copy-Item "target\${{ matrix.target }}\release\mcp-lifecycle-server.exe" $stage
+          Copy-Item LICENSE, README.md $stage
+          Compress-Archive -Path $stage -DestinationPath "${stage}.zip"
+          Remove-Item -Recurse -Force $stage
+          Get-ChildItem "${stage}.zip" | Format-Table Name, Length
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: qcode-harness-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: qcode-harness-*
+          merge-multiple: true
+          path: dist
+
+      - name: 创建 Release 并上传产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'EOF'
+          QCodeHarness 是 Rust 实现的 AI 编程执行框架（Coding Agent Harness）。
+          这个发行包是可运行的单任务 Coding Agent：读任务 → 调模型 → 执行工具
+          （文件读写、搜索、补丁、Shell、Git）→ 收集证据 → 给出可审查的结论。
+
+          ## 压缩包内容
+
+          - `QCodeHarness`（Windows 下是 `QCodeHarness.exe`）：主程序
+          - `LICENSE`：MIT 许可证
+          - `README.md`：项目说明与完整用法
+
+          ## 运行
+
+          1. 准备 `.env`：复制仓库里的 `.env.example`，填入 `LLM_BASE_URL`、
+             `LLM_API_KEY`、`LLM_MODEL` 三项。主程序读当前目录的 `.env`，
+             读不到就退回进程环境变量。
+          2. 在目标代码仓库目录里运行，主程序把当前目录当作 workspace：
+
+             ```bash
+             QCodeHarness "修复失败的测试"
+             ```
+
+          3. 默认每个非只读工具执行前都要人工审批。无人值守的场景设
+             `QCH_AUTO_APPROVE=1` 跳过审批，此时权限边界仍由内置策略与
+             越界写入检查兜住。
+
+          ## 关于这个版本
+
+          0.1.0 是首个公开发行版本，覆盖单任务执行链路：ReAct 循环、
+          内置工具、结构化补丁、权限审批、MCP 接入、跨平台沙箱、
+          会话与任务级恢复、证据与运行报表。后续能力见仓库 README。
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，改为补传产物"
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          gh release view "$TAG"

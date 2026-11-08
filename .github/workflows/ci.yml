@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# 本项目有意不使用 rustfmt：全仓按人工排版维护，跑 cargo fmt --check
+# 会因存量差异直接变红。因此这里不设格式检查步骤，也不建议后人补上。
+jobs:
+  test:
+    name: 测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 stable 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: 安装 OpenSSL 开发包
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: 缓存构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: 编译全部目标
+        run: cargo build --locked --all-targets
+
+      - name: 运行测试
+        run: cargo test --locked
+
+      # 需要真实 git 仓库的用例在默认测试里被标为 ignored：
+      # 跑 CI 的机器上 git 在 PATH 中，这里把它们补上。
+      - name: 运行依赖 git 的测试
+        run: cargo test --locked -- --ignored
+
+  lint:
+    name: 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 stable 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: 安装 OpenSSL 开发包
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: 缓存构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # 不加 -D warnings：仓库现存一批 clippy 提示（可自动修复的写法类为主），
+      # 先让 clippy 在 CI 里可见，清干净后再收紧成硬门禁。
+      - name: clippy
+        run: cargo clippy --locked --all-targets --all-features
+
+      # 文档构建是 docs.rs 的预演：文档链断了会体现在这一步。
+      - name: 构建文档
+        run: cargo doc --locked --no-deps
+
+  deps:
+    name: 依赖约束
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 stable 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: 缓存依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      # 项目约束：TLS 走 native-tls，rustls 不得进入依赖树。
+      # `cargo tree -i rustls` 在找不到时打印提示并以 0 退出，
+      # 因此按输出文本判定。
+      - name: rustls 不得进入依赖树
+        run: |
+          tree="$(cargo tree --locked --target all -i rustls 2>/dev/null || true)"
+          if printf '%s' "$tree" | grep -qE '(^|[^a-z-])rustls v[0-9]'; then
+            echo "::error::rustls 出现在依赖树里"
+            printf '%s\n' "$tree"
+            exit 1
+          fi
+          echo "rustls 未进入依赖树"
