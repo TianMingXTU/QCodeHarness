@@ -1,0 +1,36 @@
+name: 使用问题
+description: 问怎么用、问配置、问某条报错是什么意思
+title: "[提问] "
+labels:
+  - question
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: 你想做什么
+      description: 一句话说清目标：想让 agent 完成什么任务，或者想弄明白哪个行为。
+      placeholder: |
+        想让 agent 在自己的仓库里跑一次缺陷修复，命令是 cargo run -- "修复失败的测试"
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: 已经试过什么
+      description: 读过哪些文档、跑过哪些命令、看到什么输出。贴命令与输出片段，不要贴完整日志。
+      placeholder: |
+        读过 docs/usage.md 的「审批」一节
+        cargo run -- --report 输出里 MCP 计数是 0
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      description: 操作系统、Rust 版本、QCodeHarness 版本、模型服务提供方。**不要粘贴 LLM_API_KEY，也不要粘贴 .env 全文。**
+      placeholder: |
+        操作系统：Windows 11
+        Rust：rustc 1.99.1
+        模型服务：OpenAI 兼容端点
+    validations:
+      required: false
