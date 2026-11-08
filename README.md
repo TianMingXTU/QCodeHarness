@@ -7,6 +7,12 @@
 
 > 基于 Rust 的 Coding Agent 执行框架：在真实代码仓库里规划任务、调用工具、改代码、跑测试，产出可审查的结果。
 
+**English:** A coding agent harness written in Rust. The model proposes actions;
+the harness keeps control of file writes, command execution and permission
+gates, and every step leaves reviewable evidence. Process sandboxing runs on
+Windows today, Linux and macOS degrade gracefully. Documentation below is in
+Chinese.
+
 模型只负责提议动作，文件读写、命令执行与审批判断始终由 Harness 控制。
 进程沙箱目前只在 Windows 上生效，Linux 与 macOS 降级执行（见[第 8 节](#8-安全边界)）。
 
