@@ -15,28 +15,32 @@ use crate::application::memory_evidence::MemoryEvidenceSink;
 const OBSERVE_PREVIEW_CHARS: usize = 400;
 
 /// 用法说明，参数缺失时打印。
+///
+/// 命令名写产品名而不是 `cargo run --`：发行包里只有可执行文件，
+/// 照着 `cargo run --` 抄会抄不动。从源码运行的差异放在末尾一行说明。
 pub const USAGE: &str = "\
-用法: cargo run -- [--yes] [--ai-review] [--kind <模板>] \"任务描述\"
-      cargo run -- --list-sessions
-      cargo run -- [--yes] --resume <会话ID>
-      cargo run -- [--yes] [--force-worktree] --resume-task <任务ID>
-      cargo run -- --report [--report-dir <目录>] [--json]
-      cargo run -- --benchmark
-      cargo run -- --benchmark-long
-      cargo run -- --mcp-reconnect <服务器名>
-      cargo run -- --help
-示例: cargo run -- \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
-      cargo run -- --yes \"非交互场景下跑同一个任务\"
-      cargo run -- --ai-review \"让模型先审一遍，拿不准的再问人\"
-      cargo run -- --list-sessions
-      cargo run -- --resume <会话ID>
-      cargo run -- --resume-task <任务ID>
-      cargo run -- --force-worktree --resume-task <任务ID>
-      cargo run -- --report
-      cargo run -- --report --json
-      cargo run -- --benchmark
-      cargo run -- --benchmark-long
-      cargo run -- --mcp-reconnect fetch";
+用法: QCodeHarness [--yes] [--ai-review] [--kind <模板>] \"任务描述\"
+      QCodeHarness --list-sessions
+      QCodeHarness [--yes] --resume <会话ID>
+      QCodeHarness [--yes] [--force-worktree] --resume-task <任务ID>
+      QCodeHarness --report [--report-dir <目录>] [--json]
+      QCodeHarness --benchmark
+      QCodeHarness --benchmark-long
+      QCodeHarness --mcp-reconnect <服务器名>
+      QCodeHarness --help
+示例: QCodeHarness \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
+      QCodeHarness --yes \"非交互场景下跑同一个任务\"
+      QCodeHarness --ai-review \"让模型先审一遍，拿不准的再问人\"
+      QCodeHarness --list-sessions
+      QCodeHarness --resume <会话ID>
+      QCodeHarness --resume-task <任务ID>
+      QCodeHarness --force-worktree --resume-task <任务ID>
+      QCodeHarness --report
+      QCodeHarness --report --json
+      QCodeHarness --benchmark
+      QCodeHarness --benchmark-long
+      QCodeHarness --mcp-reconnect fetch
+从源码运行时在命令前加 cargo run --，例：cargo run -- --report";
 
 /// 解析出的命令行参数。
 #[derive(Debug, Clone, PartialEq)]
