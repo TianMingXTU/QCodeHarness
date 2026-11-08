@@ -160,9 +160,11 @@ jobs:
           EOF
           # 这个 job 没有 checkout，工作目录不是 git 仓库，gh 推断不出仓库名，
           # 每条命令都要显式给 --repo。
+          # --draft=false：tag 被删过再重建时，GitHub 会把原 Release 转成草稿，
+          # 改标题不会把它转回来，得显式取消草稿状态。
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，改为补传产物"
-            gh release edit "$TAG" --repo "$REPO" --title "QCodeHarness $TAG" --notes-file notes.md --prerelease
+            gh release edit "$TAG" --repo "$REPO" --title "QCodeHarness $TAG" --notes-file notes.md --prerelease --draft=false
           else
             gh release create "$TAG" --repo "$REPO" --title "QCodeHarness $TAG" --notes-file notes.md --generate-notes --prerelease
           fi
