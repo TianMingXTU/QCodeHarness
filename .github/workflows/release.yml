@@ -66,14 +66,14 @@ jobs:
           set -euo pipefail
           version="$(grep -m1 -E '^version = "' Cargo.toml | cut -d'"' -f2)"
           stage="QCodeHarness-v${version}-${{ matrix.target }}"
-          mkdir -p "$stage"
+          mkdir -p "$stage" dist
           cp "target/${{ matrix.target }}/release/QCodeHarness" "$stage/"
           cp "target/${{ matrix.target }}/release/mcp-lifecycle-server" "$stage/"
           cp LICENSE README.md .env.example "$stage/"
           cp -r docs "$stage/"
-          tar -czf "${stage}.tar.gz" "$stage"
+          tar -czf "dist/${stage}.tar.gz" "$stage"
           rm -rf "$stage"
-          ls -l "${stage}.tar.gz"
+          ls -l dist/
 
       - name: 打包 (Windows)
         if: runner.os == 'Windows'
@@ -84,13 +84,14 @@ jobs:
             Select-Object -First 1).Matches[0].Groups[1].Value
           $stage = "QCodeHarness-v$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\QCodeHarness.exe" $stage
           Copy-Item "target\${{ matrix.target }}\release\mcp-lifecycle-server.exe" $stage
           Copy-Item LICENSE, README.md, .env.example $stage
           Copy-Item -Recurse docs $stage
-          Compress-Archive -Path $stage -DestinationPath "${stage}.zip"
+          Compress-Archive -Path $stage -DestinationPath "dist\${stage}.zip"
           Remove-Item -Recurse -Force $stage
-          Get-ChildItem "${stage}.zip" | Format-Table Name, Length
+          Get-ChildItem dist | Format-Table Name, Length
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
