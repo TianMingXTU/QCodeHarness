@@ -118,6 +118,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
@@ -151,15 +152,19 @@ jobs:
 
           ## 关于这个版本
 
-          0.1.0 是首个公开发行版本，覆盖单任务执行链路：ReAct 循环、
-          内置工具、结构化补丁、权限审批、MCP 接入、跨平台沙箱、
-          会话与任务级恢复、证据与运行报表。后续能力见仓库 README。
+          0.1.0 是首个公开发行版本，覆盖单任务执行链路：ReAct 循环、内置工具、
+          结构化补丁、权限审批、MCP 接入、上下文压缩与会话/任务级恢复、
+          证据与运行报表。进程沙箱目前只在 Windows 上生效（Job Object 限制
+          进程树并整树终止），Linux 与 macOS 降级执行；文件系统级隔离尚未
+          实现。已知边界见仓库 README 第 8 节。
           EOF
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          # 这个 job 没有 checkout，工作目录不是 git 仓库，gh 推断不出仓库名，
+          # 每条命令都要显式给 --repo。
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，改为补传产物"
-            gh release edit "$TAG" --title "QCodeHarness $TAG" --notes-file notes.md --prerelease
+            gh release edit "$TAG" --repo "$REPO" --title "QCodeHarness $TAG" --notes-file notes.md --prerelease
           else
-            gh release create "$TAG" --title "QCodeHarness $TAG" --notes-file notes.md --generate-notes --prerelease
+            gh release create "$TAG" --repo "$REPO" --title "QCodeHarness $TAG" --notes-file notes.md --generate-notes --prerelease
           fi
-          gh release upload "$TAG" dist/* --clobber
-          gh release view "$TAG"
+          gh release upload "$TAG" --repo "$REPO" dist/* --clobber
+          gh release view "$TAG" --repo "$REPO"
