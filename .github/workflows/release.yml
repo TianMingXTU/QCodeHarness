@@ -69,7 +69,8 @@ jobs:
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/QCodeHarness" "$stage/"
           cp "target/${{ matrix.target }}/release/mcp-lifecycle-server" "$stage/"
-          cp LICENSE README.md "$stage/"
+          cp LICENSE README.md .env.example "$stage/"
+          cp -r docs "$stage/"
           tar -czf "${stage}.tar.gz" "$stage"
           rm -rf "$stage"
           ls -l "${stage}.tar.gz"
@@ -85,7 +86,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\QCodeHarness.exe" $stage
           Copy-Item "target\${{ matrix.target }}\release\mcp-lifecycle-server.exe" $stage
-          Copy-Item LICENSE, README.md $stage
+          Copy-Item LICENSE, README.md, .env.example $stage
+          Copy-Item -Recurse docs $stage
           Compress-Archive -Path $stage -DestinationPath "${stage}.zip"
           Remove-Item -Recurse -Force $stage
           Get-ChildItem "${stage}.zip" | Format-Table Name, Length
@@ -126,12 +128,14 @@ jobs:
           ## 压缩包内容
 
           - `QCodeHarness`（Windows 下是 `QCodeHarness.exe`）：主程序
+          - `mcp-lifecycle-server`：MCP 生命周期演示用的参考 Server
           - `LICENSE`：MIT 许可证
-          - `README.md`：项目说明与完整用法
+          - `README.md` 与 `docs/`：项目说明与完整用法手册
+          - `.env.example`：环境变量样例，复制成 `.env` 后填值
 
           ## 运行
 
-          1. 准备 `.env`：复制仓库里的 `.env.example`，填入 `LLM_BASE_URL`、
+          1. 准备 `.env`：复制压缩包里的 `.env.example`，填入 `LLM_BASE_URL`、
              `LLM_API_KEY`、`LLM_MODEL` 三项。主程序读当前目录的 `.env`，
              读不到就退回进程环境变量。
           2. 在目标代码仓库目录里运行，主程序把当前目录当作 workspace：
@@ -152,9 +156,9 @@ jobs:
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，改为补传产物"
-            gh release edit "$TAG" --notes-file notes.md
+            gh release edit "$TAG" --title "QCodeHarness $TAG" --notes-file notes.md --prerelease
           else
-            gh release create "$TAG" --title "$TAG" --notes-file notes.md --generate-notes
+            gh release create "$TAG" --title "QCodeHarness $TAG" --notes-file notes.md --generate-notes --prerelease
           fi
           gh release upload "$TAG" dist/* --clobber
           gh release view "$TAG"

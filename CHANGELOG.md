@@ -69,6 +69,11 @@
   ([07b9e2b](https://github.com/TianMingXTU/QCodeHarness/commit/07b9e2b))
 - 行尾判别读到文件末尾，不再只看开头一块；跨块的 `\r\n` 也认得出来。
   ([5f05a3b](https://github.com/TianMingXTU/QCodeHarness/commit/5f05a3b))
+- 大小写变体用例只差 `repo` 组件，盘符写法与根保持一致。
+  ([d237806](https://github.com/TianMingXTU/QCodeHarness/commit/d237806))
+- 三处断言按平台语义修正：POSIX 上的盘符路径、POSIX 的进程树终止、
+  Windows 的 8.3 短路径。CI 首次在三平台并行跑时各抓出一个。
+  ([bae1ee8](https://github.com/TianMingXTU/QCodeHarness/commit/bae1ee8))
 - `ToolGuard` 守卫链补上装配入口，守卫身份不再用名字判别。
   ([fd4b119](https://github.com/TianMingXTU/QCodeHarness/commit/fd4b119))
 - 恢复普通策略审批的"可信任"语义：复核理由只属于越界升级。
@@ -90,3 +95,7 @@
   ([a514b05](https://github.com/TianMingXTU/QCodeHarness/commit/a514b05))
 - 全仓注释按 Google 规范重写：说清意图与约束，不复述代码字面行为。
   ([cfc1959](https://github.com/TianMingXTU/QCodeHarness/commit/cfc1959))
+- 仓库展示层：README 重组为首页加十节正文，完整用法与阶段明细下沉到
+  `docs/`，补齐 Cargo 元数据、发行包内容与文档索引。
+  ([1c7a053](https://github.com/TianMingXTU/QCodeHarness/commit/1c7a053)、
+  [602df24](https://github.com/TianMingXTU/QCodeHarness/commit/602df24))
