@@ -9,6 +9,7 @@
 | 给模型的项目指令（目录、验证命令、编码与测试约定） | [QCODEHARNESS.md](../QCODEHARNESS.md) |
 | 人机协作与验收纪律 | [README 第 7 节](../README.md#7-人机协作与质量控制) |
 | 安全边界与已知限制 | [README 第 8 节](../README.md#8-安全边界)、[SECURITY.md](SECURITY.md) |
+| 行为准则与举报渠道 | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) |
 | 已交付版本内容 | [CHANGELOG.md](../CHANGELOG.md) |
 
 ## 1. 协作方式

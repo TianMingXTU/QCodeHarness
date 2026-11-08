@@ -340,6 +340,7 @@ P10 按以下四个切片交付，每片都有独立测试；能力与边界见[
 - [迭代路线明细](docs/roadmap.md)
 - [更新日志](CHANGELOG.md)
 - [贡献指南](.github/CONTRIBUTING.md)
+- [行为准则](.github/CODE_OF_CONDUCT.md)
 - [安全策略](.github/SECURITY.md)
 
 以下内容对应仓库当前版本；构建、配置、示例任务和当前能力边界均以代码、测试和运行记录为准。
