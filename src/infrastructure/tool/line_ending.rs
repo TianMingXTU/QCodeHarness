@@ -35,12 +35,17 @@ impl LineEnding {
 
     /// 判别一个文件的行尾风格。
     ///
-    /// 只读文件开头的一段：行尾风格在文件内是统一的，读几 KB 足够判断，
-    /// 不必为改一处内容把整个文件读进内存。读不出内容时按 LF 算。
+    /// 分块往后读，直到看见 `\r\n` 或读到文件末尾。行尾风格在文件内是
+    /// 统一的，但 `\r\n` 出现的位置没有保证：首行超过一整块的长行文件
+    /// （压缩过的脚本、数据行）会在第一块里看不到任何 `\r\n`，只看开头
+    /// 一块就会把 CRLF 误判成 LF。
     ///
     /// 按字节找 `\r\n`，不解码成字符串：多字节字符恰好跨过读取边界时，
     /// 解码会失败，按 LF 处理就把 CRLF 文件误判成 LF。`\r\n` 是 ASCII，
-    /// 在字节层面找它不受编码影响。
+    /// 在字节层面找它不受编码影响。上一块的末尾与下一块的开头可能正好
+    /// 拼成一个 `\r\n`，跨块的那一对也要认出来。
+    ///
+    /// 读不出内容时按 LF 算。
     pub async fn detect_in_file(path: &std::path::Path) -> Self {
         use tokio::io::AsyncReadExt;
 
@@ -48,14 +53,25 @@ impl LineEnding {
             return Self::Lf;
         };
         let mut buffer = vec![0u8; 4096];
-        let read = match file.read(&mut buffer).await {
-            Ok(read) => read,
-            Err(_) => return Self::Lf,
-        };
-        if buffer[..read].windows(2).any(|pair| pair == b"\r\n") {
-            Self::CrLf
-        } else {
-            Self::Lf
+        // 上一块最后一个字节：它可能与下一块的首字节组成 `\r\n`。
+        let mut carry: Option<u8> = None;
+        loop {
+            let read = match file.read(&mut buffer).await {
+                Ok(0) => return Self::Lf,
+                Ok(read) => read,
+                Err(_) => return Self::Lf,
+            };
+            if carry == Some(b'\r') && buffer[0] == b'\n' {
+                return Self::CrLf;
+            }
+            if buffer[..read].windows(2).any(|pair| pair == b"\r\n") {
+                return Self::CrLf;
+            }
+            carry = buffer[read - 1..read].first().copied();
+            // 读到的字节数少于请求量，说明已经到文件末尾。
+            if read < buffer.len() {
+                return Self::Lf;
+            }
         }
     }
 
@@ -187,6 +203,53 @@ mod tests {
             LineEnding::detect_in_file(&path).await,
             LineEnding::CrLf,
             "多字节字符跨过边界不该把 CRLF 误判成 LF"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 首行超过一整块时，CRLF 可能在第一块之外才出现。
+    ///
+    /// 只看开头一块就会漏掉它，把 CRLF 误判成 LF，落盘时整个文件的行尾
+    /// 被改写成 LF。
+    #[tokio::test]
+    async fn a_crlf_after_a_long_first_line_is_still_crlf() {
+        let dir = temp_dir("longline");
+
+        let mut content = vec![b'a'; 5000];
+        content.extend_from_slice(b"\r\n");
+        content.extend_from_slice(b"tail\r\n");
+        let path = dir.join("long-line.txt");
+        std::fs::write(&path, &content).expect("写长行文件");
+
+        assert_eq!(
+            LineEnding::detect_in_file(&path).await,
+            LineEnding::CrLf,
+            "首行超过一整块时不该漏掉后面的 CRLF"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `\r\n` 正好跨在两块之间时也算数。
+    ///
+    /// `\r` 是上一块的最后一个字节，`\n` 是下一块的第一个字节：两块分开
+    /// 看都凑不出一对 `\r\n`。
+    #[tokio::test]
+    async fn a_crlf_straddling_the_read_boundary_is_still_crlf() {
+        let dir = temp_dir("straddle");
+
+        // `\r` 落在第 4095 字节（第一块的最后一位），`\n` 落在第 4096 字节。
+        let mut content = vec![b'a'; 4095];
+        content.extend_from_slice(b"\r\n");
+        content.extend_from_slice(b"tail\r\n");
+        let path = dir.join("straddle.txt");
+        std::fs::write(&path, &content).expect("写跨块文件");
+
+        assert_eq!(
+            LineEnding::detect_in_file(&path).await,
+            LineEnding::CrLf,
+            "跨块的 CRLF 不该被漏掉"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
