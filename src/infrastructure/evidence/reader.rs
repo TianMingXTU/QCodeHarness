@@ -1,12 +1,12 @@
-//! 证据读取器：把 `.qcodeharness/sessions/*.jsonl` 读回成结构化数据。
+//! 证据读取器：把 `.qcodeharness/sessions/*.jsonl` 读回为结构化数据。
 //!
-//! 统计与报表的全部输入都从这里来。与 [`JsonlEvidenceSink`] 是
-//! 同一磁盘契约的两端：读回就是 `serde_json::from_str::<Evidence>()`。
+//! 统计与报表的全部输入都来自这里。与
+//! [`crate::infrastructure::evidence::jsonl::JsonlEvidenceSink`] 构成同一
+//! 磁盘契约的两端：读回即 `serde_json::from_str::<Evidence>()`。
 //!
-//! 对坏数据的取向与 sink 的降级哲学一致：**流式日志的尾部损坏是常态**
-//! （崩溃恰好发生在最需要证据的时刻），单行解析失败跳过并计数；
-//! 但一条都读不动说明选错了文件，要显式报错而不是交出一份"看起来
-//! 是空的"报表。
+//! 坏数据处理与 sink 的降级策略一致：流式日志尾部损坏是常态（崩溃常
+//! 发生在最需要证据的时候），单行解析失败跳过并计数；若所有行都无法
+//! 解析，说明选错了文件，应显式报错，不能返回一份看似正常的空报表。
 
 use std::path::{Path, PathBuf};
 
@@ -14,16 +14,17 @@ use crate::application::report::SessionLog;
 use crate::domain::evidence::Evidence;
 use crate::domain::ids::SessionId;
 
-// SessionLog 定义在 `application::report`——统计是它的消费方，且
-// infrastructure 依赖 application 是本仓库既定的方向。
+// SessionLog 定义在 `application::report`。统计是它的消费方，且
+// infrastructure 依赖 application 是本仓库既定的依赖方向。
 
 /// 证据读取失败。
 #[derive(Debug)]
 pub enum ReadError {
     /// 文件读不出来（权限、编码等 IO 层问题）。
     Io(std::io::Error),
-    /// 文件里没有一条能解析的证据——多半是选错了文件，
-    /// 交回空数据会让报表看起来"一切正常"。
+    /// 文件存在非空行，但没有一条可解析。
+    ///
+    /// 通常是选错了文件。返回空数据会让报表看起来一切正常。
     NoReadableLines {
         /// 读不动的文件路径。
         path: PathBuf,
@@ -48,12 +49,12 @@ impl std::fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-/// 读一个会话的证据文件。
+/// 读取一个会话的证据文件。
 ///
 /// # Errors
 ///
-/// 文件不存在返回 `Ok(None)`——没跑过的会话不是错误；文件存在但
-/// 读不动（IO 失败，或没有一条行能解析）才报错。
+/// 文件不存在时返回 `Ok(None)`，未运行过的会话不算错误。空文件返回空
+/// 会话。IO 失败，或存在非空行但全部无法解析时返回错误。
 pub fn read_session(path: &Path) -> Result<Option<SessionLog>, ReadError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -71,7 +72,7 @@ pub fn read_session(path: &Path) -> Result<Option<SessionLog>, ReadError> {
     let mut skipped = 0usize;
     let mut non_empty = 0usize;
     for line in text.lines() {
-        // 文件以换行结尾会产生一个空"行"，损坏也可能留下半行空白；
+        // 文件以换行结尾会产生一个空行，损坏也可能留下空白行。
         // 空行既不是事件也不是坏行，直接跳过。
         if line.trim().is_empty() {
             continue;
@@ -97,10 +98,10 @@ pub fn read_session(path: &Path) -> Result<Option<SessionLog>, ReadError> {
     }))
 }
 
-/// 读目录下全部会话（`*.jsonl`），按文件名排序保证报表顺序稳定。
+/// 读取目录下全部会话（`*.jsonl`），按文件名排序以保证报表顺序稳定。
 ///
-/// 单个文件一条都读不动时跳过并打警告——一份报表不该因为一个
-/// 选坏的文件整体出不来；IO 层错误（权限等）则照常向上传播。
+/// 单个文件全部行都无法解析时跳过并打印警告，避免一个坏文件导致整份
+/// 报表无法生成。IO 错误（如权限）照常向上传播。
 ///
 /// # Errors
 ///
@@ -130,8 +131,8 @@ pub fn read_all(dir: &Path) -> Result<Vec<SessionLog>, ReadError> {
     Ok(logs)
 }
 
-/// 把一组合成事件写成 JSONL 文本（测试用）：与 sink 落盘格式同源，
-/// 都是 `serde_json::to_string::<Evidence>`。
+/// 把合成事件写成 JSONL 文本（测试用）。字段与 sink 的 `Record` 一致，
+/// 读回时走 `Evidence` 的反序列化。
 #[cfg(test)]
 pub(crate) fn evidence_line(evidence: &Evidence) -> String {
     serde_json::to_string(evidence).expect("Evidence 序列化不应失败")
@@ -352,12 +353,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 手写一条旧版证据行：没有 `format` 键，`recorded_at` 是整秒。
+    /// 旧版证据行没有 `format` 键，`recorded_at` 为整秒。
     ///
-    /// 把时间戳精度从秒提到毫秒时，如果不在行里留标记，reader 就只能
-    /// 猜。猜错的代价是**所有历史证据的耗时统计变成垃圾**——100 秒被读成
-    /// 100 毫秒，一分钟的会话算成亚毫秒。所以旧文件必须仍然读得出正确的
-    /// 时刻，一条不漏。
+    /// 时间戳精度从秒提高到毫秒时，若行内没有标记，reader 只能猜测。猜错会
+    /// 让所有历史证据的耗时统计失效：100 秒被读成 100 毫秒，一分钟的会话
+    /// 算成亚毫秒。旧文件必须仍能读出正确时刻，且一行不漏。
     #[test]
     fn legacy_second_precision_lines_still_read_correctly() {
         let dir = temp_dir("legacy-seconds");
@@ -444,11 +444,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 不认识的格式号：跳过该行并计数，不猜。
+    /// 不认识的格式号：跳过该行并计数，不做猜测。
     ///
-    /// 猜的代价是让耗时统计悄悄变成垃圾；跳过至少能被 `skipped_lines`
-    /// 和"整文件都读不动就报错"发现。与"末行截断跳过而非报错"是同一条
-    /// 降级哲学。
+    /// 猜测会让耗时统计失效。跳过可通过 `skipped_lines` 和"整个文件无可读
+    /// 行时报错"发现，与"末行截断跳过而不报错"采用同一降级策略。
     #[test]
     fn unknown_format_marker_is_skipped_and_counted() {
         let dir = temp_dir("unknown-format");
@@ -472,7 +471,7 @@ mod tests {
 
     #[test]
     fn truncated_last_line_is_skipped_not_fatal() {
-        // 验收项：末行截断（崩溃的典型残迹）被跳过而非报错。
+        // 末行截断（崩溃的典型残迹）应跳过，不报错。
         let dir = temp_dir("truncated");
         let path = dir.join("session-2.jsonl");
         let events = every_variant();
@@ -528,8 +527,8 @@ mod tests {
 
     #[test]
     fn out_of_order_sequences_are_detectable() {
-        // 重开 sink 会从 1 重新编号，乱序在真实文件里会出现；
-        // reader 的职责是让人能发现，不是替人判断文件作废。
+        // 重开 sink 会从 1 重新编号，真实文件中可能出现乱序。
+        // reader 只负责让人能发现，不替人判断文件是否作废。
         let dir = temp_dir("gap");
         let path = dir.join("session-5.jsonl");
         let events = every_variant();
@@ -574,7 +573,7 @@ mod tests {
                 &events[..2].iter().map(evidence_line).collect::<Vec<_>>(),
             );
         }
-        // 一个全是坏行的文件：跳过并警告，不拖垮整份报表。
+        // 一个全是坏行的文件：跳过并警告，不影响整份报表。
         fs::write(dir.join("garbage.jsonl"), "垃圾数据\n").unwrap();
         // 非jsonl文件不参与。
         fs::write(dir.join("notes.txt"), "无关").unwrap();

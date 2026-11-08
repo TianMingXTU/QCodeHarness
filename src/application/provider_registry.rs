@@ -1,8 +1,7 @@
 //! 模型提供方注册表：按 id 登记与查找。
 //!
-//! 登记顺序即默认顺序：第一个登记的提供方是默认提供方。装配时只登记
-//! 一家时，行为与没有注册表时逐字相同——注册表只负责选择，不改变任何
-//! 网关行为。
+//! 第一个登记的提供方即默认提供方。只登记一家时，行为与没有注册表相同：
+//! 注册表只负责选择，不改变网关行为。
 
 use std::sync::Arc;
 
@@ -20,10 +19,10 @@ impl ProviderRegistry {
         Self::default()
     }
 
-    /// 登记一家提供方；同一 id 只保留先登记的（后到的忽略并返回 `false`）。
+    /// 登记一家提供方。同一 id 只保留先登记的，重复登记返回 `false`。
     ///
-    /// 重复 id 不覆盖：装配方同时登记两家同名提供方通常是配置错误，
-    /// 静默换掉先登记的那家会让"默认是谁"取决于代码顺序。
+    /// 重复 id 不覆盖：同时登记两家同名提供方通常是配置错误，静默替换
+    /// 会让"默认是谁"取决于代码顺序。
     pub fn register(&mut self, provider: Arc<dyn LlmProvider>) -> bool {
         if self.providers.iter().any(|known| known.id() == provider.id()) {
             return false;
@@ -37,10 +36,9 @@ impl ProviderRegistry {
         self.providers.iter().find(|provider| provider.id() == id)
     }
 
-    /// 默认提供方：第一个登记的。
+    /// 默认提供方：第一个登记的提供方。
     ///
-    /// 空注册表返回 `None` 而不是 panic：是否允许空表是装配方的决定，
-    /// 这里只如实回答"没有"。
+    /// 空注册表返回 `None`。是否允许空表由装配方决定。
     pub fn default_provider(&self) -> Option<&Arc<dyn LlmProvider>> {
         self.providers.first()
     }

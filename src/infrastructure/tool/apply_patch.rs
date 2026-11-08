@@ -1,21 +1,22 @@
-//! 结构化补丁工具：一次调用改一处或多处。
+//! 结构化补丁工具：一次调用修改一处或多处。
 //!
-//! **为什么是独立工具，不增强 `edit_file`。** 三条理由：
+//! 独立于 `edit_file`，理由有三：
 //!
-//! 1. **统一格式更容易让模型学会**。`edit_file` 的 `old_string` 要模型
-//!    逐字抄原文，抄错就失败；补丁格式带上下文行，模型只需指出"改哪
-//!    一块"。
-//! 2. **一次改多处**。`edit_file` 改 N 处要 N 轮调用，补丁一次调用改
-//!    N 处——同时省轮次。
-//! 3. **不动 `edit_file` 的既有语义**。它有 7 个测试、语义已被验证
-//!    （唯一匹配才改）。`apply_patch` 是新工具，两者并存，让模型自己选。
+//! 1. **格式更容易学习。** `edit_file` 的 `old_string` 要求模型逐字抄写
+//!    原文，抄错就失败；补丁格式带上下文行，模型只需指出修改哪一块。
+//! 2. **一次改多处。** `edit_file` 改 N 处需要 N 轮调用，补丁一次调用
+//!    完成，同时省轮次。
+//! 3. **不改动 `edit_file` 的既有语义。** 它已有 8 个测试覆盖，行为经过
+//!    验证（唯一匹配才修改）。`apply_patch` 是新工具，两者并存，由模型
+//!    选择。
 //!
-//! **原子性是这个工具相对 `edit_file` 的最大优势**：全部操作先在内存里
+//! **原子性是本工具相对 `edit_file` 的主要优势**：全部操作先在内存中
 //! 算出新内容，**全部成功才写盘**；多文件时先写全部临时文件，再逐个
-//! 改名。任何一步失败，一个文件都不会被改。
+//! 改名。内容计算与临时文件阶段失败时，所有文件保持不变。改名阶段失败
+//! 不回滚，可能已有文件被替换，报告会列出已改的文件与未改动的数量。
 //!
-//! 写盘用"临时文件 + 改名"：中途崩溃最多个残留一个 `.tmp`，绝不会留下
-//! 一个截断的文件顶替上一次的好文件（模式见
+//! 写盘使用"临时文件 + 改名"：写临时文件或改名途中崩溃，残留的是若干
+//! `.tmp`，不会留下截断的文件顶替上一次的完整文件（模式见
 //! `infrastructure::session_store::json`）。
 
 use std::collections::HashMap;
@@ -54,7 +55,8 @@ impl ApplyPatch {
                           可用 `@@ 定位提示` 限定搜索范围）、\
                           `*** Add File: 路径`（后跟每行以 `+` 开头的文件内容）、\
                           `*** Delete File: 路径`。\
-                          所有操作要么全部成功，要么一个文件都不改。\
+                          内容计算与写临时文件阶段失败时所有文件都不改；改名阶段失败则已改的文件保持新内容，\
+                          失败报告会列出明细。\
                           要改一处用 edit_file 更省事；新建文件用 write_file 或 Add File；\
                           整体重写用 write_file。"
                 .to_owned(),
@@ -65,7 +67,7 @@ impl ApplyPatch {
                 },
                 "required": ["patch"]
             }),
-            // 修改与删除文件内容不可逆，同样的补丁做第二次会失败，不幂等。
+            // 修改与删除文件内容不可逆，同一补丁执行第二次会失败，因此不幂等。
             annotations: ToolAnnotations::new(false, true, false, false),
         }
     }
@@ -79,7 +81,7 @@ struct ApplyPatchArgs {
 
 /// 一个文件在补丁应用后的最终状态。
 ///
-/// `content` 为 `None` 表示文件最终不存在（被删了）。
+/// `content` 为 `None` 表示文件最终不存在。
 struct PlannedFile {
     /// workspace 内的相对路径（原样回显给模型）。
     display: String,
@@ -87,10 +89,9 @@ struct PlannedFile {
     path: PathBuf,
     /// 最终内容。`None` = 文件最终不存在。
     content: Option<String>,
-    /// 这个文件在补丁开始前是否就存在于磁盘上。
+    /// 删除这个文件时是否需要真正执行。
     ///
-    /// 用来判断"删除"要不要真删：补丁里"先建后删"的文件从没在磁盘上
-    /// 出现过，删它是删一个不存在的东西。
+    /// 补丁里"先建后删"的文件从未在磁盘上出现，删除它没有意义。
     existed: bool,
 }
 
@@ -111,11 +112,11 @@ impl ToolInvoker for ApplyPatch {
 
             // ── 第一阶段：算出每个文件的最终内容 ────────────────────────
             //
-            // 路径校验与内容计算都在这里做完，一个文件都不碰盘。
+            // 路径校验与内容计算都在这里完成，不触碰磁盘。
             //
-            // **后一个操作看到前一个的结果**：同一个文件在补丁里出现
-            // 两次时，第二次的改动块是在第一次的结果上匹配的——否则
-            // "先改再改"的补丁会拿原文去匹配第二次的上下文，必然失败。
+            // **后一个操作看到前一个的结果**：同一文件在补丁里出现两次时，
+            // 第二次的改动块在第一次的结果上匹配。否则"先改再改"的补丁
+            // 会用原文匹配第二次的上下文，必然失败。
             let mut planned: Vec<PlannedFile> = Vec::new();
             let mut index_of: HashMap<PathBuf, usize> = HashMap::new();
 
@@ -134,7 +135,7 @@ impl ToolInvoker for ApplyPatch {
                                 Some(content) => content.clone(),
                                 None => {
                                     return ToolOutcome::failed(format!(
-                                        "补丁里 `{}` 先被删除又��更新：文件已不存在",
+                                        "补丁里 `{}` 先被删除又被更新：文件已不存在",
                                         path
                                     ));
                                 }
@@ -154,6 +155,12 @@ impl ToolInvoker for ApplyPatch {
                                 return ToolOutcome::failed(format!("补丁应用失败: {reason}"));
                             }
                         };
+                        // 保留文件最初的落盘状态：更新由本补丁新建的文件时，
+                        // 它仍然没有出现在磁盘上，后续删除要跳过。
+                        let existed = match index_of.get(&absolute).copied() {
+                            Some(index) => planned[index].existed,
+                            None => true,
+                        };
                         record(
                             &mut planned,
                             &mut index_of,
@@ -161,7 +168,7 @@ impl ToolInvoker for ApplyPatch {
                                 display: path.clone(),
                                 path: absolute,
                                 content: Some(updated),
-                                existed: true,
+                                existed,
                             },
                         );
                     }
@@ -171,8 +178,8 @@ impl ToolInvoker for ApplyPatch {
                             Err(outcome) => return outcome,
                         };
                         let absolute = resolved.as_path().to_path_buf();
-                        // "已存在"要对着**计划中的状态**判：补丁里先删后加
-                        // 是合法的（挪走再重建），对着磁盘判会误报。
+                        // "已存在"要按**计划中的状态**判断：补丁里先删后加
+                        // 合法（挪走再重建），按磁盘状态判断会误报。
                         let already_there = match index_of.get(&absolute).copied() {
                             Some(index) => planned[index].content.is_some(),
                             None => absolute.exists(),
@@ -232,15 +239,15 @@ impl ToolInvoker for ApplyPatch {
 
             // ── 第二阶段：先写全部临时文件 ──────────────────────────────
             //
-            // 全部内容都算好了，写盘失败只可能是磁盘/权限这类环境问题。
-            // 先把每个新内容写进临时文件，一个都写不成就一个都不改。
+            // 内容已全部算好，写盘失败只可能是磁盘或权限这类环境问题。
+            // 先把每个新内容写入临时文件；有一个写不成，就不改任何文件。
             let mut temps: Vec<(PathBuf, PathBuf)> = Vec::new();
             for file in planned.iter().filter(|file| file.content.is_some()) {
                 let content = file.content.as_ref().expect("过滤过有内容的");
                 let temp = temp_path(&file.path);
-                // 父目录可能还不存在（新建 `src/a/b.rs` 时 `src/a` 是新的）。
-                // 目录建不出来就报在这里——临时文件还没写，工作区仍然
-                // 一个字节都没变。
+                // 父目录可能不存在（新建 `src/a/b.rs` 时 `src/a` 是新的）。
+                // 目录创建失败在这里报错：临时文件尚未写入，工作区仍未
+                // 发生变化。
                 if let Some(parent) = temp.parent() {
                     if let Err(error) = tokio::fs::create_dir_all(parent).await {
                         for (written, _) in &temps {
@@ -253,7 +260,7 @@ impl ToolInvoker for ApplyPatch {
                     }
                 }
                 if let Err(error) = write_temp(&temp, content).await {
-                    // 已经写好的临时文件清掉：留着它们只会污染工作区。
+                    // 清掉已写好的临时文件，避免污染工作区。
                     for (temp, _) in &temps {
                         let _ = tokio::fs::remove_file(temp).await;
                     }
@@ -268,10 +275,9 @@ impl ToolInvoker for ApplyPatch {
             // ── 第三阶段：逐个改名 ──────────────────────────────────────
             //
             // 改名失败不回滚：回滚本身也可能失败（磁盘满、文件被占用），
-            // "部分成功 + 如实报告"比"回滚失败导致状态更乱"诚实。报告里
-            // 必须逐个列出已改与未改的文件，让模型知道真实状态。
+            // 部分成功并如实报告比回滚失败造成更乱的状态更可靠。报告列出
+            // 已改的文件；失败的这一个与其余未改的文件计入未改动数量。
             let mut changed: Vec<String> = Vec::new();
-            let mut unchanged: Vec<String> = Vec::new();
             for (index, (temp, target)) in temps.iter().enumerate() {
                 let display = planned
                     .iter()
@@ -280,14 +286,16 @@ impl ToolInvoker for ApplyPatch {
                     .map(|file| file.display.clone())
                     .unwrap_or_default();
                 if let Err(error) = tokio::fs::rename(temp, target).await {
-                    // 剩下的临时文件清掉，已改的如实报。
+                    // 剩下的临时文件清掉，已改的如实报。剩余文件（含失败
+                    // 的这一个）都保持原内容。
                     for (rest_temp, _) in &temps[index + 1..] {
                         let _ = tokio::fs::remove_file(rest_temp).await;
                     }
+                    let remaining = temps.len() - changed.len();
                     let mut report = format!(
                         "部分成功：已改动 {} 个文件，未改动 {} 个。改名 `{display}` 失败: {error}",
                         changed.len(),
-                        unchanged.len() + 1
+                        remaining
                     );
                     if !changed.is_empty() {
                         report.push_str(&format!("\n已改动：{}", changed.join("、")));
@@ -296,18 +304,13 @@ impl ToolInvoker for ApplyPatch {
                 }
                 changed.push(display);
             }
-            for file in planned.iter().filter(|file| file.content.is_some()) {
-                if !changed.contains(&file.display) {
-                    unchanged.push(file.display.clone());
-                }
-            }
 
             // 删除放在最后：改都改成功了，删失败只影响那一个文件。
             let mut deleted: Vec<String> = Vec::new();
             let mut delete_failed: Vec<String> = Vec::new();
             for file in planned.iter().filter(|file| file.content.is_none()) {
-                // 补丁里"先建后删"的文件从没在磁盘上出现过，删它是删一个
-                // 不存在的东西——那不是失败，是本来就不用删。
+                // 补丁里"先建后删"的文件从未在磁盘上出现，删除它没有意义，
+                // 不算失败。
                 if !file.existed {
                     continue;
                 }
@@ -368,9 +371,9 @@ fn record(
     }
 }
 
-/// 临时文件路径：与目标同目录、同名加 `.tmp` 后缀。
+/// 临时文件路径：与目标同目录，文件名加 `.tmp` 后缀。
 ///
-/// 同目录是必须的：改名（`rename`）要在同一卷上才可靠，跨卷会失败。
+/// 必须在同一目录：`rename` 要求同一卷，跨卷会失败。
 fn temp_path(target: &Path) -> PathBuf {
     let mut name = target
         .file_name()
@@ -382,8 +385,8 @@ fn temp_path(target: &Path) -> PathBuf {
 
 /// 把内容写进临时文件并刷盘。
 ///
-/// 刷盘（`sync_all`）不能省：改名之前数据必须真的落到盘上，否则断电
-/// 之后得到的是一个"存在但内容是空的"文件——比写失败更坏。
+/// `sync_all` 不可省略：改名之前数据必须真正落盘，否则断电后会得到一个
+/// "存在但内容为空"的文件，比写失败更糟。
 async fn write_temp(temp: &Path, content: &str) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut file = tokio::fs::File::create(temp).await?;
@@ -469,6 +472,31 @@ mod tests {
             fs::read_to_string(root.join("src/new.rs")).unwrap(),
             "fn new() {}\n// 第二行\n"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 先建、再改、再删：文件从未落盘，删除阶段应跳过而不是报失败。
+    #[tokio::test]
+    async fn add_then_update_then_delete_leaves_no_file_and_succeeds() {
+        let root = temp_workspace("add-update-delete");
+        let file = tool(&root);
+
+        let outcome = file
+            .invoke(&call(concat!(
+                "*** Begin Patch\n",
+                "*** Add File: temp.rs\n",
+                "+fn a() {}\n",
+                "*** Update File: temp.rs\n",
+                "@@ fn a()\n",
+                "-fn a() {}\n",
+                "+fn b() {}\n",
+                "*** Delete File: temp.rs\n",
+                "*** End Patch",
+            )))
+            .await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert!(!root.join("temp.rs").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -595,9 +623,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// **原子性：多文件补丁里一个失败，其余文件都不改。**
+    /// **原子性：多文件补丁中一个失败，其余文件都不改。**
     ///
-    /// 这是补丁相对 `edit_file` 的核心优势。第二个文件的上下文对不上，
+    /// 这是补丁相对 `edit_file` 的核心优势。第二个文件的上下文对不上时，
     /// 第一个文件一个字节都不能变。
     #[tokio::test]
     async fn one_failing_file_leaves_every_other_file_untouched() {
@@ -637,10 +665,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// **受保护路径在补丁里出现：拒绝，且不写任何文件。**
+    /// **受保护路径出现在补丁里：拒绝，且不写任何文件。**
     ///
-    /// `.git/config` 写成补丁照样拒——受保护路径的判定在路径校验层，
-    /// 不因为它藏在补丁文本里就绕过。
+    /// `.git/config` 写成补丁同样拒绝。受保护路径的判定在路径校验层，
+    /// 不会因为藏在补丁文本里而绕过。
     #[tokio::test]
     async fn a_protected_path_in_the_patch_is_refused_and_nothing_is_written() {
         let root = temp_workspace("protected");
@@ -668,8 +696,8 @@ mod tests {
             "应按受保护拒绝: {}",
             outcome.content
         );
-        // 两个文件都必须原封不动：受保护路径在补丁的**后面**，
-        // 但校验是全部做完才写盘的。
+        // 两个文件都必须保持不变：受保护路径在补丁**后面**，而校验在
+        // 全部计算完成后才写盘。
         assert_eq!(
             fs::read_to_string(root.join(".git/config")).unwrap(),
             "ORIGINAL\n"
@@ -808,9 +836,8 @@ mod tests {
 
     /// 同一个文件在补丁里出现两次：第二次在第一次的结果上匹配。
     ///
-    /// 这是"后一个操作看到前一个的结果"的直接后果，也是补丁格式的自然
-    /// 语义。第二次的改动块匹配的是第一次改出来的文本——若拿原文去
-    /// 匹配，它必然失败。
+    /// 这是"后一个操作看到前一个的结果"的直接结果。第二次的改动块匹配
+    /// 第一次改出的文本；用原文匹配必然失败。
     #[tokio::test]
     async fn a_file_touched_twice_uses_the_second_change_on_the_first_result() {
         let root = temp_workspace("twice");
@@ -835,10 +862,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 补丁里先删后加同一个文件：合法（挪走再重建）。
+    /// 补丁里先删后加同一文件：合法（挪走再重建）。
     ///
-    /// "已存在"要对着**计划中的状态**判，不能对着磁盘判——对着磁盘判
-    /// 会把这个合法的补丁误报成"文件已存在"。
+    /// "已存在"要按**计划中的状态**判断，按磁盘状态判断会把这种合法补丁
+    /// 误报为"文件已存在"。
     #[tokio::test]
     async fn deleting_then_adding_the_same_file_works() {
         let root = temp_workspace("delete-then-add");
@@ -864,11 +891,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// `apply_patch` 是破坏性工具：默认策略必须对它要审批。
+    /// `apply_patch` 是破坏性工具：默认策略必须要求审批。
     ///
-    /// `apply_patch` 一次能改多个文件，破坏面比 `edit_file` 更大——
-    /// 它必须落进"非只读一律审批"这一档，不能因为是新工具就漏在
-    /// 默认放行里。
+    /// 它一次能修改多个文件，影响面比 `edit_file` 更大。它必须落入
+    /// "非只读一律审批"这一档，不能因为是新工具就落入默认放行。
     #[test]
     fn the_default_policy_requires_approval_for_a_patch() {
         let engine = crate::domain::policy::PolicyEngine::new();
@@ -887,10 +913,10 @@ mod tests {
         );
     }
 
-    /// 注解本身也要钉住：破坏性、非只读、非幂等、不开放世界。
+    /// 注解本身也要固定：破坏性、非只读、非幂等、不开放世界。
     ///
-    /// 这四个标记是策略层与审批层的判据。`read_only` 误标成 true 会让
-    /// 默认策略直接放行——那等于把一个新工具漏出安全边界之外。
+    /// 这四个标记是策略层与审批层的判据。`read_only` 误标为 true 会让
+    /// 默认策略直接放行，新工具就落在安全边界之外。
     #[test]
     fn the_annotations_mark_the_patch_as_destructive() {
         let annotations = ApplyPatch::spec().annotations;

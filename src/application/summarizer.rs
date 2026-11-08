@@ -1,8 +1,8 @@
-//! 历史摘要器：把被裁掉的轮次压成一段文字。
+//! 历史摘要器：将被裁掉的轮次压缩成文本。
 //!
-//! 摘要是优化不是必需：生成失败一律降级为占位说明，任务继续。
-//! 这里只负责"怎么问模型"，"何时值得问"的决策在运行循环
-//! （`should_summarize`）——被裁轮次累积到策略阈值且现有摘要没覆盖才问。
+//! 摘要是优化项，生成失败一律降级为占位说明，任务继续。本模块只负责
+//! 如何询问模型；何时值得询问由运行循环的 `should_summarize` 决定，
+//! 即被裁轮次达到策略阈值且现有摘要未覆盖时。
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -14,20 +14,19 @@ use crate::domain::context::Summary;
 use crate::domain::evidence::TokenUsage;
 use crate::domain::session::ContextSlice;
 
-/// 一次摘要请求的输入。全部 owned：运行循环先同步渲染被裁片段，
-/// 再 await 模型——借用不能跨过 await 点。
+/// 一次摘要请求的输入。全部为 owned：运行循环先同步渲染被裁片段，再
+/// await 模型，借用不能跨过 await 点。
 pub struct SummarizeInput {
     /// 被裁片段渲染成的文本。
     pub dropped_transcript: String,
-    /// 已有的旧摘要。非空时要求模型在其基础上合并，而不是从头概括。
+    /// 已有摘要。非空时要求模型在此基础上合并，避免从头概括。
     pub existing: Option<Summary>,
     /// 本次摘要覆盖的轮次范围（含）。
     pub covers: (u32, u32),
     /// 被裁历史涉及的步骤号（1-based）。
     ///
-    /// 由代码从会话算出：历史里每条非交接的用户消息就是一步的交代，
-    /// 数一遍就知道每轮属于第几步。模型可能漏写、可能写错编号，而
-    /// "这份摘要讲的是哪几步"必须准确。
+    /// 由代码从会话计算：每条非交接的用户消息代表一步的交代，统计即可确定
+    /// 每轮所属步骤。模型可能漏写或写错编号，而摘要覆盖的步骤必须准确。
     pub steps: Vec<u32>,
 }
 
@@ -36,8 +35,8 @@ pub struct Summarizer {
     model: Arc<dyn ModelGateway>,
 }
 
-/// 摘要的字数上限。摘要是给模型看的备忘，不是全文备份：
-/// 太长会让"压缩"失去意义，300 字足够装下关键路径与结论。
+/// 摘要的字数上限。摘要是给模型看的备忘而非全文备份，过长会失去压缩
+/// 意义；300 字足以容纳关键路径与结论。
 const SUMMARY_MAX_CHARS: usize = 300;
 
 impl Summarizer {
@@ -45,12 +44,12 @@ impl Summarizer {
         Self { model }
     }
 
-    /// 生成摘要，成功返回摘要与本次调用的 token 用量。
+    /// 生成摘要，成功时返回摘要与本次调用的 token 用量。
     ///
     /// # Errors
     ///
     /// 模型调用失败或摘要文本为空时返回 [`ApplicationError::SummaryFailed`]。
-    /// 调用方应降级为占位说明，而不是把错误抛给任务。
+    /// 调用方应降级为占位说明，不要把错误抛给任务。
     pub async fn summarize(
         &self,
         input: SummarizeInput,
@@ -89,10 +88,10 @@ impl Summarizer {
             history: vec![ContextSlice::User(Cow::Owned(prompt))],
             spec: &spec,
             tools: &[],
-            // 摘要调用不参与前缀缓存：它每次的输入都是新裁出来的片段，
-            // 给它一个键只会让 provider 把互不相干的请求路由到同一台
-            // 机器，反而挤掉真正该命中的那条前缀。注意是 `None` 而不是
-            // 空字符串——后者在 wire 上仍是一个 `prompt_cache_key`。
+            // 摘要调用不参与前缀缓存：每次输入都是新裁出的片段。给它键会让
+            // provider 把互不相干的请求路由到同一台机器，挤掉真正应命中的
+            // 前缀。这里必须是 `None` 而非空字符串，空字符串在 wire 上仍是
+            // 一个 `prompt_cache_key`。
             cache_key: None,
         };
         let model = self.model.clone();
@@ -107,8 +106,8 @@ impl Summarizer {
         Ok((
             Summary {
                 covers: input.covers,
-                // 摘要按步骤分段：模型不按格式回答时退回原文 + 代码写的
-                // 步骤抬头，两种情况下"这份摘要讲哪几步"都是清楚的。
+                // 摘要按步骤分段。模型不按格式回答时退回原文，并补上代码
+                // 生成的步骤抬头；两种情况下摘要覆盖的步骤都清楚。
                 text: arrange_by_step(&text, &input.steps),
                 steps: input.steps,
             },
@@ -117,7 +116,7 @@ impl Summarizer {
     }
 }
 
-/// 步骤号列表的简短写法：`1-3` 或 `1、3`。
+/// 步骤号范围的简短写法：首尾不同时 `1-3`，单一步骤就是它自己。
 fn describe_steps(steps: &[u32]) -> String {
     match (steps.first(), steps.last()) {
         (Some(first), Some(last)) if first != last => format!("{first}-{last}"),
@@ -126,17 +125,15 @@ fn describe_steps(steps: &[u32]) -> String {
     }
 }
 
-/// 把模型返回的摘要整理成按步骤分段的文本。
+/// 将模型返回的摘要整理为按步骤分段的文本。
 ///
-/// **为什么要有这一步。** 摘要是给下一步的模型看的，而下一步要的是
-/// "第 1 步查出了什么、第 2 步做了什么"——一整段混在一起的文字里，
-/// 模型得自己猜哪句属于哪一步。分段之后，边界是现成的。
+/// 摘要供下一步的模型阅读，需要明确"第 1 步查出了什么、第 2 步做了什么"。
+/// 整段文本会让模型自行猜测句子归属，分段则给出明确边界。
 ///
-/// **模型不保证守格式。** 解析不出标记就退回原文加一个代码写的抬头，
-/// 而不是硬掰：掰出来的段落会把不相干的内容塞进错误的步骤，比不分
-/// 段更糟。
+/// 模型不保证遵守格式。解析不出标记时退回原文并补上代码生成的抬头，
+/// 不强行拆分；错误拆分会把内容放进错误的步骤，比不分段更糟。
 ///
-/// 分段之外的段（模型写了代码没算进去的步号）也留着：内容比格式重要。
+/// 模型写出的、不在预期步骤列表中的段也保留：内容优先于格式。
 fn arrange_by_step(text: &str, steps: &[u32]) -> String {
     let mut sections: Vec<(u32, String)> = Vec::new();
     let mut current: Option<(u32, String)> = None;
@@ -161,7 +158,7 @@ fn arrange_by_step(text: &str, steps: &[u32]) -> String {
     }
 
     if sections.is_empty() {
-        // 模型没按格式回答：原文照用，步骤抬头由代码补。
+        // 模型未按格式回答：保留原文，步骤抬头由代码补充。
         let described = describe_steps(steps);
         let header = if described.is_empty() {
             String::new()
@@ -180,7 +177,7 @@ fn arrange_by_step(text: &str, steps: &[u32]) -> String {
             .unwrap_or("（本步的内容没能概括出来）");
         out.push_str(&format!("【第 {step} 步】{body}\n"));
     }
-    // 模型写了代码没算进去的步号：也留着，别丢内容。
+    // 模型写出的、未在预期步骤列表中的步号也保留，避免丢失内容。
     for (number, body) in &sections {
         if !steps.contains(number) {
             out.push_str(&format!("【第 {number} 步】{body}\n"));
@@ -189,12 +186,12 @@ fn arrange_by_step(text: &str, steps: &[u32]) -> String {
     out.trim().to_owned()
 }
 
-/// 拆出一行里的步骤标记：`第 3 步：…`、`【第 3 步】…`、`第3步:…` 都算。
+/// 从一行中拆出步骤标记：`第 3 步：…`、`【第 3 步】…`、`第3步:…` 均可。
 ///
 /// 返回步号与标记之后的正文。行首不是标记时返回 `None`。
 ///
-/// 「第」与数字之间可以有空格：提示词里给模型的就是「第 N 步：」这种
-/// 写法，解析器得认它自己要求的样子。
+/// 「第」与数字之间允许空格：提示词要求模型使用「第 N 步：」格式，
+/// 解析器必须识别该格式。
 fn split_step_marker(line: &str) -> Option<(u32, &str)> {
     let trimmed = line.trim();
     let trimmed = trimmed
@@ -208,11 +205,11 @@ fn split_step_marker(line: &str) -> Option<(u32, &str)> {
         return None;
     }
     let rest = rest[digits.len()..].trim_start().strip_prefix('步')?;
-    // 标记后面必须是分隔符或行尾。否则"第 3 步的观察"这种正文会被
-    // 误认成标记，把后面的内容塞进错误的步骤。
+    // 标记后必须是分隔符或行尾，否则"第 3 步的观察"这类正文会被误判为
+    // 标记，内容被归入错误的步骤。
     //
-    // 分隔符里有收尾的括号：`【第 3 步】读了配置` 这种写法模型很爱写，
-    // 认不出来就等于把整段退回原文。
+    // 分隔符包含收尾括号：模型常用 `【第 3 步】读了配置` 的写法，无法识别
+    // 会导致整段退回原文。
     let body = rest.trim_start();
     if !(body.is_empty()
         || body.starts_with(['：', ':', '、', '）', ')', '】', ']', '.', '。', ' ', '\t']))
@@ -223,9 +220,8 @@ fn split_step_marker(line: &str) -> Option<(u32, &str)> {
     Some((digits.parse().ok()?, body))
 }
 
-/// 把会话切片渲染成给摘要模型看的纯文本。
-///
-/// 只保留有信息量的部分：模型文本、调用了什么、观察到了什么。
+/// 将会话切片渲染为摘要模型阅读的纯文本：用户消息、模型文本、调用与
+/// 观察全部保留，供摘要覆盖完整上下文。
 pub fn render_slices(slices: &[ContextSlice<'_>]) -> String {
     let mut text = String::new();
     for slice in slices {
@@ -266,7 +262,7 @@ mod tests {
     use crate::domain::agent::AgentTurn;
     use crate::domain::evidence::TokenUsage;
 
-    /// 回一句固定文本的假模型，顺带记下收到的提示词。
+    /// 返回固定文本的假模型，同时记录收到的提示词。
     struct ScriptedModel {
         reply: String,
         prompts: std::sync::Mutex<Vec<String>>,
@@ -340,7 +336,7 @@ mod tests {
         assert!(summary.text.contains("改了默认值"), "{}", summary.text);
     }
 
-    /// 摘要记下它讲的是哪几步：由代码给，不靠模型写。
+    /// 摘要记录覆盖的步骤，由代码计算，不依赖模型输出。
     #[tokio::test]
     async fn the_summary_records_the_steps_it_covers() {
         let model = ScriptedModel::new("第 1 步：读了配置\n");
@@ -352,7 +348,7 @@ mod tests {
         assert_eq!(summary.covers, (1, 2));
     }
 
-    /// 模型漏掉的一步要留个空位——不能装作那一步不存在。
+    /// 模型漏掉的步骤保留占位，不能略去。
     #[tokio::test]
     async fn a_step_the_model_missed_gets_a_placeholder() {
         let model = ScriptedModel::new("第 1 步：读了配置\n第 3 步：跑了测试\n");
@@ -368,7 +364,7 @@ mod tests {
         assert!(summary.text.contains("没能概括出来"), "{}", summary.text);
     }
 
-    /// 模型不守格式时退回原文加代码写的抬头，不硬掰。
+    /// 模型不遵守格式时退回原文，并补上代码生成的抬头。
     #[tokio::test]
     async fn a_model_that_ignores_the_format_still_gets_a_step_header() {
         let model = ScriptedModel::new("读了点东西，改了点东西。");
@@ -380,7 +376,7 @@ mod tests {
         assert!(summary.text.contains("读了点东西"), "{}", summary.text);
     }
 
-    /// 模型写了代码没算进去的步号：内容留着，别丢。
+    /// 模型写出的、未在预期列表中的步号也保留内容。
     #[tokio::test]
     async fn an_extra_step_the_model_invented_is_kept() {
         let model = ScriptedModel::new("第 1 步：读了配置\n第 9 步：模型自己加的一段\n");
@@ -392,7 +388,7 @@ mod tests {
         assert!(summary.text.contains("模型自己加的一段"), "{}", summary.text);
     }
 
-    /// "第 3 步的观察"是正文，不是步骤标记——认错了会把内容塞错步骤。
+    /// "第 3 步的观察"是正文而非步骤标记，误判会归错步骤。
     #[test]
     fn a_step_marker_must_be_followed_by_a_separator() {
         assert_eq!(split_step_marker("第 3 步的观察"), None);
@@ -401,7 +397,7 @@ mod tests {
         assert_eq!(split_step_marker("第3步:读了配置"), Some((3, "读了配置")));
     }
 
-    /// 问模型的话要说清要按步骤分段。
+    /// 提示词必须明确要求按步骤分段。
     #[tokio::test]
     async fn the_prompt_asks_for_per_step_sections() {
         let model = Arc::new(ScriptedModel::new("第 1 步：读了配置\n"));

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ids::CallId;
 
-/// SDK 和执行器能够证实的故障。连接关闭不等同于进程崩溃。
+/// SDK 和执行器能证实的故障。连接关闭不等同于进程崩溃。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpFaultKind {
     SandboxCreation,
@@ -52,8 +52,10 @@ pub enum McpLifecycleKind {
     Closed,
 }
 
-/// 一条连接级事实。generation 区分同名 Server 的实例，不把多个工具的
-/// 同一次断连记成多次退出；call_id 仅用于关联触发恢复或断连的调用。
+/// 一条连接级事实。
+///
+/// generation 区分同名 Server 的实例，避免把多个工具的同一次断连记成
+/// 多次退出。call_id 只用于关联触发恢复或断连的调用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpLifecycleFact {
     pub server: String,
@@ -65,8 +67,10 @@ pub struct McpLifecycleFact {
     pub tools_changed: bool,
 }
 
-/// 工具调用的失败事实。未发出请求时 result_unknown 必须为 false；
-/// 请求发出后的超时/断连只能说结果未知，不能承诺取消或恰好一次执行。
+/// 工具调用的失败事实。
+///
+/// 请求未发出时 result_unknown 必须为 false。请求发出后的超时或断连
+/// 只能标记结果未知，不能承诺取消或恰好一次执行。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpCallFailure {
     pub server: String,

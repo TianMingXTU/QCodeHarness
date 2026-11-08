@@ -1,20 +1,17 @@
-//! 任务级恢复：把一个任务的快照读回成"可以接着跑"的状态。
+//! 任务级恢复：把任务快照读回成可以继续跑的状态。
 //!
-//! 任务级恢复与会话级恢复（`AgentRunner::resume`）解决的是两个不同
-//! 层次的问题。会话级恢复回答"这个 runner 停在哪"，任务级恢复回答
-//! "这个任务做到哪"。后者多三件事：
+//! 与会话级恢复（`AgentRunner::resume`）分属两个层次。会话级回答
+//! "runner 停在哪"，任务级回答"任务做到哪"。任务级多三件事：
 //!
-//! 1. **进度的真相来源**是任务，不是 runner。任务停在第 3 步，恢复
-//!    就从第 3 步开始——前面两步不重做。
-//! 2. **每一步的结论要交回给模型**。恢复后的第 3 步必须看得见第 1、
-//!    2 步查出了什么，否则它只能从零重推——那正是长任务恢复后跑偏的
-//!    根源。
-//! 3. **恢复前要核对三件事**：任务的步骤与快照里的会话对不对得上、
-//!    会话 ID 一不一致、工作区有没有被人动过。三者任一不对，就明确
-//!    报错或要求确认，绝不静默继续。
+//! 1. 进度的真相来源是任务，不是 runner。任务停在第 3 步，恢复就从
+//!    第 3 步开始，前两步不重做。
+//! 2. 每一步的结论要交回模型。恢复后的第 3 步必须看到第 1、2 步的
+//!    结果，否则只能从零重推，长任务恢复后偏离目标多源于此。
+//! 3. 恢复前核对两件事：任务步骤与快照会话是否对应（不符即拒绝），
+//!    工作区是否被改过（不符要用户确认或按策略处理）。
 //!
-//! 核对放在恢复之前而不是之后：恢复错了还能重来，恢复对了却带着
-//! 错的状态跑下去，副作用就出去了。
+//! 核对在恢复之前完成：恢复错了可以重来；带着错状态继续跑，副作用
+//! 已经发生。
 
 use std::sync::Arc;
 
@@ -28,45 +25,44 @@ use crate::domain::ids::SessionId;
 use crate::domain::task::StepOutput;
 use crate::domain::worktree::{WorktreeChange, WorktreeManifest};
 
-/// 工作区被改动时，恢复该怎么办。
+/// 工作区被改动时恢复的策略。
 ///
-/// 这是**用户**的决定，不是程序能替他做的：改动可能正是上一个 agent
-/// 留下的半成品（那就该继续），也可能是一份与任务无关的手改（那就
-/// 该停下来）。
+/// 是否继续由用户决定：改动可能是上一个 agent 留下的半成品，也可能是
+/// 与本任务无关的手工修改。
 ///
-/// 默认 [`WorktreeChangePolicy::Refuse`]：宁可多问一句，也不要在
-/// 别人刚改过的工作区上继续改。
+/// 默认 [`WorktreeChangePolicy::Refuse`]，避免在别人刚改过的工作区上
+/// 继续改。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorktreeChangePolicy {
     /// 检测到改动就拒绝恢复。
     #[default]
     Refuse,
-    /// 用户已经看过差异并确认过了，照常恢复。
+    /// 用户已确认差异，照常恢复。
     Confirmed,
 }
 
 /// 恢复前的核对结果。
 ///
-/// 核对不通过时不是"恢复失败"，而是"恢复前必须有人拍板"——工作区被
-/// 改过这一条尤其如此：硬失败会让用户以为程序坏了，而实际上只要他
-/// 说一句"我知道，继续"就该能接着跑。
+/// 核对不通过表示恢复前需要用户决定，不是恢复失败。工作区被改过尤其
+/// 如此：硬失败会让用户以为程序坏了，而用户确认后应当可以继续。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeCheck {
-    /// 三项核对全过，可以直接恢复。
+    /// 工作区清单无差异。这只覆盖工作区检查；版本与步骤核对在
+    /// [`check_resumable`] 里完成，结果不经过本类型。
     Clean,
-    /// 工作区自快照以来被改过。`changes` 列出差异。
+    /// 工作区自快照以来被改过，`changes` 列出差异。
     ///
-    /// 这是**警告**而不是错误：改动的可能正是上一个 agent 留下的
-    /// 半成品，而用户可能知道自己在改什么。静默继续才是错的——
-    /// 模型会拿着过期的计划继续改，把用户刚做的修改覆盖掉。
+    /// 这是警告，不是错误：改动可能是上一个 agent 的半成品，用户也
+    /// 可能知道自己在改什么。不能静默继续，否则模型会按过期计划覆盖
+    /// 用户刚做的修改。
     WorktreeChanged {
         /// 差异清单。
         changes: Vec<WorktreeChange>,
     },
-    /// 工作区扫不出来（目录没了、权限不足）。检查降级为"查不了"。
+    /// 工作区无法扫描（目录不存在、权限不足）。
     ///
-    /// 与 [`ResumeCheck::Clean`] 分开：查不了不等于没改动。把"查不了"
-    /// 报成"没改动"就是在撒谎。
+    /// 与 [`ResumeCheck::Clean`] 分开：查不了与没改动是两回事，不能把
+    /// 前者报成后者。
     WorktreeUnreadable {
         /// 原因。
         reason: String,
@@ -75,9 +71,9 @@ pub enum ResumeCheck {
 
 /// 恢复前的核对失败。
 ///
-/// 这类失败是**明确拒绝**，不是"尽力恢复"：任务步骤与会话对不上、
-/// 会话 ID 不一致，都说明手里的快照与要恢复的东西不是一回事。
-/// 在这种状态下继续跑，恢复出来的模型会在错误的上下文里工作。
+/// 这是明确拒绝，不做尽力恢复：步骤对不上或会话 ID 不一致，说明手里
+/// 的快照与要恢复的任务不是一回事。继续跑会让模型在错误的上下文里
+/// 工作。
 #[derive(Debug, thiserror::Error)]
 pub enum ResumeRejection {
     /// 任务快照里的步骤与会话里的步骤交代对不上。
@@ -124,21 +120,19 @@ pub fn check_resumable(
     Ok(())
 }
 
-/// 核对任务的步骤与会话里的步骤交代。
+/// 核对任务步骤与会话里的步骤交代。
 ///
-/// 会话历史里每一步的交代是一条用户消息。任务快照里的步骤与这些交代
-/// 必须**逐字对得上**：第 i 条交代必须正是任务第 i 步会生成的交代。
+/// 每一步的交代是会话历史里的一条用户消息。任务快照的步骤必须与这些
+/// 交代逐字一致：第 i 条交代即任务第 i 步生成的文本。
 ///
-/// 为什么逐字比而不是只数条数：条数只能回答"开了几步"，回答不了
-/// "开的是不是这个任务的步"。而两者对不上，意味着手里的任务与手里的
-/// 会话不是同一个任务的两半——拿它恢复等于用 A 任务的进度去续 B 任务
-/// 的历史。
+/// 只数条数不够，它回答不了开的是不是这个任务的步。对不上说明任务与
+/// 会话不属于同一个任务，拿它恢复会混用 A 任务的进度与 B 任务的历史。
 ///
-/// 只比已经开跑的步：任务还有几步没跑，那几步的交代从来没进过历史，
-/// 这是正常的（任务正是在那一步被中断的）。
+/// 只比已经开跑的步。未跑的步其交代从未进入历史，任务就在那一步被
+/// 中断。
 ///
-/// 步骤说明在会话里是自然语言，但它由 [`step_prompt::step_prompt`]
-/// 唯一生成——构造与比对共用同一份文本，所以这里比的是确定的东西。
+/// 步骤说明是自然语言，但由 [`step_prompt::step_prompt`] 唯一生成，
+/// 构造与比对共用同一份文本，比对结果是确定的。
 fn check_steps_match(snapshot: &TaskSnapshot) -> Result<(), ResumeRejection> {
     let task = &snapshot.task;
     let total = task.steps().len();
@@ -184,9 +178,8 @@ fn check_steps_match(snapshot: &TaskSnapshot) -> Result<(), ResumeRejection> {
 
 /// 核对会话 ID。
 ///
-/// 快照里的会话 ID 与期望的不一致时说明手里的快照不是这个任务的
-/// 那份——可能是用户复制了文件，也可能任务 ID 被复用了。两种情况都
-/// 值得停下来问一句，而不是接着跑。
+/// 不一致说明快照不属于这个任务，可能是用户复制了文件，也可能任务 ID
+/// 被复用。两种情况都应停下来确认。
 fn check_session_matches(
     snapshot: &TaskSnapshot,
     expected: Option<&SessionId>,
@@ -206,24 +199,23 @@ fn check_session_matches(
 
 /// 把会话快照里的半轮现场合并进任务快照。
 ///
-/// **为什么需要这一步。** 任务快照是**步骤边界**的快照：它在每完成一步
-/// 之后落一次盘，里面记的运行状态因此总是"某一步刚做完"的样子。进程若
-/// 死在某一步的半路上（等人审批、正在执行工具），任务快照就落后了——
-/// 真正的现场（"停在第几次调用上、那次调用有没有跑过"）只存在于**会话
-/// 快照**里，那才是 runner 每到一个保存点就写一份的文件。
+/// 任务快照只在步骤边界落盘，记录的运行状态总是"某一步刚做完"。进程
+/// 若死在某一步中途（等待审批、执行工具），任务快照就落后了。真正的
+/// 现场（停在第几次调用、那次调用有没有执行过）只在会话快照里，那是
+/// runner 每到一个保存点就写一份的文件。
 ///
-/// 不合并的后果很具体：任务停在等人审批时被杀，恢复会退回步骤边界，
-/// 整个中断的步骤从头再跑一遍；停在工具执行途中被杀，那次调用的副作用
-/// 可能已经发生，而恢复路径上没有任何东西记得它。
+/// 不合并的后果：停在审批前被杀，恢复会退回步骤边界，整个步骤重跑；
+/// 停在工具执行途中被杀，该调用的副作用可能已经发生，恢复路径却不
+/// 记得它。
 ///
-/// **只合并"停在半轮"的会话快照。** 步骤边界的现场任务快照里已经有了，
-/// 合并只会引入"哪一份更新"的问题。
+/// 只合并停在半轮的会话快照。步骤边界的现场任务快照已有，合并只会
+/// 引入"哪一份更新"的问题。
 ///
-/// **合并的前提是两边说的是同一件事**：同一个会话，且会话正停在任务要
-/// 恢复的那一步上（会话开跑的步数 = 任务进度 + 1）。对不上就不合并——
-/// 宁可按步骤边界恢复（重做那一步），也不要拿一个对不上的半轮现场去续。
+/// 合并前提是两边指向同一位置：同一会话，且会话开跑的步数 = 任务
+/// 进度 + 1。对不上就不合并，按步骤边界恢复（重做那一步），不能拿
+/// 对不上的半轮现场续跑。
 ///
-/// 纯函数：不读盘、不取时钟。读盘由调用方做，好让这段判断能被单独测。
+/// 纯函数：不读盘、不取时钟。读盘由调用方完成，便于单独测试。
 pub fn merge_session_state(snapshot: TaskSnapshot, session: Option<RunSnapshot>) -> TaskSnapshot {
     let Some(session) = session else {
         return snapshot;
@@ -237,7 +229,7 @@ pub fn merge_session_state(snapshot: TaskSnapshot, session: Option<RunSnapshot>)
     if session.session_id != snapshot.run.session_id {
         return snapshot;
     }
-    // 会话停在任务要恢复的那一步上吗？
+    // 会话必须停在任务要恢复的那一步上。
     let resumed_step = snapshot.task.current_index();
     if session.session.started_steps() != resumed_step + 1 {
         return snapshot;
@@ -247,7 +239,7 @@ pub fn merge_session_state(snapshot: TaskSnapshot, session: Option<RunSnapshot>)
     merged
 }
 
-/// 比对快照时的清单与现在的清单，给出工作区有没有被动过的结论。
+/// 比对快照清单与当前清单，判断工作区是否被改动过。
 pub fn check_worktree(
     saved: &WorktreeManifest,
     scanner: &dyn WorktreeScanner,
@@ -267,23 +259,22 @@ pub fn check_worktree(
 
 /// 把已完成步骤的结论推进会话历史。
 ///
-/// 结论以用户消息的形式推进历史。三个理由：
+/// 结论以用户消息的形式写入，理由有三：
 ///
-/// 1. **裁剪不会吃掉它**。`domain::context::compact` 丢弃的是轮次，
-///    保留的是全部用户消息。结论走用户消息，就活得比历史轮次长——
-///    而长任务恰恰是历史被裁得最狠的场景。
-/// 2. **下一步的模型需要的是"结论原文"，不是"结论的概括"**。第 3 步
-///    要动手改代码，它需要第 1 步查出的根因是什么、是什么形式（路径、
-///    函数名、报错文本）。概括会丢掉这些。
-/// 3. **可判定**。恢复完成后，"第 1 步的结论在不在历史里"是能测的
-///    （见 `tests/task_resume.rs`），而不是只能靠人读一遍觉得像。
+/// 1. 裁剪不会丢弃它。`domain::context::compact` 丢弃轮次，保留全部
+///    用户消息。结论走用户消息，能活得比轮次长，长任务的历史最容易被
+///    裁。
+/// 2. 下一步需要结论原文。第 3 步要改代码，它需要第 1 步查出的根因、
+///    路径、函数名、报错文本，概括会丢掉这些。
+/// 3. 可判定。恢复后"第 1 步的结论在不在历史里"可以测（见
+///    `tests/task_resume.rs`），不必靠人读一遍判断。
 ///
-/// 代价是历史会多出几条用户消息——与步骤交代是同一类东西（都是
-/// "给下一步的提示"），量级也可控：步数是几十的量级，不是几千。
+/// 代价是历史多出几条用户消息，与步骤交代同属"给下一步的提示"，量级
+/// 可控：步数是几十的量级，不是几千。
 ///
-/// 重复交接要避免：同一份快照恢复两次，第二次不该把同一句话再推一遍。
-/// 判断依据是消息文本——[`StepOutput::handoff_message`] 由内容唯一
-/// 决定，比对文本即可。
+/// 避免重复交接：同一份快照恢复两次，第二次不应再推同一句话。依据是
+/// 消息文本，[`StepOutput::handoff_message`] 由内容唯一决定，比对文本
+/// 即可。
 pub fn hand_off_completed_outputs(runner: &mut AgentRunner, outputs: &[StepOutput]) {
     for output in outputs {
         let message = output.handoff_message();
@@ -308,9 +299,9 @@ mod tests {
     use crate::domain::session::Session;
     use crate::domain::task::{Task, TaskKind, TaskStep};
 
-    /// 一串步骤交代装进会话：第一条交代就是会话的开局消息——
-    /// 真实运行里 runner 用第一步的 `prompt` 起步（见 orchestrator 的
-    /// `AgentRunner::new`），会话里没有独立于交代的"任务原文"。
+    /// 把一串步骤交代装进会话。第一条交代是会话开局消息：真实运行里
+    /// runner 用第一步的 `prompt` 起步（见 orchestrator 的
+    /// `AgentRunner::new`），会话里没有独立于交代的任务原文。
     fn session_with_prompts(id: SessionId, prompts: usize) -> crate::domain::session::SessionSnapshot {
         let mut session = Session::new(id, "第 1 步的交代".to_owned());
         for n in 2..=prompts {
@@ -320,7 +311,7 @@ mod tests {
     }
 
     /// 停在步骤边界的任务快照：前 `done_steps` 步已完成，进度停在下一步。
-    /// 会话历史里的交代条数与进度一致——这是"正常"的任务快照。
+    /// 会话历史里的交代条数与进度一致。
     fn task_snapshot_at(done_steps: usize) -> TaskSnapshot {
         let steps: Vec<TaskStep> = (1..=done_steps + 1)
             .map(|n| TaskStep {
@@ -362,8 +353,8 @@ mod tests {
         }
     }
 
-    /// 一份"停在半轮"的会话快照：会话开跑了 `started_steps` 步，
-    /// 状态可指定。`session_id` 默认与任务快照同源。
+    /// 一份停在半轮的会话快照：会话开跑了 `started_steps` 步，状态可指定。
+    /// `session_id` 默认与任务快照同源。
     fn half_round_session(started_steps: usize, state: RunState) -> RunSnapshot {
         half_round_session_with_id(SessionId::new("s1"), started_steps, state)
     }
@@ -392,8 +383,8 @@ mod tests {
 
     #[test]
     fn a_matching_half_round_session_is_merged() {
-        // 正对照：会话与任务同一个 run、正停在要恢复的那一步上
-        // （开跑了 resumed_step + 1 步），半轮现场必须盖过步骤边界。
+        // 正对照：会话与任务同属一个 run，停在要恢复的那一步（开跑了
+        // resumed_step + 1 步），半轮现场应覆盖步骤边界。
         let snapshot = task_snapshot_at(1);
         let session = half_round_session(2, RunState::Dispatching(vec![]));
         let merged = merge_session_state(snapshot.clone(), Some(session.clone()));
@@ -402,8 +393,8 @@ mod tests {
 
     #[test]
     fn a_session_from_another_run_is_not_merged() {
-        // 会话 ID 对不上：手里的会话快照不是这个任务的那份。拿别人的
-        // 半轮现场续自己的任务，等于把副作用记到错误的账上。
+        // 会话 ID 对不上时快照不属于这个任务。拿它续跑会把副作用记到
+        // 错误的账上。
         let snapshot = task_snapshot_at(1);
         let session = half_round_session_with_id(SessionId::new("s2"), 2, RunState::Dispatching(vec![]));
         let merged = merge_session_state(snapshot.clone(), Some(session));
@@ -412,8 +403,8 @@ mod tests {
 
     #[test]
     fn a_session_stopped_at_a_different_step_is_not_merged() {
-        // 进度停在第 2 步（resumed_step=1，会话该开跑了 2 步），
-        // 会话却跑到第 3 步：两边不是同一个位置，宁可按步骤边界恢复。
+        // 进度停在第 2 步（resumed_step=1，会话应开跑 2 步），会话却跑到
+        // 第 3 步：两边不在同一位置，应按步骤边界恢复。
         let snapshot = task_snapshot_at(1);
         let session = half_round_session(3, RunState::Dispatching(vec![]));
         let merged = merge_session_state(snapshot.clone(), Some(session));
@@ -422,8 +413,8 @@ mod tests {
 
     #[test]
     fn a_session_at_a_step_boundary_is_not_merged() {
-        // 会话停在步骤边界（Completed）而不是半轮：任务快照里已经有
-        // 这个现场了，合并只会引入"哪一份更新"的问题。
+        // 会话停在步骤边界（Completed）而非半轮：任务快照已有这个现场，
+        // 合并只会引入"哪一份更新"的问题。
         let snapshot = task_snapshot_at(1);
         let session = half_round_session(2, RunState::Completed("收尾".to_owned()));
         let merged = merge_session_state(snapshot.clone(), Some(session));

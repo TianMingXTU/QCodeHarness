@@ -1,15 +1,15 @@
 //! 接口层：CLI 参数解析与控制台播报。
 //!
-//! 播报走 `EvidenceSink` 而不是在循环里直接 `println!`：`AgentRunner`
-//! 因此完全不知道有控制台的存在，换个前端（Web、IDE）只需换一个
-//! `EvidenceSink` 实现，循环一行不用改。
+//! 播报通过 `EvidenceSink` 输出，不在循环中直接 `println!`。`AgentRunner`
+//! 因此不感知控制台；替换前端（Web、IDE）只需更换 `EvidenceSink` 实现，
+//! 循环无需修改。
 
 use std::sync::Mutex;
 
 use crate::application::port::{EvidenceSink, Timestamp};
 use crate::domain::evidence::AuditEvent;
 use crate::domain::tool::ToolCall;
-use crate::infrastructure::evidence::memory::MemoryEvidenceSink;
+use crate::application::memory_evidence::MemoryEvidenceSink;
 
 /// 观察结果在控制台最多显示的字符数，超出截断；完整内容仍会回填给模型。
 const OBSERVE_PREVIEW_CHARS: usize = 400;
@@ -41,55 +41,53 @@ pub const USAGE: &str = "\
 /// 解析出的命令行参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CliArgs {
-    /// 要完成的任务描述。`--resume` 沿用快照里的原任务、
-    /// `--list-sessions` 只列清单，两种模式下可以缺省。
+    /// 要完成的任务描述。`--resume` / `--resume-task` 沿用快照中的原任务；
+    /// `--list-sessions`、报表、基准与 `--mcp-reconnect` 模式不需要。
     pub task: Option<String>,
     /// 跳过人工审批，所有工具自动放行。
     pub auto_approve: bool,
-    /// 启用 AI 审批审查员：模型先判 approve/deny/human，只有它
-    /// 拿不准时才退回交互式闸门问人。
+    /// 启用 AI 审批审查员：模型先判 approve/deny/human；拿不准、调用
+    /// 失败、超时或恢复后的重新询问都退回交互式闸门问人。
     pub ai_review: bool,
     /// 要恢复的会话 ID（`--resume <id>`）。
     pub resume: Option<String>,
     /// 要恢复的任务 ID（`--resume-task <id>`）。
     ///
-    /// 与 `--resume` 的分工：`--resume` 恢复的是**一个 runner**
-    /// （"这个会话停在哪"），从半轮接着跑；`--resume-task` 恢复的是
-    /// **一个任务**（"这个任务做到哪"），从步骤边界接着走，前面的步骤
+    /// 与 `--resume` 的分工：`--resume` 恢复一个 runner，从会话中断处
+    /// 继续；`--resume-task` 恢复一个任务，从步骤边界继续，已完成步骤
     /// 不重做。
     pub resume_task: Option<String>,
-    /// 恢复任务时，即使工作区被改动过也继续（`--force-worktree`）。
+    /// 恢复任务时，即使工作区被改动也继续（`--force-worktree`）。
     ///
-    /// 工作区被改动默认是**拒绝恢复**：改动可能与任务无关，也可能正是
-    /// 上一个 agent 留下的半成品，只有人看得懂区别。这个开关是人的
-    /// 决定——用过它就等于说"我知道，继续"。
+    /// 工作区被改动时默认拒绝恢复。改动可能与任务无关，也可能是上一个
+    /// agent 留下的半成品，只有人能判断。使用该开关表示确认继续。
     pub force_worktree: bool,
     /// 只列出可恢复的会话（`--list-sessions`），然后退出。
     pub list_sessions: bool,
     /// 任务模板名（`--kind <name>`），交给任务编排解析。
     pub kind: Option<String>,
-    /// 生成运行报表（`--report`）：读证据统计成功率、工具结局与成本。
+    /// 生成运行报表（`--report`）：读取证据统计成功率、工具结局与成本，
     /// 不需要模型配置。
     pub report: bool,
-    /// 报表统计的证据根目录（`--report-dir <dir>`），在该目录的
-    /// `.qcodeharness/sessions/` 下找证据文件；缺省为当前工作区。
+    /// 报表统计的证据根目录（`--report-dir <dir>`）。在该目录的
+    /// `.qcodeharness/sessions/` 下查找证据文件，缺省为当前工作区。
     pub report_dir: Option<String>,
     /// 报表输出 JSON（`--json`），只与 `--report` 搭配有效。
     pub json: bool,
     /// 跑 `benchmarks/` 下的基准任务集并打分（`--benchmark`）。
     pub benchmark: bool,
-    /// 跑长任务基准集（`--benchmark-long`）：两段式跑法——先故意耗尽
-    /// 预算制造中断，再从任务快照恢复着跑完。
+    /// 运行长任务基准集（`--benchmark-long`）。两段式执行：先耗尽预算
+    /// 制造中断，再从任务快照恢复并跑完。
     pub benchmark_long: bool,
-    /// 显式尝试重连一个 MCP Server（`--mcp-reconnect <服务器名>`）。
+    /// 显式重连一个 MCP Server（`--mcp-reconnect <服务器名>`）。
     ///
-    /// 独立模式：不跑任务、不需要模型配置——只做一次有界的握手与工具
-    /// 发现，把结果写进连接审计后关闭连接退出。任务中途没有自动重试，
-    /// 恢复通信是人明确下令的动作（与"调用超时不自动重放"同一条线）。
+    /// 独立模式：不运行任务，不需要模型配置。执行一次有界的握手与工具
+    /// 发现，将结果写入连接审计后关闭连接退出。任务中途不会自动重试；
+    /// 恢复通信需要人明确发起，与"调用超时不自动重放"一致。
     pub mcp_reconnect: Option<String>,
     /// 打印用法后正常退出（`--help` / `-h`）。
     ///
-    /// 帮助是纯查询：与其他开关同场时也只看帮助，不跑任务、不做模式校验。
+    /// 与其他开关同时出现时仅处理帮助，不运行任务，也不做模式校验。
     pub help: bool,
 }
 
@@ -98,11 +96,11 @@ pub fn parse_args() -> Option<CliArgs> {
     parse_from(std::env::args().skip(1))
 }
 
-/// 从给定参数列表解析。与 [`parse_args`] 的分工：后者读真实环境，
-/// 这个纯函数可测试。
+/// 从给定参数列表解析。与 [`parse_args`] 的分工：后者读取真实环境，
+/// 本函数为纯函数，便于测试。
 ///
-/// 开关可以在任何位置出现；剩下的第一个位置参数是任务描述。
-/// 不接 `clap`——个位数开关不值得引一个依赖。
+/// 开关可出现在任意位置。剩余的唯一个位置参数是任务描述。
+/// 未引入 `clap`：开关数量很少，不值得增加依赖。
 pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut auto_approve = false;
     let mut ai_review = false;
@@ -171,8 +169,8 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         }
     }
 
-    // 帮助是纯查询：忽略其余开关与位置参数，也不走下面的模式校验。
-    // 让 `--help` 和别的开关同场时报错，只会把"我想看用法"变成一道谜题。
+    // 帮助是纯查询：忽略其余开关与位置参数，也不进入后续模式校验。
+    // 若与其他开关同场时报错，会让查看用法变得困难。
     if help {
         return Some(CliArgs {
             task: None,
@@ -198,14 +196,14 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         return None;
     }
     let task = positional.into_iter().next();
-    // 报表与基准都是不接任务描述的独立模式：带着描述跑只会让人以为
-    // 描述也生效了，直接拒掉。
+    // 报表与基准是不接受任务描述的独立模式。带描述运行会让人误以为描述
+    // 生效，因此直接拒绝。
     if task.is_some() && (report || benchmark || benchmark_long) {
         eprintln!("--report / --benchmark / --benchmark-long 不接受任务描述");
         return None;
     }
-    // 恢复模式沿用快照里的原任务：再塞一条用户消息会破坏
-    // "助手轮次后面紧跟观察"的配对，也说不清哪条才是真任务。
+    // 恢复模式沿用快照中的原任务。追加用户消息会破坏"助手轮次后紧跟
+    // 观察"的配对，也无法确定真正的任务。
     if task.is_some() && resume.is_some() {
         eprintln!("--resume 会沿用快照里的原任务，不能再另外指定任务描述");
         return None;
@@ -214,13 +212,13 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         eprintln!("--resume-task 会沿用快照里的原任务，不能再另外指定任务描述");
         return None;
     }
-    // 会话级与任务级恢复不能同时给：它们恢复的是两样不同的东西，
-    // 同时给的话只有一边会生效，而用户不会知道自己给的那条被吃了。
+    // 会话级与任务级恢复不能同时使用。二者恢复的对象不同，同时指定时
+    // 只有一方生效，用户不会察觉另一项被忽略。
     if resume.is_some() && resume_task.is_some() {
         eprintln!("--resume 与 --resume-task 不能同时使用：一个恢复会话，一个恢复任务");
         return None;
     }
-    // 搭错车的开关要当场指出来，静默忽略等于悄悄吃掉用户的意图。
+    // 组合无效的开关应立即报错。静默忽略会丢弃用户的意图。
     if json && !report {
         eprintln!("--json 需要与 --report 搭配");
         return None;
@@ -237,8 +235,8 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         eprintln!("--benchmark 不能与 --resume-task 搭配");
         return None;
     }
-    // 两种基准互斥：跑法不同（长任务先故意耗尽再恢复），同时给的话
-    // 只有跑得快的那种会被注意到。
+    // 两种基准互斥，执行方式不同（长任务基准先耗尽预算再恢复）。同时
+    // 指定时只有较快的一项会被注意到。
     if benchmark && benchmark_long {
         eprintln!("--benchmark 与 --benchmark-long 不能同时使用");
         return None;
@@ -247,9 +245,9 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         eprintln!("--force-worktree 只对 --resume-task 有意义");
         return None;
     }
-    // `--mcp-reconnect` 是独立模式：探测完就退出。与它同场出现的其他
-    // 意图（跑任务、恢复、报表、基准）都会被跳过——静默丢掉其中一半
-    // 等于悄悄吃掉用户的指令，所以直接拒。
+    // `--mcp-reconnect` 是独立模式，探测完成后退出。与其他意图（运行
+    // 任务、恢复、报表、基准）同时出现时只能执行其一，静默丢弃会忽略
+    // 用户指令，因此直接拒绝。
     if mcp_reconnect.is_some()
         && (task.is_some()
             || resume.is_some()
@@ -295,10 +293,10 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     })
 }
 
-/// 把审计事件渲染到控制台。
+/// 将审计事件渲染到控制台。
 ///
-/// 实现 `EvidenceSink` 是为了搭上 runner 已经在发的事件流：
-/// 思考、行动、观察各有其事件，播报只是它们的另一种落点。
+/// 实现 `EvidenceSink` 以接入 runner 已有的事件流。思考、行动、观察
+/// 各有事件，播报是其另一种输出方式。
 #[derive(Debug)]
 pub struct ConsoleReporter {
     /// 配置的最大轮数，只用于轮次分隔线上的总数。
@@ -309,7 +307,7 @@ pub struct ConsoleReporter {
     trail: MemoryEvidenceSink,
 }
 
-/// 进程保护状态的后缀：未受保护时提醒读者，别让"无保护"悄悄混过控制台。
+/// 进程保护状态后缀。未受保护时给出提示，避免无保护状态被忽略。
 fn isolation_note(fact: &crate::domain::mcp::McpLifecycleFact) -> &'static str {
     if fact.process_isolation {
         ""
@@ -318,8 +316,8 @@ fn isolation_note(fact: &crate::domain::mcp::McpLifecycleFact) -> &'static str {
     }
 }
 
-/// 故障类别后缀：连接没起来或没救回来时，只说"失败"读者无从下手——
-/// 启动进程失败、握手超时和工具发现超时是三个不同的修法。
+/// 故障类别后缀。连接失败或恢复失败时只显示"失败"无法定位问题；启动
+/// 进程失败、握手超时与工具发现超时的处理方式不同。
 fn fault_note(fact: &crate::domain::mcp::McpLifecycleFact) -> String {
     match fact.fault {
         Some(kind) => format!("（{kind}）"),
@@ -353,16 +351,15 @@ impl ConsoleReporter {
                 println!("[观察] {}", preview(&outcome.content));
             }
             AuditEvent::SandboxApplied { platform, active, .. } => {
-                // 生效时不播报：那是默认预期，每条命令刷一行只会让人
-                // 跳过所有行。未生效必须立刻看见——"有沙箱"的假设一旦
-                // 悄悄成立，就没有人会去查它。
+                // 生效时不播报，这是默认预期；每条命令输出一行会让人跳过
+                // 所有输出。未生效必须立即显示，否则沙箱状态不会被检查。
                 if !active {
                     println!("[边界] {platform}：本次执行无进程沙箱保护");
                 }
             }
             AuditEvent::PolicyEvaluated { verdict, reason, .. } => {
-                // 只播报被拒绝的裁决：放行和"要审批"对读者没有新信息，
-                // 而拒绝必须让人立刻看见——那是模型被拦下来的地方。
+                // 只播报拒绝的裁决。放行与要求审批不提供新信息；拒绝表示
+                // 模型被拦截，需要立即显示。
                 if matches!(verdict, crate::domain::policy::PolicyVerdict::Deny) {
                     println!("[策略] {reason}");
                 }
@@ -373,8 +370,8 @@ impl ConsoleReporter {
                 dropped,
                 ..
             } => {
-                // 历史被裁剪要让人知道：从这轮起模型看不到全文了，
-                // 它"忘了"早先的细节不是傻，是被裁掉的。
+                // 历史被裁剪时需要提示。从该轮起模型无法看到完整历史，
+                // 早先细节丢失的原因是裁剪，不是模型遗忘。
                 if !dropped.is_empty() {
                     println!(
                         "[上下文] 历史已裁剪：{rounds_before} 轮 → {rounds_after} 轮（省略第 {}-{} 轮）",
@@ -389,7 +386,7 @@ impl ConsoleReporter {
                 dropped_tokens,
                 ..
             } => {
-                // token 账与轮数账一起看：轮数是手段，token 才是花掉的钱。
+                // 输出净省下的 token。轮数只表示裁剪次数，token 反映实际成本。
                 if *dropped_tokens > 0 {
                     println!(
                         "[上下文] 约省下 {dropped_tokens} token（估算 {tokens_before} → {tokens_after}）",
@@ -397,25 +394,25 @@ impl ConsoleReporter {
                 }
             }
             AuditEvent::SummaryGenerated { covers, .. } => {
-                // 多花的一次调用要有出处：这行告诉读者"刚才那次慢，
-                // 是在补历史摘要"。
+                // 摘要调用会产生额外开销，此行说明之前的延迟来自生成
+                // 历史摘要。
                 println!("[摘要] 已生成第 {}-{} 轮的历史摘要", covers.0, covers.1);
             }
             AuditEvent::SummaryFailed { .. } => {
-                // 摘要失败只提示不报错：历史退回占位说明，任务继续跑。
+                // 摘要失败只提示，不报错。历史退回占位说明，任务继续执行。
                 println!("[摘要] 生成失败，继续用占位说明");
             }
             AuditEvent::ToolCallReplayed { tool, reason, .. } => {
-                // 重放提示要让人看见：那个调用可能已经跑过了，程序没有
-                // 自动再跑一次，而是把决定权交回给模型。
+                // 重放提示需要显示。该调用可能已执行，程序不会自动重跑，
+                // 而是把决定权交回模型。
                 println!("[恢复] 工具 `{tool}` 之前已发起执行，未自动重跑：{reason}");
             }
             AuditEvent::ApprovalReasked { tool, .. } => {
                 println!("[恢复] 工具 `{tool}` 的审批重新问了一次（之前问过，没答复）");
             }
             AuditEvent::StepStarted { role, .. } => {
-                // 每步开始时报出角色：读者要知道接下来是"谁"在干活，
-                // 尤其是编排把不同角色串起来的时候。
+                // 每步开始时输出角色。读者需要知道接下来由谁执行，尤其当
+                // 编排串联多个角色时。
                 println!("[角色] {} 开始执行", role.name());
             }
             AuditEvent::McpLifecycle { fact, .. } => match fact.kind {
@@ -450,14 +447,14 @@ impl ConsoleReporter {
             },
             AuditEvent::McpCallFailed { failure, .. } => {
                 if failure.result_unknown {
-                    // "结果未知"必须让人看见：远端可能已经产生了副作用。
+                    // "结果未知"必须显示，因为远端可能已产生副作用。
                     println!(
                         "[MCP] `{}` 调用故障（{}），远端结果未知，未自动重放",
                         failure.server, failure.kind
                     );
                 }
             }
-            // 审批与 token 用量暂不进控制台，避免淹没主要流程。
+            // 审批与 token 用量暂不输出到控制台，避免淹没主要流程。
             AuditEvent::ApprovalDecided { .. } => {}
         }
     }
@@ -482,7 +479,7 @@ impl EvidenceSink for ConsoleReporter {
     }
 }
 
-/// 把一次调用渲染成 `name({...})`，与重构前的输出格式一致。
+/// 将调用渲染为 `name({...})`，保持既有输出格式。
 fn render_call(call: &ToolCall) -> String {
     let arguments = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned());
     format!("{}({})", call.name, arguments)
@@ -541,9 +538,8 @@ mod tests {
 
     /// `--ai-review` 与 `--yes` 各自独立，也能同时给出。
     ///
-    /// 同时给出时 main.rs 走 `--yes`（用户已声明不用人管，再插一次模型
-    /// 审查只是白花调用）——解析层不替用户做这个决定，只把两个意图都
-    /// 如实带下去。
+    /// 同时给出时 main.rs 采用 `--yes`。用户已声明无需人工干预，再执行
+    /// 模型审查只会浪费调用。解析层不替用户决定，只如实传递两个意图。
     #[test]
     fn ai_review_flag_stands_alone_and_combines_with_yes() {
         let alone = parse_from(argv(&["--ai-review", "跑一下测试"])).unwrap();
@@ -598,8 +594,8 @@ mod tests {
 
     /// `--force-worktree` 只对任务级恢复有意义。
     ///
-    /// 它是"我知道工作区被改过，继续"的声明——挂在别的模式上就是
-    /// 一个没人读的开关，不如当场拒掉。
+    /// 它表示确认工作区已被修改并继续。与其他模式搭配时该开关不会被
+    /// 使用，应在解析阶段拒绝。
     #[test]
     fn force_worktree_needs_resume_task() {
         let parsed = parse_from(argv(&["--force-worktree", "--resume", "s1"]));
@@ -689,10 +685,11 @@ mod tests {
         assert!(parse_from(argv(&["--mcp-reconnect", "demo", "--report"])).is_none());
         assert!(parse_from(argv(&["--mcp-reconnect", "demo", "--benchmark"])).is_none());
 
-        // 缺值必须拒：否则下一个参数会被当成任务描述，探测悄悄变成跑任务。
+        // 缺值必须拒绝，否则下一个参数会被当作任务描述，探测模式变成
+        // 运行任务。
         assert!(parse_from(argv(&["--mcp-reconnect"])).is_none());
 
-        // 审批类开关不改探测语义：共存放行但无作用，静默吃掉反而更糟。
+        // 审批类开关不改变探测语义。允许共存但不生效；直接拒绝反而更糟。
         let yes = parse_from(argv(&["--mcp-reconnect", "demo", "--yes"])).unwrap();
         assert!(yes.auto_approve);
         assert_eq!(yes.mcp_reconnect.as_deref(), Some("demo"));
@@ -763,10 +760,11 @@ mod tests {
         assert_eq!(*reporter.announced_turn.lock().unwrap(), 2);
     }
 
-    /// 连接事件不播报轮次：它没有模型轮次，`turn: 0` 也不是"第 0 轮"。
+    /// 连接事件不播报轮次。
     ///
-    /// 报表按 `is_lifecycle_only` 把它认成连接日志，控制台同样不该为它
-    /// 画一条"第 0/N 轮"的分隔线——那条线会让读者去找一个不存在的轮次。
+    /// 它没有模型轮次，`turn: 0` 也不是第 0 轮。报表通过
+    /// `is_lifecycle_only` 将这类日志识别为连接日志；控制台也不应输出
+    /// "第 0/N 轮"分隔线，否则读者会寻找不存在的轮次。
     #[test]
     fn lifecycle_events_announce_no_turn() {
         let reporter = ConsoleReporter::new(20);
@@ -824,10 +822,10 @@ mod tests {
         assert_eq!(reporter.trail.events().len(), 1);
     }
 
-    /// 两个提示后缀都只认执行层给的事实，不认输出文本。
+    /// 两个提示后缀都只使用执行层提供的事实，不解析输出文本。
     ///
-    /// 控制台上"连接失败"后面跟的是哪一类故障，决定读者去查启动参数、
-    /// 握手还是 Server 的 list_tools；把这三者压成一句"失败"就等于让人猜。
+    /// 故障类别决定读者检查启动参数、握手还是 Server 的 `list_tools`。
+    /// 只显示"失败"会让人无从判断。
     #[test]
     fn mcp_note_suffixes_come_from_structured_facts() {
         let fact = crate::domain::mcp::McpLifecycleFact {

@@ -1,7 +1,7 @@
 //! QCodeHarness 库入口。
 //!
-//! 把四个层暴露成一个库目标，供集成测试（`tests/`）与未来的其他前端
-//! 复用。`main.rs` 是薄壳，只做装配；所有逻辑都在库这边。
+//! 四个层作为库目标导出，供集成测试（`tests/`）与其他前端复用。
+//! `main.rs` 只做装配，逻辑均在库中。
 
 pub mod application;
 pub mod domain;

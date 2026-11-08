@@ -1,9 +1,9 @@
 //! 工作流模板：把任务类型展开成有序步骤。
 //!
-//! 模板是"步骤的配方"，[`WorkflowTemplate::expand`] 把它实例化成
-//! [`TaskStep`] 列表。模板文本里的 `{goal}` 占位符在展开时替换成实际
-//! 任务目标——步骤说明因此必须自包含（步骤边界是一条独立的用户消息，
-//! 模型是从它知道"现在做第几步"的），不能只写"继续"。
+//! 模板是步骤的配方，[`WorkflowTemplate::expand`] 把它实例化成
+//! [`TaskStep`] 列表。模板文本里的 `{goal}` 在展开时替换为实际任务目标。
+//! 因此步骤说明必须自包含：步骤边界是一条独立的用户消息，模型从中知道
+//! 现在做第几步，不能只写"继续"。
 //!
 //! 内置模板之外，用户自定义模板的加载留给产品化阶段。
 
@@ -28,8 +28,8 @@ pub struct WorkflowTemplate {
 pub struct StepTemplate {
     /// 步骤说明。
     pub description: String,
-    /// 这一步期望 Agent 扮演的角色。编排器按它查档案装配
-    /// （系统提示词 + 工具子集），不再是统一的 Coder。
+    /// 这一步期望 Agent 扮演的角色。编排器按它查找档案并装配系统提示词
+    /// 与工具子集，不再统一使用 Coder。
     pub role: AgentRole,
     /// 完成判据。
     pub done_when: String,
@@ -56,10 +56,10 @@ pub struct WorkflowCatalog {
 }
 
 impl WorkflowCatalog {
-    /// 四个内置模板，步骤对齐架构文档 §04 与 README §4.3。
+    /// 四个内置模板，步骤对齐 README §4.3 的角色分派。
     /// 角色分派原则：只读分析交给 Planner/Reviewer，动手改动交给
-    /// Coder，跑命令收集结果交给 Tester——角色能做的事与步骤要做的
-    /// 事必须对得上，否则模型拿着只读工具被要求改文件，只会反复受挫。
+    /// Coder，跑命令收集结果交给 Tester。角色能力必须覆盖步骤要求，
+    /// 否则模型拿着只读工具去改文件，只会反复失败。
     pub fn builtin() -> Self {
         let step = |role: AgentRole, description: &str, done_when: &str| StepTemplate {
             description: description.to_owned(),
@@ -75,18 +75,18 @@ impl WorkflowCatalog {
                     steps: vec![
                         step(
                             AgentRole::Planner,
-                            // Planner 是只读角色，跑不了测试；"复现"由
-                            // 后面的 Tester 步骤做，这里只要求读码定位。
+                            // Planner 是只读角色，无法运行测试。"复现"由
+                            // 后面的 Tester 步骤完成，这里只要求读码定位。
                             "定位问题：{goal}。先读相关代码与测试，找出根因。",
                             "说清问题根因，引用读到的代码或测试输出",
                         ),
                         step(
                             AgentRole::Coder,
-                            // "已完成修复"的出口必须给：实测（Xing4.0-29B）
-                            // 第 1 步常顺手把修复做掉，判据若只认"已修改"，
-                            // 弱模型会为字面达标反复提交空修改直到预算耗尽。
-                            // 不提"根因"——步骤说明必须自包含（模块头注释）：
-                            // 上一步的结论在历史里，但这一步的指令要从这里拿。
+                            // 必须给出"已完成修复"的出口。实测（Xing4.0-29B）
+                            // 第 1 步常直接完成修复；判据只认"已修改"时，
+                            // 弱模型会为字面达标反复提交空修改，直到预算耗尽。
+                            // 不提"根因"：步骤说明必须自包含（见模块头注释）。
+                            // 上一步的结论在历史里，这一步的指令要从这里取。
                             "实施最小修改，修复 {goal}；若前面的步骤已完成修复，核实改动正确并说明即可，不要重复修改。",
                             "相关代码已修改（或确认此前已修复且测试通过），改动范围最小且不引入无关变更",
                         ),
@@ -119,15 +119,15 @@ impl WorkflowCatalog {
                         ),
                         step(
                             AgentRole::Coder,
-                            // 不提"按计划"——规划在历史里，但这一步要做
-                            // 什么必须在这里说清，文本自包含（模块头注释）。
+                            // 不提"按计划"：规划在历史里，但这一步要做什么
+                            // 必须在这里说清，文本自包含（见模块头注释）。
                             "编写 {goal} 的实现。",
                             "功能代码已就位，风格与现有代码一致",
                         ),
                         step(
                             AgentRole::Tester,
-                            // Tester 是只读 + 命令角色，写不了新测试；
-                            // 验证（跑既有测试、实测新行为）才是它的职责。
+                            // Tester 是只读加命令角色，不能写新测试。它的
+                            // 职责是验证：运行既有测试、实测新行为。
                             "验证 {goal} 的实现：运行相关测试与功能验证，确认新行为生效。",
                             "相关测试通过，既有测试未被破坏",
                         ),
@@ -294,7 +294,8 @@ mod tests {
         let catalog = WorkflowCatalog::builtin();
         let template = catalog.find(TaskKind::Refactor).unwrap();
         let steps = template.expand("把模块拆小");
-        // 第一步的说明里有 {goal}，第四步的"对比结果"没有占位符也不该被改动。
+        // 第一步的说明里有 {goal}；第三步的回归判据是写死的文案，
+        // 不含占位符，替换后必须原样保留。
         assert!(steps[0].description.contains("把模块拆小"));
         assert!(steps[2].done_when == "相关测试全部通过，行为与改造前一致");
     }

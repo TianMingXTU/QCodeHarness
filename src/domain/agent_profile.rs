@@ -1,13 +1,13 @@
 //! 角色档案：一个 Agent 角色的系统提示词与工具白名单。
 //!
-//! 不同角色看到不同的提示词、拿到不同的工具子集。工具约束必须是
-//! 双重的：① 提示词里说明不许做（降低概率）；② 调用层按白名单拒绝越权
-//! 调用（硬边界）。只有 ① 没有 ② 的约束靠模型自觉，不构成边界。
+//! 不同角色使用不同的提示词与工具子集。工具约束分两层：提示词说明
+//! 禁止事项（降低概率），调用层按白名单拒绝越权调用（硬边界）。只有
+//! 提示词约束依赖模型自觉，不构成边界。
 //!
-//! 白名单不做装配期过滤：模型每一步看到的都是全量注册表
-//! （前缀缓存要求工具定义跨步一致），白名单下沉为调用时校验——越权
-//! 调用拿到一条指明角色可用工具的拒绝观察，工具根本不会执行。这里的
-//! 数据因此就是边界的唯一真相来源，应用层（`AgentRunner`）按它逐条判断。
+//! 白名单不在装配期过滤。模型每一步看到全量注册表（前缀缓存要求工具
+//! 定义跨步一致），白名单在调用时校验：越权调用收到一条指明可用工具
+//! 的拒绝观察，工具不执行。因此本模块的数据是边界的唯一来源，应用层
+//! （`AgentRunner`）逐条按它判断。
 
 use super::agent::{AgentRole, Effort, Verbosity};
 
@@ -20,11 +20,10 @@ pub struct AgentProfile {
     pub system_prompt: String,
     /// 这个角色允许使用的工具名。`None` 表示不限（用全部已注册工具）。
     pub tools: Option<Vec<String>>,
-    /// 这个角色用的模型名。`None` = 用运行时的默认模型。
+    /// 这个角色使用的模型名。`None` 表示使用运行时默认模型。
     ///
-    /// **模型是运行时的属性，不是 agent 规格的一部分**——同一个角色在
-    /// 不同部署里该用不同的模型，用户在自己的网关上跑什么模型只有他
-    /// 知道。所以这里存的是"要覆盖成什么"，具体值由配置注入。
+    /// 具体值来自配置，编排时复制进 `AgentSpec::model`，随每次请求
+    /// 覆盖网关的默认模型；同一角色在不同部署中可配置不同模型。
     pub model: Option<String>,
     /// 这个角色的推理档位。`None` = provider 默认。
     pub effort: Option<Effort>,
@@ -32,12 +31,12 @@ pub struct AgentProfile {
     pub verbosity: Option<Verbosity>,
 }
 
-/// 只读工具集：Planner 与 Reviewer 共用。任何会改动文件或执行命令的
-/// 工具都不在其中。
+/// 只读工具集，Planner 与 Reviewer 共用。不包含任何会改动文件或
+/// 执行命令的工具。
 ///
 /// `read_files` 与 `read_file` 同权（同一条读取路径、同一套路径校验），
-/// 只是批量——把它挡在名单外会让受限角色明明有更省往返的读法却不能用，
-/// 而这不构成任何边界：读什么、读几个文件，权限上是一件事。
+/// 区别只是批量。将其排除会让受限角色无法使用更省往返的读法，且不
+/// 增加任何边界：读什么、读几个文件在权限上是同一件事。
 const READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "read_files",
@@ -48,9 +47,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 impl AgentProfile {
-    /// 四个内置档案。提示词都遵循 main.rs 的 ReAct 基调，并明确写出
-    /// "不许做什么"——模型看到工具列表里有写工具就可能去用，提示词
-    /// 是第一道软约束（硬约束在调用层的白名单校验上）。
+    /// 四个内置档案。提示词遵循 main.rs 的 ReAct 基调，并明确写出
+    /// 禁止事项。模型看到写工具就可能调用，提示词是第一道软约束，
+    /// 硬约束在调用层的白名单校验。
     pub fn builtin() -> Vec<AgentProfile> {
         let read_only_frame = "\
 你是一个运行在受控 workspace 中的只读分析角色，按照 ReAct 循环完成任务：
@@ -73,7 +72,7 @@ impl AgentProfile {
 - 任务完成时停止调用工具，直接输出最终答案；
 - 最终答案要包含：对目标的理解、有序步骤清单（每步带完成判据）、遗漏与风险。"
                 ),
-                // 只读 5 件套。
+                // 只读工具，共 6 个。
                 tools: Some(READ_ONLY_TOOLS.iter().map(|name| (*name).to_owned()).collect()),
                 model: None,
                 effort: None,
@@ -96,8 +95,8 @@ impl AgentProfile {
 - 任务完成、或确认无法完成时，停止调用工具，直接输出最终答案；
 - 最终答案要包含：结论、依据（引用你读到的内容或执行结果）、遗留风险。"
                     .to_owned(),
-                // 编码者是动手角色：不限工具，注册什么用什么
-                //（包括将来经 MCP 接入的外部工具，照常走策略与审批）。
+                // 编码者是动手角色：不限工具，注册什么用什么，
+                // 包括经 MCP 接入的外部工具（照常走策略与审批）。
                 tools: None,
                 model: None,
                 effort: None,
@@ -181,7 +180,7 @@ mod tests {
 
     #[test]
     fn reviewer_profile_has_no_write_tools() {
-        // 硬边界的静态断言：评审者的白名单里绝不能出现任何写工具。
+        // 静态断言：评审者的白名单不含任何写工具。
         let reviewer = AgentProfile::builtin()
             .into_iter()
             .find(|profile| profile.role == AgentRole::Reviewer)
@@ -203,12 +202,11 @@ mod tests {
         assert_eq!(planner.tools, reviewer.tools);
     }
 
-    /// 批量读取工具要在只读名单里，且名单里不得混进任何写工具。
+    /// 批量读取工具在只读名单内，名单中不含写工具。
     ///
-    /// `read_files` 和 `read_file` 走同一条读取路径、同一套
-    /// 路径校验，权限上是同一件事——漏加它不削弱边界，但会让受限角色
-    /// 明明有更省往返的读法却用不上。断言的后一半守住的是反方向：
-    /// "批量"没有被当成"什么都能批量"的借口，写工具一个都不在。
+    /// `read_files` 与 `read_file` 使用同一条读取路径和同一套路径校验，
+    /// 权限相同。漏加它不削弱边界，但受限角色会失去更省往返的读法。
+    /// 后一半断言检查反方向：写工具一个都不在。
     #[test]
     fn read_only_set_includes_the_batch_reader_and_no_write_tool() {
         for role in [AgentRole::Planner, AgentRole::Reviewer] {
@@ -240,7 +238,7 @@ mod tests {
             .unwrap();
         assert_eq!(coder.tools, None, "编码者不限工具");
 
-        // 每个受限角色的提示词都要写明"不许做"——软约束与硬约束并存。
+        // 每个受限角色的提示词都写明禁止事项：软约束与硬约束并存。
         for role in [AgentRole::Planner, AgentRole::Tester, AgentRole::Reviewer] {
             let profile = AgentProfile::builtin()
                 .into_iter()
@@ -253,11 +251,11 @@ mod tests {
         }
     }
 
-    /// `apply_patch` 是破坏性工具，只该让不限工具的 Coder 用到。
+    /// `apply_patch` 是破坏性工具，只允许不限工具的 Coder 使用。
     ///
-    /// 受限三角色的白名单都不得出现它；Coder 的 `tools: None` 表示不限，
-    /// 登记进注册表即自动可用。白名单是边界的唯一真相来源（见本模块
-    /// 顶部说明），这里钉住新写工具不会漏进只读角色。
+    /// 三个受限角色的白名单都不含它。Coder 的 `tools: None` 表示不限，
+    /// 登记进注册表即可用。白名单是边界的唯一来源（见模块文档），
+    /// 此测试固定新写工具不会进入受限角色。
     #[test]
     fn apply_patch_stays_out_of_the_restricted_roles() {
         for role in [AgentRole::Planner, AgentRole::Tester, AgentRole::Reviewer] {

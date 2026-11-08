@@ -1,8 +1,8 @@
 //! 单文件 JSON 快照存储。
 //!
-//! 路径布局：`<workspace>/.qcodeharness/snapshots/<session_id>.json`，
-//! 与证据目录（`sessions/`）平行——两者都按会话 ID 命名，复盘时一个 ID
-//! 能同时找到"当时发生了什么"（证据）和"停在了哪"（快照）。
+//! 路径布局：`<workspace>/.qcodeharness/snapshots/<session_id>.json`，与
+//! 证据目录 `sessions/` 平行。两者都按会话 ID 命名，复盘时用同一个 ID
+//! 即可找到证据与快照。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,8 +36,8 @@ impl SessionStore for JsonSessionStore {
     fn save(&self, snapshot: &RunSnapshot) -> Result<(), StoreError> {
         fs::create_dir_all(&self.dir)?;
         let path = self.path_for(&snapshot.session_id);
-        // 原子写：先写临时文件并刷盘，再改名覆盖。半途崩溃最多个
-        // 残留一个 .tmp，绝不会留下一个截断的快照顶替上一次的好快照。
+        // 原子写：先写临时文件并刷盘，再改名覆盖。中途崩溃最多残留一个
+        // .tmp，不会留下截断的快照覆盖上一份有效快照。
         let temp = path.with_extension("json.tmp");
         {
             let mut file = fs::File::create(&temp)?;
@@ -63,7 +63,7 @@ impl SessionStore for JsonSessionStore {
         let mut ids = Vec::new();
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
-            // 目录还不存在 = 还没有任何快照，不是错误。
+            // 目录不存在表示尚无快照，不属于错误。
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
             Err(error) => return Err(error.into()),
         };
@@ -92,7 +92,7 @@ mod tests {
     use crate::domain::session::Session;
     use std::time::Duration;
 
-    /// 每次测试用独立的临时目录，避免并行测试互相踩。
+    /// 每次测试使用独立的临时目录，避免并行测试相互干扰。
     fn temp_workspace(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("qch-store-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -211,7 +211,7 @@ mod tests {
 
         store.save(&snapshot_for("../../evil", 1)).unwrap();
 
-        // 净化后的文件名落在快照目录里，而不是目录外。
+        // 净化后的文件名位于快照目录内。
         assert!(store.path_for(&evil).file_name().unwrap() == "______evil.json");
         assert!(store.path_for(&evil).starts_with(&store.dir));
         assert!(store.load(&evil).unwrap().is_some());

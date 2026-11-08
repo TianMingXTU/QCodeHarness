@@ -1,8 +1,7 @@
 //! 查找替换式编辑工具。
 //!
-//! 唯一性校验是这个工具的核心价值：模型给的 `old_string` 如果匹配多处，
-//! 静默替换第一处会制造难以察觉的错误——宁可让它失败，带上"匹配到 N 处"
-//! 的说明，让模型补充更长的上下文重试。
+//! 核心是唯一性校验。`old_string` 匹配多处时，替换第一处会产生难以发现
+//! 的错误。此时应返回失败并说明匹配数量，让模型补充更长的上下文后重试。
 
 use serde::Deserialize;
 use serde_json::json;
@@ -43,7 +42,8 @@ impl EditFile {
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
-            // 修改文件内容不可逆，且同样的替换做第二次会失败（old 已不在），不幂等。
+            // 修改文件内容不可逆，重复执行不是空操作（当 `new_string` 含
+            // `old_string` 时重复替换会继续增长），因此不幂等。
             annotations: ToolAnnotations::new(false, true, false, false),
         }
     }
@@ -82,7 +82,7 @@ impl ToolInvoker for EditFile {
                 }
             };
 
-            let occurrences = content.matches(&args.old_string).count();
+            let occurrences = occurrence_count(&content, &args.old_string);
             match occurrences {
                 0 => ToolOutcome::failed(format!(
                     "在 `{}` 中找不到要替换的文本（old_string 与文件内容不一致）",
@@ -109,6 +109,24 @@ impl ToolInvoker for EditFile {
             }
         })
     }
+}
+
+/// `needle` 在 `haystack` 中出现的次数，包含重叠位置。
+///
+/// `str::matches` 只返回不重叠的匹配，`"aaa"` 中的 `"aa"` 会被数成 1。
+/// 唯一性校验必须把重叠位置也算上，否则会放行一次有歧义的替换。
+fn occurrence_count(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let step = needle.chars().next().map_or(1, char::len_utf8);
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(offset) = haystack[start..].find(needle) {
+        count += 1;
+        start += offset + step;
+    }
+    count
 }
 
 #[cfg(test)]
@@ -180,6 +198,22 @@ mod tests {
             fs::read_to_string(root.join("lib.rs")).unwrap(),
             "let x = 1;\nlet x = 2;\n"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn overlapping_matches_fail_instead_of_picking_the_first() {
+        let root = temp_workspace("overlap");
+        fs::write(root.join("lib.rs"), "aaa\n").unwrap();
+        let file = tool(&root);
+
+        let outcome = file
+            .invoke(&call(edit_args("lib.rs", "aa", "b")))
+            .await;
+
+        assert_eq!(outcome.status, OutcomeStatus::Failed, "两个重叠位置同样不唯一");
+        assert!(outcome.content.contains("匹配到 2 处"), "{}", outcome.content);
+        assert_eq!(fs::read_to_string(root.join("lib.rs")).unwrap(), "aaa\n");
         let _ = fs::remove_dir_all(&root);
     }
 

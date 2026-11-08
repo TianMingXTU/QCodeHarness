@@ -1,8 +1,8 @@
 //! JSONL 证据汇：把审计事件追加写入 JSONL 文件。
 //!
-//! 选 JSONL 而不是单文件 JSON：证据是流式的，运行中要能随时 `tail -f`
-//! 看进度；JSON 数组要等写完整才合法。每行一条 `Evidence`，字段名与
-//! 内存版一致，换存储不需要改读日志的代码。
+//! 证据是流式的，运行中需要能 `tail -f` 查看进度；JSON 数组必须写完整
+//! 才合法，因此选 JSONL。每行一条 `Evidence`，字段名与内存实现一致，
+//! 更换存储不需要修改日志读取代码。
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -16,49 +16,49 @@ use serde::Serialize;
 use crate::application::port::{EvidenceSink, Timestamp};
 use crate::domain::evidence::{AuditEvent, EVIDENCE_FORMAT_MILLIS};
 
-/// 落在磁盘上的证据汇。
+/// 写入磁盘的证据汇。
 ///
-/// 文件句柄只开一次并保持追加模式：每条事件都重新开关文件会让一次
-/// 运行退化成 N 次 syscall 风暴，而且中途换 inode 还可能写到错误的文件。
-/// 句柄包在 `Mutex` 里是因为 `EvidenceSink::record` 只拿 `&self`。
+/// 文件句柄只打开一次并保持追加模式。每次事件重新开关文件会产生大量
+/// syscall，中途换 inode 还可能写入错误的文件。句柄放在 `Mutex` 中，
+/// 因为 `EvidenceSink::record` 只接收 `&self`。
 pub struct JsonlEvidenceSink {
     /// 落盘路径，仅用于错误信息和测试断言。
     path: PathBuf,
     /// 下一条事件的序号。
     ///
-    /// 用原子类型而不是塞进 `Mutex`：`record` 拿的是 `&self`，
-    /// 而这个字段不需要和句柄一起加锁——序号自增是独立的一次操作。
+    /// 使用原子类型，不放进 `Mutex`：序号自增是独立操作，不需要与文件
+    /// 句柄共用一把锁。
     next_sequence: AtomicU64,
-    /// 写入器。用 `Option` 包住是为了能在写失败时降级——见 `write`。
+    /// 写入器。用 `Option` 包住，写失败后可降级，见 `write`。
     writer: Mutex<Option<BufWriter<File>>>,
 }
 
 /// 序列化到磁盘的一行。
 ///
-/// 不直接序列化 `Evidence`：`Evidence` 是领域类型，它的字段（比如
-/// `recorded_at`）可能会变；这里显式列出落盘字段，磁盘格式就成了
-/// 一个独立的契约，改领域类型不会悄悄改日志格式。
+/// 不直接序列化 `Evidence`：领域类型的字段（如 `recorded_at`）可能变化。
+/// 这里显式列出落盘字段，使磁盘格式成为独立契约，修改领域类型不会
+/// 改变日志格式。
 ///
-/// `event` 保持嵌套而不是 `#[serde(flatten)]` 拍平：拍平后每行要靠
-/// `turn`/`text` 这些字段名反推是哪类事件，而 `AuditEvent` 是 enum，
-/// serde 的反序列化需要外层的 tag 才能选对变体。嵌套让磁盘格式与
-/// 领域类型的结构一一对应，读回来就是 `serde_json::from_str::<Evidence>()`。
+/// `event` 保持嵌套，不使用 `#[serde(flatten)]`。拍平后需要靠 `turn` /
+/// `text` 等字段名反推事件类型，而 `AuditEvent` 是 enum，serde 反序列化
+/// 需要外层 tag 选择变体。嵌套使磁盘格式与领域结构一一对应，可直接
+/// `serde_json::from_str::<Evidence>()`。
 #[derive(Debug, Serialize)]
 struct Record<'a> {
     sequence: u64,
-    /// 磁盘格式号。reader 按它解释 `recorded_at` 的单位，缺省按秒
-    /// （兼容旧版证据文件）。写死常量而不是从别处取：这一行
-    /// 是磁盘契约，契约里的字面量不该被间接改动。
+    /// 磁盘格式号。reader 按它解释 `recorded_at` 的单位，缺省为秒，
+    /// 以兼容旧证据文件。使用固定常量：这是磁盘契约，字面量不应被
+    /// 间接修改。
     format: u32,
     recorded_at: u64,
     event: &'a AuditEvent,
 }
 
 impl JsonlEvidenceSink {
-    /// 打开（必要时创建）证据文件，准备追加。
+    /// 打开证据文件（必要时创建），准备追加。
     ///
-    /// 父目录不存在时会递归创建——证据文件路径由会话 ID 推导而来，
-    /// 要求调用方先建好目录只会把 `mkdir -p` 的逻辑推给每一处调用点。
+    /// 父目录不存在时递归创建。证据文件路径由会话 ID 推导，要求调用方
+    /// 先建目录会把 `mkdir -p` 逻辑推给每个调用点。
     ///
     /// # Errors
     ///
@@ -68,12 +68,11 @@ impl JsonlEvidenceSink {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // 追加到已有文件时，序号要从文件里最后一条接着往下走。
+        // 追加到已有文件时，序号从最后一条继续。
         //
-        // 不接上的话，重开一次 sink（会话级恢复、基准的两段式跑法）
-        // 就让序号归 1，文件里出现两段各自从 1 开始的编号——证据仍然
-        // 读得出来，但"序号连续"这条可检查的性质没了，而它正是用来
-        // 发现"证据被截断或改写"的。
+        // 否则重开 sink（会话级恢复、两段式基准）会让序号回到 1，
+        // 文件里出现两段从 1 开始的编号。证据仍可读取，但"序号连续"
+        // 这一性质失效，而它用于发现证据被截断或改写。
         let next_sequence = last_sequence(path).map_or(1, |sequence| sequence + 1);
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
@@ -83,10 +82,10 @@ impl JsonlEvidenceSink {
         })
     }
 
-    /// 把一条记录写进文件。
+    /// 把一条记录写入文件。
     ///
-    /// 返回 `Ok(true)` 表示真正落盘，`Ok(false)` 表示已降级丢弃，
-    /// `Err` 表示本次写入失败并已转入降级。调用方据此决定序号是否推进。
+    /// `Ok(true)` 表示已落盘；`Ok(false)` 表示 sink 已降级，本条丢弃；
+    /// `Err` 表示本次写入失败并转入降级。调用方据此决定是否推进序号。
     fn write(&self, record: &Record<'_>) -> std::io::Result<bool> {
         let mut guard = self.lock();
         let Some(writer) = guard.as_mut() else {
@@ -99,8 +98,7 @@ impl JsonlEvidenceSink {
             *guard = None;
             return Err(error);
         }
-        // 每条事件都 flush：证据的价值在于"崩了之后还能看到最后发生了什么"，
-        // 而崩溃恰恰发生在最需要它的时刻。
+        // 每条事件都 flush：崩溃后仍需看到最后发生的事件。
         if let Err(error) = writer.flush() {
             *guard = None;
             return Err(error);
@@ -108,7 +106,7 @@ impl JsonlEvidenceSink {
         Ok(true)
     }
 
-    /// 锁被毒化时照样拿到内容：理由同 `MemoryEvidenceSink`。
+    /// 锁毒化时仍取出内容，理由同 `MemoryEvidenceSink`。
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<BufWriter<File>>> {
         self.writer
             .lock()
@@ -133,11 +131,11 @@ impl EvidenceSink for JsonlEvidenceSink {
         match self.write(&record) {
             // 真正落盘了才推进序号，否则日志里会出现跳号。
             Ok(true) => self.advance_sequence(),
-            // 已降级丢弃：不推进、不刷屏，静默跳过。
+            // 已降级丢弃：不推进序号，不重复告警。
             Ok(false) => {}
             Err(error) => {
-                // 审计故障绝不能把任务搞崩：一条证据写不进去，比整个
-                // ReAct 循环挂掉要轻得多。降级为丢弃这条 + stderr 警告。
+                // 审计写入失败不能中断任务。丢弃本条并向 stderr 输出警告，
+                // 避免整个 ReAct 循环失败。
                 eprintln!(
                     "警告：证据写入 {} 失败（第 {sequence} 条已丢弃）: {error}",
                     self.path.display(),
@@ -147,30 +145,29 @@ impl EvidenceSink for JsonlEvidenceSink {
     }
 }
 
-/// `SystemTime` 转毫秒 Unix 时间戳。
+/// 把 `SystemTime` 转为毫秒 Unix 时间戳。
 ///
-/// 早于 UNIX_EPOCH 的时间戳按 0 处理——本项目的运行时刻不可能早于 1970 年，
-/// 而为此引入有符号类型只会让反序列化多一种要处理的情况。
+/// 早于 UNIX_EPOCH 的时间按 0 处理。运行时刻不会早于 1970 年，引入
+/// 有符号类型只会增加反序列化分支。
 ///
-/// 毫秒而不是秒：要统计"每轮模型调用花了多久"，一次快的调用只有
-/// 几百毫秒，秒级精度下它们全被记成 0，延迟分布画不出来。
-/// 精度必须和 `format` 一起给（见 [`EVIDENCE_FORMAT_MILLIS`]）——
-/// 不留标记就改精度，会让所有历史证据的耗时统计变成垃圾。
+/// 使用毫秒精度：统计每轮模型调用耗时时，几百毫秒的调用在秒级精度下
+/// 会记成 0，无法还原延迟分布。精度必须与 `format` 一起记录（见
+/// [`EVIDENCE_FORMAT_MILLIS`]）；不标记就改精度会使历史证据的耗时统计失效。
 fn unix_millis(time: SystemTime) -> u64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
 
-/// 读出文件里最后一条证据的序号。
+/// 读取文件中最后一条证据的序号。
 ///
-/// 只看文件尾部：证据文件可能有几万行，全读一遍只为拿最后一个数
-/// 不值当。尾部读不全（末行是崩溃留下的半截 JSON）就跳过它往前找；
-/// 一条都读不出来时返回 `None`——调用方按"从 1 开始"处理，性质变差
-/// 但证据一条不丢。
+/// 只读文件尾部：证据文件可能有几万行，为最后一个编号全量读取不划算。
+/// 尾部内容不完整（末行是崩溃留下的半截 JSON）时跳过并继续向前查找。
+/// 一条都读不出时返回 `None`，调用方从 1 开始编号；序号连续性变差，
+/// 但不会丢失已有证据。
 fn last_sequence(path: &Path) -> Option<u64> {
-    /// 读的尾部字节数。够装下最后一条证据（它带一段工具输出，
-    /// 可能不小），又不用把整个文件读进内存。
+    /// 尾部读取字节数。足以容纳最后一条证据（可能带较大的工具输出），
+    /// 又不需要读入整个文件。
     const TAIL_BYTES: u64 = 64 * 1024;
 
     let mut file = File::open(path).ok()?;
@@ -192,9 +189,9 @@ fn last_sequence(path: &Path) -> Option<u64> {
         })
 }
 
-/// 会话 ID 里可能带路径分隔符（理论上），先做一次净化，否则
-/// `../../etc/passwd` 这样的 ID 能把文件写到 workspace 外面去。
-/// 证据文件与快照文件共用同一条规则，同一个 ID 不会落成两个名字。
+/// 净化会话 ID 中的路径分隔符，防止 `../../etc/passwd` 之类的 ID 把文件
+/// 写到 workspace 外。证据文件与快照文件共用此规则，同一个 ID 只会得到
+/// 一个文件名。
 pub(crate) fn sanitize_session_id(session_id: &str) -> String {
     session_id
         .chars()
@@ -291,9 +288,9 @@ mod tests {
             })
             .collect();
 
-        // 重开 sink 是会话级恢复与两段式基准的必经路径：序号必须从文件
-        // 里最后一条接着走，而不是归 1——归 1 之后文件里出现两段各自
-        // 从 1 开始的编号，"序号连续"这条发现证据被截断的性质就没了。
+        // 重开 sink 是会话级恢复与两段式基准的必经路径。序号必须从文件
+        // 最后一条继续，否则会出现两段从 1 开始的编号，失去"序号连续"
+        // 这一检测证据截断的手段。
         assert_eq!(content.lines().count(), 3);
         assert_eq!(sequences, vec![1, 2, 3]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -364,8 +361,8 @@ mod tests {
 
         sink.record(SystemTime::UNIX_EPOCH, thought_event(1, "先写一条"));
 
-        // 拿走写入器，模拟"句柄已失效"这一降级状态。
-        // 这是 write() 内部遇到 IO 错误时走的同一条路径。
+        // 移除写入器，模拟句柄失效的降级状态。
+        // 这与 write() 内部遇到 IO 错误时走的是同一条路径。
         *sink.lock() = None;
 
         // 降级后反复写入都不该 panic。
@@ -379,7 +376,7 @@ mod tests {
     #[test]
     fn unopenable_path_reports_an_error_instead_of_panicking() {
         let dir = temp_dir("badpath");
-        // 父路径是一个文件而不是目录，create_dir_all 必然失败。
+        // 父路径是文件，create_dir_all 必然失败。
         let blocker = dir.join("not-a-dir");
         std::fs::write(&blocker, "x").expect("创建占位文件");
 
@@ -399,7 +396,7 @@ mod tests {
             root.join(".qcodeharness/sessions/session-123-456.jsonl")
         );
 
-        // 路径分隔符被替换掉，写不出 workspace。
+        // 路径分隔符被替换，无法写出 workspace。
         // 只检查会话 ID 那一层：root 本身用什么分隔符取决于调用方。
         let escaped = session_path(root, "../../etc/passwd");
         assert!(escaped.starts_with(root.join(".qcodeharness/sessions")));

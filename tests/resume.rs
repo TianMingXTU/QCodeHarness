@@ -1,8 +1,8 @@
 //! 会话恢复的集成验收。
 //!
-//! 不走网络：模型用 `MockCompletionModel` 脚本化。重点不是"快照能序列化"，
-//! 而是恢复后的行为语义——半轮不重跑已执行的调用、审批请求重新递给闸门、
-//! 取消不跨恢复传递、保存失败不拖垮任务。
+//! 不使用网络，模型由 `MockCompletionModel` 脚本化。重点在恢复后的行为
+//! 语义：半轮不重跑已执行的调用、审批请求重新交给闸门、取消不跨恢复
+//! 传递、保存失败不影响任务完成。
 
 use std::fs;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ use qcode_harness::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSp
 use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::clock::SystemClock;
-use qcode_harness::infrastructure::evidence::memory::MemoryEvidenceSink;
+use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::tool::all_tools;
@@ -94,7 +94,7 @@ fn deps_with(
     }
 }
 
-/// 强制 read_file 也要审批的策略：把运行停在闸门前用。
+/// 要求 read_file 必须审批的策略，用于把运行停在闸门前。
 fn approval_policy() -> PolicyEngine {
     PolicyEngine::with_rules(vec![PolicyRule {
         tool: Some("read_file".to_owned()),
@@ -117,7 +117,7 @@ impl ApprovalGate for CountingGate {
     }
 }
 
-/// 记录"真的执行了哪些调用"的假执行器：同名调用靠参数区分。
+/// 记录实际执行了哪些调用的假执行器，同名调用靠参数区分。
 #[derive(Default)]
 struct RecordingInvoker {
     executed: Mutex<Vec<String>>,
@@ -147,14 +147,14 @@ impl SessionStore for FailingStore {
     }
 }
 
-/// 每次测试用独立的临时目录，避免并行测试互相踩。
+/// 每次测试使用独立的临时目录，避免并行测试互相干扰。
 fn temp_workspace(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qch-resume-{}-{}", name, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     dir
 }
 
-/// 一份合法的"停在正常点"的最小快照，供损坏文件测试打底。
+/// 一份合法的最小快照（停在正常点），作为损坏文件测试的基础。
 fn minimal_snapshot(id: &str) -> RunSnapshot {
     RunSnapshot {
         format_version: RUN_FORMAT,
@@ -180,13 +180,13 @@ async fn budget_stop_then_resume_finishes_the_remaining_rounds() {
         deps_with(&mock1, registry(), Arc::new(AutoApproveGate), PolicyEngine::new(), None),
     );
 
-    // 只给 2 轮预算：两轮工具调用跑完，第 3 次问模型之前被预算拦下。
+    // 只给 2 轮预算：两轮工具调用完成后，第 3 次调用模型前被预算拦下。
     let error = runner.run(&Budget::new(2)).await.unwrap_err();
     assert!(matches!(error, ApplicationError::BudgetExhausted { max_turns: 2 }), "{error}");
     assert_eq!(runner.session().rounds(), 2);
     let snapshot = runner.snapshot();
 
-    // 换一个接续脚本的模型：第 3、4 轮 + 最终答案。
+    // 换一个接续脚本的模型：第 3、4 轮与最终答案。
     let mock2 = MockCompletionModel::from_turns(vec![
         MockTurn::tool_call("call_3", "read_file", json!({"path": "c"})),
         MockTurn::tool_call("call_4", "read_file", json!({"path": "d"})),
@@ -216,7 +216,7 @@ async fn awaiting_approval_snapshot_reasks_the_gate_on_resume() {
         deps_with(&mock1, registry(), Arc::new(AutoApproveGate), approval_policy(), None),
     );
 
-    // 手动推进：第 1 步给出调用（Evaluating），第 2 步停在闸门前。
+    // 手动推进：第 1 步产生调用（Evaluating），第 2 步停在审批闸门前。
     let state = runner.step().await.unwrap();
     assert!(matches!(state, RunState::Evaluating(_)), "{state:?}");
     let state = runner.step().await.unwrap();
@@ -227,7 +227,7 @@ async fn awaiting_approval_snapshot_reasks_the_gate_on_resume() {
     let snapshot = runner.snapshot();
     assert_eq!(snapshot.state, state, "快照要原样记住停在哪");
 
-    // 恢复：闸门换成一个会计数的——验证恢复后同一个请求被重新递给闸门。
+    // 恢复时换成会计数的闸门，验证同一请求被重新递交一次。
     let gate = Arc::new(CountingGate::default());
     let mock2 = MockCompletionModel::from_turns(vec![MockTurn::text("审批后完成")]);
     let mut runner2 = AgentRunner::resume(
@@ -240,7 +240,7 @@ async fn awaiting_approval_snapshot_reasks_the_gate_on_resume() {
     assert_eq!(outcome.answer, "审批后完成");
     assert_eq!(*gate.asked.lock().unwrap(), 1, "恢复后应把同一请求重新递给闸门恰好一次");
     assert_eq!(runner2.session().rounds(), 1);
-    // 闸门放行后模型才被再次询问，且只问了这一次（终答案）。
+    // 闸门放行后模型才被再次调用，且只有这一次（最终答案）。
     assert_eq!(mock2.requests().len(), 1);
 }
 
@@ -282,14 +282,14 @@ async fn half_dispatched_snapshot_does_not_rerun_the_call_that_was_in_flight() {
     let outcome = runner.run(&Budget::new(5)).await.unwrap();
 
     assert_eq!(outcome.answer, "半轮续跑完成");
-    // 两条都不重跑：第一条已有观察（重跑就是白读一遍），第二条是中断时
-    // 正在执行的那一条——它可能已经产生了副作用，恢复不替模型重跑一次。
+    // 两条都不重跑。第一条已有观察，重跑没有意义；第二条是中断时正在
+    // 执行的调用，可能已经产生副作用，恢复不替模型重跑。
     assert!(
         invoker.executed.lock().unwrap().is_empty(),
         "已执行的与在途的调用都不得被自动重跑"
     );
     assert_eq!(runner.session().rounds(), 1, "半轮应配平并提交成完整一轮");
-    // 提交的那轮带两条观察：一条来自快照，一条是重放提示。
+    // 提交的那一轮包含两条观察：一条来自快照，一条是重放提示。
     let turns = runner.session().snapshot().turns;
     let Some(Turn::Observation(outcomes)) = turns.last() else {
         panic!("最后一轮应是观察，实际 {:?}", turns.last());
@@ -308,13 +308,13 @@ async fn half_dispatched_snapshot_does_not_rerun_the_call_that_was_in_flight() {
     );
 }
 
-/// 恢复路径也必须过角色边界。
+/// 恢复路径同样要经过角色边界。
 ///
-/// P9-3 把角色白名单从"装配时过滤注册表"移到"调用时校验"，注册表因此
-/// 对每个角色都是全量的。这条测试守的是那次迁移唯一真实的坑：快照可以
-/// 直接停在 `Dispatching`，恢复后 `Evaluating` 的检查被整段跳过。如果
-/// 只在 `Evaluating` 查一次，一个停在 `Dispatching(write_file)` 的受限
-/// 角色快照就能把写工具放行——白名单名义上还在，实际上少了一半入口。
+/// P9-3 将角色白名单从"装配时过滤注册表"改为"调用时校验"，注册表因此
+/// 对所有角色都是全量的。风险在于快照可以直接停在 `Dispatching`，
+/// 恢复后 `Evaluating` 的检查会被跳过。若只在 `Evaluating` 检查一次，
+/// 停在 `Dispatching(write_file)` 的受限角色快照就能放行写工具，白名单
+/// 只剩一半入口。
 #[tokio::test]
 async fn dispatching_snapshot_of_a_restricted_role_still_refuses_the_write() {
     let workspace = std::env::temp_dir().join(format!("qch-resume-role-{}", std::process::id()));
@@ -353,7 +353,7 @@ async fn dispatching_snapshot_of_a_restricted_role_still_refuses_the_write() {
         }),
     };
 
-    // 真实工具、全量注册表——与 P9-3 之后生产路径给 runner 的一致。
+    // 真实工具与全量注册表，与 P9-3 之后生产路径交给 runner 的一致。
     let registry = ToolRegistry::new(all_tools(WorkspaceRoot::new(workspace.clone())));
     let mock = MockCompletionModel::from_turns(vec![MockTurn::text("改用文字给出结论")]);
     let mut runner = AgentRunner::resume(
@@ -364,13 +364,13 @@ async fn dispatching_snapshot_of_a_restricted_role_still_refuses_the_write() {
     let outcome = runner.run(&Budget::new(5)).await.unwrap();
 
     assert_eq!(outcome.answer, "改用文字给出结论");
-    // 文件一个字节都没动：恢复路径上的角色边界与正常调用链是同一条。
+    // 文件内容未变：恢复路径与正常调用链走同一条角色边界。
     assert_eq!(
         fs::read_to_string(&target).expect("读回文件"),
         "原文",
         "恢复后停在 Dispatching 的越权调用必须被拒"
     );
-    // 拒绝观察如实回给模型，指明是角色权限问题。
+    // 拒绝观察如实返回模型，并指明是角色权限问题。
     let turns = runner.session().snapshot().turns;
     let Some(Turn::Observation(outcomes)) = turns.last() else {
         panic!("最后一轮应是观察，实际 {:?}", turns.last());
@@ -424,8 +424,8 @@ async fn normal_stop_with_pending_is_rejected_on_resume() {
 
 #[tokio::test]
 async fn mismatched_call_list_is_rejected_on_resume() {
-    // 状态机记的调用清单与 pending 里的清单不一致：step() 按前者取
-    // 下一个调用、按后者收观察，错位会让调用与观察配错对。
+    // 状态机记录的调用清单与 pending 中的清单不一致：step() 按前者取下一
+    // 个调用，按后者收集观察，错位会导致调用与观察配对错误。
     let snapshot = RunSnapshot {
         format_version: RUN_FORMAT,
         session_id: SessionId::new("resume-mismatch"),
@@ -483,7 +483,7 @@ async fn snapshot_save_failure_degrades_without_breaking_the_run() {
         ),
     );
 
-    // 每个保存点都会失败（stderr 警告），但运行必须照常完成。
+    // 每个保存点都会失败并输出 stderr 警告，但运行必须照常完成。
     let outcome = runner.run(&Budget::new(5)).await.unwrap();
 
     assert_eq!(outcome.answer, "保存坏了也能跑完");
@@ -503,7 +503,7 @@ async fn cancelled_state_does_not_survive_resume() {
     let error = runner.run(&Budget::new(5)).await.unwrap_err();
     assert!(matches!(error, ApplicationError::Cancelled), "{error}");
 
-    // 恢复是一次新的"继续"意图：取消标记不跟着快照走。
+    // 恢复是一次新的继续意图，取消标记不随快照保存。
     let mock2 = MockCompletionModel::from_turns(vec![MockTurn::text("恢复后完成")]);
     let mut runner2 = AgentRunner::resume(
         runner.snapshot(),
@@ -528,7 +528,7 @@ async fn awaiting_approval_autosaves_and_resumes_from_disk() {
         deps_with(&mock1, registry(), Arc::new(AutoApproveGate), approval_policy(), Some(store.clone())),
     );
 
-    // 走到审批前——这是自动保存点之一。
+    // 走到审批前，这是自动保存点之一。
     runner.step().await.unwrap();
     let state = runner.step().await.unwrap();
     assert!(matches!(state, RunState::AwaitingApproval(_)), "{state:?}");

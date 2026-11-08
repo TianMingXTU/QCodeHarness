@@ -1,9 +1,8 @@
 //! 基准任务集的装载：把 `benchmarks/<id>/` 目录读成领域任务。
 //!
-//! 每个任务是一个目录：`task.toml` 声明任务与判据，`repo/` 是给
-//! agent 动手的 fixture 仓库。装载期把能提前发现的问题全部拦在
-//! 运行前——id 对不上目录名、任务类型写错、repo 缺失，都直接报错，
-//! 而不是让任务跑到一半才用奇怪的方式失败。
+//! 每个任务是一个目录：`task.toml` 声明任务与判据，`repo/` 是给 agent
+//! 动手的 fixture 仓库。装载期拦截能提前发现的问题：id 与目录名不符、
+//! 任务类型写错、repo 缺失都直接报错，不让任务跑到一半才失败。
 
 use std::path::{Path, PathBuf};
 
@@ -34,8 +33,8 @@ pub enum BenchmarkLoadError {
         /// 说明性原因（来自 toml 解析器或本模块的校验）。
         message: String,
     },
-    /// task.toml 里的 id 与所在目录名不一致——目录名是任务的唯一
-    /// 标识（fixture 路径、结果里的 task_id 都从它推导），两者必须同名。
+    /// task.toml 里的 id 与目录名不一致。目录名是任务的唯一标识
+    /// （fixture 路径、结果里的 task_id 都从它推导），两者必须同名。
     #[error("任务目录 {dir} 里的 id 写的是 `{id}`，与目录名不一致")]
     IdMismatch { dir: String, id: String },
     /// 任务目录缺少 repo/ fixture 仓库。
@@ -43,8 +42,8 @@ pub enum BenchmarkLoadError {
     MissingRepo(String),
 }
 
-/// `task.toml` 的中间结构。领域类型不碰 toml，解析在这里完成，
-/// 越过本模块之后全是领域类型。
+/// `task.toml` 的中间结构。领域类型不接触 toml，解析在此完成，越过
+/// 本模块之后全是领域类型。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskFile {
@@ -76,10 +75,10 @@ struct LongRunFile {
     context_max_tokens: Option<usize>,
 }
 
-/// `[criteria]` 表的中间结构。判据字段全部必填：漏写 `requires_changes`
-/// 这类判据等于悄悄放宽验收，宁可让作者把三个字段都写全。
+/// `[criteria]` 表的中间结构。前三项必填：漏写 `requires_changes` 这类
+/// 判据会放宽验收，要求作者写全。
 ///
-/// 后三个判据可选：短任务用不上它们，缺省即"不检查"。
+/// 后三项可选，短任务用不上，缺省即不检查。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CriteriaFile {
@@ -92,20 +91,19 @@ struct CriteriaFile {
     must_mention_after_compaction: Vec<String>,
 }
 
-/// 读取基准根目录下的全部短任务，按目录名排序返回——顺序确定，
+/// 读取基准根目录下的全部短任务，按目录名排序返回。顺序确定，
 /// 基准结果才可复现、可对比。
 ///
-/// 只考虑子目录：根目录下的 README 等文件直接跳过。任何任务的
-/// 配置不合法都让整个装载失败——基准要么完整可跑，要么明确报错，
-/// 不做"跳过坏任务继续跑"的静默降级：漏跑一个任务的基准比不跑
-/// 更误导人。
+/// 只考虑子目录，根目录下的 README 等文件跳过。任一任务配置不合法
+/// 就让整个装载失败：基准要么完整可跑，要么明确报错。不做"跳过坏
+/// 任务继续跑"的静默降级，漏跑一个任务比不跑更误导人。
 ///
-/// 长任务不在这里：它们由 [`load_long_tasks`] 单独装载，两段式跑法
-/// 与短任务不同，混在一个列表里跑就是两套语义共用一条路。
+/// 长任务由 [`load_long_tasks`] 单独装载。两段式跑法与短任务不同，
+/// 混在一个列表里会共用两套语义。
 ///
 /// # Errors
 ///
-/// 根目录不可读，或任一任务的配置不合法时返回 [`BenchmarkLoadError`]。
+/// 根目录不可读，或任一任务配置不合法时返回 [`BenchmarkLoadError`]。
 pub fn load_tasks(benchmarks_root: &Path) -> Result<Vec<BenchmarkTask>, BenchmarkLoadError> {
     load_suite(benchmarks_root, "default")
 }
@@ -114,21 +112,21 @@ pub fn load_tasks(benchmarks_root: &Path) -> Result<Vec<BenchmarkTask>, Benchmar
 ///
 /// # Errors
 ///
-/// 根目录不可读，或任一长任务的配置不合法时返回 [`BenchmarkLoadError`]。
+/// 根目录不可读，或任一任务（无论属于哪个套件）配置不合法时返回
+/// [`BenchmarkLoadError`]（装载与校验先于套件筛选，见 [`load_suite`]）。
 pub fn load_long_tasks(benchmarks_root: &Path) -> Result<Vec<BenchmarkTask>, BenchmarkLoadError> {
     load_suite(benchmarks_root, LONG_SUITE)
 }
 
 /// 读取指定套件的任务。
 ///
-/// **先全部装载校验，再按套件筛选**——顺序反过来（边装载边筛）会把
-/// 一个不合法任务的装载错误一起筛掉，坏任务静默消失，而"漏跑一个任务
-/// 的基准比不跑更误导人"对坏任务同样成立。
+/// 先全部装载校验，再按套件筛选。反过来做（边装载边筛）会把不合法
+/// 任务的装载错误筛掉，坏任务静默消失。
 ///
 /// # Errors
 ///
-/// 根目录不可读，或**任一**任务（无论属于哪个套件）的配置不合法时
-/// 返回 [`BenchmarkLoadError`]。
+/// 根目录不可读，或任一任务（无论属于哪个套件）配置不合法时返回
+/// [`BenchmarkLoadError`]。
 pub fn load_suite(
     benchmarks_root: &Path,
     suite: &str,
@@ -211,7 +209,7 @@ fn load_one(dir: &Path, name: &str) -> Result<BenchmarkTask, BenchmarkLoadError>
 mod tests {
     use super::*;
 
-    /// 每次测试用独立的临时目录，避免并行测试互相踩。
+    /// 每次测试使用独立的临时目录，避免并行测试互相干扰。
     fn temp_root(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("qch-benchload-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -239,8 +237,8 @@ answer_must_mention = []
 
     #[test]
     fn shipped_fixtures_load_with_expected_ids_and_kinds() {
-        // 直接装载随库发布的基准任务：fixture、task.toml、判据三者
-        // 有一个坏掉，这条测试就会在 CI 上炸出来。
+        // 装载随库发布的基准任务：fixture、task.toml、判据任一损坏，
+        // 这条测试就会失败。
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmarks");
         let tasks = load_tasks(&root).expect("随库发布的任务应能装载");
 
@@ -313,8 +311,8 @@ answer_must_mention = []
 
     #[test]
     fn unknown_fields_are_rejected_instead_of_ignored() {
-        // 拼错的字段（比如 criteria 写成 criterias）必须炸出来，
-        // 不能静默忽略——被忽略的判据等于悄悄放水的验收。
+        // 拼错的字段（如 criteria 写成 criterias）必须报错，不能静默忽略。
+        // 被忽略的判据会放宽验收。
         let root = temp_root("unknown-field");
         write_task(&root, "demo", &VALID_TASK.replace("description", "descripton"));
 
@@ -384,17 +382,17 @@ answer_must_mention = []
     fn an_invalid_task_is_rejected_even_if_it_is_in_another_suite() {
         let root = temp_root("bad-suite");
         write_task(&root, "demo", VALID_TASK);
-        // 长任务里类型写错：装载 long 套件时它必须报错，而不是被筛掉。
+        // 长任务类型写错：装载 long 套件时必须报错，不能被筛掉。
         write_task(&root, "demo-long", &LONG_TASK.replace("bug-fix", "nonsense"));
 
         let error = load_long_tasks(&root).unwrap_err();
         assert!(matches!(&error, BenchmarkLoadError::Invalid { task, .. } if task == "demo-long"), "{error}");
-        // 短任务装载同样要被拦住——坏的是任务本身，不是套件的归属。
+        // 短任务装载同样要被拦住：坏的是任务本身，与套件归属无关。
         assert!(load_tasks(&root).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 一个合法长任务任务书：带两段配置与长任务判据。
+    /// 一个合法的长任务配置：带两段配置与长任务判据。
     const LONG_TASK: &str = r#"id = "demo-long"
 kind = "bug-fix"
 description = "一个长任务"

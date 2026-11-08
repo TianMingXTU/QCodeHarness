@@ -1,8 +1,8 @@
-//! 预算抽象：轮数与墙钟的上限。
+//! 预算抽象：轮数与墙钟上限。
 //!
-//! 预算在应用层检查，不依赖外部库。之所以单独成模块而不是塞进 `AgentSpec`
-//! 的一个字段：预算是"每次运行可调的外部输入"（命令行、配置），
-//! 规格是"这个 agent 是什么"，两者变化频率不同。
+//! 预算在应用层检查，不依赖外部库。独立成模块而不作为 `AgentSpec` 的
+//! 字段：预算是每次运行可调的外部输入（命令行、配置），规格描述 agent
+//! 本身，两者变化频率不同。
 
 use std::time::Duration;
 
@@ -11,17 +11,18 @@ use serde::{Deserialize, Serialize};
 /// 一次运行的上限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
-    /// 最大 ReAct 轮数，即最大模型调用次数。防止模型无限调用工具。
+    /// 最大 ReAct 轮数，即最大模型调用次数，用于限制模型无休止调用工具。
     ///
-    /// 开启历史摘要（[`ContextBudget::with_summarize`]）后，摘要调用
-    /// 也计入 `turns`，但它发生在轮内补摘要的挂点上、不在本闸门的
-    /// 检查点之间——实际调用数最多可能比 `max_turns` 多 1 次
-    /// （该轮的摘要 + 正式调用）。墙钟预算不受影响。
+    /// 开启历史摘要
+    /// （[`crate::domain::context::ContextBudget::with_summarize`]）后，摘要
+    /// 调用也计入 `turns`，但它发生在轮内补摘要的挂点，不在本闸门的检查点
+    /// 之间。实际调用数最多可能比 `max_turns` 多 1 次（该轮摘要加正式调用）。
+    /// 墙钟预算不受影响。
     pub max_turns: u32,
     /// 整体墙钟上限。`None` 表示不限时。
     ///
-    /// 轮数限制防不住"每轮各跑 30 秒命令"的任务——10 轮 × 30 秒也是
-    /// 几分钟。墙钟是兜底维度：超了就停，正在执行的轮次允许跑完。
+    /// 轮数限制无法约束每轮执行 30 秒命令的任务，10 轮也要几分钟。墙钟是
+    /// 兜底维度：超时即停，正在执行的轮次允许跑完。
     pub max_wall_clock: Option<Duration>,
 }
 
@@ -51,10 +52,10 @@ impl Budget {
 
 /// 已消耗的量。
 ///
-/// `elapsed` 只是"已测量结果"的容器：domain 不取时间（纯净性约束），
-/// 测量由调用方通过 `Clock` 端口完成（见 `application::port::Clock::elapsed_since`）。
+/// `elapsed` 只保存测量结果。domain 不读取时间，测量由调用方通过
+/// `Clock` 端口完成（见 `application::port::Clock::elapsed_since`）。
 ///
-/// 可序列化：恢复时要接着算轮数与墙钟预算，不能从零开始。
+/// 可序列化：恢复后需要接着计算轮数与墙钟预算，不能从零开始。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Consumption {
     /// 已经发生的模型调用次数。

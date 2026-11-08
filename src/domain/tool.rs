@@ -1,7 +1,7 @@
 //! 工具抽象：模型可调用的能力。
 //!
-//! 领域层的工具定义不依赖 rig，只在基础设施层翻译成 rig 的 `ToolDefinition`。
-//! 这样"模型看到什么"与"Harness 用什么框架执行"可以独立变化。
+//! 领域层的工具定义不依赖 rig，由基础设施层翻译成 rig 的 `ToolDefinition`。
+//! 模型看到的能力与 Harness 的执行框架因此可以独立变化。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,11 +13,11 @@ use super::sandbox::ExecutionBoundary;
 /// MCP 工具注册名的前缀：`mcp__<server>__<tool>`。
 pub const MCP_TOOL_PREFIX: &str = "mcp__";
 
-/// 工具的风险注解：向模型和审批环节声明这个工具的副作用特征。
+/// 工具的风险注解：向模型和审批环节声明副作用特征。
 ///
-/// rig 的 `ToolAnnotations` 早已存在，但原有代码完全没有填写，
-/// 等于把"哪些工具能改文件"这件事只留在了 prompt 里。这里在领域侧
-/// 用自己的类型表达同一组语义，由基础设施层翻译过去。
+/// rig 已有 `ToolAnnotations`，但原有代码从未填写，哪些工具能改文件只
+/// 存在于 prompt 中。这里在领域侧用自有类型表达同一组语义，由基础设施层
+/// 翻译。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ToolAnnotations {
     /// 是否只读。只读是"确定无副作用"的唯一可靠信号。
@@ -31,7 +31,7 @@ pub struct ToolAnnotations {
 }
 
 impl ToolAnnotations {
-    /// 组装一份注解。字段用命名参数形式传入，避免四个 bool 连写看错行。
+    /// 构造注解。四个 bool 连续传入，调用点需注意参数顺序。
     #[allow(clippy::too_many_arguments)]
     pub fn new(read_only: bool, destructive: bool, idempotent: bool, open_world: bool) -> Self {
         Self {
@@ -42,11 +42,11 @@ impl ToolAnnotations {
         }
     }
 
-    /// 是否需要过审批闸门。
+    /// 是否需要通过审批闸门。
     ///
-    /// 判据取 `!read_only` 而不是 `destructive`：破坏性是工具作者的主观声明，
-    /// 漏标一个工具就等于开了一个后门；而"不是只读"是客观的——
-    /// 只要可能改动状态就先问一声，与任何恒放行的实现保持同一接缝。
+    /// 判据是 `!read_only` 而非 `destructive`：破坏性由工具作者主观声明，
+    /// 漏标即留下后门；「非只读」是客观属性，只要可能改变状态就先询问，
+    /// 与任何恒放行的实现保持同一接缝。
     pub fn requires_approval(&self) -> bool {
         !self.read_only
     }
@@ -65,9 +65,8 @@ pub struct ToolSpec {
     pub annotations: ToolAnnotations,
 }
 
-/// 模型提出的一次工具调用意图。
-///
-/// 注意这只是"意图"：领域层记录它，但执行与否、何时执行由应用层决定。
+/// 模型提出的一次工具调用意图。领域层只记录，是否执行与执行时机由
+/// 应用层决定。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// 模型给出的调用 ID，观察结果凭此送回。
@@ -89,7 +88,7 @@ pub enum OutcomeStatus {
     Refused,
 }
 
-/// 一次工具执行的观察结果，会被回填给模型。
+/// 一次工具执行的观察结果，会回填给模型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolOutcome {
     /// 给模型看的文本内容。失败时这里是原因说明。
@@ -104,8 +103,8 @@ pub struct ToolOutcome {
     pub execution: Option<ExecutionBoundary>,
     /// MCP 执行器给出的调用故障事实；应用层取走后单独记入 `McpCallFailed`。
     ///
-    /// 与 `execution` 一样只作进程内交接：不写入 `ToolObserved`、快照或
-    /// 历史，避免执行器错误文本成为判断故障类别的依据。
+    /// 与 `execution` 相同，只作进程内交接：不写入 `ToolObserved`、快照或
+    /// 历史，避免用执行器错误文本推断故障类别。
     #[serde(skip)]
     pub mcp_failure: Option<McpCallFailure>,
 }
@@ -153,8 +152,8 @@ impl ToolOutcome {
         self
     }
 
-    /// 回填给模型时是否标记为错误。拒绝同样算错误——模型需要知道
-    /// 这一步没成，才能换路子，而不是假设成功继续往下编。
+    /// 回填给模型时是否标记为错误。拒绝也算错误，模型需要知道这一步未成功，
+    /// 才能选择其他路径，避免按成功继续推理。
     pub fn is_error(&self) -> bool {
         !matches!(self.status, OutcomeStatus::Success)
     }

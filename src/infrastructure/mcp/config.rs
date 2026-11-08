@@ -1,7 +1,7 @@
-//! MCP Server 的配置：从 TOML 文件读要连哪些 Server。
+//! MCP Server 配置：从 TOML 文件读取要连接的 Server。
 //!
-//! 独立于策略配置文件：策略是"允许什么"，MCP 是"接什么"，两者的
-//! 变更频率与评审视角都不同，混在一个文件里会互相牵制。
+//! 与策略配置文件分离：策略描述"允许什么"，MCP 描述"连接什么"。两者
+//! 变更频率与评审视角不同，放在同一文件中会互相牵制。
 //!
 //! ```toml
 //! [[mcp_servers]]
@@ -16,8 +16,8 @@ use serde::Deserialize;
 
 /// MCP 配置文件的整体结构。
 ///
-/// 拒绝未知字段：手误（`[[mcp_server]]` 少个 s）或多写的字段若被
-/// 静默忽略，MCP 会无声关闭或配置悄悄失效——配置错误必须显式报错。
+/// 拒绝未知字段。`[[mcp_server]]` 少写 s 或多写字段时，静默忽略会让
+/// MCP 关闭或配置失效，配置错误必须显式报错。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
@@ -40,8 +40,9 @@ pub struct McpServerConfig {
 }
 
 impl McpConfig {
-    /// 从 TOML 文件加载。文件不存在返回 `Ok(None)`——不配 MCP 是常态，
-    /// 不该为缺文件报错；文件存在但内容非法才报错。
+    /// 从 TOML 文件加载。
+    ///
+    /// 文件不存在时返回 `Ok(None)`：未配置 MCP 是常态，缺文件不报错。
     ///
     /// # Errors
     ///
@@ -58,10 +59,9 @@ impl McpConfig {
         Ok(Some(config))
     }
 
-    /// 结构校验：Server 名字会进工具名前缀，字符集必须受控，否则
-    /// `mcp__<name>__<tool>` 可能出现歧义或不可读的名字。
-    /// 重名更要拒绝：两个同名 Server 的同款工具会在注册表里
-    /// 静默互相覆盖。
+    /// 结构校验。Server 名字会进入工具名前缀，字符集必须受控，否则
+    /// `mcp__<name>__<tool>` 可能产生歧义或不可读的名字。重名同样拒绝：
+    /// 两个同名 Server 的同名工具会在注册表中互相覆盖。
     fn validate(&self) -> Result<(), String> {
         for (index, server) in self.mcp_servers.iter().enumerate() {
             if server.name.is_empty() {
@@ -150,8 +150,8 @@ mod tests {
 
     #[test]
     fn typoed_keys_and_unknown_fields_are_rejected_not_ignored() {
-        // serde 默认忽略未知字段：不拦的话，`[[mcp_server]]` 手误会让
-        // MCP 无声关闭（解析成 0 个 Server），用户毫无线索。
+        // serde 默认忽略未知字段。不拦截时，`[[mcp_server]]` 拼写错误会
+        // 让 MCP 关闭（解析为 0 个 Server），用户没有线索。
         let typo = temp_path("typo.toml");
         fs::write(&typo, "[[mcp_server]]\nname = \"fetch\"\ncommand = \"uvx\"\n").unwrap();
         let error = McpConfig::load(&typo).unwrap_err();
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn duplicate_server_names_are_rejected() {
-        // 同名 Server 的同款工具会在注册表里静默互相覆盖，加载时就得拦下。
+        // 同名 Server 的同名工具会在注册表中互相覆盖，加载时必须拒绝。
         let path = temp_path("dup.toml");
         fs::write(
             &path,

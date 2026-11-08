@@ -1,22 +1,21 @@
-//! stdio MCP Server 的生命周期测试夹具：真实进程、协议与确定性副作用计数。
+//! stdio MCP Server 的生命周期测试夹具：真实进程、真实协议、确定性副作用计数。
 //!
-//! 作为独立 bin 而不是 example：`cargo test` 编译它之后，测试可以用
-//! `env!("CARGO_BIN_EXE_...")` 拿到确切路径。它手工应答 stdio JSON-RPC
-//! 帧而不是走 rmcp Server 栈，行为完全由命令行模式决定——"先落盘计数
-//! 再不回应"这类确定性故障，rmcp 的 handler 抽象反而不好表达。
-//! 诊断写 stderr，不污染协议流。
+//! 独立 bin：`cargo test` 编译后可用 `env!("CARGO_BIN_EXE_...")`
+//! 取得确切路径。它手工应答 stdio JSON-RPC 帧，不走 rmcp Server 栈，
+//! 行为完全由命令行模式决定。"先落盘计数再决定是否回应"这类确定性故障
+//! 用 rmcp 的 handler 抽象不好表达。诊断写 stderr，不污染协议流。
 //!
 //! 确定性信号约定（均由第二个参数 counter_path 派生）：
-//! - `counter_path`：每次 `tools/call` **先**追加一行计数再决定响应与否，
-//!   副作用计数因此不受响应模式影响。计数跨进程续接：启动时先数一遍
-//!   已有行数作为起点，`drop-after-N` 才能表达"全局恰好第 N 次调用退出"
-//!   ——重连后的新进程接着数，测试才能区分"重放"与"新调用"；
-//! - `counter_path` + `.pid`：启动时写入自身 PID，供"进程是否还活着"的
-//!   有界轮询（握手超时走的是 rmcp 的 kill-on-drop，没有 EOF 可看，
-//!   只能按 PID 查证清理真的发生）；
-//! - `counter_path` + `.eof`：stdin 收到 EOF 时写入。父进程走完 transport
-//!   优雅关闭（关 stdin）才会触发——它是"清理真的执行到了子进程"的凭据，
-//!   不靠睡眠等进程消失；
+//! - `counter_path`：每次 `tools/call` 先追加一行计数，再决定是否响应，
+//!   副作用计数不受响应模式影响。计数跨进程续接：启动时数一遍已有行数
+//!   作为起点，`drop-after-N` 因而表示"全局第 N 次调用时退出"。重连后的
+//!   新进程接着数，测试可据此区分重放与新调用。
+//! - `counter_path` + `.pid`：启动时写入自身 PID，供有界轮询判断进程
+//!   是否存活。握手超时走 rmcp 的 kill-on-drop，没有 EOF 可看，只能按
+//!   PID 查证清理是否发生。
+//! - `counter_path` + `.eof`：stdin 收到 EOF 时写入。父进程完成 transport
+//!   优雅关闭（关闭 stdin）后触发，是"清理确实到达子进程"的凭据，
+//!   不依赖睡眠等待进程消失。
 //! - `counter_path` + `.child`：`with-child` 模式启动时写入孙进程 PID。
 
 use std::fs::OpenOptions;
@@ -40,12 +39,12 @@ fn main() {
         std::process::exit(9);
     }
     if mode == "with-child" {
-        // 整树清理的展示位：已纳入 Job 的进程所创建的子进程由系统自动
-        // 继承成员资格。这里拉一个长命的 `ping` 并把它的 PID 落盘，
-        // 测试观察"关闭之后它还活着吗"。
+        // 整树清理的验证点：Job 中的进程创建的子进程自动继承成员资格。
+        // 这里拉起长命的 `ping` 并写入其 PID，测试据此判断关闭后它是否
+        // 仍然存活。
         spawn_grandchild(&counter_path);
     }
-    // "no-init-reply"：收帧但对 initialize 永不回应——握手超时路径。
+    // "no-init-reply"：收帧但对 initialize 永不回应，触发握手超时。
     let never_init_reply = mode == "no-init-reply";
     // "silent-after-N"：第 N 次调用前照常落盘计数，但不再回响应（连接保留）。
     // "drop-after-N"：第 N 次调用前落盘计数后直接退出（传输断开）。
@@ -64,8 +63,9 @@ fn main() {
 
 fn spawn_grandchild(counter_path: &Option<PathBuf>) {
     let Some(path) = counter_path else { return };
-    // `-n` 在 Windows 与 Linux 的 ping 里都是"次数"：这条测试只在 Windows
-    // 跑，代码保持跨平台可编译。孙进程只需活得比一次测试长，120 次足够。
+    // `ping -n` 是 Windows 的次数参数（Linux iputils 里 `-n` 表示数值
+    // 输出）。这条测试只在 Windows 跑，代码保持跨平台可编译。孙进程只需
+    // 活得比一次测试长，120 次足够。
     let Ok(child) = std::process::Command::new("ping")
         .args(["-n", "120", "127.0.0.1"])
         .stdout(std::process::Stdio::null())
@@ -79,8 +79,8 @@ fn spawn_grandchild(counter_path: &Option<PathBuf>) {
     if let Err(error) = std::fs::write(&pid_path, child.id().to_string()) {
         eprintln!("helper 写孙进程 PID 失败: {error}");
     }
-    // 故意不 wait 也不持有句柄：孙进程必须活过本夹具的退出，
-    // 才能证明"父进程死了不等于整树死了"，Job 才是那条边界。
+    // 故意不 wait，也不持有句柄：孙进程必须活过夹具退出，才能证明
+    // 父进程退出不会带走整棵树，Job 才是清理边界。
     std::mem::forget(child);
 }
 
@@ -98,10 +98,10 @@ fn serve(
 ) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    // 跨进程续接计数：重连拉起的新进程从"已有副作用数"之后接着数。
-    // drop-after-N 因此是"全局恰好第 N 次调用退出"（单发），新进程不再
-    // 退出；silent-after-N 保持"第 N 次起永远沉默"（持续）。两种语义的
-    // 区别在于重连测试里第二个进程必须能正常应答，才能证明"恢复后调用可用"。
+    // 跨进程续接计数：重连拉起的新进程从已有副作用数之后接着数。
+    // drop-after-N 表示全局第 N 次调用时退出（单发），新进程不再退出；
+    // silent-after-N 表示第 N 次起持续沉默。重连测试依赖两种语义的区别：
+    // 第二个进程必须能正常应答，才能证明恢复后调用可用。
     let mut calls = counter_path
         .as_ref()
         .and_then(|path| std::fs::read_to_string(path).ok())
@@ -119,8 +119,8 @@ fn serve(
         };
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-        // 通知（无 id）不回响应；initialize 必答，否则握手过不去——
-        // 正因如此 no-init-reply 模式靠"唯独不回它"来制造握手挂死。
+        // 通知（无 id）不回响应；initialize 必须应答，否则握手无法完成。
+        // no-init-reply 模式只对 initialize 不回应，以此制造握手挂死。
         let response = match method {
             "initialize" if !never_init_reply => Some(json!({
                 "jsonrpc":"2.0","id":id,
@@ -168,8 +168,8 @@ fn serve(
             }
         }
     }
-    // stdin EOF：父进程关闭了写端。落一个标记文件，让"清理执行到了这里"
-    // 变成可以断言的事实，而不是"过几秒看看进程还在不在"。
+    // stdin EOF：父进程关闭了写端。写一个标记文件，让"清理到达子进程"
+    // 成为可断言的事实，无需等待数秒后再检查进程是否存在。
     if let Some(path) = &counter_path {
         let eof_path = with_suffix(path, ".eof");
         if let Err(error) = std::fs::write(&eof_path, "eof") {

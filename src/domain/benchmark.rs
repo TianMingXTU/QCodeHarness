@@ -1,9 +1,8 @@
-//! 基准评测的领域类型：任务定义、成功判据与一次运行的结果。
+//! 基准评测的领域类型：任务定义、成功判据与运行结果。
 //!
-//! 判据全部是**机器可检查的客观条件**——测试命令的退出码、工作区
-//! 有没有实际改动、最终答案有没有提到关键词。不靠人看答案打分，
-//! 基准才能复现。本模块只有类型与纯判定逻辑，任务文件怎么读、
-//! 模型怎么跑都在外层。
+//! 判据全部是机器可检查的客观条件：测试命令退出码、工作区是否有实际
+//! 改动、最终答案是否提到关键词。不靠人评分，基准才可复现。本模块只
+//! 包含类型与纯判定逻辑，任务文件读取与模型执行都在外层。
 
 use serde::{Deserialize, Serialize};
 
@@ -19,15 +18,15 @@ pub struct BenchmarkTask {
     pub kind: TaskKind,
     /// 给模型的任务描述。
     pub description: String,
-    /// 任务属于哪个套件：`default` 是短任务，`long` 是长任务。
+    /// 任务所属套件：`default` 为短任务，`long` 为长任务。
     ///
-    /// 两套任务跑法不同——长任务要先故意耗尽预算再恢复——所以它们
-    /// 由不同的运行器接手，不混在一条路上。
+    /// 两套跑法不同：长任务先耗尽预算再恢复，因此由不同运行器处理，
+    /// 不共用执行路径。
     #[serde(default)]
     pub suite: String,
     /// 成功判据。
     pub criteria: SuccessCriteria,
-    /// 两阶段运行配置。只在长任务套件里用得上，短任务留空即可。
+    /// 两阶段运行配置。仅长任务套件使用，短任务留空即可。
     #[serde(default)]
     pub long_run: LongRunConfig,
 }
@@ -37,55 +36,57 @@ pub struct BenchmarkTask {
 pub struct SuccessCriteria {
     /// 必须通过的测试命令（在任务仓库根执行，退出码 0 即通过）。
     pub test_command: String,
-    /// 是否要求工作区有实际改动。修 bug 类任务"测试通过"可能只是
-    /// fixture 本来就能过——要求有改动才能证明 agent 真的动了手。
+    /// 是否要求工作区有实际改动。
+    ///
+    /// 修 bug 类任务中"测试通过"可能只是 fixture 本来就能过，要求有改动
+    /// 才能证明 agent 确实修改了代码。
     pub requires_changes: bool,
     /// 最终答案必须提及的词（大小写不敏感）。空清单表示不检查。
     pub answer_must_mention: Vec<String>,
     /// 最少模型调用轮数。
     ///
-    /// 长任务用它证明"确实跑了那么多"：一个三轮就交差的运行不该被
-    /// 算作长任务。`None` 表示不限。
+    /// 长任务据此确认运行轮数达标，三轮就结束的运行不应算作长任务。
+    /// `None` 表示不限。
     #[serde(default)]
     pub min_turns: Option<u32>,
-    /// 不许重复执行的命令。
+    /// 禁止重复执行的命令。
     ///
-    /// 恢复之后把已经跑过的命令再跑一遍，副作用就重复了——而命令
-    /// 是不是"已经跑过"，证据里数得出来。`None` 表示不检查。
+    /// 恢复后重跑已执行过的命令会重复触发副作用，证据里可以数出重复次数。
+    /// `None` 表示不检查。
     #[serde(default)]
     pub no_repeated_commands: Option<Vec<String>>,
-    /// 上下文被压缩之后，模型输出里仍然必须出现的词。
+    /// 上下文压缩后，模型输出中仍必须出现的词。
     ///
-    /// 这是"压缩后关键上下文还在不在"的判据：历史被裁掉之后，模型
-    /// 仍然得知道它动过哪些文件、跑过什么命令——那正是它继续干活的
-    /// 依据。空清单表示不检查。
+    /// 用于判断关键上下文是否保留：历史被裁剪后，模型仍需知道它改过哪些
+    /// 文件、跑过哪些命令，这是继续执行任务的依据。空清单表示不检查。
     #[serde(default)]
     pub must_mention_after_compaction: Vec<String>,
 }
 
 /// 长任务的两阶段运行配置。
 ///
-/// 长任务与短任务的跑法不一样：短任务一遍跑完，长任务要**故意**在
-/// 第一次运行里把预算耗尽，再从任务快照恢复着跑完。这两个旋钮就
-/// 写在这儿——写在任务文件里，而不是写死在运行器里：不同任务的
-/// "故意耗尽"位置不一样。
+/// 短任务一次跑完；长任务在第一次运行中故意耗尽预算，再从任务快照
+/// 恢复跑完。两个参数写在任务文件里，不同任务的耗尽位置不同，不能
+/// 写死在运行器里。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LongRunConfig {
-    /// 第一次运行的轮数上限：故意让它耗尽，逼出中断与恢复。
+    /// 第一次运行的轮数上限，故意设置得会耗尽，以触发中断与恢复。
     ///
-    /// `None` 表示不刻意制造中断（长任务也可以一遍跑完）。
+    /// 省略时运行器取默认值 2 轮，仍然会在第一步内中断。
     #[serde(default)]
     pub exhaust_turns: Option<u32>,
-    /// 上下文 token 预算：压小到必然触发裁剪。
+    /// 上下文 token 预算，应压小到必然触发裁剪。
     ///
-    /// 不压小的话，长任务的历史可能一直撑不到上限，"压缩后上下文
-    /// 还在不在"这条判据就无从核对。
+    /// 否则长任务历史可能达不到上限，"压缩后上下文是否保留"的判据
+    /// 无从核对。
     #[serde(default)]
     pub context_max_tokens: Option<usize>,
 }
 
-/// 判据评估时能观察到的事实。与判据分开定义：判据是声明，
-/// 事实是运行后采集到的数据，[`SuccessCriteria::evaluate`] 对照两者。
+/// 判据评估时观察到的事实。
+///
+/// 与判据分开定义：判据是声明，事实是运行后采集的数据，
+/// [`SuccessCriteria::evaluate`] 对照两者。
 #[derive(Debug, Clone, Copy)]
 pub struct CriteriaObservation<'a> {
     /// 测试命令是否以 0 退出。
@@ -98,14 +99,14 @@ pub struct CriteriaObservation<'a> {
     pub turns_used: u32,
     /// 重复执行过的命令（同一命令文本被调用了不止一次）。
     pub repeated_commands: &'a [String],
-    /// 第一次上下文压缩之后模型说的话。
+    /// 第一次上下文压缩后模型的输出。
     ///
-    /// `None` 表示这次运行没有发生过压缩。
+    /// `None` 表示本次运行未发生压缩。
     pub text_after_compaction: Option<&'a str>,
 }
 
 impl SuccessCriteria {
-    /// 逐条核对判据，返回**未满足**判据的说明（全部满足则为空）。
+    /// 逐条核对判据，返回未满足判据的说明（全部满足时为空）。
     pub fn evaluate(&self, observed: CriteriaObservation<'_>) -> Vec<String> {
         let mut failures = Vec::new();
         if !observed.test_exit_success {
@@ -131,15 +132,15 @@ impl SuccessCriteria {
                 ));
             }
         }
-        // 判定与展示必须共用同一本账：runner 打印"重复副作用 N 次"时
-        // 数的也是这份违规清单，而不是所有重复过的命令——模型修完一个
-        // 缺陷重跑全量测试是正常迭代，不是副作用重复。
+        // 判定与展示使用同一份违规清单：runner 打印"重复副作用 N 次"时也数
+        // 这份清单，不统计所有重复过的命令。模型修完缺陷后重跑全量测试属于
+        // 正常迭代，不算副作用重复。
         for command in self.forbidden_repeats(&observed.repeated_commands) {
             failures.push(format!("命令 `{command}` 被重复执行——副作用重复触发"));
         }
         if !self.must_mention_after_compaction.is_empty() {
-            // 没有压缩就没有"压缩之后"：这条判据无从核对，如实说出来，
-            // 而不是悄悄放行——放行等于把一条没跑的检查当成跑过了。
+            // 没有压缩就不存在"压缩之后"。这条判据无从核对，应当如实报告，
+            // 不能放行，否则未执行的检查会被当作已通过。
             let Some(text) = observed.text_after_compaction else {
                 failures.push("本次运行没有发生上下文压缩，判据无从核对".to_owned());
                 return failures;
@@ -156,10 +157,10 @@ impl SuccessCriteria {
         failures
     }
 
-    /// `no_repeated_commands` 里真正被重复执行了的命令。
+    /// `no_repeated_commands` 中确实被重复执行的命令。
     ///
-    /// 判据未声明（`None`）时没有可违规的清单，返回空。这是"重复
-    /// 副作用"的唯一判定口径，展示层也用它，两处不会走样。
+    /// 判据未声明（`None`）时返回空。这是"重复副作用"的唯一判定口径，
+    /// 展示层同样使用它，两处保持一致。
     pub fn forbidden_repeats(&self, repeated_commands: &[String]) -> Vec<String> {
         let Some(forbidden) = &self.no_repeated_commands else {
             return Vec::new();
@@ -177,12 +178,11 @@ impl SuccessCriteria {
 pub struct BenchmarkResult {
     /// 任务标识。
     pub task_id: String,
-    /// 该任务第一次**完成**步骤的会话 ID（证据文件的入口）。
+    /// 该任务第一次完成步骤的会话 ID，也是证据文件的入口。
     ///
-    /// 一个任务只有一个会话，且会话在第一步之前就开好——
-    /// 所以只要任务真的跑起来过，哪怕是第一步就失败，这里也有 ID
-    /// （失败步骤的观察在同一份证据里，可恢复可复盘）。只有任务还没
-    /// 开跑就出错（fixture 拷贝、装载之类）时为 `None`。
+    /// 一个任务只有一个会话，会话在第一步之前创建。任务只要开始运行，
+    /// 即使第一步失败也有 ID，失败步骤的观察记录在同一份证据里，可恢复、
+    /// 可复盘。任务未开始就出错（如 fixture 拷贝、装载）时为 `None`。
     pub session_id: Option<SessionId>,
     /// 是否通过全部判据。
     pub passed: bool,
@@ -192,38 +192,38 @@ pub struct BenchmarkResult {
     pub steps_completed: usize,
     /// 全部步骤消耗的模型调用轮数（这个任务唯一会话里的思考事件数）。
     pub turns_used: u32,
-    /// 本次任务的墙钟（毫秒）。
+    /// 本次任务的墙钟耗时（毫秒）。
     ///
-    /// 取该会话的首末事件间隔：证据里本来就有每条事件的
-    /// 时间戳，再起一个计时器只会多一处可能对不上的真相。它不含
-    /// fixture 拷贝与判据命令的时间——那两段不是"等模型"。
+    /// 取会话首末事件的时间戳间隔。证据里已有每条事件的时间戳，另起计时器
+    /// 会多一处可能不一致的数据。不含 fixture 拷贝与判据命令的时间，这两
+    /// 段不属于等待模型。
     pub wall_clock_ms: u64,
-    /// 审批次数合计（这个任务唯一会话里的 `ApprovalDecided` 事件数）。
+    /// 审批裁决次数合计，即该任务唯一会话中的 `ApprovalDecided` 事件数。
     ///
-    /// 基准强制 `AutoApproveGate`（无人值守），所以这里恒为 0。
-    /// **真实使用中的审批次数要从 `--report` 看**，不要拿这个 0 得出
-    /// "人工等待不是问题"的结论——它衡量的是另一条路径。
+    /// 基准使用 `AutoApproveGate`（无人值守），这个数字表示有多少次调用
+    /// 走到了审批闸门，不是人工审批次数。真实使用中的审批情况应查看
+    /// `--report`，两者衡量的是不同路径。
     pub approvals: usize,
     /// 缓存命中率：读回的输入 token 占全部输入 token 的比例。
-    /// 没有任何输入 token 时为 `None`（含义是"没数据"，不是"0% 命中"）。
+    /// 没有输入 token 时为 `None`，表示没有数据，不是 0% 命中。
     pub cache_hit_ratio: Option<f64>,
-    /// 成本合计（美元）。任一次调用成本未知时为 `None`——被低估的合计
-    /// 比"未知"更危险。
+    /// 成本合计（美元）。任一次调用成本未知时为 `None`。低估的合计比
+    /// 未知更危险。
     pub cost_usd: Option<f64>,
 }
 
 /// 长任务两段式运行的结果。
 ///
-/// **第一次运行的失败与恢复后的结果是两件事**，分开记：混在一起就
-/// 看不出"恢复到底救回来了没有"。
+/// 第一次运行的失败与恢复后的结果分开记录，否则无法判断恢复是否
+/// 挽回了任务。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LongBenchmarkResult {
     /// 任务标识。
     pub task_id: String,
     /// 会话 ID（两段共用同一个会话：恢复接着上一次的会话跑）。
     pub session_id: Option<SessionId>,
-    /// 第一次运行的失败原因。空串表示第一次运行没失败——
-    /// 那通常意味着"故意耗尽预算"没生效，这一趟没测到想测的东西。
+    /// 第一次运行的失败原因。空串表示第一次运行没有失败，通常说明
+    /// "故意耗尽预算"未生效，本次运行没有测到目标场景。
     pub first_run_failure: String,
     /// 第一次运行完成的步数。
     pub first_run_steps: usize,
@@ -239,7 +239,7 @@ pub struct LongBenchmarkResult {
     pub total_turns: u32,
     /// 任务总步数。
     pub steps_total: usize,
-    /// 恢复后完成的步数。
+    /// 两段合计完成的步数。第一段单独记在 `first_run_steps`。
     pub steps_completed: usize,
     /// 是否通过全部判据。
     pub passed: bool,
@@ -247,7 +247,7 @@ pub struct LongBenchmarkResult {
     pub failures: Vec<String>,
     /// 重复执行过的命令。空清单表示没有重复副作用。
     pub repeated_commands: Vec<String>,
-    /// 成本合计（美元）。未知就是未知。
+    /// 成本合计（美元）。成本未知时为 `None`。
     pub cost_usd: Option<f64>,
     /// 墙钟（毫秒）：两段合计。
     pub wall_clock_ms: u64,
@@ -352,10 +352,10 @@ mod tests {
 
     // ── 长任务判据 ───────────────────────────────────────────────────
 
-    /// 长任务观察：补上轮数、重复命令与压缩之后的模型输出。
+    /// 长任务观察样本：补齐轮数、重复命令与压缩后的模型输出。
     ///
-    /// 答案带上基础判据的关键词（panic）：这里的用例只关心长任务判据
-    /// 本身，别的判据都该是满足的。
+    /// 答案包含基础判据的关键词（panic），使其他判据保持满足，用例只关注
+    /// 长任务判据。
     fn long_observation<'a>(
         turns_used: u32,
         repeated_commands: &'a [String],
@@ -427,9 +427,9 @@ mod tests {
 
     #[test]
     fn a_repeat_outside_the_forbidden_list_is_not_a_side_effect_violation() {
-        // 模型修完一个缺陷重跑全量测试：重复发生了，但任务只禁止
-        // `cargo test --test utils`——未声明的重复是正常迭代。
-        // 判定与展示共用 forbidden_repeats，这里锁的是这个口径。
+        // 模型修完缺陷后重跑全量测试：重复发生了，但任务只禁止
+        // `cargo test --test utils`。未声明的重复属于正常迭代。
+        // 判定与展示共用 forbidden_repeats，这条测试锁定该口径。
         let criteria = SuccessCriteria {
             no_repeated_commands: Some(vec!["cargo test --test utils".to_owned()]),
             ..criteria()
@@ -448,8 +448,8 @@ mod tests {
 
     #[test]
     fn a_repeat_without_a_forbidden_list_is_never_a_violation() {
-        // no_repeated_commands 缺省（None）：没有可违规的清单，
-        // 任何重复都不算违规——展示层同样说"没有违规"。
+        // no_repeated_commands 缺省（None）：没有违规清单，任何重复都不算
+        // 违规，展示层同样报告"没有违规"。
         let criteria = criteria();
         let repeated = vec!["cargo test".to_owned(), "cargo build".to_owned()];
 
@@ -486,8 +486,8 @@ mod tests {
 
     #[test]
     fn a_run_without_compaction_cannot_claim_the_context_survived() {
-        // 没有压缩就没有"压缩之后"：这条判据必须说"无从核对"，
-        // 而不是悄悄放行——放行等于把没跑的检查当成跑过了。
+        // 没有压缩就不存在"压缩之后"。这条判据必须报告"无从核对"，
+        // 不能放行，否则未执行的检查会被当作已通过。
         let criteria = SuccessCriteria {
             must_mention_after_compaction: vec!["parser.rs".to_owned()],
             ..criteria()

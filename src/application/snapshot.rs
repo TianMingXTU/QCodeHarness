@@ -1,12 +1,11 @@
 //! 运行快照：会话恢复所需的全部状态，以及快照存储的端口。
 //!
-//! 快照放在应用层而不是 domain：它引用 `RunState` / `PendingRound`
-//! 这两个应用层状态机类型，domain 反向依赖 application 会把分层倒过来。
-//! 纯历史的 [`SessionSnapshot`] 仍在 domain——那是领域数据。
+//! 快照放在应用层，因为它引用应用层状态机类型 `RunState` / `PendingRound`；
+//! 放进 domain 会让 domain 反向依赖 application。纯历史的 [`SessionSnapshot`]
+//! 仍在 domain，属于领域数据。
 //!
-//! `format_version` 是这份契约的版本号：快照是跨进程、跨版本的持久数据，
-//! 静默兼容会把损坏或不兼容的状态带进运行，读到一个不认识的版本必须
-//! 显式报错，而不是猜着填默认值。
+//! `format_version` 是这份持久契约的版本号。快照跨进程、跨版本使用，
+//! 读到不认识的版本必须显式报错；静默兼容会把损坏或不兼容的状态带进运行。
 
 use serde::{Deserialize, Serialize};
 
@@ -19,21 +18,19 @@ use crate::domain::worktree::WorktreeManifest;
 
 use super::agent_run::{PendingRound, RunState};
 
-/// 当前快照格式版本。每次快照结构发生不兼容变化时 +1。
+/// 当前快照格式版本。快照结构发生不兼容变化时加 1。
 ///
-/// v2：`AgentRole` 有四个变体，角色的序列化形态比 v1 丰富——v1 快照
-/// 被显式拒绝而不是猜着解释。
+/// v2：`AgentRole` 增加到四个变体，序列化形态比 v1 丰富，v1 快照被显式拒绝。
 ///
-/// v3：快照描述的是"整个任务"而不只是"一个 runner"。v2 快照没有任务
-/// 上下文，恢复时无法回答"这是整个任务的哪一步"，因此明确拒绝而不是
-/// 猜着填。
+/// v3：快照描述整个任务，不再只是单个 runner。v2 快照没有任务上下文，
+/// 恢复时无法判断当前进度，因此拒绝加载。
 pub const RUN_FORMAT: u32 = 3;
 
 /// 当前任务快照格式版本。
 ///
-/// 与 [`RUN_FORMAT`] 分开：两者落在不同的文件里（`.qcodeharness/snapshots/`
-/// 与 `.qcodeharness/tasks/`），版本号各自演进。共用一个号会让"改了一边
-/// 就得改另一边"，而两边的结构没有这种依赖关系。
+/// 与 [`RUN_FORMAT`] 分开：两者存放在不同目录（`.qcodeharness/snapshots/`
+/// 与 `.qcodeharness/tasks/`），版本号独立演进。两边的结构互不依赖，
+/// 共用版本号只会迫使一边跟着另一边改。
 pub const TASK_FORMAT: u32 = 1;
 
 /// 一次运行的可序列化快照：恢复所需的全部状态。
@@ -45,29 +42,28 @@ pub struct RunSnapshot {
     pub session_id: SessionId,
     /// 本次运行的 Agent 规格。
     ///
-    /// 规格草图里没有它，但恢复要用回同一份系统提示词——
-    /// 换成别的提示词等于换了一个 agent 接手半截任务。
+    /// 规格草图里没有它，但恢复必须用回同一份系统提示词；换提示词会让
+    /// 另一个 agent 接手半截任务。
     pub spec: AgentSpec,
     /// 完整会话历史。
     pub session: SessionSnapshot,
     /// 状态机停在哪。
     pub state: RunState,
-    /// 已消耗的量（轮数 + 耗时）。
+    /// 已消耗的轮数与耗时。
     pub consumption: Consumption,
-    /// 工具已经跑完、还没提交的那半轮。`None` 表示不在处理调用的中途。
+    /// 工具已跑完但尚未提交的半轮。`None` 表示不在调用处理中途。
     pub pending: Option<PendingRound>,
 }
 
-/// 一个任务的可序列化快照：任务级恢复所需的全部状态。
+/// 任务的可序列化快照：任务级恢复所需的全部状态。
 ///
-/// 与 [`RunSnapshot`] 的分工：`RunSnapshot` 描述"一个 runner 停在哪"，
-/// 任务快照描述"一个任务做到哪"。后者多两样东西：
+/// 与 [`RunSnapshot`] 的分工：`RunSnapshot` 描述单个 runner 停在哪，
+/// 任务快照描述任务做到哪。后者多两样东西：
 ///
-/// - `task`：任务本身的进度（`TaskState::Running { step }` 是进度的
-///   唯一真相来源）。没有它，恢复时不知道该从第几步接着走。
-/// - `completed_outputs`：每一步的结论。没有它，恢复后的下一步看不见
-///   前面几步查出了什么，只能从零重推——那正是"长任务恢复后跑偏"的
-///   根源。
+/// - `task`：任务进度，`TaskState::Running { step }` 是进度的唯一来源。
+///   缺少它，恢复时不知道从第几步继续。
+/// - `completed_outputs`：各步结论。缺少它，恢复后的下一步看不到前面的
+///   结果，只能从零重推，长任务恢复后容易跑偏。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskSnapshot {
     /// 快照格式版本。读到时先校验，拒绝不认识的版本。
@@ -78,17 +74,16 @@ pub struct TaskSnapshot {
     pub run: RunSnapshot,
     /// 已完成步骤的结论，按步骤号升序。
     pub completed_outputs: Vec<StepOutput>,
-    /// 存快照时的工作区清单。
+    /// 保存快照时的工作区清单。
     ///
-    /// 恢复时拿它与"现在的清单"比对，得出工作区有没有被人动过。
-    /// 快照里**必须**留着它：没有它就无从判断——拿现在的清单跟自己
-    /// 比永远得到"没变过"，那不是检查，那是自欺。
+    /// 恢复时与当前清单比对，判断工作区是否被改过。快照里**必须**保留它；
+    /// 没有基准清单，比对只能得到"没变过"。
     #[serde(default)]
     pub worktree: WorktreeManifest,
 }
 
 impl TaskSnapshot {
-    /// 校验快照版本，不认识就报错。
+    /// 校验快照版本，不匹配时返回错误。
     ///
     /// # Errors
     ///
@@ -112,7 +107,7 @@ impl TaskSnapshot {
 }
 
 impl RunSnapshot {
-    /// 校验快照版本，不认识就报错。
+    /// 校验快照版本，不匹配时返回错误。
     ///
     /// # Errors
     ///
@@ -130,10 +125,10 @@ impl RunSnapshot {
     }
 }
 
-/// 快照存储：把运行状态写到磁盘、读回来。
+/// 会话快照存储端口：把运行状态写入磁盘并读回。
 ///
-/// 是端口而不是具体实现：编排器与 CLI 依赖这个抽象，
-/// 落盘方式（单文件 JSON、SQLite、远端）由基础设施层决定。
+/// 编排器与 CLI 依赖这个抽象；落盘方式（单文件 JSON、SQLite、远端）
+/// 由基础设施层决定。
 pub trait SessionStore: Send + Sync {
     /// 保存快照。同名覆盖。
     ///
@@ -154,12 +149,12 @@ pub trait SessionStore: Send + Sync {
     fn list(&self) -> Result<Vec<SessionId>, StoreError>;
 }
 
-/// 任务快照存储：把任务级状态写到磁盘、读回来。
+/// 任务快照存储端口：把任务级状态写入磁盘并读回。
 ///
-/// 与 [`SessionStore`] 分开而不是合并：两者的键不同（任务 ID vs 会话 ID）、
-/// 落盘位置不同（`tasks/` vs `snapshots/`）、回答的问题也不同（"这个任务
-/// 做到哪" vs "这个 runner 停在哪"）。合成一个 trait 会让"只想读会话
-/// 快照"的调用方也得实现任务快照的方法。
+/// 与 [`SessionStore`] 分开：两者的键不同（任务 ID vs 会话 ID），
+/// 落盘位置不同（`tasks/` vs `snapshots/`），回答的问题也不同
+/// （任务做到哪 vs runner 停在哪）。合并成一个 trait 会迫使只想读会话
+/// 快照的调用方也实现任务快照方法。
 pub trait TaskStore: Send + Sync {
     /// 保存任务快照。同名覆盖。
     ///
@@ -187,7 +182,7 @@ pub enum StoreError {
     #[error("快照读写失败: {0}")]
     Io(#[from] std::io::Error),
 
-    /// 快照内容不是合法 JSON 或结构与当前版本不符。
+    /// 快照不是合法 JSON，或结构与当前版本不符。
     #[error("快照解析失败: {0}")]
     Parse(#[from] serde_json::Error),
 
@@ -200,7 +195,7 @@ pub enum StoreError {
         expected: u32,
     },
 
-    /// 快照内容能解析，但状态自相矛盾（如停在半轮却没有待配平的轮次）。
+    /// 快照可解析，但状态自相矛盾，例如停在半轮却没有待配平的轮次。
     #[error("快照状态损坏：{0}")]
     Corrupt(String),
 }
@@ -216,8 +211,8 @@ mod tests {
     use crate::domain::tool::{ToolCall, ToolOutcome};
     use serde_json::json;
 
-    /// 造一份停在"半轮"状态的快照：调用已给出、观察收了一半。
-    /// 这是恢复语义最挑剔的状态，round-trip 必须无损。
+    /// 构造半轮状态的快照：调用已给出，观察只收到一半。
+    /// 恢复语义在此最挑剔，往返必须无损。
     fn mid_round_snapshot() -> RunSnapshot {
         let mut session = Session::new(SessionId::new("s1"), "任务");
         session
@@ -294,9 +289,8 @@ mod tests {
 
     #[test]
     fn snapshot_from_previous_format_is_rejected() {
-        // v1 快照：AgentRole 扩展后序列化形态已变，必须明确拒绝
-        // 而不是猜着兼容——这是 acceptance 的硬要求，也是静默兼容更危险
-        // 的直接体现。
+        // v1 快照：AgentRole 扩展后序列化形态已变，必须明确拒绝。
+        // 静默兼容会把不兼容状态带进运行。
         let mut snapshot = mid_round_snapshot();
         snapshot.format_version = 1;
         let error = snapshot.check_version().unwrap_err();
@@ -306,11 +300,10 @@ mod tests {
         assert_eq!(expected, RUN_FORMAT);
     }
 
-    /// 旧快照（v2）也要被明确拒绝。
+    /// v2 快照必须被明确拒绝。
     ///
-    /// v2 的快照结构本身还能读，但它只描述一个 runner——没有任务上下文，
-    /// 恢复时回答不了"这是整个任务的哪一步"。任务级恢复要的是能回答
-    /// 这个问题的快照，所以 v2 明确拒绝，而不是猜着补一个空任务。
+    /// v2 结构仍可解析，但只描述一个 runner，没有任务上下文，恢复时
+    /// 无法判断当前步骤。任务级恢复需要任务上下文，因此拒绝加载，不补空任务。
     #[test]
     fn a_v2_snapshot_is_rejected_after_the_task_level_upgrade() {
         let mut snapshot = mid_round_snapshot();
@@ -325,7 +318,7 @@ mod tests {
 
     // ── 任务快照 ────────────────────────────────────────────────────────
 
-    /// 一个三步任务、停在第 2 步、已完成第 1 步的任务快照。
+    /// 一个两步任务、停在第 2 步、已完成第 1 步的任务快照。
     fn task_snapshot() -> TaskSnapshot {
         let steps = vec![
             TaskStep {
@@ -383,7 +376,7 @@ mod tests {
 
         assert_eq!(restored, snapshot);
         assert!(restored.check_version().is_ok());
-        // 进度与结论都在：这是任务级恢复的两条命脉。
+        // 进度与结论都在，这是任务级恢复的两个关键。
         assert_eq!(restored.task.state(), TaskState::Running { step: 1 });
         assert_eq!(restored.completed_outputs.len(), 1);
         assert_eq!(restored.completed_outputs[0].answer, "根因在解析层");
@@ -403,10 +396,10 @@ mod tests {
         ), "{error}");
     }
 
-    /// 任务快照里的任务本身也走 `Task` 的重建校验。
+    /// 任务快照里的任务也要通过 `Task` 的重建校验。
     ///
-    /// 任务快照是外部可改的文件：把 `state` 改成越界的进度下标，
-    /// 整个任务快照就应当读不回来，而不是带着一个坏任务进入编排。
+    /// 任务快照是外部可修改的文件。把 `state` 改成越界的进度下标后，
+    /// 整个快照必须读取失败，不能带着坏任务进入编排。
     #[test]
     fn a_task_snapshot_with_a_broken_task_is_rejected() {
         let snapshot = task_snapshot();

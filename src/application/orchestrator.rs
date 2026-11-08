@@ -1,15 +1,17 @@
 ﻿//! 任务编排器：按模板把任务拆成步骤，逐步驱动 `AgentRunner`。
 //!
-//! 编排策略刻意简单可预测：任一步失败立即停；runner 按步骤的角色装配，
+//! 编排策略简单可预测：任一步失败立即停。runner 按步骤的角色装配，
 //! 提示词与工具白名单都来自角色档案（`AgentRoster`）。多 Agent 并行
 //! 调度留给后续阶段。
 //!
-//! **一个任务只开一个会话**：步骤之间不另起 runner，而是在同一个会话里
-//! 推进一步——换角色、交代步骤、把上一步的结论落进历史。换来三件事：
-//! 历史跨步延续（下一步看得见上一步读过的文件，不必重读）、轮数与墙钟
-//! 按任务累计（不再每步各发一份预算）、缓存路由键跨步稳定（provider
-//! 才可能把前面攒下的前缀缓存读回来）。代价是会话历史会变长，由
-//! `ContextBudget` 在步骤边界自然裁掉（见 `domain::context`）。
+//! 一个任务只开一个会话。步骤之间不另起 runner，直接在同一会话里推进：
+//! 换角色、交代步骤、把上一步的结论写进历史。由此得到三点：
+//! - 历史跨步延续，下一步看得见上一步读过的文件；
+//! - 轮数与墙钟按任务累计，不再每步各发一份预算；
+//! - 缓存路由键跨步稳定，provider 才可能读回前缀缓存。
+//!
+//! 代价是会话历史变长，由 `ContextBudget` 在每次模型请求前裁掉（见
+//! `domain::context`）。
 
 use std::sync::Arc;
 
@@ -27,21 +29,22 @@ use crate::domain::ids::{SessionId, TaskId};
 use crate::domain::task::{StepOutput, Task, TaskError, TaskKind, TaskState};
 use crate::domain::workflow::WorkflowCatalog;
 
-/// 每任务证据汇的工厂：编排器为任务开一个会话与一份证据文件，怎么造汇
-/// 由装配方（main）决定——应用层不依赖具体实现。会话 ID 在 `run` 内部
-/// 生成后传给工厂，证据文件因此与会话同名可互查。
+/// 每任务证据汇的工厂：为整个任务唯一的会话建一份证据。
+///
+/// 具体实现由装配方（main）决定，应用层不依赖它。会话 ID 在 `run` 内部
+/// 生成后传给工厂，证据文件因此与会话同名，可互相查。
 pub type EvidenceFactory =
     Arc<dyn Fn(&SessionId) -> std::io::Result<Arc<dyn EvidenceSink>> + Send + Sync>;
 
 /// 一次编排的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskOutcome {
-    /// 最终答案（最后一步的输出）。
+    /// 最终答案，即最后一步的输出。
     pub answer: String,
-    /// 本次运行完成的步数。从 `Running { step }` 续跑时它小于任务总步数
-    /// ——任务级进度看 [`Task::progress`]。
+    /// 本次运行完成的步数。从 `Running { step }` 续跑时小于任务总步数；
+    /// 任务级进度看 [`Task::progress`]。
     pub steps_completed: usize,
-    /// 本次任务的会话 ID。一个任务只有一个会话：证据文件、快照、
+    /// 本次任务的会话 ID。一个任务只有一个会话，证据文件、快照与
     /// `--resume` 都用它。
     pub session_id: SessionId,
 }
@@ -51,40 +54,40 @@ pub struct Orchestrator {
     deps: AgentDependencies,
     budget: Budget,
     templates: WorkflowCatalog,
-    /// 每个任务的证据汇工厂：一个任务只调用一次，为整个任务的唯一
-    /// 会话建一份证据。
+    /// 任务证据汇工厂。`run` 与 `resume` 各调用一次，为该次运行的会话
+    /// 建证据；先跑后恢复的同一任务会调用两次，证据按会话 ID 追加到
+    /// 同一份文件。
     evidence_factory: EvidenceFactory,
     /// 任务快照存储。`None` 表示不落任务快照。
     ///
-    /// 与 `deps.session_store` 分开：前者存"这个任务做到哪"，
-    /// 后者存"这个 runner 停在哪"。两者回答的问题不同，恢复的粒度
-    /// 也不同——任务级恢复能从步骤边界继续，会话级恢复只能从半轮继续。
+    /// 与 `deps.session_store` 分开：前者存"任务做到哪"，后者存
+    /// "runner 停在哪"。恢复粒度不同：任务级能从步骤边界继续，
+    /// 会话级只能从半轮继续。
     task_store: Option<Arc<dyn TaskStore>>,
     /// 工作区扫描器：存快照时记一份清单，恢复时拿它比对。
     ///
-    /// `None` 表示不做工作区一致性检查。快照里的清单因此是空的，
-    /// 恢复时也拿不到可比的"当时的样子"——检查降级为"查不了"。
+    /// `None` 表示不做一致性检查。快照里的清单为空，恢复时没有可比的
+    /// "当时的样子"，检查降级为"查不了"。
     worktree_scanner: Option<Arc<dyn WorktreeScanner>>,
     /// 工作区被改动时的处置策略。
     worktree_policy: WorktreeChangePolicy,
 }
 
 impl Orchestrator {
-    /// 组装编排器，用内置花名册。`budget` 是编排级配置：每个步骤的
-    /// runner 都用同一个预算。
+    /// 组装编排器，使用内置花名册。`budget` 是编排级配置，每个步骤的
+    /// runner 共用。
     pub fn new(deps: AgentDependencies, budget: Budget, evidence_factory: EvidenceFactory) -> Self {
         Self::with_roster(deps, budget, evidence_factory, AgentRoster::builtin())
     }
 
-    /// 用给定花名册组装（测试与将来的自定义配置用）。
+    /// 用给定花名册组装，供测试与自定义配置使用。
     ///
-    /// 花名册是装配的必要输入：某步的角色查不到档案时，该步显式报错
-    /// （[`ApplicationError::ProfileMissing`]），绝不静默退回默认角色。
+    /// 花名册是必要输入：某步的角色查不到档案时该步显式报错
+    /// （[`ApplicationError::ProfileMissing`]），不退回默认角色。
     ///
-    /// 花名册只存一份：写进 `deps.roster`，任务里既用它拼系统提示词，
-    /// 也用它做调用层的角色白名单。若编排器再另存一份，提示词与白名单
-    /// 就可能从两份分叉的花名册上各自取值——提示词说"你是审阅者"，
-    /// 白名单却按另一个角色放行，谁都没错却整条链路错了。
+    /// 花名册只存一份，写进 `deps.roster`。拼系统提示词与调用层角色白名单
+    /// 都用它。若另存一份，两者可能取自不同的花名册：提示词说"你是审阅者"，
+    /// 白名单却按另一个角色放行。
     pub fn with_roster(
         mut deps: AgentDependencies,
         budget: Budget,
@@ -105,8 +108,8 @@ impl Orchestrator {
 
     /// 接上任务快照存储。
     ///
-    /// 接上之后，任务每完成一步就落一份任务快照——中断时才有"这个任务
-    /// 做到哪"的记录可查。没接的话任务照跑，只是不能任务级恢复。
+    /// 接上后每完成一步落一份任务快照，中断时能查到任务做到哪。没接时
+    /// 任务照跑，只是不能任务级恢复。
     pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
         self.task_store = Some(store);
         self
@@ -114,8 +117,8 @@ impl Orchestrator {
 
     /// 接上工作区扫描器。
     ///
-    /// 接上之后，任务快照里会带一份工作区清单；恢复时拿它与当时的清单
-    /// 比对，得出"工作区有没有被人动过"。这是"不静默继续"的数据来源。
+    /// 接上后任务快照带一份工作区清单，恢复时与当前清单比对，判断工作区
+    /// 是否被改动。检测到改动时拒绝静默恢复。
     pub fn with_worktree_scanner(mut self, scanner: Arc<dyn WorktreeScanner>) -> Self {
         self.worktree_scanner = Some(scanner);
         self
@@ -123,10 +126,8 @@ impl Orchestrator {
 
     /// 设定工作区被改动时的处置策略。
     ///
-    /// 默认 [`WorktreeChangePolicy::Refuse`]：检测到改动就拒绝恢复。
-    /// 用户看过差异并确认之后，用
-    /// [`WorktreeChangePolicy::Confirmed`] 放行——那是人的决定，
-    /// 程序不替他做。
+    /// 默认 [`WorktreeChangePolicy::Refuse`]，检测到改动就拒绝恢复。
+    /// 用户查看差异并确认后，用 [`WorktreeChangePolicy::Confirmed`] 放行。
     pub fn with_worktree_policy(mut self, policy: WorktreeChangePolicy) -> Self {
         self.worktree_policy = policy;
         self
@@ -143,17 +144,17 @@ impl Orchestrator {
         Task::new(id, kind, goal, steps)
     }
 
-    /// 按模板执行一个任务：一个会话跑完所有步骤。
+    /// 按模板执行一个任务：所有步骤在同一个会话里跑完。
     ///
-    /// 步骤之间不另起 runner：`begin_step` 换角色、交代步骤、把上一步的
-    /// 结论落进历史，会话 ID、轮数、墙钟与缓存路由键全部延续。
+    /// 步骤之间不另起 runner。`begin_step` 换角色、交代步骤、把上一步的
+    /// 结论写进历史，会话 ID、轮数、墙钟与缓存路由键全部延续。
     ///
-    /// 从 `Running { step }` 接着跑：进度只有一个真相来源。
+    /// 从 `Running { step }` 接着跑。进度只以任务状态为准。
     ///
     /// # Errors
     ///
-    /// 任一步失败：任务标记 [`TaskState::Failed`]（记录步号与原因），
-    /// 返回 [`ApplicationError::StepFailed`]，不继续后续步骤。
+    /// 任一步失败时任务标记 [`TaskState::Failed`]（记录步号与原因），
+    /// 返回 [`ApplicationError::StepFailed`]，后续步骤不再执行。
     /// 任务不在可执行状态时返回 [`ApplicationError::Task`]。
     pub async fn run(&mut self, task: &mut Task) -> Result<TaskOutcome, ApplicationError> {
         let budget = self.budget;
@@ -162,10 +163,9 @@ impl Orchestrator {
 
     /// 用调用方给的预算跑一个任务，其余与 [`Self::run`] 相同。
     ///
-    /// 长任务基准的第一段要用一个**故意设小**的轮数上限逼出中断，
-    /// 而编排器自带的预算是给正常运行用的——为这一个场景改装配里的
-    /// 预算，等于让装配配置为实验条件让路。预算是"这一次运行"的参数，
-    /// 不是编排器的身份，所以它跟在 run 后面而不是构造器里。
+    /// 长任务基准的第一段需要故意设小的轮数上限来逼出中断；构造器里的
+    /// 预算是全局配置，这个方法允许单次覆盖，不让全局配置为单次实验
+    /// 让路。
     ///
     /// # Errors
     ///
@@ -182,17 +182,16 @@ impl Orchestrator {
             TaskState::Running { step } => step,
             _ => return Err(ApplicationError::Task(TaskError::NotRunning)),
         };
-        // 会话与证据在进入步骤循环前一次定好：后面每一步都往同一个
-        // 会话里推，而不是每步另开一个。这也是缓存能跨步命中的前提——
-        // 路由键取会话 ID，每步换键等于每步换一台机器。
+        // 会话与证据在进入步骤循环前定好，每一步都往同一个会话里推。
+        // 缓存路由键取会话 ID，跨步命中依赖这一点。
         let session_id = new_session_id(&*self.deps.clock);
         let evidence = (self.evidence_factory)(&session_id)
             .map_err(|error| ApplicationError::EvidenceInit(error.to_string()))?;
         let mut runner: Option<AgentRunner> = None;
         let mut completed = 0usize;
         let mut last_answer = String::new();
-        // 每一步的结论。任务级恢复要靠它把"前面几步查出了什么"交回
-        // 给模型（见 `application::task_resume`）。
+        // 每一步的结论。任务级恢复用它把前面几步查到的内容交回模型
+        // （见 `application::task_resume`）。
         let mut completed_outputs: Vec<StepOutput> = Vec::new();
 
         for index in start..task.steps().len() {
@@ -210,20 +209,19 @@ impl Orchestrator {
                         role: step_role,
                         answer,
                     });
-                    // 每完成一步就落一份任务快照：中断时"做到哪"才查得到。
+                    // 每完成一步落一份任务快照，中断时才能查到任务做到哪。
                     self.save_task_snapshot(task, runner.as_ref(), &completed_outputs);
                 }
                 Err(error) => {
                     let reason = format!("第 {} 步失败: {error}", index + 1);
                     task.fail(reason.clone());
-                    // 失败这一刻也要落快照：任务失败在第几步、失败前
-                    // 完成了哪些步骤，都在快照里。
+                    // 失败时同样落快照，记录失败步号与已完成的步骤。
                     self.save_task_snapshot(task, runner.as_ref(), &completed_outputs);
                     return Err(ApplicationError::StepFailed {
                         step: index + 1,
                         message: reason,
-                        // 失败步骤的观察也在同一个证据文件里：带着 ID 出去，
-                        // 失败时刻就能翻证据，不用再去 --list-sessions 找。
+                        // 失败步骤的观察也写在这个证据文件里。带出 ID，失败时
+                        // 可以直接翻证据，不必再查 --list-sessions。
                         session_id,
                         steps_completed: completed,
                     });
@@ -238,13 +236,12 @@ impl Orchestrator {
         })
     }
 
-    /// 把当前的任务状态落成一份任务快照。
+    /// 把当前任务状态写成一份任务快照。
     ///
-    /// 落盘失败降级为 stderr 警告：任务快照是恢复的便利，不是任务本身
-    /// 的成败——一次写盘失败不该把跑了几十轮的任务带崩（同
-    /// `AgentRunner::save_snapshot` 的立场）。
+    /// 落盘失败只输出 stderr 警告。任务快照服务于恢复，一次写盘失败不应
+    /// 让已跑了几十轮的任务失败（与 `AgentRunner::save_snapshot` 一致）。
     ///
-    /// 存不下就不存：没接存储的编排器（单测、基准）不受影响。
+    /// 未接存储时不写快照，单元测试不受影响。
     fn save_task_snapshot(
         &self,
         task: &Task,
@@ -255,7 +252,7 @@ impl Orchestrator {
             return;
         };
         let Some(runner) = runner else {
-            // 还没开跑就没有运行状态可存。第一步完成时 runner 一定在。
+            // 还没开跑，没有运行状态可存。第一步完成后 runner 一定存在。
             return;
         };
         let snapshot = TaskSnapshot {
@@ -270,10 +267,10 @@ impl Orchestrator {
         }
     }
 
-    /// 扫一遍工作区，给快照留一份"当时的样子"。
+    /// 扫描工作区，为快照记录当时的状态。
     ///
-    /// 扫不出来时给空清单：那意味着"当时是什么样"根本不知道，恢复时的
-    /// 工作区检查会降级为"查不了"——而不是假装没改动过。
+    /// 扫描失败时返回空清单，表示当时的状态未知。恢复时工作区检查会
+    /// 降级为"查不了"，不能当作没有改动。
     fn scan_worktree(&self) -> crate::domain::worktree::WorktreeManifest {
         match self.worktree_scanner.as_ref() {
             Some(scanner) => scanner.scan().unwrap_or_default(),
@@ -281,20 +278,18 @@ impl Orchestrator {
         }
     }
 
-    /// 恢复前核对工作区：被人动过就按策略处理。
+    /// 恢复前核对工作区，被改动时按策略处理。
     ///
     /// 三个分支：
     ///
-    /// - **没动过**：放行。
-    /// - **动过且策略是 `Refuse`**：返回 [`ApplicationError::WorktreeChanged`]，
-    ///   差异清单带在错误里，用户看得见到底改了什么。
-    /// - **扫不出来**：只打一条警告就放行。查不了不等于没改动，
-    ///   但也拦不住——硬失败会让一个本来能恢复的任务彻底卡住，
-    ///   而工作区读不出来通常是环境问题，不是任务问题。
+    /// - 没动过：放行。
+    /// - 动过且策略是 `Refuse`：返回 [`ApplicationError::WorktreeChanged`]，
+    ///   差异清单随错误带出。
+    /// - 扫不出来：打一条警告后放行。读不出来不代表没改动，但硬失败会让
+    ///   本可恢复的任务卡住，而这类失败通常是环境问题。
     ///
-    /// 快照里没有清单（老版本的任务快照，或扫描没留下基准）时跳过检查：
-    /// 没有可比的基准，比出来的"没改动"是假的。跳过要出声——用户得知道
-    /// 这一道检查没有发生，而不是被一条看不见的绿灯骗过去。
+    /// 快照里没有清单时（老版本快照，或扫描未留下基准）跳过检查，
+    /// 因为没有可比基准。跳过时输出警告，让用户知道检查没有发生。
     fn check_worktree_unchanged(&self, snapshot: &TaskSnapshot) -> Result<(), ApplicationError> {
         if snapshot.worktree.is_empty() {
             eprintln!("警告：快照里没有工作区清单，跳过工作区一致性检查");
@@ -321,24 +316,24 @@ impl Orchestrator {
         }
     }
 
-    /// 从任务快照恢复一个任务，接着把剩下的步骤跑完。
+    /// 从任务快照恢复任务，把剩余步骤跑完。
     ///
-    /// 与 [`Self::run`] 的分工：`run` 从头跑一个任务；这里接手一个
-    /// 中途断掉的任务，从它停下的那一步继续，前面做完的步骤**不重做**。
+    /// 与 [`Self::run`] 的分工：`run` 拒绝 `Failed` 状态的任务，
+    /// `resume` 接手中途断掉的任务，从停下的一步继续，已完成的步骤
+    /// 不重做。
     ///
-    /// 恢复要过的三道关（任一不过就不恢复）：
+    /// 恢复前的核对：
     ///
-    /// 1. **快照版本**要对（[`task_resume::check_resumable`]）。
-    /// 2. **任务与会话要对得上**：任务的步骤数与会话里开跑的步数必须
-    ///    一致，`session_id` 也必须一致。对不上说明手里的两半不是同一个
-    ///    任务，拿它恢复等于用 A 的进度续 B 的历史。
-    /// 3. **工作区要没被人动过**：动过了就返回
+    /// 1. 快照版本与步骤交代一致（[`task_resume::check_resumable`]），
+    ///    不符即拒绝恢复。
+    /// 2. 工作区一致性检查：有差异且策略为 `Refuse` 时返回
     ///    [`task_resume::ResumeCheck::WorktreeChanged`]，由调用方要求
-    ///    人确认——绝不静默继续。
+    ///    用户确认；清单缺失、扫描器未装配或工作区读不出来时打警告
+    ///    放行，检查降级但不阻塞恢复。
     ///
-    /// 恢复后每一步的结论会作为用户消息交回给模型（见
-    /// [`task_resume::hand_off_completed_outputs`]），所以第 3 步看得见
-    /// 第 1、2 步查出了什么。
+    /// 恢复后已完成的结论会作为用户消息交回模型（见
+    /// [`task_resume::hand_off_completed_outputs`]），后续步骤因此能看见
+    /// 前面几步的结果。
     ///
     /// # Errors
     ///
@@ -348,24 +343,21 @@ impl Orchestrator {
         &mut self,
         snapshot: TaskSnapshot,
     ) -> Result<TaskOutcome, ApplicationError> {
-        // 工作区检查：拿快照里存的"当时的样子"与"现在的样子"比对。
-        // 改动过就按策略处理——默认拒绝，绝不静默继续。
+        // 用快照记录的清单与当前工作区比对，改动过就按策略处理，默认拒绝。
         self.check_worktree_unchanged(&snapshot)?;
-        // 任务快照是**步骤边界**的快照。若进程死在某一步的半路上（等人
-        // 审批、正在执行工具），真正的现场在会话快照里——把它合并进来，
-        // 恢复才谈得上"不静默重复已发生的副作用"（见
-        // [`task_resume::merge_session_state`]）。
+        // 任务快照只记录步骤边界。进程若在某一步中途退出（等审批、
+        // 执行工具），实际现场在会话快照里。合并进来，恢复才不会重复
+        // 已发生的副作用（见 [`task_resume::merge_session_state`]）。
         let snapshot = self.merge_session_state(snapshot);
         task_resume::check_resumable(&snapshot, None)?;
         let session_id = snapshot.run.session_id.clone();
         let evidence = (self.evidence_factory)(&session_id)
             .map_err(|error| ApplicationError::EvidenceInit(error.to_string()))?;
-        // 恢复沿用编排器的预算（轮数上限对整个任务计）。
+        // 恢复沿用编排器的预算，轮数上限按整个任务计算。
         let budget = &self.budget;
 
         let mut task = snapshot.task.clone();
-        // 任务停在 Failed 上（被中断时编排器会标记失败）：放回运行态，
-        // 进度不倒退——从失败的那一步接着走。
+        // 任务被中断时会停在 Failed。放回运行态，从失败的那一步继续。
         if matches!(task.state(), TaskState::Failed) {
             task.retry()?;
         }
@@ -385,20 +377,18 @@ impl Orchestrator {
             _ => return Err(ApplicationError::Task(TaskError::NotRunning)),
         };
 
-        // runner 从快照里的运行状态重建：会话历史、轮数、墙钟、缓存
-        // 路由键全部延续——换 runner 等于换了一个 agent 接手半截任务。
+        // runner 从快照里的运行状态重建，会话历史、轮数、墙钟、缓存
+        // 路由键全部延续。
         let mut deps = self.deps.clone();
         deps.evidence = evidence.clone();
         let mut runner = AgentRunner::resume(snapshot.run.clone(), deps)?;
-        // 把已完成步骤的结论交回给模型：恢复后的下一步必须看得见前面
-        // 几步查出了什么，否则它只能从零重推。
+        // 把已完成步骤的结论交回模型，否则下一步只能从零重推。
         task_resume::hand_off_completed_outputs(&mut runner, &snapshot.completed_outputs);
 
         let mut completed = 0usize;
         let mut last_answer = String::new();
         let mut completed_outputs = snapshot.completed_outputs.clone();
-        // runner 住在循环外：每一步都在同一个 runner 上推进一步，
-        // 历史、轮数、墙钟与缓存路由键因此跨步延续。
+        // runner 放在循环外，每一步都在同一个 runner 上推进，状态跨步延续。
         let mut runner = Some(runner);
 
         for index in start..task.steps().len() {
@@ -439,11 +429,11 @@ impl Orchestrator {
         })
     }
 
-    /// 把会话快照里的半轮现场合并进任务快照。
+    /// 把会话快照里的半轮状态合并进任务快照。
     ///
-    /// 读盘在这里做，合并的判断在 [`task_resume::merge_session_state`]
-    /// （纯函数，可单独测）。会话快照读不出来或读坏了都按"没有现场"处理：
-    /// 退回到步骤边界恢复只是重做那一步，而拿一个坏现场去续会出事。
+    /// 读盘在这里完成，合并逻辑在 [`task_resume::merge_session_state`]
+    /// （纯函数，可单独测试）。会话快照读不出来或损坏时按"没有现场"处理：
+    /// 退回步骤边界恢复只会重做那一步，用损坏的现场继续则可能出错。
     fn merge_session_state(&self, snapshot: TaskSnapshot) -> TaskSnapshot {
         let Some(store) = self.deps.session_store.as_ref() else {
             return snapshot;
@@ -461,14 +451,14 @@ impl Orchestrator {
 
     /// 执行第 `index` 步（0-based），返回该步的最终答案。
     ///
-    /// 按步骤的角色装配：系统提示词来自角色档案，工具白名单由 runner 按
-    /// 同一个角色在调用层校验（见 [`AgentRunner::begin_step`]）。
-    /// 第一步新建 runner，后续步骤在同一个 runner 上推进一步。
+    /// 按步骤的角色装配。系统提示词来自角色档案，工具白名单由 runner 按
+    /// 同一角色在调用层校验（见 [`AgentRunner::begin_step`]）。第一步
+    /// 新建 runner，后续步骤在同一个 runner 上推进。
     ///
     /// # Errors
     ///
-    /// 角色缺档案、证据初始化、模型调用或预算耗尽时上抛；步骤失败的
-    /// 处理（标记任务、停止后续）由 [`Self::run`] 统一做。
+    /// 角色缺档案、证据初始化失败、模型调用失败或预算耗尽时上抛。
+    /// 步骤失败的处理（标记任务、停止后续步骤）由 [`Self::run`] 统一完成。
     async fn run_step(
         &self,
         task: &Task,
@@ -478,8 +468,8 @@ impl Orchestrator {
         evidence: &Arc<dyn EvidenceSink>,
         runner: &mut Option<AgentRunner>,
     ) -> Result<String, ApplicationError> {
-        // 循环边界保证 index < total；空步骤任务已被 start() 拒绝
-        // （TaskError::NoSteps），到这里越界只剩程序错误，直接下标访问。
+        // 循环保证 index < total；空步骤任务已被 start() 以 NoSteps 拒绝，
+        // 越界只可能是程序错误，直接用下标访问。
         let step = &task.steps()[index];
         let total = task.steps().len();
         let profile = self
@@ -493,9 +483,8 @@ impl Orchestrator {
         let spec = AgentSpec {
             role: step.role,
             system_prompt: profile.system_prompt.clone(),
-            // 角色专属的模型与档位：档案里配了就用，没配就用运行时的默认。
-            // 这一步是"能力与延迟"的分水岭——规划要强推理，
-            // 测试跑命令读输出就行。
+            // 角色专属的模型与档位：档案有配置就用，否则用运行时默认值。
+            // 规划需要强推理，测试只需跑命令读输出，两者对能力的要求不同。
             model: profile.model.clone(),
             effort: profile.effort,
             verbosity: profile.verbosity,
@@ -518,8 +507,7 @@ impl Orchestrator {
                 AgentRunner::new(spec, session_id.clone(), prompt, deps)
             }
         };
-        // 证据自述角色与起点：JSONL 里每一步开始处都写明是谁在跑、
-        // 从第几轮接上，事后翻证据不必借助快照交叉对照。
+        // 记录步骤开始时的角色与轮次，事后查证据不必再对照快照。
         evidence.record(
             self.deps.clock.now(),
             AuditEvent::StepStarted {
@@ -527,9 +515,9 @@ impl Orchestrator {
                 role: step.role,
             },
         );
-        // 这一步失败时 runner **要放回去**：它带着这轮的历史、轮数与
-        // 墙钟，正是恢复需要的全部状态。丢掉它的话，任务快照存下来的
-        // 会话停在"上一步结束"的地方，恢复时那一步的交代与观察全没了。
+        // 这一步失败时仍要把 runner 放回去。它持有本轮的历史、轮数与
+        // 墙钟，恢复所需的状态都在这里。丢弃后任务快照里的会话会停在上一步
+        // 结束处，这一步的交代与观察都会丢失。
         let outcome = active.run(budget).await;
         *runner = Some(active);
         Ok(outcome?.answer)
@@ -550,7 +538,7 @@ mod tests {
     use crate::domain::workspace::WorkspaceRoot;
     use crate::infrastructure::approval::auto::AutoApproveGate;
     use crate::infrastructure::clock::SystemClock;
-    use crate::infrastructure::evidence::memory::MemoryEvidenceSink;
+    use crate::application::memory_evidence::MemoryEvidenceSink;
     use crate::infrastructure::model::rig_chat::RigChatGateway;
     use crate::infrastructure::tool::all_tools;
 
@@ -576,16 +564,16 @@ mod tests {
         }
     }
 
-    /// 测试用证据工厂：一个任务一个内存汇，不落盘。
+    /// 测试用证据工厂：每个任务一个内存汇，不落盘。
     fn test_factory() -> EvidenceFactory {
         Arc::new(|_session_id: &SessionId| {
             Ok(Arc::new(MemoryEvidenceSink::new()) as Arc<dyn EvidenceSink>)
         })
     }
 
-    /// 共享一个内存汇的工厂：编排器只调用一次，所以拿到的就是整个任务
-    /// 的证据。"这个工具真被调了几次"只能从这里数——请求历史里同一次
-    /// 调用会在后续每一轮原样重放，数历史会把它算成好几次。
+    /// 共享一个内存汇的工厂：编排器只调用一次，拿到的是整个任务的证据。
+    /// 统计"工具被调了几次"只能从这里数。请求历史会重放此前的调用，
+    /// 按历史计数会重复。
     fn shared_factory() -> (EvidenceFactory, Arc<MemoryEvidenceSink>) {
         let sink = Arc::new(MemoryEvidenceSink::new());
         let cloned = sink.clone();
@@ -594,8 +582,8 @@ mod tests {
         (factory, sink)
     }
 
-    /// 全量 10 个内置工具的注册表（真实规格），角色边界测试的底座。
-    /// 工具本身会被真的执行（白名单测试就要看文件有没有被改动）。
+    /// 全量 10 个内置工具的注册表，使用真实规格，供角色边界测试使用。
+    /// 工具会被真实执行，白名单测试依赖文件是否被改动来判断。
     fn full_registry() -> ToolRegistry {
         let root = std::env::temp_dir().join(format!("qch-orch-tools-{}", std::process::id()));
         ToolRegistry::new(all_tools(WorkspaceRoot::new(root)))
@@ -610,10 +598,10 @@ mod tests {
             .collect()
     }
 
-    /// 请求里工具定义的序列化形式，用来断言"逐字相同"。
+    /// 请求里工具定义的序列化形式，用于断言逐字相同。
     ///
-    /// 只比名字不够：描述或参数 schema 变了同样会废掉前缀缓存，
-    /// 而那种抖动在名字列表上看不出来。
+    /// 只比较名字不够：描述或参数 schema 变化同样会破坏前缀缓存，
+    /// 这种变化在名字列表上看不出来。
     fn tools_json(mock: &MockCompletionModel, index: usize) -> String {
         serde_json::to_string(&mock.requests()[index].tools).expect("工具定义应可序列化")
     }
@@ -649,7 +637,7 @@ mod tests {
             .collect()
     }
 
-    /// 请求历史的序列化形式，用来断言"上一步的结论有没有到下一步眼里"。
+    /// 请求历史的序列化形式，用于断言上一步的结论是否进入下一步。
     fn history_text(mock: &MockCompletionModel, index: usize) -> String {
         serde_json::to_string(&mock.requests()[index].chat_history).expect("历史应可序列化")
     }
@@ -675,9 +663,8 @@ mod tests {
         assert_eq!(outcome.steps_completed, 4);
         assert_eq!(outcome.answer, "第4步产出");
         assert_eq!(mock.requests().len(), 4, "一步一问");
-        // 一个任务一个会话：四次请求必须带同一个缓存路由键。换键等于换
-        // 一台机器，provider 会把前面攒下的前缀缓存全部作废——这是
-        // 单会话最主要的收益来源，这里钉住它。
+        // 一个任务一个会话：四次请求必须用同一个缓存路由键。换键会让
+        // provider 作废此前的前缀缓存，这是单会话的主要收益。
         for request in &mock.requests() {
             assert_eq!(
                 request.options.cache_key.as_deref(),
@@ -706,15 +693,14 @@ mod tests {
 
     #[tokio::test]
     async fn cross_step_history_means_the_same_file_is_read_once() {
-        // 验收项：跨步骤不重读。规划步读一次 notes.txt，实施步的请求里
-        // 必须已经带着那份内容——它没有理由再读一遍。
+        // 跨步骤不重读：规划步读一次 notes.txt，实施步的请求里应已带有
+        // 该内容。
         //
-        // 注意 harness 不做"读取去重"：两次读之间文件可能已被写工具改掉，
-        // 旧观察是过期的，硬拦截会让模型拿着陈年内容干活。"不重读"靠的是
-        // 历史可见性，不是拦截。所以本测试的判别性断言在历史文本上——
-        // 一旦回归成"每步一个会话"，第 2 步的请求就只剩步骤指令，
-        // 断言会红；而 mock 脚本里第 2 步根本没再发 read_file，是因为
-        // 脚本模拟的正是"模型已经看见了内容"的行为。
+        // harness 不做读取去重。两次读之间文件可能已被写入，旧观察可能
+        // 过期，硬性拦截会迫使模型使用陈旧内容。不重读依赖历史可见性。
+        // 因此判别断言落在历史文本上：若回归成每步一个会话，第 2 步的
+        // 请求只剩步骤指令，断言会失败。mock 脚本第 2 步不再发 read_file，
+        // 模拟的是模型已经看到内容的行为。
         let workspace = std::env::temp_dir().join(format!("qch-orch-reread-{}", std::process::id()));
         std::fs::create_dir_all(&workspace).expect("建临时工作区");
         std::fs::write(workspace.join("notes.txt"), "根因在解析层").expect("写 fixture 文件");
@@ -724,8 +710,8 @@ mod tests {
             // 第 1 步（Planner，只读）：读文件 → 给出根因。
             MockTurn::tool_call("call_r1", "read_file", json!({"path": "notes.txt"})),
             MockTurn::text("根因在解析层，notes.txt 已说明"),
-            // 第 2~4 步：不再读文件，只引用"notes.txt 已说明"的内容——
-            // 脚本敢这么写，前提正是那份观察已经在历史里。
+            // 第 2~4 步不再读文件，只引用 notes.txt 中说明的内容。
+            // 脚本可以这样写，前提是该观察已在历史里。
             MockTurn::text("按 notes.txt 的根因改好了"),
             MockTurn::text("测试通过"),
             MockTurn::text("汇总：按 notes.txt 定位的根因修复"),
@@ -741,17 +727,17 @@ mod tests {
         let outcome = orchestrator.run(&mut task).await.unwrap();
 
         assert_eq!(task.state(), TaskState::Completed);
-        // 判别性断言：第 2 步的请求里带着第 1 步读到的内容。
-        // 每步一个会话的旧实现下，这一步的历史是空的，这条断言会红。
+        // 判别断言：第 2 步的请求里带有第 1 步读到的内容。每步一个会话
+        // 的旧实现下历史为空，这条断言会失败。
         let second = history_text(&mock, 2);
         assert!(second.contains("根因在解析层"), "第 2 步应已拿到文件内容: {second}");
-        // 内容还要活过后续步骤：第 3、4 步同样看得到，而不是只在跨一步
-        // 时碰巧在。两条都断，单会话编排的连续性才算是钉住了。
+        // 内容在后续步骤中仍然可见：第 3、4 步也能看到。两处都断言，
+        // 才能确认单会话编排的连续性。
         for index in [3, 4] {
             let text = history_text(&mock, index);
             assert!(text.contains("根因在解析层"), "第 {index} 步应仍带着第 1 步的内容: {text}");
         }
-        // 脚本里模型确实只发出过这一次 read_file——它没有理由再读。
+        // 脚本里模型只发出过一次 read_file。
         let reads = evidence
             .events()
             .iter()
@@ -767,9 +753,9 @@ mod tests {
 
     #[tokio::test]
     async fn tool_definitions_are_identical_across_steps() {
-        // 每一步发给模型的工具定义必须逐字相同。不同的话
-        // 每步的工具数组都不一样，provider 的前缀缓存一步都命不中——
-        // 单会话省下来的历史传递全被工具定义的抖动吃回去。
+        // 每一步发给模型的工具定义必须逐字相同。否则每步的工具数组都
+        // 不同，provider 的前缀缓存无法命中，单会话节省的历史传递会被
+        // 工具定义的抖动抵消。
         let mock = MockCompletionModel::from_turns(vec![
             MockTurn::text("规划产出"),
             MockTurn::text("实现产出"),
@@ -786,7 +772,7 @@ mod tests {
         orchestrator.run(&mut task).await.unwrap();
 
         assert_eq!(mock.requests().len(), 4);
-        // 全量注册表：不再按角色裁掉模型可见的工具。
+        // 全量注册表，不按角色裁剪模型可见的工具。
         // 10 = read_file / read_files / list_dir / write_file / search_text /
         //      edit_file / apply_patch / run_command / git_status / git_diff。
         assert_eq!(offered_tools(&mock, 0).len(), 10);
@@ -825,16 +811,16 @@ mod tests {
         for (a, b) in prompts.iter().zip(prompts.iter().skip(1)) {
             assert_ne!(a, b, "相邻步骤的提示词应不同");
         }
-        // 第 2、4 步同为 Coder，提示词必须一字相同——同一个 runner 换
-        // spec，不该有"第二步的实施者提示词和第四步不一样"这种怪事。
+        // 第 2、4 步同为 Coder，提示词必须相同：同一个 runner 只换 spec，
+        // 同一角色的提示词不应变化。
         assert_eq!(prompts[1], prompts[3]);
     }
 
     #[tokio::test]
     async fn role_whitelist_is_enforced_at_the_call_layer() {
-        // 验收项：角色白名单在调用层生效。评审妄想写文件——工具定义里
-        // 看得见 write_file（对所有步骤统一），但调用在分发前就
-        // 被角色边界拒下，文件一个字节都没动。
+        // 角色白名单在调用层生效。Reviewer 尝试写文件时，工具定义里能
+        // 看到 write_file（对所有步骤统一），但调用在分发前被角色边界
+        // 拒绝，文件没有改动。
         let workspace =
             std::env::temp_dir().join(format!("qch-orch-whitelist-{}", std::process::id()));
         std::fs::create_dir_all(&workspace).expect("建临时工作区");
@@ -849,7 +835,7 @@ mod tests {
                 json!({"path": "keep.txt", "content": "被改"}),
             ),
             MockTurn::text("第 1 步评审结论"),
-            // 第 2 步换一种越权：跑命令（Tester 有，Reviewer 没有）。
+            // 第 2 步换一种越权：执行命令（Tester 有权限，Reviewer 没有）。
             MockTurn::tool_call("call_c1", "run_command", json!({"command": "echo hi"})),
             MockTurn::text("第 2 步评审结论"),
             MockTurn::text("第 3 步评审结论"),
@@ -866,13 +852,13 @@ mod tests {
 
         assert_eq!(task.state(), TaskState::Completed);
         assert_eq!(outcome.answer, "第 4 步评审结论");
-        // 边界不是"审一下再说"，是根本不许执行。
+        // 越权调用不允许执行，不存在"审一下再放行"。
         assert_eq!(
             std::fs::read_to_string(&target).expect("读回文件"),
             "原文",
             "越权写入必须连执行都到不了"
         );
-        // 拒绝观察回到了模型手里，并且点破这是角色权限而非审批问题。
+        // 拒绝观察回到模型，并说明这是角色权限问题，审批无法解决。
         let after_write_refusal = history_text(&mock, 1);
         assert!(
             after_write_refusal.contains("角色 `reviewer` 无权调用工具 `write_file`"),
@@ -882,7 +868,7 @@ mod tests {
             after_write_refusal.contains("不是审批问题"),
             "拒绝说明必须让模型知道换参数或求审批都没用: {after_write_refusal}"
         );
-        // 工具定义里确实有 write_file——边界在调用层，不在可见性层。
+        // 工具定义里包含 write_file，边界在调用层，不在可见性层。
         assert!(offered_tools(&mock, 0).contains(&"write_file".to_owned()));
         // run_command 同样越权。
         let after_command_refusal = history_text(&mock, 3);
@@ -890,8 +876,7 @@ mod tests {
             after_command_refusal.contains("无权调用工具 `run_command`"),
             "{after_command_refusal}"
         );
-        // 每步两问（妄想调用 + 拒绝后的结论），第 4 步一问。
-        // 第 1、2 步各两问（妄想调用 + 拒绝后的结论），第 3、4 步各一问。
+        // 第 1、2 步各两次请求（越权调用与拒绝后的结论），第 3、4 步各一次。
         assert_eq!(mock.requests().len(), 6);
 
         let _ = std::fs::remove_dir_all(&workspace);
@@ -899,7 +884,7 @@ mod tests {
 
     #[tokio::test]
     async fn unrestricted_role_still_gets_every_tool() {
-        // 白名单不是把 Coder 也关起来：`None` = 不限，Coder 一步都不能少。
+        // 白名单不限制 Coder：`None` 表示不限，Coder 可以调用全部工具。
         let mock = MockCompletionModel::from_turns(vec![
             MockTurn::text("规划产出"),
             MockTurn::tool_call(
@@ -935,7 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn step_failure_fails_the_task_and_stops_later_steps() {
-        // 第 2 步两次拿到空回复（原始 + 重试）→ EmptyResponse → 该步失败。
+        // 第 2 步连续两次空回复（原始与重试）触发 EmptyResponse，该步失败。
         // 第 3 步的脚本不应被消费。
         let mock = MockCompletionModel::from_turns(vec![
             MockTurn::text("第1步产出"),
@@ -960,8 +945,8 @@ mod tests {
         let failure = task.failure().unwrap();
         assert_eq!(failure.step, 1, "失败详情记录 0-based 步号");
         assert!(failure.reason.contains("第 2 步失败"));
-        // 一个任务一个会话：失败步骤的观察也在同一个证据文件里，
-        // 所以会话 ID 无条件带得出来——包括第 1 步就失败的场景。
+        // 一个任务一个会话，失败步骤的观察也在同一个证据文件里。因此
+        // 会话 ID 总能带出，包括第 1 步就失败的场景。
         let ApplicationError::StepFailed {
             session_id,
             steps_completed,
@@ -975,14 +960,13 @@ mod tests {
             !session_id.as_str().is_empty(),
             "会话 ID 必须带出，失败时刻就能翻证据"
         );
-        // 第 1 步问过 1 次，第 2 步问了原始 + 重试共 2 次；第 3 步的脚本
-        // 原封不动——后续步骤没被执行。
+        // 第 1 步 1 次请求，第 2 步 2 次（原始加重试），第 3 步的脚本未被消费。
         assert_eq!(mock.requests().len(), 3);
     }
 
     #[tokio::test]
     async fn empty_step_task_cannot_run() {
-        // 空步骤任务（模板缺失的产物）必须报错，不能零调用"完成"。
+        // 空步骤任务必须报错，不能零次调用就标为完成。
         let mock = MockCompletionModel::from_turns(vec![]);
         let mut orchestrator = Orchestrator::new(deps(&mock), Budget::new(20), test_factory());
         let mut task = Task::new(TaskId::new("t4"), TaskKind::Review, "空任务", vec![]);
@@ -1002,7 +986,7 @@ mod tests {
         let mut orchestrator = Orchestrator::new(deps(&mock), Budget::new(20), test_factory());
         let mut task = orchestrator.create_task(TaskId::new("t3"), TaskKind::Feature, "加个功能");
 
-        // 已失败的任务是终态：直接拒绝，不做任何模型调用。
+        // 已失败的任务是终态：直接拒绝，不调用模型。
         task.fail("预先失败");
         let error = orchestrator.run(&mut task).await.unwrap_err();
         assert!(
@@ -1015,7 +999,7 @@ mod tests {
     #[tokio::test]
     async fn missing_profile_fails_the_step_explicitly() {
         // 空花名册：任何角色都没有档案。该步显式失败并标记任务失败，
-        // 绝不 panic、也绝不静默退回某个默认角色。
+        // 不 panic，也不退回默认角色。
         let mock = MockCompletionModel::from_turns(vec![]);
         let mut orchestrator = Orchestrator::with_roster(
             deps(&mock),
@@ -1037,13 +1021,12 @@ mod tests {
         assert_eq!(mock.requests().len(), 0, "装配失败不应触发模型调用");
     }
 
-    // ── 项目指令真的到达模型 ───────────────────────────────────────────
+    // ── 项目指令到达模型 ───────────────────────────────────────────────
 
-    /// 端到端验证：注入的项目指令必须出现在模型收到的系统提示词里。
+    /// 端到端验证注入的项目指令出现在模型收到的系统提示词里。
     ///
-    /// 前面 roster 的测试只证明"字符串拼对了"，这条证明"拼对的字符串
-    /// 真的发出去了"——中间任何一环漏传（快照用了旧 spec、编排器没用
-    /// 注入了的花名册）都会在这里露出来。
+    /// roster 测试只验证字符串拼接，这里验证拼好的字符串确实发出。任一
+    /// 环节漏传（快照用了旧 spec、编排器未使用注入的花名册）都会在此暴露。
     #[tokio::test]
     async fn project_instructions_reach_the_model() {
         let mock = MockCompletionModel::from_turns(vec![
@@ -1068,10 +1051,10 @@ mod tests {
         }
     }
 
-    /// 没注入项目指令时，模型收到的就是内置档案那一份，一字不多。
+    /// 未注入项目指令时，模型收到内置档案原文，不加任何内容。
     ///
-    /// 这是兼容性承诺：workspace 里没有 QCODEHARNESS.md 时，
-    /// 行为与加这个特性之前完全一致。
+    /// 兼容性承诺：workspace 中没有 QCODEHARNESS.md 时，行为与加入该
+    /// 特性之前一致。
     #[tokio::test]
     async fn without_project_instructions_the_prompt_is_unchanged() {
         let mock = MockCompletionModel::from_turns(vec![
@@ -1097,14 +1080,13 @@ mod tests {
 
     // ── 按角色分配模型与档位 ───────────────────────────────────────────
 
-    /// 四步任务里，每一步都用它自己角色的模型。
+    /// 四步任务中每一步都使用自身角色的模型。
     ///
-    /// 编排器按步骤查档案、把档案里的模型名带进 `AgentSpec`，网关再把
-    /// 它写到请求的 `model` 字段上——这条断言把整条链路钉住：哪一环
-    /// 漏传，模型名都会退回成 rig 填的默认值，测试立刻红。
+    /// 编排器按步骤查档案，把模型名带进 `AgentSpec`，网关再写入请求的
+    /// `model` 字段。任一环节漏传，模型名会退回 rig 的默认值，测试失败。
     ///
-    /// 用 `Refactor` 模板而不是 `BugFix`：它的四步刚好覆盖四个角色
-    /// （测试者/编码者/测试者/评审者），`BugFix` 只有三步且不含评审者。
+    /// 使用 `Refactor` 模板：四步覆盖三个角色（测试者/编码者/评审者），
+    /// `BugFix` 的四步是规划者/编码者/测试者/编码者，不含评审者。
     #[tokio::test]
     async fn each_step_uses_the_model_of_its_own_role() {
         let mock = MockCompletionModel::from_turns(vec![
@@ -1145,18 +1127,17 @@ mod tests {
         }
     }
 
-    /// 没配角色模型时，请求里的模型名是 rig 自己填的默认值，我们不覆盖它。
+    /// 未配置角色模型时，请求里的模型名由 rig 填入默认值，我们不覆盖。
     ///
-    /// rig 的 operation 层在发送前会把空的 `request.model` 补成 wire 自己的
+    /// rig 的 operation 层在发送前会把空的 `request.model` 补成 wire 的
     /// 模型名（`operation/completion.rs` 的 `request.model.take()...or_else(
-    /// || Some(target.model()))`），所以生产路径上"没配"表现为**请求里
-    /// 带着 provider 的默认模型**，而不是不带模型。
+    /// || Some(target.model()))`）。生产路径上"未配置"表现为请求带有
+    /// provider 默认模型，不会出现空模型名。
     ///
-    /// 这条断言守的是反方向：没配时我们绝不能塞一个模型名进去。塞进去
-    /// 就等于把用户部署的默认模型顶掉——那正是"没配却变了"。
-    /// 请求里"确实没有我们设的模型名"这一条由
-    /// `rig_chat` 的 `without_a_configured_model_the_request_carries_none`
-    /// 在 build_request 层守住（那里能看见 rig 填充之前的原始请求）。
+    /// 这条断言检查反方向：未配置时不能自行写入模型名，否则会覆盖用户
+    /// 部署的默认模型。请求中确实没有我们设置的模型名，由 `rig_chat` 的
+    /// `without_a_configured_model_the_request_carries_none` 在
+    /// build_request 层验证，那里能看到 rig 填充之前的原始请求。
     #[tokio::test]
     async fn without_role_models_the_request_keeps_the_default_model() {
         let mock = MockCompletionModel::from_turns(vec![
@@ -1183,8 +1164,8 @@ mod tests {
 
     #[tokio::test]
     async fn one_session_means_one_task_level_turn_budget() {
-        // 预算按任务累计，不再每步各发一份：四步共用 max_turns。
-        // 第 1、2 步各花 2 轮就把它用光，第 3 步一开始就被拦下。
+        // 预算按任务累计，四步共用 max_turns。第 1、2 步各花 2 轮用光，
+        // 第 3 步一开始即被拦下。
         let mock = MockCompletionModel::from_turns(vec![
             MockTurn::tool_call("call_1", "read_file", json!({"path": "a.txt"})),
             MockTurn::text("第1步产出"),
@@ -1209,8 +1190,8 @@ mod tests {
 
     #[tokio::test]
     async fn long_multi_step_history_still_compacts_at_step_boundaries() {
-        // 单会话让历史变长，裁剪因此更常发生。裁掉的必须是轮次，
-        // 步骤交代（"现在在第几步"）一条都不能少。
+        // 单会话使历史变长，裁剪更常发生。裁剪只删轮次，步骤交代
+        // （"现在在第几步"）必须全部保留。
         let mut turns = Vec::new();
         // bug-fix 四步，前两步各 3 轮工具调用 + 1 轮结论，后两步各 1 轮结论。
         for step in 1..=2u32 {
@@ -1252,7 +1233,7 @@ mod tests {
 
         assert_eq!(task.state(), TaskState::Completed);
         assert_eq!(outcome.answer, "第4步产出");
-        // 最后一次请求（第 4 步）只保留 2 轮，但四条步骤交代都在。
+        // 最后一次请求（第 4 步）只保留 2 轮，四条步骤交代都在。
         let last = user_messages(&mock, mock.requests().len() - 1);
         for expected in ["任务：读六个文件再汇总", "第 2/4 步", "第 3/4 步", "第 4/4 步"] {
             assert!(
@@ -1260,7 +1241,7 @@ mod tests {
                 "裁剪后仍应看到 {expected}: {last:?}"
             );
         }
-        // 第 1 步的观察确实被裁掉了（否则这条测试什么都没验证）。
+        // 确认第 1 步的观察已被裁掉。
         let joined = last.join("\n");
         assert!(
             !joined.contains("r1-1.txt 的内容"),

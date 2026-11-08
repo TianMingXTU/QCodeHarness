@@ -17,8 +17,7 @@ QCodeHarness 是一个 Rust 的 Coding Agent 框架。跑任务的不是它自�
 - `src/domain/` 是纯领域层：**禁止**任何 IO、`rig`、`toml`、`windows`、`tokio`。
   验收会 grep，写进去就是破坏架构边界。
 - `src/application/` 只放端口 trait、编排逻辑与不碰 IO 的默认实现。
-- `src/infrastructure/` 是新代码唯一允许碰文件、进程、网络的地方
-  （既有越层见 `docs/architecture.md`，不要仿效）。
+- `src/infrastructure/` 是唯一允许碰文件、进程、网络的地方。
 - `src/interface/` 只做 CLI 解析与控制台播报。
 - 跨层依赖只允许 `interface → application → domain`，
   `infrastructure → application/domain`。

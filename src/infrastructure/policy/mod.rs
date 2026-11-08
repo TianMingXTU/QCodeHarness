@@ -1,7 +1,7 @@
 //! 策略基础设施：从 TOML 文件加载规则。
 //!
-//! 读文件是 IO，所以这一层属于 infrastructure；解析出的 `PolicyEngine`
-//! 是领域类型，纯函数、无 IO。分界线就在 `load` 这个函数上。
+//! 读文件属于 IO，因此放在 infrastructure。解析得到的 `PolicyEngine` 是
+//! 领域类型，纯函数、无 IO。分界在 `load`。
 
 use std::path::Path;
 
@@ -11,19 +11,20 @@ use crate::domain::policy::{PolicyEngine, PolicyRule, PolicyScope, PolicyVerdict
 
 /// 加载策略配置。
 ///
-/// 路径为 `None` 时返回内置默认策略（自带一份免审基线，见
-/// [`crate::domain::policy::PolicyEngine::new`]）；为 `Some` 时读取并解析
-/// 该文件。
+/// 路径为 `None` 时返回内置默认策略，自带一份免审基线（见
+/// [`crate::domain::policy::PolicyEngine::new`]）。为 `Some` 时读取并
+/// 解析该文件。
 ///
-/// **显式配置整体取代基线，不与它合并。** 写了配置文件就意味着"规则我
-/// 自己定"，此时基线里的 `cargo test *` 之类不再自动生效——想让某条命令
-/// 免审，就把它写进自己的配置（`policy.example.toml` 已经这么做了）。
-/// 空文件因此比不给文件更严：那是"我声明了没有任何规则"。
+/// 显式配置整体取代基线，不与其合并。提供配置文件即表示由用户定义规则，
+/// 基线中的 `cargo test *` 等不再生效。需要免审的命令必须写进自己的
+/// 配置，`policy.example.toml` 已按此方式编写。空文件比不提供文件更严，
+/// 表示声明了没有任何规则。
 ///
 /// # Errors
 ///
-/// 文件不存在、内容不是合法 TOML、或字段取值不在允许范围内时返回
-/// 带行号的错误——配置文件是手写的，报错必须能直接定位到那一行。
+/// 文件不存在时返回 [`PolicyConfigError::Read`]；内容不是合法 TOML 时返回
+/// 带行列号的 [`PolicyConfigError::Parse`]，由用户手写的配置需要能直接
+/// 定位到行。
 pub fn load(path: Option<&Path>) -> Result<PolicyEngine, PolicyConfigError> {
     let Some(path) = path else {
         return Ok(PolicyEngine::new());
@@ -38,9 +39,9 @@ pub fn load(path: Option<&Path>) -> Result<PolicyEngine, PolicyConfigError> {
     })
 }
 
-/// 解析 TOML 文本为策略引擎。
+/// 把 TOML 文本解析为策略引擎。
 ///
-/// 独立成 pub 函数是为了测试：不需要临时文件就能验证解析规则。
+/// 独立为 pub 函数以便测试，无需临时文件即可验证解析规则。
 pub fn parse(text: &str) -> Result<PolicyEngine, toml::de::Error> {
     let config: PolicyConfig = toml::from_str(text)?;
     Ok(PolicyEngine::with_rules(
@@ -50,9 +51,9 @@ pub fn parse(text: &str) -> Result<PolicyEngine, toml::de::Error> {
 
 /// TOML 侧的配置结构。
 ///
-/// 与领域类型分开定义而不是直接 `Deserialize` 到 `PolicyRule`：
-/// 配置里用字符串表达裁决（`verdict = "deny"`），而领域里用枚举；
-/// 这层翻译同时承担了"字符串 → 枚举"的校验，非法值在这里就能报错。
+/// 与领域类型分开定义，因为配置用字符串表示裁决（`verdict = "deny"`），
+/// 领域类型用枚举。无法识别的裁决字符串按 fail-closed 处理：规则落到
+/// `RequireApproval`（见 `PolicyVerdict::from_str`），不在此报错。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyConfig {
@@ -69,19 +70,19 @@ struct RuleConfig {
     tool: Option<String>,
     /// 匹配时给出的裁决：`allow` / `require_approval` / `deny`。
     verdict: String,
-    /// 规则说明，进入证据和给模型的解释。
+    /// 规则说明，写入证据与给模型的解释。
     #[serde(default)]
     description: String,
-    /// 参数级作用域。缺省表示不再卡参数，只按工具名匹配。
+    /// 参数级作用域。缺省时只按工具名匹配，不检查参数。
     #[serde(default)]
     scope: Option<ScopeConfig>,
 }
 
 /// TOML 侧的作用域。
 ///
-/// `deny_unknown_fields` 是安全要求而不是洁癖：拼错一个字段若被静默
-/// 忽略，作用域就整个消失了——一条本意"只放行 cargo test"的规则会
-/// 悄悄扩大成"放行所有 run_command"。配置是手写的，拼错必须当场报错。
+/// `deny_unknown_fields` 是安全要求：拼错的字段若被忽略，作用域会整体
+/// 失效，一条本意只放行 cargo test 的规则会扩大为放行所有 run_command。
+/// 配置由用户手写，拼写错误必须立即报错。
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopeConfig {
@@ -113,10 +114,10 @@ impl From<RuleConfig> for PolicyRule {
     }
 }
 
-/// 把配置里的裁决字符串翻译成领域枚举。
+/// 把配置中的裁决字符串转换为领域枚举。
 ///
-/// 无法识别的值落到 `RequireApproval`：宁可多问一句，
-/// 也不能因为一个拼写错误就把高危工具放过去。
+/// 无法识别的值按 `RequireApproval` 处理，避免拼写错误导致高危工具
+/// 被放行。
 impl PolicyVerdict {
     fn from_str(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -184,9 +185,8 @@ mod tests {
     fn no_path_means_default_policy() {
         let engine = load(None).expect("无路径应返回默认策略");
 
-        // 默认策略带一份内置基线（cargo test/build、git status/diff
-        // 免审）。断言它非空而不是空：空规则表意味着"cargo test 每次都要
-        // 人按 y"，基线存在的意义正是消掉这份等待。
+        // 默认策略带内置基线（cargo test/build、git status/diff 免审）。
+        // 断言非空：空规则表会让 cargo test 每次都要人工确认。
         assert!(!engine.rules.is_empty(), "默认策略应带内置基线");
         assert_eq!(
             engine
@@ -284,7 +284,7 @@ description = "大写也行"
 
     #[test]
     fn unknown_verdict_fails_closed_to_require_approval() {
-        // 拼错成 deny 的近义词不应静默放行。
+        // 拼成 deny 的近义词不应被放行。
         let engine = parse(
             r#"
 [[rules]]
@@ -303,8 +303,8 @@ description = "手滑打错"
 
     // ── 作用域（scope）────────────────────────────────────────────────
 
-    /// `scope = { command_prefix = "cargo test *" }` 把一条针对
-    /// `run_command` 的放行收窄到 cargo test 一族。
+    /// `scope = { command_prefix = "cargo test *" }` 把针对 `run_command`
+    /// 的放行限制在 cargo test 一类命令。
     #[test]
     fn scope_with_command_prefix_narrows_the_rule() {
         let engine = parse(
@@ -363,7 +363,7 @@ scope = { path_prefix = "src/*" }
         );
     }
 
-    /// 空 `scope = {}` 等于没配作用域：规则仍只按工具名匹配。
+    /// 空 `scope = {}` 与未配置作用域相同，规则仍只按工具名匹配。
     #[test]
     fn empty_scope_table_behaves_like_no_scope() {
         let engine = parse(
@@ -385,11 +385,10 @@ scope = {}
         );
     }
 
-    /// 拼错作用域字段必须报错，不能被静默忽略。
+    /// 拼错作用域字段必须报错，不能被忽略。
     ///
-    /// `command_pretix` 若被当成"没有作用域"，一条本意"只放行 cargo test"
-    /// 的规则会悄悄扩大成"放行所有 run_command"。配置是手写的，拼错要
-    /// 当场炸出来。
+    /// `command_pretix` 若按"没有作用域"处理，本意只放行 cargo test 的
+    /// 规则会扩大为放行所有 run_command。
     #[test]
     fn misspelled_scope_field_is_rejected() {
         let result = parse(
@@ -461,11 +460,11 @@ description = "忘了写 verdict"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 仓库里的示例配置必须能被当前解析器吃下。
+    /// 仓库中的示例配置必须能被当前解析器解析。
     ///
-    /// 这份文件是用户照着抄的模板，也是 README 引用的样例。它和解析器
-    /// 之间的漂移是静默的：示例里多了个字段、少了条规则，测试全绿、
-    /// 用户一抄就报错——所以拿它当解析器的回归测试跑。
+    /// 该文件是用户抄写用的模板，也被 README 引用。示例与解析器不一致时
+    /// 测试仍然通过，用户抄写后才会报错，因此用示例文件做解析器的回归
+    /// 测试。
     #[test]
     fn the_shipped_example_config_parses() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.toml");
@@ -479,13 +478,12 @@ description = "忘了写 verdict"
         );
     }
 
-    /// 示例里那条带 scope 的 allow 必须真的排在前、兜底 require_approval 排在后。
+    /// 示例中带 scope 的 allow 必须排在兜底 require_approval 之前。
     ///
-    /// 用户验收时审计指出：README 有一段 `write_file` 的示例写着"src/ 下的
-    /// 写入免审"却**没有 scope**——描述承诺了范围，规则却没给，用户照抄会
-    /// 得到"所有 write_file 都免审"。文档与规则之间的这种漂移是静默的：
-    /// 测试全绿、抄过去就出事。这里顺带钉住"allow 在前、require_approval
-    /// 兜底在后"的顺序，顺序反了 cargo test 反而要审批。
+    /// README 的 `write_file` 示例曾只写"src/ 下的写入免审"而缺少 scope：
+    /// 描述承诺了范围，规则没有，用户照抄会得到"所有 write_file 都免审"。
+    /// 这类漂移不会让测试失败。本测试同时固定顺序：allow 在前，
+    /// require_approval 兜底在后；顺序反了 cargo test 会需要审批。
     #[test]
     fn the_scoped_allow_rule_comes_before_the_catch_all() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("policy.example.toml");

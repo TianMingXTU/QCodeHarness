@@ -1,14 +1,14 @@
-//! 最小 MCP stdio Server：MCP 接入的连通性自测工具。
+//! 最小 MCP stdio Server，用于验证 MCP 接入是否连通。
 //!
 //! 暴露两个工具，各对应一条审批路径：
-//! - `fetch_page`：读语义（名字带 fetch），Harness 推断为只读，免审；
-//! - `send_message`：写语义（名字带 send），推断为非只读，执行前走审批闸门。
+//! - `fetch_page`：名字带 fetch，Harness 推断为只读，免审；
+//! - `send_message`：名字带 send，推断为非只读，执行前走审批。
 //!
-//! 两者都返回固定文本——这个 Server 只为验证"Harness 能不能接上、
-//! 注解怎么分级、观察怎么回填"，不提供真实能力。
+//! 两者都返回固定文本。用途仅限验证 Harness 能否接上、注解如何分级、
+//! 观察如何回填，不提供真实能力。
 //!
-//! 用法：`cargo build --examples` 后，把可执行文件路径填进 MCP 配置
-//! 的 `command` 字段（见 mcp.example.toml），再用 QCH_MCP_CONFIG 指向它。
+//! 用法：`cargo build --examples` 后，把可执行文件路径填进 MCP 配置的
+//! `command` 字段（见 mcp.example.toml），再用 QCH_MCP_CONFIG 指向它。
 
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -80,6 +80,6 @@ async fn main() {
         .serve((stdin, stdout))
         .await
         .expect("stdio Server 握手失败");
-    // 跟随客户端生命周期：客户端断开（stdin EOF）后这里返回，进程退出。
+    // 跟随客户端生命周期：客户端断开（stdin EOF）后 waiting() 返回，进程退出。
     service.waiting().await.ok();
 }

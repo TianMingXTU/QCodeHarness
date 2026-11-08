@@ -1,40 +1,38 @@
-//! 工具注册表：模型可见的规格与真正的执行入口合一。
+//! 工具注册表：模型可见的规格与执行入口合在一起。
 //!
-//! 把两者拆开（`AgentSpec.tools` 与 `invoker` 各一份）意味着要手工保持
-//! 同步：加工具时要改两处，漏改一处的表现是——模型看得见却执行不了，
-//! 或者执行得了但模型不知道。收敛成一个注册表后，"加一个工具"只在一处
-//! 发生。
+//! 两者分开维护（`AgentSpec.tools` 与 `invoker` 各一份）需要手工同步。
+//! 漏改一处会导致模型看得见工具却无法执行，或工具可执行但模型不知道。
+//! 合并到注册表后，新增工具只需改一处。
 
 use std::sync::Arc;
 
 use crate::domain::tool::{ToolCall, ToolOutcome, ToolSpec};
 use crate::application::port::{BoxFuture, ToolInvoker};
 
-/// 一个工具的完整登记：模型看到的规格 + 真正执行它的入口。
+/// 一个工具的完整登记：模型可见的规格与执行入口。
 ///
-/// 两个字段绑在一起，spec 与执行器就不可能各自漂移。
+/// 两个字段绑定在一起，规格和执行器不会各自漂移。
 ///
-/// 可克隆：编排器每步要用同一套依赖克隆出新的 runner，
-/// `Arc` 的克隆只是引用计数 +1，真正的工具实现不会跟着复制。
+/// 可克隆：编排器每一步要用同一套依赖克隆新的 runner。`Arc` 克隆只增加
+/// 引用计数，工具实现不会复制。
 #[derive(Clone)]
 pub struct ToolEntry {
     /// 模型可见的规格（名字、描述、参数 schema、风险注解）。
     pub spec: ToolSpec,
-    /// 这个工具的执行入口。每个工具可以有自己的配置——
-    /// 比如 `run_command` 需要超时与输出上限，而 `read_file` 只要 workspace 根。
+    /// 执行入口。每个工具可自带配置，例如 `run_command` 需要超时和输出上限，
+    /// `read_file` 只需要 workspace 根。
     pub invoker: Arc<dyn ToolInvoker>,
 }
 
-/// 工具来源：一批登记项加一个来源名。
+/// 工具来源：一批登记项加来源名。
 ///
-/// 注册表只关心"有哪些工具"；来源把"这批工具从哪来"（内置、某个 MCP
-/// Server、后续的第三方工具包）保留在装配层，排查工具清单时能说清出处。
-/// 实现方返回的登记项必须 spec 与执行入口成对——那是 [`ToolEntry`] 的
-/// 不变量，来源只是批量提供它。
+/// 注册表只关心有哪些工具；来源名记录工具出处（内置、某个 MCP Server、
+/// 第三方工具包），便于排查工具清单。实现方返回的登记项必须规格与执行
+/// 入口成对；这是 [`ToolEntry`] 的不变量，来源只负责批量提供。
 pub trait ToolSource: Send + Sync {
-    /// 来源名，供装配方与诊断识别来源。
+    /// 来源名，供装配和诊断识别来源。
     ///
-    /// 合并时**不看名字**：按装配顺序展开，同名工具后到的来源胜出
+    /// 合并时**不比较名字**：按装配顺序展开，同名工具以后到的来源为准
     /// （见 [`ToolRegistry::from_sources`]）。
     fn name(&self) -> &str;
 
@@ -44,9 +42,8 @@ pub trait ToolSource: Send + Sync {
 
 /// 工具注册表。
 ///
-/// 用 `Vec` 而不是 `HashMap`：工具数量是个位数到十几个，线性查找没有
-/// 可观测的开销；而 `Vec` 保序，"注册表里有哪些工具"能以注册顺序呈现，
-/// 调试时工具列表是稳定的。
+/// 用 `Vec`，不用 `HashMap`：工具数量在个位数到十几个之间，线性查找没有
+/// 可观测开销。`Vec` 还保持注册顺序，调试时工具列表稳定。
 #[derive(Clone)]
 pub struct ToolRegistry {
     entries: Vec<ToolEntry>,
@@ -55,8 +52,7 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     /// 用一组登记项构造注册表。
     ///
-    /// 名字重复时后者覆盖前者：装配代码可以无痛替换某个工具的实现，
-    /// 而不必先显式移除旧的。
+    /// 名字重复时后者覆盖前者，装配代码可直接替换某个工具的实现。
     pub fn new(entries: Vec<ToolEntry>) -> Self {
         let mut registry = Self {
             entries: Vec::with_capacity(entries.len()),
@@ -76,8 +72,8 @@ impl ToolRegistry {
 
     /// 从多个来源装配注册表。
     ///
-    /// 按来源顺序合并；同名工具沿用 [`new`](Self::new) 的覆盖语义——
-    /// 后到的来源胜出。顺序由装配方决定，注册表只如实执行。
+    /// 按来源顺序合并；同名工具沿用 [`new`](Self::new) 的覆盖语义，
+    /// 后到的来源胜出。顺序由装配方决定。
     pub fn from_sources(sources: &[Arc<dyn ToolSource>]) -> Self {
         let entries: Vec<ToolEntry> = sources
             .iter()
@@ -88,8 +84,8 @@ impl ToolRegistry {
 
     /// 模型可见的全部规格。
     ///
-    /// 克隆而不是借出：调用方（rig 防腐层）要把它们序列化进请求，
-    /// 返回所有权省去一次借用传递。
+    /// 直接返回克隆：调用方（rig 防腐层）需要把它们序列化进请求，
+    /// 给出所有权可省去借用传递。
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.entries.iter().map(|entry| entry.spec.clone()).collect()
     }
@@ -99,10 +95,9 @@ impl ToolRegistry {
         self.entries.iter().find(|entry| entry.spec.name == name)
     }
 
-    /// 统一的执行入口：找到登记项就交给它执行，找不到给拒绝观察。
+    /// 统一执行入口：找到登记项就交给它执行，找不到返回拒绝观察。
     ///
-    /// 放在注册表而不是 `AgentRunner`：分发是"注册表"自己的职责，
-    /// 循环不该关心名字背后是谁在干活。
+    /// 分发由注册表负责，`AgentRunner` 的循环不需要关心名字背后的执行者。
     pub async fn invoke(&self, call: &ToolCall) -> ToolOutcome {
         match self.find(&call.name) {
             Some(entry) => entry.invoker.invoke(call).await,
@@ -212,7 +207,7 @@ mod tests {
 
     #[test]
     fn duplicate_names_keep_the_later_entry() {
-        // 后注册的同名工具覆盖先注册的：装配代码可以无痛替换某个工具的实现。
+        // 后注册的同名工具覆盖先注册的，装配代码可直接替换实现。
         let registry = ToolRegistry::new(vec![
             ToolEntry {
                 spec: spec("read_file"),
@@ -272,13 +267,13 @@ mod tests {
         assert_eq!(hit.content, "远端写", "同名工具应以后到的来源为准");
     }
 
-    /// 证据台账的分类表要与真实注册表对得上。
+    /// 证据台账的分类表必须与真实注册表一致。
     ///
-    /// 两头都要守：表里的名字拼错了，台账会静默少记一项；真实工具没
-    /// 进表、也没说清为什么不记，新工具就会悄悄消失在台账里——用户
-    /// 看报表以为"这个任务没碰过那些文件"。
+    /// 两处都要校验：分类表里的名字拼错会让台账少记一项；真实工具
+    /// 没进分类表、也没说明不记的理由，会从台账里消失，用户会误以为
+    /// 任务没有访问过相关文件。
     ///
-    /// 所以真实工具要么被分类，要么在"明确不记"名单里写清理由。
+    /// 因此每个真实工具要么被分类，要么在"明确不记"名单里写明理由。
     #[test]
     fn the_evidence_ledger_knows_every_real_tool() {
         let registry = ToolRegistry::new(crate::infrastructure::tool::all_tools(
@@ -302,10 +297,9 @@ mod tests {
             ("git_status", "查仓库状态，不指向具体文件"),
             ("git_diff", "看的是改动，不是读过哪个文件"),
             // apply_patch 的参数是一整块补丁文本，没有 path/paths 字段，
-            // 台账的 subject() 取不到对象，只能退化成工具名本身——把
-            // "apply_patch" 当文件名记进"写过的文件"是错的。动过哪些
-            // 文件要从补丁文本里解析，那是基础设施层的事，台账宁可少记
-            // 一类也不记错。
+            // 台账的 subject() 取不到对象，只能退化成工具名。把
+            // "apply_patch" 当文件名记进"写过的文件"是错的。解析补丁文本
+            // 属于基础设施层；台账宁可少记一类，也不记错。
             ("apply_patch", "参数是补丁文本，没有路径字段，台账取不到对象"),
         ];
         for (name, reason) in deliberately_untracked {

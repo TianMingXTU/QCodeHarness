@@ -1,14 +1,14 @@
 //! 任务级恢复的集成验收。
 //!
-//! 走的是与生产完全相同的装配路径：真的编排器、真的快照文件、真的
-//! 恢复。重点不是"快照能序列化"，而是恢复后的行为语义——
+//! 使用与生产相同的装配路径：真实编排器、真实快照文件、真实恢复流程。
+//! 重点在恢复后的行为语义：
 //!
-//! - 中断后从原来的步骤继续，**已完成的步骤不重做**；
-//! - 恢复后的模型**看得见前面几步的结论**；
-//! - 工作区被人动过时**不静默继续**；
-//! - 步骤数或会话 ID 对不上时**明确拒绝**。
+//! - 中断后从原步骤继续，**已完成的步骤不重做**。
+//! - 恢复后的模型**能看到前面各步的结论**。
+//! - 工作区被改动时**不静默继续**。
+//! - 步骤数或会话 ID 不匹配时**明确拒绝**。
 //!
-//! 不走网络：模型用 `MockCompletionModel` 脚本化。
+//! 不访问网络，模型由 `MockCompletionModel` 脚本化。
 
 use std::fs;
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ use qcode_harness::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSp
 use qcode_harness::domain::worktree::{WorktreeEntry, WorktreeManifest};
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::clock::SystemClock;
-use qcode_harness::infrastructure::evidence::memory::MemoryEvidenceSink;
+use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::task_store::JsonTaskStore;
@@ -57,8 +57,7 @@ fn temp_workspace(name: &str) -> PathBuf {
     dir
 }
 
-/// 组装依赖。工具表是空的：这些测试关心的是步骤与结论的交接，
-/// 不是工具本身。
+/// 组装依赖。工具表为空：这些测试关注步骤与结论的交接，不涉及工具本身。
 fn deps(mock: &MockCompletionModel) -> AgentDependencies {
     AgentDependencies {
         model: Arc::new(RigChatGateway::new(mock.clone().erase())),
@@ -99,12 +98,12 @@ fn user_messages(mock: &MockCompletionModel, index: usize) -> Vec<String> {
     texts
 }
 
-/// 请求历史的序列化形式，用来断言"上一步的结论有没有到下一步眼里"。
+/// 请求历史的序列化形式，用于断言上一步的结论是否进入下一步。
 fn history_text(mock: &MockCompletionModel, index: usize) -> String {
     serde_json::to_string(&mock.requests()[index].chat_history).expect("历史应可序列化")
 }
 
-/// 造一个固定清单的扫描器，用来稳定地复现"工作区被改过"这个分支。
+/// 固定清单的扫描器，用于稳定复现"工作区被改过"分支。
 struct FixedScanner {
     manifest: WorktreeManifest,
 }
@@ -128,15 +127,15 @@ fn manifest_with(path: &str, hash: u64) -> WorktreeManifest {
 
 // ── 1b/1e：任务快照的落盘与读回 ───────────────────────────────────────
 
-/// 任务跑到一半中断时，任务快照要落在约定位置上。
+/// 任务中途中断时，任务快照落在约定位置。
 ///
-/// 位置约定是 `.qcodeharness/tasks/<task_id>.json`——与会话快照
-/// （`snapshots/`）平行，一个任务 ID 一个文件。
+/// 位置为 `.qcodeharness/tasks/<task_id>.json`，与会话快照目录
+/// `snapshots/` 平级，一个任务 ID 一个文件。
 #[tokio::test]
 async fn an_interrupted_task_leaves_a_task_snapshot_on_disk() {
     let workspace = temp_workspace("snapshot");
     let store = Arc::new(JsonTaskStore::new(&workspace));
-    // 第 2 步拿到空回复 → 那一步失败 → 任务中断。
+    // 第 2 步收到空回复，该步失败，任务中断。
     let mock = MockCompletionModel::from_turns(vec![
         MockTurn::text("第1步产出"),
         MockTurn::text(""),
@@ -158,7 +157,7 @@ async fn an_interrupted_task_leaves_a_task_snapshot_on_disk() {
         .join("t-snap.json");
     assert!(path.exists(), "任务快照应落在 {}", path.display());
 
-    // 快照里要有"做到哪"与"完成了什么"。
+    // 快照需要包含进度与已完成结论。
     let snapshot = store.load(&TaskId::new("t-snap")).unwrap().unwrap();
     assert_eq!(snapshot.task.current_index(), 1, "第 1 步已完成");
     assert_eq!(snapshot.completed_outputs.len(), 1);
@@ -168,8 +167,8 @@ async fn an_interrupted_task_leaves_a_task_snapshot_on_disk() {
 
 /// 版本不匹配的任务快照必须被明确拒绝。
 ///
-/// 任务快照是跨版本的持久数据：猜着解释旧格式等于把不兼容的状态带进
-/// 运行，而那正是"恢复后跑偏"的来源。
+/// 任务快照是跨版本持久数据。猜测解释旧格式会把不兼容状态带进运行，
+/// 导致恢复后跑偏。
 #[tokio::test]
 async fn a_task_snapshot_from_another_version_is_rejected() {
     let workspace = temp_workspace("version");
@@ -205,10 +204,10 @@ async fn a_task_snapshot_from_another_version_is_rejected() {
 
 // ── 1d：恢复前的三项核对 ──────────────────────────────────────────────
 
-/// 任务的步骤数与会话里开跑的步数对不上时，必须明确拒绝。
+/// 任务步骤数与会话中已开跑的步数不匹配时，必须明确拒绝。
 ///
-/// 对不上意味着手里的任务与手里的会话不是同一个任务的两半——拿它
-/// 恢复等于用 A 任务的进度去续 B 任务的历史。
+/// 不匹配说明任务与会话不属于同一个任务，恢复会用 A 任务的进度延续
+/// B 任务的历史。
 #[tokio::test]
 async fn a_task_and_session_with_different_step_counts_are_rejected() {
     let workspace = temp_workspace("mismatch");
@@ -245,7 +244,7 @@ async fn a_task_and_session_with_different_step_counts_are_rejected() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 会话 ID 对不上时必须明确拒绝。
+/// 会话 ID 不一致时必须明确拒绝。
 #[tokio::test]
 async fn a_mismatched_session_id_is_rejected() {
     let workspace = temp_workspace("session-id");
@@ -274,9 +273,9 @@ async fn a_mismatched_session_id_is_rejected() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 工作区被人动过时，检查要报出差异，而不是报"干净"。
+/// 工作区被改动时，检查要报告差异，不能报告干净。
 ///
-/// 这是"不静默继续"的第一半：先要能看出来。
+/// 这是"不静默继续"的前提：先能检测到改动。
 #[test]
 fn a_modified_worktree_is_detected() {
     let saved = manifest_with("src/lib.rs", 1);
@@ -307,10 +306,10 @@ fn a_modified_worktree_is_detected() {
     assert_eq!(check, ResumeCheck::Clean);
 }
 
-/// 扫不出来时要报"查不了"，不能报"没改动"。
+/// 无法扫描时必须报告"不可读"，不能报告"未改动"。
 ///
-/// 把"查不了"说成"没改动"就是在撒谎：用户据此以为工作区是干净的，
-/// 恢复出来的模型就会覆盖掉别人刚做的修改。
+/// 把无法扫描说成未改动会误导用户，使其认为工作区干净；恢复后的模型
+/// 可能覆盖他人刚做的修改。
 #[test]
 fn an_unreadable_worktree_is_not_reported_as_clean() {
     struct Broken;
@@ -351,11 +350,11 @@ fn the_real_scanner_finds_a_changed_file() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 真扫描器碰到没了的根目录：必须报"查不了"，不能交出一份空清单。
+/// 真实扫描器遇到不存在的根目录时，必须报告"不可读"，不能返回空清单。
 ///
-/// 空清单会让 `check_worktree` 把"当时"的每个文件都判成删除——用户
-/// 看到的是"工作区被大改"，实际是"根本没看成"。根目录读不出必须在
-/// 扫描那一层就失败，把原因原样递上去。
+/// 空清单会让 `check_worktree` 把快照中的每个文件判为删除，用户看到
+/// "工作区被大改"，实际是扫描失败。根目录不可读必须在扫描层失败，
+/// 并原样向上传递原因。
 #[test]
 fn the_real_scanner_reports_a_missing_root_as_unreadable() {
     let workspace = temp_workspace("gone-root");
@@ -377,22 +376,20 @@ fn the_real_scanner_reports_a_missing_root_as_unreadable() {
 
 // ── 1b 的核心：恢复后的模型看得见前面几步的结论 ──────────────────────
 
-/// **恢复后模型看得见第 1 步的结论。**
+/// **恢复后模型能看到第 1 步的结论。**
 ///
-/// 这是切片 1 的核心验收项。第 1 步查出了根因，第 2 步因为预算耗尽
-/// 中断；恢复之后，第 2 步的请求里必须带着第 1 步的结论——
-/// 否则恢复出来的模型只能从零重推，长任务恢复就会跑偏。
+/// 第 1 步查出根因，第 2 步因预算耗尽中断。恢复后，第 2 步的请求必须
+/// 包含第 1 步的结论；否则模型只能从零重推，长任务恢复后会跑偏。
 ///
-/// 同时钉住"已完成的步骤不重做"：恢复后的第 2 步请求里，第 1 步的
-/// 步骤交代还在（说明它没被重跑），而第 1 步的结论以**交接消息**的
-/// 形式在场。
+/// 同时验证已完成的步骤不重做：第 2 步请求里仍有第 1 步的步骤交代，
+/// 说明第 1 步未被重跑；其结论以**交接消息**的形式存在。
 #[tokio::test]
 async fn after_resume_the_model_sees_the_first_steps_conclusion() {
     let workspace = temp_workspace("handoff");
     let store = Arc::new(JsonTaskStore::new(&workspace));
 
-    // 第一次运行：第 1 步跑完，第 2 步一进门就撞上预算上限。
-    // bug-fix 模板是 4 步，所以第 2 步的脚本不会被消费。
+    // 第一次运行：第 1 步完成，第 2 步开始时预算耗尽。
+    // bug-fix 模板有 4 步，因此第 2 步的脚本不会被消费。
     let mock1 = MockCompletionModel::from_turns(vec![MockTurn::text("根因在解析层")]);
     let mut orchestrator = Orchestrator::new(deps(&mock1), Budget::new(1), test_factory())
         .with_task_store(store.clone());
@@ -424,13 +421,13 @@ async fn after_resume_the_model_sees_the_first_steps_conclusion() {
     // 恢复后一共问了 3 次：第 2、3、4 步各一次。第 1 步**没有重跑**。
     assert_eq!(mock2.requests().len(), 3, "第 1 步不应重跑");
 
-    // 判别性断言：第 2 步的请求里看得见第 1 步的结论。
+    // 关键断言：第 2 步的请求中包含第 1 步的结论。
     let second = history_text(&mock2, 0);
     assert!(
         second.contains("根因在解析层"),
         "恢复后第 2 步必须看得见第 1 步的结论: {second}"
     );
-    // 而且是以交接消息的形式在场（带标记），不是碰巧撞见。
+    // 并且以带标记的交接消息形式出现，避免偶然匹配。
     let messages = user_messages(&mock2, 0);
     assert!(
         messages
@@ -442,9 +439,9 @@ async fn after_resume_the_model_sees_the_first_steps_conclusion() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 恢复后的每一步都看得见前面**所有**步骤的结论。
+/// 恢复后每一步都能看到前面**所有**步骤的结论。
 ///
-/// 只交第 1 步不够：第 4 步同样需要知道第 1、2、3 步各自查出了什么。
+/// 只交接第 1 步不够；第 4 步同样需要第 1、2、3 步的结果。
 #[tokio::test]
 async fn after_resume_every_step_sees_all_earlier_conclusions() {
     let workspace = temp_workspace("handoff-all");
@@ -475,9 +472,9 @@ async fn after_resume_every_step_sees_all_earlier_conclusions() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 同一份快照恢复两次，结论不会被交接两遍。
+/// 同一份快照恢复两次时，结论不会被交接两遍。
 ///
-/// 交接消息的文本由内容唯一决定，所以重复恢复可以靠文本比对认出来。
+/// 交接消息的文本由内容唯一确定，重复恢复可通过文本比对识别。
 #[tokio::test]
 async fn resuming_the_same_snapshot_twice_does_not_duplicate_the_handoff() {
     let workspace = temp_workspace("handoff-twice");
@@ -498,7 +495,7 @@ async fn resuming_the_same_snapshot_twice_does_not_duplicate_the_handoff() {
     let mut orchestrator = Orchestrator::new(deps(&mock2), Budget::new(20), test_factory());
     orchestrator.resume(snapshot.clone()).await.unwrap();
 
-    // 恢复同一份快照第二次：交接不该再推一遍。
+    // 第二次恢复同一份快照，交接消息不应再次追加。
     let mock3 = MockCompletionModel::from_turns(vec![
         MockTurn::text("第二步的结论"),
         MockTurn::text("第三步的结论"),
@@ -516,11 +513,11 @@ async fn resuming_the_same_snapshot_twice_does_not_duplicate_the_handoff() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 恢复不重跑已完成的步骤：第 1 步的步骤交代还在历史里，
-/// 但没有第 1 步的新一轮模型调用。
+/// 恢复不重跑已完成的步骤：第 1 步的交代仍在历史中，但没有第 1 步的
+/// 新模型调用。
 ///
-/// 这条从"步骤交代还在"与"请求数"两头夹住：前一条钉住"历史延续"，
-/// 这一条钉住"没有重跑"。
+/// 这条测试同时检查交代存在与请求数量，前者验证历史延续，后者验证
+/// 没有重跑。
 #[tokio::test]
 async fn resuming_does_not_rerun_the_completed_step() {
     let workspace = temp_workspace("no-rerun");
@@ -544,7 +541,7 @@ async fn resuming_does_not_rerun_the_completed_step() {
 
     // 恢复后只问了 3 次：第 2、3、4 步。第 1 步被跳过了。
     assert_eq!(mock2.requests().len(), 3);
-    // 第 1 步的步骤交代仍在历史里（它是第 1 步的交代，不是第 2 步的）。
+    // 第 1 步的交代仍在历史中，它属于第 1 步，不属于第 2 步。
     let messages = user_messages(&mock2, 0);
     assert!(
         messages.iter().any(|text| text.contains("第 1/4 步")),
@@ -558,11 +555,11 @@ async fn resuming_does_not_rerun_the_completed_step() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 恢复时当前这一步的交代不该被推两遍。
+/// 恢复时当前步骤的交代不应重复追加。
 ///
-/// 中断就发生在这一步当中，交接是快照的一部分——它的交代已经在历史
-/// 里了。恢复时再推一遍，模型就会看到两条一模一样的指令，而"会话
-/// 开了几步"也会因此算错（后续的恢复核对会误报"任务与会话不一致"）。
+/// 中断发生在这一步当中，快照中已有该交代。恢复时再追加一次会让模型
+/// 看到两条相同指令，也会使会话步数计算错误，后续恢复核对会误报
+/// "任务与会话不一致"。
 #[tokio::test]
 async fn resuming_does_not_duplicate_the_current_step_prompt() {
     let workspace = temp_workspace("dup-prompt");
@@ -608,20 +605,20 @@ async fn resuming_does_not_duplicate_the_current_step_prompt() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 半步中断：交代已进历史、该步又提交了轮次，恢复仍不该重复交代。
+/// 半步中断：交代已进入历史，且该步已提交轮次，恢复仍不应重复交代。
 ///
-/// 这是 P10 长任务基准刻意制造的形状——预算耗尽时末条是**观察**（那一轮
-/// 已提交），交代在更早的位置。只看历史末尾的守卫在这里失效：交代被再推
-/// 一遍，历史里出现两条"第 N/M 步"，"会话开了几步"随之算错，后续恢复
-/// 会被 `check_steps_match` 以"一一对应"不符**永久拒绝**。
+/// P10 长任务基准刻意制造这种状态：预算耗尽时末条是**观察**（该轮已
+/// 提交），交代位于更早位置。只检查历史末尾的守卫在此失效，会再次追加
+/// 交代，使历史出现两条"第 N/M 步"，会话步数计算错误，后续恢复被
+/// `check_steps_match` 以"一一对应"不符**永久拒绝**。
 #[tokio::test]
 async fn resuming_after_committed_rounds_does_not_duplicate_the_step_prompt() {
     let workspace = temp_workspace("dup-prompt-mid");
     let store = Arc::new(JsonTaskStore::new(&workspace));
 
-    // 中断落在第 2 步：第 1 步答完（1 turn）→ 第 2 步读（2）→ 写（3）
-    // → 给出第 2 步结论（4）→ 第 3 步读（5）→ 预算在 5 turns 耗尽。
-    // 此时第 3 步的交代已进历史、且第 3 步已提交一轮（末条是观察）。
+    // 中断落在第 3 步：第 1 步答完（1 turn），第 2 步读（2）、写（3），
+    // 给出第 2 步结论（4），第 3 步读（5），预算在 5 turns 时耗尽。
+    // 此时第 3 步的交代已进入历史，且已提交一轮（末条是观察）。
     let mock1 = MockCompletionModel::from_turns(vec![
         MockTurn::text("第一步的结论"),
         MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
@@ -635,7 +632,7 @@ async fn resuming_after_committed_rounds_does_not_duplicate_the_step_prompt() {
     orchestrator.run(&mut task).await.unwrap_err();
 
     let snapshot = store.load(&TaskId::new("t-dpm")).unwrap().unwrap();
-    // 中断确实落在第 3 步，且末条不是用户消息（是观察）——这是本测试与
+    // 中断落在第 3 步，末条为观察，不是用户消息。这是本测试与
     // `resuming_does_not_duplicate_the_current_step_prompt` 的区别。
     assert_eq!(snapshot.task.current_index(), 2, "前两步已完成");
     let last = snapshot.run.session.turns.last().cloned();
@@ -689,7 +686,7 @@ async fn resuming_a_completed_task_runs_nothing() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 真实扫描器与快照清单配套：工作区被改过 → 明确拒绝，不静默继续。
+/// 真实扫描器与快照清单配套：工作区被改过时能报告差异。
 #[tokio::test]
 async fn a_real_worktree_change_is_refused_before_resuming() {
     let workspace = temp_workspace("real-blocked");
@@ -719,12 +716,12 @@ async fn a_real_worktree_change_is_refused_before_resuming() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// **工作区被改过时，恢复不会静默继续。**
+/// **工作区被改动时，恢复不会静默继续。**
 ///
-/// 这是切片 1 的核心验收项之一，而且是端到端的：快照里存着"当时的
-/// 工作区"，有人在中断期间改了文件，恢复前的检查必须把它查出来。
+/// 端到端验证：快照保存了当时的工作区，中断期间文件被修改，恢复前的
+/// 检查必须发现该改动。
 ///
-/// 三段都要在：查得出差异、差异说得清、恢复被挡住。
+/// 需要同时满足：检测到差异、差异描述清楚、恢复被阻止。
 #[tokio::test]
 async fn a_changed_worktree_is_detected_end_to_end_and_blocks_the_resume() {
     let workspace = temp_workspace("e2e-blocked");
@@ -754,7 +751,7 @@ async fn a_changed_worktree_is_detected_end_to_end_and_blocks_the_resume() {
     // 快照之后有人改了文件。
     fs::write(workspace.join("a.txt"), "被人改过了").unwrap();
 
-    // 检查查得出差异。
+    // 检查能发现差异。
     let scanner = RootedWorktreeScanner::new(&workspace);
     let check = task_resume::check_worktree(&snapshot.worktree, &scanner);
     let ResumeCheck::WorktreeChanged { changes } = &check else {
@@ -776,17 +773,17 @@ async fn a_changed_worktree_is_detected_end_to_end_and_blocks_the_resume() {
         matches!(error, ApplicationError::WorktreeChanged { .. }),
         "工作区被改过时恢复必须被挡住: {error}"
     );
-    // 差异说得清：用户看得见到底改了什么，也知道这是要人拍板的一关。
+    // 差异描述清楚：用户能看到具体改动，也知道需要确认。
     assert!(error.to_string().contains("修改 a.txt"), "{error}");
     assert!(error.to_string().contains("恢复前需要确认"), "{error}");
-    // 恢复被挡住 → 模型一次都没被问。
+    // 恢复被阻止时，模型一次都没有被调用。
     assert_eq!(mock2.requests().len(), 0, "恢复被挡住时不该问模型");
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 用户看过差异并确认之后，恢复可以放行。
+/// 用户看过差异并确认后，恢复可以继续。
 ///
-/// 工作区检查是"要人拍板"，不是"一票否决"：用户确认了就该能继续。
+/// 工作区检查需要用户确认后才能继续。
 #[tokio::test]
 async fn a_confirmed_worktree_change_lets_the_resume_through() {
     let workspace = temp_workspace("confirmed");
@@ -816,9 +813,9 @@ async fn a_confirmed_worktree_change_lets_the_resume_through() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 工作区没被动过时，恢复照常进行。
+/// 工作区未改动时，恢复照常进行。
 ///
-/// 上一条的反面：检查不能变成"总是报错"，那等于没有检查。
+/// 检查不能总是报错，否则等同于没有检查。
 #[tokio::test]
 async fn an_untouched_worktree_lets_the_resume_through() {
     let workspace = temp_workspace("e2e-clean");
@@ -850,7 +847,7 @@ async fn an_untouched_worktree_lets_the_resume_through() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 任务快照的 JSON 形态要能被读回来（结构契约）。
+/// 任务快照的 JSON 形态可读回（结构契约）。
 #[tokio::test]
 async fn a_task_snapshot_on_disk_has_the_documented_shape() {
     let workspace = temp_workspace("shape");
@@ -868,7 +865,7 @@ async fn a_task_snapshot_on_disk_has_the_documented_shape() {
     let wire: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 
-    // 四个顶层字段，名字与文档一致。
+    // 文档列出的四个顶层字段都在。
     for key in ["format_version", "task", "run", "completed_outputs"] {
         assert!(wire.get(key).is_some(), "任务快照应有字段 `{key}`: {wire}");
     }
@@ -881,10 +878,10 @@ async fn a_task_snapshot_on_disk_has_the_documented_shape() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// 快照里的任务本身坏了，整个快照读不回来。
+/// 快照中的任务损坏时，整个快照必须读取失败。
 ///
-/// 任务快照是外部可改的文件：越界的进度下标必须让读回失败，
-/// 而不是带着一个坏任务进入编排。
+/// 任务快照是外部可修改的文件。越界的进度下标必须导致读取失败，不能
+/// 带着坏任务进入编排。
 #[tokio::test]
 async fn a_task_snapshot_with_a_broken_task_cannot_be_loaded() {
     let workspace = temp_workspace("broken-task");
@@ -933,10 +930,9 @@ async fn a_task_snapshot_round_trips_through_the_store() {
 
 // ── 2b/2c：半轮中断的任务级恢复 ──────────────────────────────────────
 //
-// 任务快照是**步骤边界**的快照。会话快照记的才是"半轮现场"——进程死在
-// 一步的半路上时，真正的现场（停在等人审批？正在执行哪个调用？）只在
-// 会话快照里。恢复必须把两者合起来看，否则任务级恢复会退化成"整步重跑"，
-// 而"整步重跑"正是长任务恢复后跑偏、重复副作用的根源。
+// 任务快照记录的是**步骤边界**。进程在一步中途退出时，真正的现场
+// （等待审批还是正在执行调用）只存在于会话快照中。恢复必须同时使用
+// 两者，否则会退化为整步重跑，导致长任务恢复后跑偏、副作用重复。
 
 /// 记录"真的执行了哪些调用"的假执行器。
 #[derive(Default)]
@@ -951,9 +947,9 @@ impl ToolInvoker for RecordingInvoker {
     }
 }
 
-/// 永远不返回的执行器：模拟"进程死在工具执行途中"。
+/// 永不返回的执行器，模拟进程在工具执行途中退出。
 ///
-/// 计数照记——恢复后这个计数变成 2，就说明那次调用被重跑了一遍。
+/// 仍记录调用计数。恢复后计数变成 2，说明该调用被重跑。
 struct HangingInvoker {
     entered: tokio::sync::Notify,
     executed: Mutex<usize>,
@@ -984,7 +980,7 @@ impl ToolInvoker for HangingInvoker {
     }
 }
 
-/// 永远不答复的闸门：模拟"人被叫走，进程随后被杀"。
+/// 永不答复的闸门，模拟用户离开、进程随后被终止。
 struct BlockingGate {
     asked: tokio::sync::Notify,
 }
@@ -1012,7 +1008,7 @@ impl ApprovalGate for BlockingGate {
     }
 }
 
-/// 记录被问到的审批请求的闸门：恢复路径上"人有没有被再问一次"靠它判定。
+/// 记录审批请求的闸门，用于判断恢复路径上是否再次询问用户。
 #[derive(Default)]
 struct RecordingGate {
     requests: Mutex<Vec<ApprovalRequest>>,
@@ -1027,8 +1023,8 @@ impl ApprovalGate for RecordingGate {
 
 /// 记录审计事件的证据汇。
 ///
-/// 不用 `MemoryEvidenceSink`：它的事件列表只在单元测试里可见（`cfg(test)`），
-/// 集成测试拿不到。
+/// 不使用 `MemoryEvidenceSink`：它的事件列表仅在单元测试中可见
+/// （`cfg(test)`），集成测试无法访问。
 #[derive(Default)]
 struct RecordingEvidence {
     events: Mutex<Vec<AuditEvent>>,
@@ -1058,7 +1054,7 @@ fn registry_with(invoker: Arc<dyn ToolInvoker>) -> ToolRegistry {
     }])
 }
 
-/// 强制 `read_file` 也要审批的策略：把运行停在闸门前用。
+/// 强制 `read_file` 也需审批的策略，用于把运行停在闸门前。
 fn approval_policy() -> PolicyEngine {
     PolicyEngine::with_rules(vec![PolicyRule {
         tool: Some("read_file".to_owned()),
@@ -1086,22 +1082,21 @@ fn base_deps(mock: &MockCompletionModel) -> AgentDependencies {
     }
 }
 
-/// 证据工厂：所有任务共用一份内存汇，测试要翻它。
+/// 证据工厂：所有任务共用一份内存汇，供测试检查。
 fn shared_factory(sink: Arc<RecordingEvidence>) -> EvidenceFactory {
     Arc::new(move |_session_id: &SessionId| Ok(sink.clone() as Arc<dyn EvidenceSink>))
 }
 
-/// **恢复时停在审批闸门上的任务，人要再点一次。**
+/// **恢复停在审批闸门的任务时，用户必须再次确认。**
 ///
-/// 场景来自真实用法：模型要跑一个要审批的命令，人被叫走去开会，进程就
-/// 这么没了。恢复时那一次审批**不能凭快照自动放行**——快照只说明"问过"，
-/// 不说明"点过"。
+/// 场景：模型发起需要审批的命令，用户离开，进程退出。恢复时该审批
+/// **不能凭快照自动放行**；快照只说明问过，不说明用户答复过。
 ///
-/// 三件事都要在：
+/// 需要验证三件事：
 ///
-/// 1. 会话快照停在等人审批（任务快照是步骤边界，看不到这一步的现场）；
-/// 2. 恢复后同一个请求被**再问一次**，且标明是恢复后的重问；
-/// 3. 模型不用重新提议那次调用——半轮现场被保留下来了。
+/// 1. 会话快照停在等待审批状态。任务快照只记录步骤边界，看不到该现场。
+/// 2. 恢复后同一请求被**再次询问**，并标明是恢复后的重问。
+/// 3. 模型无需重新提议该调用，半轮现场已保留。
 #[tokio::test]
 async fn resuming_a_task_interrupted_at_the_approval_gate_asks_the_human_again() {
     let workspace = temp_workspace("gate-interrupt");
@@ -1110,7 +1105,7 @@ async fn resuming_a_task_interrupted_at_the_approval_gate_asks_the_human_again()
     let gate = Arc::new(BlockingGate::new());
     let evidence = Arc::new(RecordingEvidence::default());
 
-    // 第一次运行：第 1 步给出结论，第 2 步想读文件——策略要求审批。
+    // 第一次运行：第 1 步给出结论，第 2 步想读文件，策略要求审批。
     let mock = MockCompletionModel::from_turns(vec![
         MockTurn::text("第1步产出"),
         MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
@@ -1127,7 +1122,7 @@ async fn resuming_a_task_interrupted_at_the_approval_gate_asks_the_human_again()
     let mut task = orchestrator.create_task(TaskId::new("t-gate"), TaskKind::BugFix, "修好它");
 
     {
-        // 跑到闸门就"被杀"：人没答复，进程也没了。
+        // 运行到闸门时模拟进程终止：用户未答复，进程退出。
         let run = orchestrator.run(&mut task);
         tokio::pin!(run);
         tokio::select! {
@@ -1141,7 +1136,7 @@ async fn resuming_a_task_interrupted_at_the_approval_gate_asks_the_human_again()
     assert_eq!(task_snapshot.task.current_index(), 1, "第 1 步已完成");
     assert_eq!(task_snapshot.completed_outputs.len(), 1);
 
-    // 真正的现场在会话快照里：它停在等人审批。
+    // 真正的现场在会话快照中：停在等待审批。
     let session_snapshot = session_store
         .load(&task_snapshot.run.session_id)
         .unwrap()
@@ -1175,17 +1170,17 @@ async fn resuming_a_task_interrupted_at_the_approval_gate_asks_the_human_again()
     let outcome = orchestrator.resume(task_snapshot).await.unwrap();
 
     assert_eq!(outcome.answer, "第四步的结论");
-    // 人要再点一次：闸门被问到了，而且这次标明是恢复后的重问。
+    // 用户需要再次确认：闸门收到请求，且标明为恢复后的重问。
     let requests = recording_gate.requests.lock().unwrap();
     assert_eq!(requests.len(), 1, "恢复后应把同一个审批请求重新问一次");
     assert!(requests[0].resumed, "这次询问必须标明是恢复后的重问");
     assert_eq!(requests[0].call.id.as_str(), "call_1", "问的还是那一次调用");
     drop(requests);
-    // 半轮现场保住了：模型不用重新提议那次调用，只被问了 3 次（3 步各一次）。
+    // 半轮现场保留：模型无需重新提议该调用，只被调用 3 次，每步一次。
     assert_eq!(mock2.requests().len(), 3, "模型不该被要求重新提议那次调用");
     // 工具在审批通过之后才跑，且只跑了一次。
     assert_eq!(second_invoker.executed.lock().unwrap().len(), 1);
-    // 审计里留下"重新问过"这条痕迹。
+    // 审计记录中留下重新询问的痕迹。
     assert!(
         evidence
             .events
@@ -1198,13 +1193,13 @@ async fn resuming_a_task_interrupted_at_the_approval_gate_asks_the_human_again()
     let _ = fs::remove_dir_all(&workspace);
 }
 
-/// **恢复时正在执行的那个调用，不会被自动再跑一次。**
+/// **恢复时，正在执行的调用不会被自动重跑。**
 ///
-/// 这是切片 2 里最危险的一个半轮状态：调用已发起，副作用可能已经发生，
-/// 而结果未知。重跑一次就是把同一次副作用做两遍；不重跑又不能装作没发生。
+/// 这是最危险的半轮状态：调用已发起，副作用可能已经发生，结果未知。
+/// 重跑会重复副作用，不重跑又不能忽略该事实。
 ///
-/// 于是恢复后模型看见的是"这个调用之前跑过、结果未知、要不要再跑你判断"，
-/// 由它自己决定。
+/// 恢复后模型会看到"此调用已执行、结果未知、是否重跑由你判断"，并由
+/// 模型自行决定。
 #[tokio::test]
 async fn resuming_a_task_interrupted_during_a_tool_call_does_not_run_it_again() {
     let workspace = temp_workspace("in-flight");
@@ -1213,7 +1208,7 @@ async fn resuming_a_task_interrupted_during_a_tool_call_does_not_run_it_again() 
     let invoker = Arc::new(HangingInvoker::new());
     let evidence = Arc::new(RecordingEvidence::default());
 
-    // 第一次运行：第 1 步给出结论，第 2 步读文件——进程死在执行途中。
+    // 第一次运行：第 1 步给出结论，第 2 步读文件时进程在执行途中退出。
     let mock = MockCompletionModel::from_turns(vec![
         MockTurn::text("第1步产出"),
         MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
@@ -1236,7 +1231,7 @@ async fn resuming_a_task_interrupted_during_a_tool_call_does_not_run_it_again() 
         }
     }
 
-    // 会话快照停在"正要执行这一次调用"——副作用可能已经发生。
+    // 会话快照停在"正要执行这一次调用"，副作用可能已经发生。
     let task_snapshot = task_store.load(&TaskId::new("t-inflight")).unwrap().unwrap();
     let session_snapshot = session_store
         .load(&task_snapshot.run.session_id)
@@ -1269,7 +1264,7 @@ async fn resuming_a_task_interrupted_during_a_tool_call_does_not_run_it_again() 
     let outcome = orchestrator.resume(task_snapshot).await.unwrap();
 
     assert_eq!(outcome.answer, "第四步的结论");
-    // 关键断言：在途的那一次调用没有被再跑一遍。
+    // 关键断言：在途调用没有被重跑。
     assert_eq!(
         second_invoker.executed.lock().unwrap().len(),
         0,
@@ -1280,7 +1275,7 @@ async fn resuming_a_task_interrupted_during_a_tool_call_does_not_run_it_again() 
         1,
         "整个过程中那次调用只该跑过一次"
     );
-    // 证据里留下了"这个调用之前跑过"。
+    // 证据中记录了该调用此前执行过。
     assert!(
         evidence
             .events
@@ -1290,7 +1285,7 @@ async fn resuming_a_task_interrupted_during_a_tool_call_does_not_run_it_again() 
             .any(|event| matches!(event, AuditEvent::ToolCallReplayed { .. })),
         "证据里应留下重放记录"
     );
-    // 模型看得见重放提示，并由它自己决定要不要再跑。
+    // 模型能看到重放提示，并自行决定是否重跑。
     assert!(
         history_text(&mock2, 0).contains("中断恢复"),
         "模型应看见「这个调用之前跑过」的提示"

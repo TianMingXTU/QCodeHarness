@@ -1,7 +1,7 @@
 //! 证据抽象：可审计的操作记录。
 //!
-//! 每次思考、调用、观察都留下证据，供后续审查或回放，以 JSONL 持久化——
-//! 事件类型在领域层定好了，换存储不用改产生事件的代码。
+//! 每次思考、调用与观察都留下证据，供审查或回放，以 JSONL 持久化。
+//! 事件类型定义在领域层，更换存储不影响产生事件的代码。
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,8 +13,8 @@ use super::tool::{ToolCall, ToolOutcome};
 
 /// 一次模型调用的 token 用量与成本。
 ///
-/// 从 rig 的 `Usage` 平移而来。成本是 provider 报告的原值，不在领域层
-/// 用单价表推算——推算值会随价目表过时而失真，报表宁可显示"未知"。
+/// 来自 rig 的 `Usage`。成本使用 provider 报告的原值，不在领域层按
+/// 单价表推算：推算值会随价目表过时，报表宁可显示"未知"。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// 输入 token 数（含系统提示与历史）。
@@ -23,21 +23,21 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     /// 本次调用从 provider 缓存读回的输入 token 数。
     ///
-    /// 命中缓存的输入按更低费率计费，也省掉对应的 prefill 时间——
-    /// 这是"快"最直接的度量，所以必须单独记：把它并进
-    /// `input_tokens` 就看不出缓存有没有生效。
+    /// 缓存命中按更低费率计费，并省掉对应的 prefill 时间，是衡量速度
+    /// 的直接指标，必须单独记录。并入 `input_tokens` 后无法判断缓存
+    /// 是否生效。
     #[serde(default)]
     pub cached_input_tokens: u64,
     /// 本次调用写入 provider 缓存的输入 token 数。
     ///
-    /// 写一次的费率高于普通输入，但后续请求读它更便宜。单独记才能
-    /// 算清"这次多花的钱换来了多少次命中"。
+    /// 写入费率高于普通输入，后续读取更便宜。单独记录才能计算多花的
+    /// 费用换来了多少次命中。
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
     /// 本次调用的成本（美元）。`None` 表示 provider 未报告且无法定价。
     ///
-    /// 报表必须显示"未知"而不是 0：填 0 会让"免费"和"没查到"混为
-    /// 一谈，部分已知的合计是一个被低估的数字，比"未知"更危险。
+    /// 报表显示"未知"，不填 0。填 0 会混淆"免费"与"未查到"，且部分
+    /// 已知的合计会被低估，比"未知"更容易误导。
     #[serde(default)]
     pub cost_usd: Option<f64>,
 }
@@ -47,14 +47,12 @@ pub struct TokenUsage {
 pub enum AuditEvent {
     /// 一步开始执行，记录执行者的角色。
     ///
-    /// 一个任务一个会话与证据文件，但 JSONL 里原本没有说明"这一步
-    /// 是谁跑的"；
-    /// 事后翻证据要能不借助快照就回答这个问题，靠的就是这条事件。
+    /// 一个任务对应一个会话与一份证据文件。事后查看证据时无需借助
+    /// 快照即可确认每一步的执行者，依据是这条事件。
     StepStarted {
-        /// 本步第一条模型回复将要占用的轮次号。
+        /// 本步第一条模型回复占用的轮次号。
         ///
-        /// 单会话编排下下一步的开始轮次是前面各步累计的轮数 + 1，
-        /// 所以它不是常量。
+        /// 单会话编排下为前面各步累计轮数 + 1，随步骤变化。
         turn: u32,
         /// 执行这一步的角色。
         role: super::agent::AgentRole,
@@ -97,9 +95,8 @@ pub enum AuditEvent {
     },
     /// 策略引擎对一次调用给出了裁决。
     ///
-    /// 与 `ApprovalDecided` 分开记：前者是"闸门问过了"，后者是
-    /// "规则判过了"。被 `Deny` 的调用根本不会走到闸门，
-    /// 只有这条事件能解释它为什么被拒。
+    /// 与 `ApprovalDecided` 分开记录：`ApprovalDecided` 记录审批闸门的
+    /// 结论。被 `Deny` 的调用不会走到闸门，只有这条事件能说明拒绝原因。
     PolicyEvaluated {
         /// 轮次号。
         turn: u32,
@@ -114,9 +111,8 @@ pub enum AuditEvent {
     },
     /// 发给模型前按上下文预算裁剪了历史。
     ///
-    /// 与 `Thought` 分开记：后者是"模型说了什么"，这条是"我们让它看到了
-    /// 什么"。事后翻 JSONL 要能回答"第 5 轮发给模型的历史里有没有第 1 轮"，
-    /// 靠的就是这条事件的 `dropped` 清单。
+    /// 与 `Thought` 分开记录：后者记录模型说了什么，这条记录模型看到
+    /// 了什么。`dropped` 清单可用于事后确认每轮保留的历史范围。
     ContextCompacted {
         /// 即将进入的轮次号。
         turn: u32,
@@ -127,12 +123,11 @@ pub enum AuditEvent {
         /// 被丢弃的轮次号。
         dropped: Vec<u32>,
     },
-    /// 按 token 预算裁剪历史的账。
+    /// 按 token 预算裁剪历史的记录。
     ///
-    /// 与 [`AuditEvent::ContextCompacted`] 分开记：那条说"裁了几轮"，
-    /// 这条说"省了多少 token"。轮数是裁剪的**手段**，token 才是用户
-    /// 真正掏钱的东西——只报轮数，长任务里"裁了 3 轮"可能省了两百个
-    /// token，也可能省了两万个。
+    /// 与 [`AuditEvent::ContextCompacted`] 分开记录：那条记录裁剪轮数，
+    /// 这条记录节省的 token。轮数是手段，token 是实际成本。同样裁掉
+    /// 3 轮，可能只省两百个 token，也可能省两万个。
     ContextBudgeted {
         /// 即将进入的轮次号。
         turn: u32,
@@ -145,8 +140,8 @@ pub enum AuditEvent {
     },
     /// 为被裁历史额外花了一次模型调用生成摘要。
     ///
-    /// 事后翻 JSONL 要能回答"这一轮为什么多了一次调用"——没有这条，
-    /// token 账对不上；有了它，摘要的覆盖范围与用量都可查。
+    /// 没有这条事件，token 账目对不上多出的调用。摘要的覆盖范围与
+    /// 用量记录在事件中，可事后核对。
     SummaryGenerated {
         /// 即将进入的轮次号。
         turn: u32,
@@ -157,13 +152,13 @@ pub enum AuditEvent {
     },
     /// 恢复时提示模型：某个调用在中断前可能已经执行过。
     ///
-    /// 与 `ToolObserved` 互补而不是重复：`ToolObserved` 说"这次调用跑完了，
-    /// 结果是 X"，这条说"这次调用**可能**跑过了，结果未知"。
+    /// 与 `ToolObserved` 互补：后者记录已完成的调用与结果 X，这条表示
+    /// 调用**可能**已执行、结果未知。
     ///
-    /// 中断发生在调用发起之后、观察记下之前——副作用可能已经出去
-    /// （文件已写、命令已跑），而我们无从得知。恢复路径因此**不自动
-    /// 重跑**：重跑一次就是把同一次副作用做两遍。不重跑又不能装作
-    /// 没发生过，于是把这件事告诉模型，由它决定要不要再来一次。
+    /// 中断发生在调用发起之后、观察记录之前，副作用可能已经发生
+    /// （文件已写入、命令已执行）且无法确认。恢复路径**不自动重跑**，
+    /// 否则同一次副作用会执行两遍。同时不能忽略这一情况，因此把事实
+    /// 告知模型，由模型决定是否重新调用。
     ToolCallReplayed {
         /// 轮次号。
         turn: u32,
@@ -176,12 +171,12 @@ pub enum AuditEvent {
         /// `None` 表示没有可参照的先例，或中断发生在执行期间、结果未知。
         previous_outcome: Option<ToolOutcome>,
     },
-    /// 恢复时重新问了一次审批。
+    /// 恢复时重新询问了一次审批。
     ///
-    /// 单独记一条的原因：审批请求本身不落进事件流，只有"问过"与"答复"
-    /// 两种事件。从快照恢复时那一次"问过"发生在**上一个进程**里，当前
-    /// 证据文件里根本没有——没有这条事件，事后翻 JSONL 会以为人从头到尾
-    /// 只被问过一次，而实际是他被问了两次、第一次没答复。
+    /// 审批请求本身不落进事件流，只有"询问"与"答复"两类事件。从快照
+    /// 恢复时，上一次询问发生在**上一个进程**，当前证据文件里没有记录。
+    /// 缺少这条事件，事后查看 JSONL 会认为用户只被询问过一次，实际是
+    /// 两次，第一次未答复。
     ApprovalReasked {
         /// 轮次号。
         turn: u32,
@@ -192,14 +187,14 @@ pub enum AuditEvent {
     },
     /// 本地子进程或外部 MCP 调用的执行边界记录。
     ///
-    /// `run_command`、`git_status`、`git_diff` 只在实际启动子进程后记录；
-    /// 启动前的拒绝或失败不生成此事件。MCP 工具记录将调用交给外部
-    /// Server 的尝试，不表示服务端已经执行或调用成功；该进程在 Windows 上
-    /// 于握手之前被纳入同一个 Job（见 `active`），Job 创建失败时连接被拒绝、
-    /// 不生成本事件。
+    /// `run_command`、`git_status`、`git_diff` 只在实际启动子进程后记录，
+    /// 启动前的拒绝或失败不生成事件。MCP 工具记录将调用交给外部 Server
+    /// 的尝试，不表示服务端已执行或调用成功；该进程在 Windows 上于握手
+    /// 前被纳入同一个 Job（见 `active`）。Job 创建失败时连接被拒绝，
+    /// 不生成此事件。
     ///
-    /// 与 `ToolObserved` 分开记录：本事件描述进程管理与调用前检查，
-    /// 工具结果仍由 `ToolObserved` 表达。两者都不承诺文件系统隔离。
+    /// 与 `ToolObserved` 分开记录：本条描述进程管理与调用前检查，工具
+    /// 结果仍由 `ToolObserved` 表达。两者都不承诺文件系统隔离。
     SandboxApplied {
         /// 轮次号。
         turn: u32,
@@ -211,23 +206,23 @@ pub enum AuditEvent {
         platform: String,
         /// 本 harness 的进程限额与进程树管理是否实际生效。
         ///
-        /// Windows 子进程成功纳入 Job 后为 true；启动后 `assign` 失败
-        /// 仍记录本事件，但为 false。启动前 Job 创建失败则拒绝执行，
-        /// 不生成本事件。MCP 调用在 Windows 上于握手前纳入 Job 后为 true
-        /// （纳入之后该进程创建的子孙一并受管）；非 Windows 平台、PID 已
-        /// 失效或纳入失败时为 false。
+        /// Windows 子进程成功纳入 Job 后为 true。启动后 `assign` 失败
+        /// 仍记录本事件，值为 false；启动前 Job 创建失败则拒绝执行，
+        /// 不生成事件。MCP 调用在 Windows 上于握手前纳入 Job 后为 true，
+        /// 此后该进程创建的子孙一并受管；非 Windows 平台、PID 已失效或
+        /// 纳入失败时为 false。
         active: bool,
-        /// `run_command` 是否做过命令字面路径检查。
+        /// `run_command` 是否执行过命令字面路径检查。
         ///
         /// 不覆盖脚本运行时计算的路径，也不提供文件系统隔离。
-        /// `git_status`、`git_diff` 与 MCP 调用为 false；文件类工具不发此事件。
+        /// `git_status`、`git_diff` 与 MCP 调用为 false；文件类工具不
+        /// 发送此事件。
         boundary_checked: bool,
     },
     /// 摘要调用失败，历史退回占位说明。
     ///
-    /// 与 `SummaryGenerated` 成对：摘要是一次真实的模型调用，失败了也是
-    /// 花掉的时间与配额——没有这条，JSONL 里只看到多等了一会儿却什么
-    /// 都没发生，token 账与耗时都对不上。
+    /// 与 `SummaryGenerated` 成对。摘要是一次真实的模型调用，失败同样
+    /// 消耗时间与配额。缺少这条事件，token 账目与耗时就对不上。
     SummaryFailed {
         /// 即将进入的轮次号。
         turn: u32,
@@ -236,9 +231,10 @@ pub enum AuditEvent {
     },
     /// MCP Server 的一次连接级事实（建立、断开、恢复或关闭）。
     ///
-    /// 与 `ToolObserved`、`SandboxApplied` 分开：一次启动失败没有工具调用，
-    /// 不该伪造观察或执行边界；同一连接的多个工具共享一个 generation，
-    /// 断连只记一次。连接事件用 `turn: 0` 表示它不属于任何模型轮次。
+    /// 与 `ToolObserved`、`SandboxApplied` 分开记录：启动失败没有工具
+    /// 调用，不伪造观察或执行边界。同一连接的多个工具共享一个
+    /// generation，断连只记一次。连接事件用 `turn: 0` 表示不属于任何
+    /// 模型轮次。
     McpLifecycle {
         /// 恒为 0，见变体说明。
         turn: u32,
@@ -247,8 +243,8 @@ pub enum AuditEvent {
     },
     /// 一次 MCP 工具调用的结构化失败事实。
     ///
-    /// 观察文本仍由 `ToolObserved` 承载；这条只给审计和报表提供分类，
-    /// 包括"请求已发出、远端结果未知"这一不能自动重放的状态。
+    /// 观察文本仍由 `ToolObserved` 承载。本条为审计和报表提供分类，
+    /// 包括"请求已发出、远端结果未知"这种不能自动重放的状态。
     McpCallFailed {
         /// 轮次号。
         turn: u32,
@@ -262,7 +258,8 @@ pub enum AuditEvent {
 }
 
 impl AuditEvent {
-    /// 事件所属的轮次号，从 1 开始。
+    /// 事件所属的轮次号，从 1 开始；连接级 `McpLifecycle` 事件不属于任何
+    /// 模型轮次，恒为 0。
     pub fn turn(&self) -> u32 {
         match self {
             Self::StepStarted { turn, .. }
@@ -286,16 +283,16 @@ impl AuditEvent {
 
 /// 一条带序号和时间戳的证据记录。
 ///
-/// 序号由存储方分配，保证同一 sink 内严格递增；时间戳取事件发生时刻
-/// 而非落库时刻，所以由产生事件的一方传入。
+/// 序号由存储方分配，在同一 sink 内严格递增。时间戳取事件发生时刻
+/// 而非写入时刻，由产生事件的一方传入。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Evidence {
     /// sink 内的递增序号，从 1 开始。
     pub sequence: u64,
     /// 本行的格式版本，见 [`EVIDENCE_FORMAT_MILLIS`]。
     ///
-    /// 不带默认值：缺省（旧文件）按秒解释，这是 [`Evidence`] 的反序列化
-    /// 实现自己处理的，字段本身不允许被写成别的数。
+    /// 字段缺省（旧文件）时按秒解释，由 [`Evidence`] 的反序列化实现
+    /// 处理。字段本身不接受未知取值。
     #[serde(default = "legacy_format")]
     pub format: u32,
     /// 事件发生时刻。
@@ -308,16 +305,15 @@ pub struct Evidence {
     pub event: AuditEvent,
 }
 
-/// 旧证据行的格式号：`recorded_at` 是整秒。
+/// 旧证据行的格式号：`recorded_at` 为整秒。
 ///
-/// 读取时靠"字段缺失"识别——旧文件里根本没有 `format` 这个键。
+/// 读取时靠字段缺失识别：旧文件没有 `format` 键。
 pub const EVIDENCE_FORMAT_SECONDS: u32 = 0;
 
-/// 现行证据行的格式号：`recorded_at` 是毫秒。
+/// 现行证据行的格式号：`recorded_at` 为毫秒。
 ///
-/// 精度到毫秒是因为"每轮模型调用花了多久"要作为度量呈现：一次调用
-/// 动辄几秒、快的时候几百毫秒——秒级精度下快的那些轮次全被记成 0，
-/// 延迟分布根本画不出来。
+/// 每轮模型调用耗时需要作为指标呈现：调用通常耗时几秒，快时只有几百
+/// 毫秒。秒级精度下较快的轮次记为 0，无法画出延迟分布。
 pub const EVIDENCE_FORMAT_MILLIS: u32 = 2;
 
 /// 缺省格式号：老文件没有 `format` 键，按秒解释。
@@ -328,8 +324,8 @@ fn legacy_format() -> u32 {
 impl Evidence {
     /// 构造一条现行格式（毫秒）的证据记录。
     ///
-    /// 新代码一律走这里，不直接拼结构体：格式号与精度必须一起给，
-    /// 分开给就会出现"标着毫秒却写秒"或反之的错配。
+    /// 新代码统一使用此构造函数，不直接拼结构体。格式号与精度必须
+    /// 一起设置，分开设置会产生"标记毫秒、写入秒"之类的错配。
     pub fn new(sequence: u64, recorded_at: SystemTime, event: AuditEvent) -> Self {
         Self {
             sequence,
@@ -341,11 +337,10 @@ impl Evidence {
 
     /// 事件发生时刻的毫秒表示。
     ///
-    /// 只做一次换算，且**不再看格式号**：反序列化时秒级的旧文件已经乘过
-    /// 1000 存进 `recorded_at`（见本文件里 `Deserialize` 的实现），这里
-    /// 再按格式补一次就会把旧文件的耗时放大一千倍。而墙钟走另一条路
-    /// （直接读 `recorded_at`），两列会因此互相矛盾：墙钟说 60 秒，
-    /// 轮延迟说 6000 万毫秒。
+    /// 只做一次换算，**不再读取格式号**。反序列化时秒级的旧文件已经
+    /// 乘 1000 存进 `recorded_at`（见下方 `Deserialize` 实现），这里再
+    /// 按格式换算会放大一千倍。墙钟直接读 `recorded_at`，两列会互相
+    /// 矛盾：墙钟 60 秒，轮延迟 6000 万毫秒。
     pub fn recorded_at_millis(&self) -> u64 {
         self.recorded_at
             .duration_since(UNIX_EPOCH)
@@ -354,15 +349,15 @@ impl Evidence {
     }
 }
 
-/// `Evidence` 的反序列化：按行自带的格式号解释 `recorded_at`。
+/// `Evidence` 的反序列化：按行内的格式号解释 `recorded_at`。
 ///
-/// 不手写这个实现而靠 `#[serde(with)]` 做不到：时间戳的解释依赖同一行
-/// 里的另一个字段，派生宏看不到跨字段关系。这是本模块唯一手写
-/// `Deserialize` 的原因。
+/// `#[serde(with)]` 无法表达这一逻辑：时间戳的解释依赖同一行的另一个
+/// 字段，派生宏看不到跨字段关系。这是本模块唯一手写 `Deserialize`
+/// 的原因。
 ///
-/// 格式号不认识时返回错误而不是猜：reader 会跳过该行并计数。猜的代价
-/// 是让所有耗时统计悄悄变成垃圾，而跳过至少能被 `skipped_lines`
-/// 发现——与"末行截断跳过而非报错"是同一条降级哲学。
+/// 格式号未知时返回错误，不做猜测。读取方会跳过该行并计数，跳过至少
+/// 能被 `skipped_lines` 发现；猜测会让所有耗时统计失真。这与"末行
+/// 截断时跳过而非报错"是同一条降级策略。
 impl<'de> Deserialize<'de> for Evidence {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -395,9 +390,8 @@ impl<'de> Deserialize<'de> for Evidence {
 
 /// `SystemTime` 与毫秒 Unix 时间戳之间的序列化桥。
 ///
-/// 落盘格式用整数毫秒而不是 RFC 3339 字符串：事件之间的间隔常常只有
-/// 几百毫秒（一次快的模型调用），纳秒精度对 diff 没有意义，
-/// 而毫秒足够画出每轮延迟分布。
+/// 落盘格式使用整数毫秒，不用 RFC 3339 字符串。事件间隔常只有几百
+/// 毫秒，毫秒精度足以分析每轮延迟分布，纳秒精度没有意义。
 mod unix_millis {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

@@ -1,10 +1,10 @@
-//! 补丁格式的解析与匹配：纯逻辑，不碰文件系统。
+//! 补丁格式的解析与匹配：纯逻辑，不访问文件系统。
 //!
-//! 拆出来的理由：补丁格式是**协议**——模型看到什么、我们认什么，
-//! 与执行（读文件、写盘、路径校验）是两件事。分开之后，格式的每个
-//! 歧义都能用纯输入输出测到，不必先摆一个临时目录。
+//! 补丁格式是协议：模型写什么、解析器接受什么，与执行（读文件、写盘、
+//! 路径校验）相互独立。分开后，格式的每个歧义都能用纯输入输出测试，
+//! 无需临时目录。
 //!
-//! 格式取 Codex 的 `*** Begin Patch` 风格：
+//! 格式采用 Codex 的 `*** Begin Patch` 风格：
 //!
 //! ```text
 //! *** Begin Patch
@@ -18,8 +18,8 @@
 //! *** End Patch
 //! ```
 //!
-//! 三种前缀标记行前缀（`+` / `-` / 空格）决定这一行进旧片段还是新片段：
-//! 上下文行进两边，删除行只进旧片段，新增行只进新片段。
+//! 三种行前缀（`+` / `-` / 空格）决定该行进入旧片段还是新片段：
+//! 上下文行进入两边，删除行只进旧片段，新增行只进新片段。
 
 /// 补丁文本的起止标记。
 const BEGIN_MARKER: &str = "*** Begin Patch";
@@ -54,8 +54,8 @@ pub enum Operation {
 pub struct Hunk {
     /// `@@` 之后的定位提示。
     ///
-    /// 给出时只在它**之后**的文本里找匹配：这是"跳到某个函数再改"的
-    /// 语义。没给就在整个文件里找。
+    /// 提供时只在其后的文本中查找匹配，用于"跳到某个函数再改"。未提供
+    /// 时在整个文件中查找。
     pub anchor: Option<String>,
     /// 旧文本片段：上下文行与被删除的行。
     pub old: Vec<String>,
@@ -63,10 +63,12 @@ pub struct Hunk {
     pub new: Vec<String>,
 }
 
-/// 解析一段补丁文本，返回其中的操作。
+/// 解析补丁文本，返回其中的操作。
 ///
-/// 失败时给出**可操作的**说明：模型据此能改对再来一次，而不是猜。
-/// 常见的错法（漏了 Begin/End、路径后多了字、行前缀写错）都各自点名。
+/// 失败时给出可操作的说明，让模型能直接修正后重试。常见错误（缺少
+/// Begin/End、操作头后缺路径、行前缀错误）分别指出；路径只做去空白，
+/// `*** Update File: a.rs extra` 这样的多余内容会原样成为路径，最终由
+/// 文件查找报"找不到"。
 pub fn parse_patch(text: &str) -> Result<Vec<Operation>, String> {
     let lines: Vec<&str> = text.lines().collect();
     let trimmed: Vec<&str> = lines
@@ -141,23 +143,21 @@ pub fn parse_patch(text: &str) -> Result<Vec<Operation>, String> {
     Ok(operations)
 }
 
-/// 解析 Update 块的内容：若干改动块。
-///
-/// 返回改动块与消耗的行数。
+/// 解析 Update 块的内容，返回改动块与消耗的行数。
 fn parse_hunks(body: &[&str]) -> Result<(Vec<Hunk>, usize), String> {
     let mut hunks: Vec<Hunk> = Vec::new();
     let mut current: Option<Hunk> = None;
     let mut consumed = 0usize;
 
     for line in body {
-        // 到下一个操作标记为止：改动块不能跨过操作边界——否则下一个
-        // 操作的头部与内容会被当成当前块的上下文行。
+        // 遇到下一个操作标记即停止。改动块不能跨过操作边界，否则下一个
+        // 操作的头部与内容会被当作当前块的上下文行。
         if line.starts_with("*** ") {
             break;
         }
         consumed += 1;
         if let Some(anchor) = line.strip_prefix("@@") {
-            // 新改动块开始：上一块收尾。
+            // 新的改动块开始，先结束上一块。
             if let Some(hunk) = current.take() {
                 hunks.push(finish_hunk(hunk)?);
             }
@@ -173,7 +173,7 @@ fn parse_hunks(body: &[&str]) -> Result<(Vec<Hunk>, usize), String> {
             });
             continue;
         }
-        // `@@` 之前的内容（没有 @@ 头）也要能构成一个改动块。
+        // 没有 `@@` 头的行也要能构成改动块。
         let Some(hunk) = current.as_mut() else {
             current = Some(Hunk {
                 anchor: None,
@@ -196,20 +196,18 @@ fn parse_hunks(body: &[&str]) -> Result<(Vec<Hunk>, usize), String> {
     Ok((hunks, consumed))
 }
 
-/// 按行前缀把一行分派到旧片段或新片段。
+/// 按行前缀把一行加入旧片段或新片段。
 ///
-/// 前缀的含义：`+` 是新增、`-` 是删除，**其余整行都是上下文**，而
-/// 上下文的行首空白是原文的一部分。
+/// `+` 表示新增，`-` 表示删除，其余整行都是上下文。上下文行首的空白
+/// 属于原文。
 ///
-/// 这里有个容易搞错的地方：Codex 格式里上下文行也常写成"一个空格 +
-/// 原文"，那个空格是**前缀标记**，不是内容。但模型写补丁时并不总是
-/// 带上它（尤其空行根本带不了）。两种写法都要认，且必须给出同一个
-/// 结果——否则同一个补丁会因为写法不同而匹配上/匹配不上。
+/// Codex 格式中上下文行常写成"一个空格 + 原文"，该空格是前缀标记而非
+/// 内容。模型写补丁时不一定带它，空行也无法带。两种写法都要接受，且
+/// 必须得到相同结果，否则同一个补丁会因写法不同而匹配或匹配不上。
 ///
-/// 判定办法：行首的空格若**只有一个**，且后面紧跟非空格内容，那它
-/// 更像前缀标记；否则它是原文的缩进。这条判定有歧义（原文本来就以
-/// 一个空格开头时），但那种情况极少见，而"上下文行的缩进被吃掉"
-/// 会让每一次匹配都失败——后者是常态，前者是例外。
+/// 判定规则：行首只有一个空格且其后紧跟非空格内容时，按前缀标记处理；
+/// 否则视为原文缩进。原文本身以单个空格开头时会产生歧义，但这种情况
+/// 少见。若把缩进误当作前缀剥掉，每次匹配都会失败。
 fn apply_line_prefix(hunk: &mut Hunk, line: &str) -> Result<(), String> {
     if let Some(text) = line.strip_prefix('+') {
         hunk.new.push(text.to_owned());
@@ -229,7 +227,7 @@ fn apply_line_prefix(hunk: &mut Hunk, line: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 收尾一个改动块：旧片段不能为空，否则这个块什么都不改。
+/// 结束一个改动块。旧片段不能为空，否则该块没有修改内容。
 fn finish_hunk(hunk: Hunk) -> Result<Hunk, String> {
     if hunk.old.is_empty() {
         return Err("改动块没有要替换的内容（只有 `+` 行，没有 `-` 或上下文行）".to_owned());
@@ -240,9 +238,7 @@ fn finish_hunk(hunk: Hunk) -> Result<Hunk, String> {
     Ok(hunk)
 }
 
-/// 解析 Add 块的内容：文件的每一行。
-///
-/// 返回行与消耗的行数。
+/// 解析 Add 块的内容，返回文件各行与消耗的行数。
 fn parse_added_lines(body: &[&str]) -> Result<(Vec<String>, usize), String> {
     let mut lines: Vec<String> = Vec::new();
     let mut consumed = 0usize;
@@ -266,17 +262,17 @@ fn parse_added_lines(body: &[&str]) -> Result<(Vec<String>, usize), String> {
     Ok((lines, consumed))
 }
 
-/// 把一个 Update 的改动块按顺序应用到文件内容上。
+/// 把 Update 的改动块按顺序应用到文件内容。
 ///
-/// 每个改动块在**上一个块应用之后**的内容上找匹配：改动块之间可能
-/// 互相影响行号，顺序应用才能对上。
+/// 每个改动块都在上一个块应用后的内容上查找匹配。块之间可能改变行号，
+/// 顺序应用才能对应正确。
 ///
-/// 失败时给出可操作的说明，并附上文件的相关片段让模型能纠正。
+/// 失败时给出可操作的说明，并附上文件相关片段供模型纠正。
 pub fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
     let ends_with_newline = content.ends_with('\n');
     let mut lines: Vec<String> = content.split('\n').map(str::to_owned).collect();
     if ends_with_newline {
-        // `split` 对以换行结尾的内容会多出一个空串尾巴。
+        // 内容以换行结尾时 `split` 会多出一个空字符串。
         lines.pop();
     }
 
@@ -310,9 +306,9 @@ pub fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
     Ok(result)
 }
 
-/// 在 `lines` 里找 `old` 片段的唯一匹配位置。
+/// 在 `lines` 中查找 `old` 片段的唯一匹配位置。
 ///
-/// 找不到与匹配到多处都算失败：猜一次就可能改错地方。
+/// 找不到或匹配到多处都算失败，避免修改错误位置。
 fn find_unique(lines: &[String], old: &[String], start: usize) -> Result<usize, String> {
     let mut positions: Vec<usize> = Vec::new();
     if old.len() <= lines.len() {
@@ -331,10 +327,10 @@ fn find_unique(lines: &[String], old: &[String], start: usize) -> Result<usize, 
     }
 }
 
-/// 摘出文件的相关片段附在错误说明里，让模型知道文件实际长什么样。
+/// 摘出文件的相关片段附在错误说明中，展示文件的实际内容。
 ///
-/// 只给片段而不是全文：全文可能很大，而模型要看的正是"我以为的位置"
-/// 与"实际的位置"的差别。
+/// 只提供片段，因为全文可能很大，模型需要看的是预期位置与实际位置的
+/// 差异。
 fn excerpt(lines: &[String], around: usize) -> String {
     let start = around.saturating_sub(3);
     let end = (around + 8).min(lines.len());
@@ -357,11 +353,11 @@ mod tests {
         parse_patch(text).expect("补丁应当能解析")
     }
 
-    /// 更新一个文件里的一处。
+    /// 更新文件中的一处。
     ///
-    /// 补丁文本用 `concat!` 逐行拼而不是 `\` 续行：续行会吃掉下一行的
-    /// 行首空白，而补丁的上下文行对空白**逐字敏感**——那正是"上下文不
-    /// 匹配"要抓的东西，测试自己却把它吃了，测的就不是真的了。
+    /// 补丁文本用 `concat!` 逐行拼接，不用 `\` 续行。续行会去掉下一行的
+    /// 行首空白，而上下文行对空白逐字敏感；测试自己丢掉空白就测不到
+    /// 真实行为。
     #[test]
     fn parses_an_update_with_context_lines() {
         let operations = patch(concat!(
@@ -385,7 +381,7 @@ mod tests {
         assert_eq!(hunks[0].new, vec!["    let x = 1;", "    let x = 3;"]);
     }
 
-    /// 空行常常不带空格前缀：Codex 的补丁里这是常态，必须认。
+    /// 空行通常不带空格前缀，Codex 补丁中很常见，必须接受。
     #[test]
     fn a_bare_blank_line_is_a_context_line() {
         let operations = patch(concat!(
@@ -404,11 +400,11 @@ mod tests {
         assert_eq!(hunks[0].new, vec!["", "new"]);
     }
 
-    /// 上下文行的两种写法必须得到同一个结果。
+    /// 上下文行的两种写法必须得到相同结果。
     ///
-    /// Codex 格式把上下文写成"一个空格 + 原文"，那个空格是前缀标记；
-    /// 模型手写时常常直接写原文（缩进原样）。两种写法指的是同一段
-    /// 原文——判据不同的话，同一个补丁会因为写法不同而匹配上/匹配不上。
+    /// Codex 格式把上下文写成"一个空格 + 原文"，该空格是前缀标记；模型
+    /// 手写时常直接写原文并保留缩进。两种写法表示同一段原文，判定必须
+    /// 一致。
     #[test]
     fn a_context_line_reads_the_same_with_or_without_the_prefix_space() {
         let with_marker = patch(concat!(
@@ -465,7 +461,7 @@ mod tests {
         );
     }
 
-    /// 缺了起止标记必须明确报错：模型据此能改对再来一次。
+    /// 缺少起止标记时必须明确报错，模型据此修正后重试。
     #[test]
     fn missing_markers_are_reported_actionably() {
         let no_begin = parse_patch("*** Update File: a.txt\n- x\n+ y\n*** End Patch");
@@ -490,7 +486,7 @@ mod tests {
         );
     }
 
-    /// 认不出来的操作标记要原样报出来：模型能照着改。
+    /// 无法识别的操作标记要原样回显，便于模型修正。
     #[test]
     fn an_unknown_operation_marker_is_quoted_back() {
         let error = parse_patch(
@@ -504,7 +500,7 @@ mod tests {
         assert!(error.contains("Update File"), "应说清只认哪三种: {error}");
     }
 
-    /// 新建文件的内容行必须带 `+`：漏了就是模型没按格式写。
+    /// 新建文件的内容行必须带 `+`。
     #[test]
     fn added_lines_must_carry_the_plus_prefix() {
         let error = parse_patch(
@@ -518,7 +514,7 @@ mod tests {
         assert!(error.contains("要以 `+` 开头"), "实际: {error}");
     }
 
-    /// 应用改动块：命中的那段被替换，其余原样保留。
+    /// 应用改动块时替换命中的片段，其余内容保持不变。
     #[test]
     fn applies_a_hunk_to_the_matching_place() {
         let content = "fn main() {\n    let x = 1;\n    let x = 2;\n    println!(\"{x}\");\n}\n";
@@ -536,7 +532,7 @@ mod tests {
         );
     }
 
-    /// 上下文对不上：失败，且带上文件片段让模型能纠正。
+    /// 上下文不匹配时失败，并附带文件片段供模型纠正。
     #[test]
     fn a_context_mismatch_fails_with_the_actual_content() {
         let content = "fn main() {\n    let x = 1;\n}\n";
@@ -552,7 +548,7 @@ mod tests {
         assert!(error.contains("let x = 1;"), "应附上文件实际内容: {error}");
     }
 
-    /// 上下文有歧义：多处匹配时拒绝改。
+    /// 多处匹配时拒绝修改。
     #[test]
     fn an_ambiguous_context_is_refused() {
         let content = "let x = 1;\nlet x = 1;\n";
@@ -568,7 +564,7 @@ mod tests {
         assert!(error.contains("更长的上下文"), "应提示怎么改: {error}");
     }
 
-    /// 锚点把搜索范围限定在它之后：同名代码在锚点之前不该被误改。
+    /// 锚点把搜索范围限定在其后，锚点之前的同名代码不应被修改。
     #[test]
     fn the_anchor_limits_the_search_to_what_follows_it() {
         let content = "fn first() {\n    let x = 1;\n}\nfn second() {\n    let x = 1;\n}\n";
@@ -580,12 +576,12 @@ mod tests {
 
         let updated = apply_hunks(content, &hunks).unwrap();
 
-        // 锚点之后的那处被改，锚点之前的原封不动。
+        // 锚点之后的匹配被修改，锚点之前保持不变。
         assert!(updated.contains("fn first() {\n    let x = 1;\n}"));
         assert!(updated.contains("fn second() {\n    let x = 2;\n}"));
     }
 
-    /// 锚点不存在：明确失败，不去别处乱找。
+    /// 锚点不存在时明确失败，不在其他位置查找。
     #[test]
     fn a_missing_anchor_is_reported() {
         let content = "fn main() {}\n";
@@ -601,7 +597,7 @@ mod tests {
         assert!(error.contains("fn nowhere()"), "应点出找不到的锚点: {error}");
     }
 
-    /// 多个改动块按顺序应用：第二个块在第一个的结果上找。
+    /// 多个改动块按顺序应用，后一个块在前一个的结果上查找。
     #[test]
     fn several_hunks_apply_in_order() {
         let content = "a\nb\nc\n";
@@ -621,7 +617,7 @@ mod tests {
         assert_eq!(apply_hunks(content, &hunks).unwrap(), "A\nb\nC\n");
     }
 
-    /// 文件末尾有没有换行要原样保留：补丁不该顺手改动它。
+    /// 文件末尾的换行状态必须原样保留。
     #[test]
     fn the_trailing_newline_is_preserved() {
         let with_newline = "a\nb\n";
@@ -636,7 +632,7 @@ mod tests {
         assert_eq!(apply_hunks(without_newline, &hunks).unwrap(), "A\nb");
     }
 
-    /// 新旧内容相同的改动块没有意义：直接拒绝，不让它白跑一趟。
+    /// 新旧内容相同的改动块直接拒绝。
     #[test]
     fn a_no_op_hunk_is_refused() {
         let error = parse_patch(

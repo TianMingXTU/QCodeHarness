@@ -1,7 +1,7 @@
 //! OpenAI 兼容提供方：内置的默认 [`LlmProvider`] 实现。
 //!
-//! 只做装配：把连接配置变成 [`RigChatGateway`]。请求怎么拼、超时怎么
-//! 兜底都归网关管——换掉这一层不改变 wire 上的任何字节。
+//! 只负责装配，将连接配置转换为 [`RigChatGateway`]。请求构造与超时处理
+//! 由网关负责，替换本层不改变线上传输内容。
 
 use std::sync::Arc;
 
@@ -20,9 +20,9 @@ pub struct OpenAiCompatProvider {
 impl OpenAiCompatProvider {
     /// 用连接参数构造。
     ///
-    /// 必须走 `chat()`（`/chat/completions`）：`completion()` 对 OpenAI
-    /// 方言默认指向 Responses API（`/responses`），DeepSeek 等兼容网关
-    /// 并不支持。
+    /// 必须使用 `chat()`（`/chat/completions`）。`completion()` 在 OpenAI
+    /// 方言下默认指向 Responses API（`/responses`），DeepSeek 等兼容网关
+    /// 不支持。
     pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
         let client = OpenAIConfig::new(api_key).with_base_url(base_url).client();
         Self::with_model(client.chat(model).erase())
@@ -30,8 +30,8 @@ impl OpenAiCompatProvider {
 
     /// 用已擦除的 rig 模型构造。
     ///
-    /// 供自带客户端的装配方与测试使用：网关行为与 [`Self::new`] 完全
-    /// 相同，变的只是模型的来源。
+    /// 供自带客户端的装配方与测试使用。网关行为与 [`Self::new`] 相同，
+    /// 仅模型来源不同。
     pub fn with_model(model: DynModel<Completion>) -> Self {
         Self {
             gateway: Arc::new(RigChatGateway::new(model)),
@@ -80,11 +80,11 @@ mod tests {
         }
     }
 
-    /// 从注册表取出的默认网关与直连网关发出逐字段相同的请求。
+    /// 注册表取出的默认网关与直连网关记录到的请求逐字段一致。
     ///
-    /// 这是"接入方式可替换、wire 行为不变"的钉子：请求拼装仍然只有
-    /// [`RigChatGateway`] 一条路径，提供方与注册表只负责把同一份网关
-    /// 交到装配方手里。未配角色模型时请求同样不带 `model` 字段。
+    /// 锁定"接入方式可替换、wire 行为不变"：请求拼装只有
+    /// [`RigChatGateway`] 一条路径。提供方与注册表只负责把同一个网关交给
+    /// 装配方。
     #[tokio::test]
     async fn registry_gateway_sends_the_same_request_as_a_direct_gateway() {
         let session = Session::new(SessionId::new("s1"), "任务");
@@ -123,11 +123,11 @@ mod tests {
 
         let via_provider = &via_provider_mock.requests()[0];
         let direct = &direct_mock.requests()[0];
-        // mock 会把自己的模型名填进 `request.model`，所以这里比较的是
-        // "两条路径记录到的请求完全一致"，而不是字面上的 `None`。
-        // "未配角色模型时 build_request 产出的 model 是 None"由
-        // rig_chat 的 `without_a_configured_model_the_request_carries_none`
-        // 直接盯着构造侧，那条钉子不经过任何 mock。
+        // mock 会把自己的模型名填入 `request.model`，因此这里比较两条路径
+        // 记录到的请求是否一致，而非字面值 `None`。"未配角色模型时
+        // `build_request` 产生的 `model` 为 `None`"由 rig_chat 的
+        // `without_a_configured_model_the_request_carries_none` 直接验证
+        // 构造侧，不经过 mock。
         assert_eq!(
             via_provider.model, direct.model,
             "注册表路径与直连路径对 model 字段的处理必须一致"
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(via_provider.tools.len(), direct.tools.len());
     }
 
-    /// 内置提供方的标识是注册表的查找键，改名等于改契约。
+    /// 内置提供方标识是注册表查找键，修改名称即修改契约。
     #[test]
     fn the_builtin_provider_is_identified_as_openai_compat() {
         let provider = OpenAiCompatProvider::with_model(

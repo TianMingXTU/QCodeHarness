@@ -1,14 +1,14 @@
-//! shell 命令的结构化词法模型（纯数据，不做 shell 求值）。
+//! shell 命令的结构化词法模型，纯数据，不做 shell 求值。
 //!
-//! 这个模块只回答"命令文本由哪些段、哪些词元、哪些重定向与 flag 值组成"，
-//! 供 `domain::sandbox` 的两道边界防线共用一份解析结果。它**不是** shell 解析
-//! 器，也不提供隔离：不展开 `$OUT` / `%OUT%`，不执行 `` `…` `` / `$(…)`，
-//! 不解码编码过的路径，不访问文件系统，也不解析符号链接与 junction 的物理
-//! 目标。引号只影响分词，不代表运行时求值结果。
+//! 只描述命令文本包含哪些段、词元、重定向与 flag 值，供 `domain::sandbox`
+//! 的两道边界防线共用。它不是 shell 解析器，也不提供隔离：不展开
+//! `$OUT`/`%OUT%`，不执行反引号或 `$(…)`，不解码编码路径，不访问文件
+//! 系统，不解析符号链接与 junction 的物理目标。引号只影响分词，不代表
+//! 运行时求值结果。
 //!
-//! 取向是保守收紧：宁可把可疑文本也纳入检查，也不让一个真实存在的路径词元
-//! 从模型里消失。重定向目标因此**同时**留在有序词元流里——"任何词元
-//! 提到 workspace 外路径即触发"是收紧后的口径，不能因为结构化就倒退。
+//! 词法处理偏保守：宁可把可疑文本纳入检查，也不让真实的路径词元从模型中
+//! 消失。重定向目标因此同时保留在有序词元流中。"任何词元提到 workspace 外
+//! 路径即触发"是收紧后的口径，结构化处理不应放松它。
 
 /// 段与段之间的链接符。它们是词法边界，不是普通词元。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +21,7 @@ pub enum ShellOperator {
     Sequence,
     /// `|`
     Pipe,
-    /// 单个 `&`（后台再拉一条命令）
+    /// 单个 `&`，后台执行
     Background,
     /// 换行
     Newline,
@@ -34,7 +34,7 @@ pub enum RedirectOp {
     Output,
     /// `>>` / `1>>` / `2>>`
     Append,
-    /// `<` / `<<`；输入不是写操作，裁决时不套用"输出重定向"的理由。
+    /// `<` / `<<`。输入不是写操作，裁决时不套用输出重定向的理由。
     Input,
     /// `&>`：stdout 与 stderr 一起写。
     OutputAndError,
@@ -63,8 +63,8 @@ impl CommandWord {
         }
     }
 
-    /// 路径判据要检查的字面值：有 `=` 时只看等号后的值，与"任何词元
-    /// 都查"的口径一致。
+    /// 路径判据检查的字面值。存在 `=` 时只取等号后的值，与逐词元检查的
+    /// 口径一致。
     pub fn path_candidate(&self) -> &str {
         self.flag_value.as_deref().unwrap_or(&self.text)
     }
@@ -80,7 +80,8 @@ pub struct Redirect {
 /// 一段命令：一个程序、它的参数词元、以及本段收齐的全部重定向。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSegment {
-    /// 首段为 `None`；后续段记录把它与前面分开的链接符。
+    /// 常规命令的首段为 `None`；以链接符开头的命令（`&& cargo test`）首段
+    /// 也带该链接符；后续段记录把它与前面分开的链接符。
     pub operator_before: Option<ShellOperator>,
     /// 有序词元流，含程序、参数、重定向目标与嵌套补查词元。
     pub words: Vec<CommandWord>,
@@ -133,8 +134,8 @@ struct DraftSegment {
     redirects: Vec<Redirect>,
 }
 
-/// 只在外层（depth 0）补查一次：递归展开引号里的引号会让模型无限生长，
-/// 而真正需要覆盖的是 `cmd /C "echo x > D:\outside\x"` 这一层。
+/// 只在外层（depth 0）做一次补查。递归展开引号内的引号会使模型无限增长；
+/// 需要覆盖的场景是 `cmd /C "echo x > D:\outside\x"`。
 fn parse_at_depth(command: &str, depth: u8) -> ParsedCommand {
     let segments = lex(command)
         .into_iter()
@@ -145,11 +146,10 @@ fn parse_at_depth(command: &str, depth: u8) -> ParsedCommand {
                 .map(|word| CommandWord::new(word.text.clone(), word.quoted, false))
                 .collect();
             let mut redirects = draft.redirects;
-            // 只对"shell 启动器 + 一段引号包住的命令文本"补查一层：
-            // `cmd /C "echo x > D:\outside\x"` 是真实绕过形状，而 `git
-            // commit -m "提到 C:\Users\x 的说明"` 是普通文本。无差别递归会
-            // 把提交说明里的路径误判成越界，那是收紧过头，违背本模块
-            // "保守但不误伤普通文本"的目的。
+            // 只对"shell 启动器加一段带引号的命令文本"补查一层。
+            // `cmd /C "echo x > D:\outside\x"` 是真实的绕过形式，而
+            // `git commit -m "提到 C:\Users\x 的说明"` 是普通文本。
+            // 无差别递归会把提交说明中的路径误判为越界。
             if depth == 0
                 && draft
                     .words
@@ -181,17 +181,18 @@ fn parse_at_depth(command: &str, depth: u8) -> ParsedCommand {
     ParsedCommand { segments }
 }
 
-/// 含空白或 shell 操作符的引号词，按"复合命令文本"再切一层词元。
+/// 判断带引号的词是否含空白或 shell 操作符，是则按复合命令再切一层词元。
 ///
-/// 只是补查：原词本身仍作为完整候选先被裁决，所以带空格的完整路径在理由里
-/// 不会被切成两截（`quoted_redirect_reason_keeps_the_complete_path` 钉住了它）。
+/// 这只是一次补查。原词仍作为完整候选先被裁决，因此带空格的完整路径不会
+/// 在理由中被拆开（由 `quoted_redirect_reason_keeps_the_complete_path`
+/// 测试锁定）。
 fn looks_like_compound(text: &str) -> bool {
     text.chars()
         .any(|ch| ch.is_whitespace() || matches!(ch, '&' | '|' | ';' | '>' | '<' | '\n'))
 }
 
-/// 会把后面整段文本交给 shell 再解释的程序。只有它们面前的一段引号
-/// 内容有资格按"复合命令"补查；其他工具的参数是普通文本。
+/// 会把后续整段文本交给 shell 解释的程序。只有它们的引号内容按复合命令
+/// 补查；其他工具的参数是普通文本。
 fn is_shell_launcher(program: &str) -> bool {
     let name = program
         .rsplit(['\\', '/'])
@@ -202,8 +203,8 @@ fn is_shell_launcher(program: &str) -> bool {
     matches!(stem, "cmd" | "sh" | "bash" | "zsh" | "powershell" | "pwsh")
 }
 
-/// 单遍词法扫描。反斜杠与反引号都是普通字符——引入转义处理会放松
-/// Windows 路径的现有判据，而词法的取向恰恰是不放松。
+/// 单遍词法扫描。反斜杠与反引号按普通字符处理。引入转义处理会放松
+/// Windows 路径的现有判据。
 fn lex(command: &str) -> Vec<DraftSegment> {
     let mut segments: Vec<DraftSegment> = Vec::new();
     let mut operator_before: Option<ShellOperator> = None;
@@ -304,11 +305,12 @@ fn lex(command: &str) -> Vec<DraftSegment> {
                     );
                     pending = Some(op);
                 }
-                // `2>&1` 里的 `&` 是 fd 复制：只有重定向正等着目标（pending）、
-                // 当前没在攒词元、且 `&` 后紧跟数字时才算——数字一起并进
-                // 目标词元（`&1`）。否则 `&` 是后台链接符，必须结束当前目标
-                // 并分段——`echo x > local.txt&D:\outside\run.cmd` 的 `&`
-                // 后是路径，若并进 current 会让真实越界目标从模型里消失。
+                // `2>&1` 中的 `&` 表示 fd 复制，仅在以下条件成立时按此
+                // 处理：有重定向等待目标（pending）、当前词元为空、且 `&`
+                // 后紧跟数字。数字并入目标词元（`&1`）。否则 `&` 是后台
+                // 链接符，必须结束当前目标并分段。例如
+                // `echo x > local.txt&D:\outside\run.cmd` 中 `&` 后是路径，
+                // 并入 current 会让真实越界目标从模型中消失。
                 Some(digit) if digit.is_ascii_digit()
                     && pending.is_some() && current.is_empty() =>
                 {
@@ -407,8 +409,8 @@ fn lex(command: &str) -> Vec<DraftSegment> {
         &mut quoted,
         &mut pending,
     );
-    // 命令以链接符结尾时不留一个空的尾巴段——否则单段命令的理由会凭空
-    // 多出"（第 2 段…）"，单段不加段号的文案约定就没了。
+    // 命令以链接符结尾时不保留空尾段。否则单段命令的理由会多出
+    // "（第 2 段…）"，违反单段不带段号的约定。
     if !words.is_empty() || !redirects.is_empty() || segments.is_empty() {
         segments.push(DraftSegment {
             operator_before,
@@ -429,9 +431,9 @@ fn flush_word(
 ) {
     let was_quoted = std::mem::replace(quoted, false);
     if current.is_empty() {
-        // 空引号目标没有路径可判，但仍要占住这次重定向：否则 pending 会被
-        // 下一个操作覆盖，模型里"全部重定向目标"的契约就悄悄少了一条。
-        // 只认显式空引号词，重定向后的普通空格必须继续等真正的目标词元。
+        // 空引号目标没有路径可判，但仍要保留这次重定向，否则 pending 会被
+        // 下一个操作覆盖，重定向目标列表将不完整。只处理显式空引号词；
+        // 重定向后的普通空格仍需等待真正的目标词元。
         if was_quoted {
             if let Some(op) = pending.take() {
                 redirects.push(Redirect {
@@ -471,8 +473,8 @@ fn end_segment(
     pending: &mut Option<RedirectOp>,
     operator: ShellOperator,
 ) {
-    // 开头就是链接符时不留空的前导段：否则"只有一条真命令"也会被算成
-    // 第 2 段，理由凭空多出段号（与尾随链接符的对称处理）。
+    // 开头是链接符时不保留空的前导段。否则只有一条命令也会被算作第 2 段，
+    // 多出段号。与尾随链接符的处理对称。
     if !words.is_empty() || !redirects.is_empty() || !segments.is_empty() {
         segments.push(DraftSegment {
             operator_before: *operator_before,
@@ -705,8 +707,8 @@ mod tests {
         assert_eq!(words(&parsed, 0)[1], r"..\secret");
     }
 
-    /// 命令替换、反引号、$() 与变量都不展开；括号独立成词（与旧词法一致），
-    /// 里面的绝对路径词元因此不会从模型里消失（边界判据照旧看得见）。
+    /// 命令替换、反引号、`$()` 与变量都不展开。括号独立成词（与旧词法
+    /// 一致），其中的绝对路径词元仍保留在模型中。
     #[test]
     fn substitutions_are_not_evaluated_but_their_words_remain_visible() {
         assert_eq!(
@@ -727,8 +729,8 @@ mod tests {
         );
     }
 
-    /// 只有 shell 启动器的引号命令文本才补查；普通引号路径仍是一个词元，
-    /// 不会被嵌套词法切碎（根内放行与完整理由都靠它）。
+    /// 只有 shell 启动器的引号命令文本才补查。普通引号路径仍是一个词元，
+    /// 不会被嵌套词法拆开，根内放行与完整理由依赖这一点。
     #[test]
     fn shell_launcher_quotes_get_one_bounded_nested_pass() {
         let parsed = single(r#"cmd /C "echo x > D:\outside\x""#);

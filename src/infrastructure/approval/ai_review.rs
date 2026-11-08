@@ -1,18 +1,16 @@
-//! AI 审批审查员：先用模型过一遍，拿不准的交回给人。
+//! AI 审批审查员：先用模型筛选，拿不准的交给人工。
 //!
-//! 对标 Codex 的自动审批：交互式闸门（`cli`）每问一次都要人坐在终端前，
-//! 长时间运行的编排任务里这个成本很高——人会疲劳，疲劳的人会一律放行，
-//! 于是闸门名存实亡。这一层把"明显安全的调用"交给模型先筛一遍，
-//! 只把**它拿不准的**留给人。
+//! 对标 Codex 的自动审批。交互式闸门（`cli`）每次都要求人守在终端前，
+//! 长时间运行的编排任务中成本很高；人容易疲劳，疲劳时会一律放行，
+//! 闸门随之失效。本层让模型先筛出明显安全的调用，只把拿不准的留给人。
 //!
-//! 三条不可动摇的规则：
-//! 1. **只减负，不放权**。审查员说 `approve` 时工具仍要过策略与沙箱；
-//!    它替代的只是"人点头"这一个动作。
-//! 2. **任何异常都退回给人**。模型超时、返回空、输出不是约定的 JSON、
-//!    明确说 `human`——一律落到 `fallback` 闸门，绝不因为"审查员坏了"
-//!    就悄悄放行。
-//! 3. **不确定就说不确定**。提示词把 `human` 设为拿不准时的正确选项，
-//!    而不是让模型在 approve/deny 之间猜。
+//! 三条硬性规则：
+//! 1. 只减负，不放权。审查员返回 `approve` 时工具仍要经过策略与沙箱；
+//!    它只替代"人点头"这一个动作。
+//! 2. 任何异常都退回给人。模型超时、空回复、输出不是约定 JSON、明确
+//!    返回 `human`，一律落到 `fallback` 闸门，不能因审查员故障而放行。
+//! 3. 不确定时明确报告不确定。提示词将 `human` 设为拿不准时的正确
+//!    选项，避免模型在 approve 与 deny 之间猜测。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,15 +24,15 @@ use crate::domain::tool::ToolAnnotations;
 
 /// 审查员单次调用的时限。
 ///
-/// 比网关自己的 300 秒短得多：审批是同步卡在工具执行前的，审查员多拖一秒
-/// 用户就多等一秒。30 秒够模型输出一行 JSON；超时就说明它不在状态，
-/// 这时候该问人而不是继续等。
+/// 远短于网关的 300 秒：审批同步阻塞在工具执行前，审查员多花一秒，
+/// 用户就多等一秒。30 秒足够模型输出一行 JSON；超时说明模型没有正常
+/// 响应，此时应询问人工，不再等待。
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 审查员的系统提示词。
 ///
-/// 四个维度来自 Codex 的自动审批清单，刻意写得很具体：泛泛地问"这安全吗"
-/// 会让模型回一句"看起来安全"，具体列出四类风险它才会逐条对照。
+/// 四个维度来自 Codex 的自动审批清单。问题写得具体：泛泛询问"这安全吗"
+/// 只会得到"看起来安全"，逐条列出四类风险模型才会对照检查。
 const REVIEWER_SYSTEM_PROMPT: &str = "\
 你是审批审查员。有一个工具调用即将在受控 workspace 中执行，请判断它是否安全。
 
@@ -52,7 +50,7 @@ decision 的取值：
 - deny：明确命中某条风险，必须阻止；
 - human：无法判断，或需要人来判断。拿不准时选这个，不要猜。";
 
-/// 审查结论。只接受这三个取值——别的字符串一律当作"审查员没回答"。
+/// 审查结论。只接受这三个取值，其他字符串视为审查员未回答。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ReviewDecision {
@@ -71,38 +69,40 @@ struct ReviewReply {
     reason: String,
 }
 
-/// 从模型输出里解析审查结论。
+/// 从模型输出解析审查结论。
 ///
-/// **严格**：只认一条干净的 JSON 对象。带 Markdown 代码块、前后有解释文字、
-/// 缺字段、decision 取值不在三个之内——全部算解析失败，由调用方退回给人。
+/// 解析严格：只接受一条干净的 JSON 对象。带 Markdown 代码块、前后有
+/// 解释文字、缺字段、decision 取值不在三个之内，全部算解析失败，由调用方
+/// 退回人工。
 ///
-/// 不做"把 ```json 剥掉再试"的宽容处理：那是在猜模型想说什么，而猜错的
-/// 代价是把危险调用放过去。宁可多问人一次。
+/// 不做"剥掉 ```json 再试"的宽容处理。那需要猜测模型意图，猜错会让危险
+/// 调用通过。宁可多问一次人工。
 fn parse_review(text: &str) -> Option<ReviewReply> {
     serde_json::from_str(text.trim()).ok()
 }
 
 /// AI 审批审查员：模型先筛，拿不准的交回 `fallback`。
 pub struct AiReviewGate {
-    /// 审查用的模型网关。与主循环共用同一个实例：审查是一次普通调用，
-    /// 走同一条超时与错误路径。
+    /// 审查用的模型网关，与主循环共用同一实例。审查是普通调用，使用同一条
+    /// 超时与错误路径。
     model: Arc<dyn ModelGateway>,
-    /// 审查员拿不准（或坏了）时的退路。生产环境是 [`CliApprovalGate`]。
+    /// 审查员拿不准（或坏了）时的退路。生产环境是
+    /// [`crate::infrastructure::approval::cli::CliApprovalGate`]。
     fallback: Box<dyn ApprovalGate>,
-    /// 单次审查的时限。生产取 [`REVIEW_TIMEOUT`]，测试调小免得干等。
+    /// 单次审查的时限。生产取 `REVIEW_TIMEOUT`，测试调小以加快返回。
     timeout: Duration,
 }
 
 impl AiReviewGate {
-    /// 用审查模型与退路闸门构造，时限取 [`REVIEW_TIMEOUT`]。
+    /// 用审查模型与退路闸门构造，时限取 `REVIEW_TIMEOUT`。
     pub fn new(model: Arc<dyn ModelGateway>, fallback: Box<dyn ApprovalGate>) -> Self {
         Self::with_timeout(model, fallback, REVIEW_TIMEOUT)
     }
 
     /// 自定义单次审查时限。
     ///
-    /// 与 `RigChatGateway::with_timeout` 同一路数：生产永远用默认值，
-    /// 只有测试需要把"模型挂住"这条路径跑得快一点。
+    /// 与 `RigChatGateway::with_timeout` 相同：生产使用默认值，测试用它
+    /// 加快"模型挂住"路径的执行。
     pub fn with_timeout(
         model: Arc<dyn ModelGateway>,
         fallback: Box<dyn ApprovalGate>,
@@ -117,13 +117,12 @@ impl AiReviewGate {
 
     /// 把审批请求渲染成给审查员的提问。
     ///
-    /// 参数原文整体给出，不做截断：审查员要看的正是参数里那一段越界路径
-    /// 或外传地址，截断了它就什么也判断不出来。
+    /// 参数原文完整给出，不截断。审查员需要查看参数中的越界路径或外传
+    /// 地址，截断后无法判断。
     ///
-    /// `request.reason`（策略追加复核时给出的理由）必须一起给：策略之上
-    /// 追加的复核是"这条被判定疑似越界"的唯一线索，审查员看不到它就把
-    /// 一次升级审当普通调用放行——"每次都要人过目"的承诺会在这一层
-    /// 被静默降级成"模型说行就行"。
+    /// 必须附带 `request.reason`（策略追加复核时给出的理由）。它是"该调用
+    /// 被判定疑似越界"的唯一线索，审查员看不到就会把升级审查当作普通调用
+    /// 放行，"每次都要人过目"的保证会在这里退化为"模型同意即可"。
     fn review_prompt(request: &ApprovalRequest) -> String {
         let escalation = match &request.reason {
             Some(reason) => format!("\n策略追加的复核理由: {reason}"),
@@ -163,11 +162,11 @@ fn risk_flags(annotations: &ToolAnnotations) -> String {
 impl ApprovalGate for AiReviewGate {
     fn request<'a>(&'a self, request: &'a ApprovalRequest) -> BoxFuture<'a, Decision> {
         Box::pin(async move {
-            // 恢复后的重新询问直接交给人，不经审查员。
+            // 恢复后的重新询问直接交给人工，不经过审查员。
             //
-            // "重新问一次，人要再点一次"是硬要求：上一次问的是上一个
-            // 进程里的人，那次没答复。让审查员替人点头，等于把"人没点过"
-            // 记成"人点过了"——那正是这条防线要防的事。
+            // 人必须重新确认：上一次询问发生在上一个进程，且未获答复。
+            // 让审查员代替人批准，会把"人未确认"记为"人已确认"，而这条
+            // 防线就是为了避免这种情况。
             if request.resumed {
                 println!(
                     "[AI 审查] 这是恢复后的重新询问（之前问过，没答复），直接问人"
@@ -181,15 +180,15 @@ impl ApprovalGate for AiReviewGate {
                 ))],
                 spec: &spec,
                 tools: &[],
-                // 审查调用的输入每次都是"这一次待审调用"，彼此不共享前缀，
-                // 给它键没有意义——`None` 让 provider 自行路由。不能拿空
-                // 字符串顶替：那在 wire 上仍是一个 `prompt_cache_key`，
-                // 所有审查请求会共用一个固定的空键。
+                // 审查调用的输入是当次待审调用，请求之间不共享前缀，设置
+                // 缓存键没有意义。`None` 让 provider 自行路由。不能用空字符串
+                // 代替：那在 wire 上仍是 `prompt_cache_key`，所有审查请求会
+                // 共用一个固定空键。
                 cache_key: None,
             };
 
-            // 任何一步失败都退回给人：超时、网关报错、空回复、解析不出来。
-            // 审查员是减负设施，不是安全边界——它哑了的时候安全边界仍在。
+            // 任何一步失败都退回人工：超时、网关报错、空回复、解析失败。
+            // 审查员只负责减负，不承担安全边界；它失效时安全边界仍然存在。
             let reply = match tokio::time::timeout(self.timeout, self.model.complete(model_request))
                 .await
             {
@@ -339,8 +338,8 @@ mod tests {
         }
     }
 
-    /// 给 `Arc<RecordingFallback>` 也实现闸门：测试要同时握住断言把手
-    /// 和交给审查员的那一份。
+    /// 为 `Arc<RecordingFallback>` 实现闸门，使测试同时持有断言句柄和
+    /// 交给审查员的那一份。
     impl ApprovalGate for Arc<RecordingFallback> {
         fn request<'a>(&'a self, _request: &'a ApprovalRequest) -> BoxFuture<'a, Decision> {
             Box::pin(async move {
@@ -366,7 +365,7 @@ mod tests {
         assert_eq!(reviewer.call_count(), 1, "一次审批只审一次");
     }
 
-    /// `deny` 直接否决，同样不问人——但理由要带给模型。
+    /// `deny` 直接否决，不询问人工，理由需返回给模型。
     #[tokio::test]
     async fn deny_decision_refuses_with_the_reviewers_reason() {
         let reviewer = ScriptedReviewer::new(vec![
@@ -401,10 +400,10 @@ mod tests {
         assert_eq!(fallback.asked(), 1, "human 必须问人");
     }
 
-    /// 输出不是一条干净的 JSON → 退回给人。
+    /// 输出不是干净的 JSON 时退回人工。
     ///
-    /// 模型爱给 Markdown 代码块，这是最常见的形态；刻意不做剥壳处理，
-    /// 猜错代价是把危险调用放过去。
+    /// Markdown 代码块是最常见的形式。刻意不做剥壳处理，猜错会让危险调用
+    /// 通过。
     #[tokio::test]
     async fn markdown_fenced_output_falls_back() {
         let reviewer = ScriptedReviewer::new(vec![
@@ -444,10 +443,10 @@ mod tests {
         assert_eq!(fallback.asked(), 1);
     }
 
-    /// decision 取值不在三个之内 → 退回给人。
+    /// decision 取值不在三个之内时退回人工。
     ///
-    /// 模型偶尔会自创第四个选项（"maybe"、"unknown"），不能因为它
-    /// 发明了词就按 approve 处理。
+    /// 模型偶尔会自创第四个选项（如 "maybe"、"unknown"），不能因此按
+    /// approve 处理。
     #[tokio::test]
     async fn unknown_decision_value_falls_back() {
         let reviewer = ScriptedReviewer::new(vec![
@@ -461,7 +460,7 @@ mod tests {
         assert_eq!(fallback.asked(), 1);
     }
 
-    /// 缺 reason 字段同样算坏 JSON——严格就是严格。
+    /// 缺 reason 字段同样算无效 JSON。
     #[tokio::test]
     async fn missing_reason_field_falls_back() {
         let reviewer = ScriptedReviewer::new(vec![r#"{"decision":"approve"}"#]);
@@ -473,7 +472,7 @@ mod tests {
         assert_eq!(fallback.asked(), 1);
     }
 
-    /// 网关报错 → 退回给人，不把"审查员坏了"当成"可以执行"。
+    /// 网关报错时退回人工，不将审查员故障视为可以执行。
     #[tokio::test]
     async fn model_error_falls_back() {
         struct FailingReviewer;
@@ -497,7 +496,7 @@ mod tests {
         assert_eq!(fallback.asked(), 1);
     }
 
-    /// 模型挂住 → 超时退回给人，不能把审批永远卡在"等审查"。
+    /// 模型挂住时在超时后退回人工，审批不能一直停留在等待审查。
     #[tokio::test]
     async fn hung_model_falls_back_at_the_timeout() {
         let fallback = RecordingFallback::approving();
@@ -515,7 +514,7 @@ mod tests {
         assert_eq!(fallback.asked(), 1, "超时必须问人");
     }
 
-    /// 退路闸门否决时，否决必须透传——审查员不能覆盖人的决定。
+    /// 退路闸门否决时，否决必须透传，审查员不能覆盖人的决定。
     #[tokio::test]
     async fn fallback_denial_is_not_overridden() {
         let reviewer = ScriptedReviewer::new(vec![
@@ -534,10 +533,10 @@ mod tests {
         assert_eq!(decision, Err("人不同意".to_owned()));
     }
 
-    /// 提问里必须带上工具名、参数原文与风险标记。
+    /// 提问必须包含工具名、参数原文与风险标记。
     ///
-    /// 参数原文尤其不能截断：审查员要判断的正是参数里那段越界路径，
-    /// 截断了它只能瞎猜。
+    /// 参数原文不能截断。审查员需要判断的就是参数中的越界路径，截断后只能
+    /// 猜测。
     #[tokio::test]
     async fn review_prompt_carries_the_full_call() {
         let reviewer = ScriptedReviewer::new(vec![
@@ -560,13 +559,11 @@ mod tests {
         assert!(prompt.contains("破坏性"), "风险标记必须带上: {prompt}");
     }
 
-    /// 策略追加的升级理由必须进提问。
+    /// 策略追加的升级理由必须出现在提问中。
     ///
-    /// 用户验收时发现的文档不诚实：README 写"审查员拿到工具名、参数、
-    /// 风险注解与升级理由"，而 `review_prompt` 一次都没用 `request.reason`。
-    /// 后果是策略之上的越界写入复核在 `--ai-review` 下被静默降级——
-    /// 审查员只看到一条普通的 echo 重定向，一句 approve 就放行，
-    /// 人永远看不到 CLI 闸门里那行 `复核:`。
+    /// 缺少该理由时，越界写入复核在 `--ai-review` 下会被降级：审查员只看到
+    /// 普通的 echo 重定向，返回 approve 即放行，用户看不到 CLI 闸门中的
+    /// `复核:` 提示。
     #[test]
     fn review_prompt_carries_the_escalation_reason() {
         let mut req = request(
@@ -587,10 +584,10 @@ mod tests {
         );
     }
 
-    /// 常规审批（没有升级理由）的提问里不该出现那行小标题。
+    /// 常规审批（没有升级理由）的提问不出现该小标题。
     ///
-    /// 否则每次普通审批都多一句空标题，模型会以为每条调用都被判定过
-    /// 疑似越界——噪声会让真正的升级被淹没。
+    /// 否则每次普通审批都多一个空标题，模型会误以为每条调用都被判定为
+    /// 疑似越界，真正的升级信息会被噪声淹没。
     #[test]
     fn review_prompt_omits_the_escalation_line_when_there_is_none() {
         let req = request("write_file", json!({"path": "out.txt", "content": "OK"}));
@@ -603,11 +600,11 @@ mod tests {
         );
     }
 
-    /// 恢复后的重新询问直接问人，不经审查员。
+    /// 恢复后的重新询问直接询问人工，不经过审查员。
     ///
-    /// "人要再点一次"是硬要求：上一次问的是上一个进程里的人，那次没
-    /// 答复。审查员替人点头等于把"人没点过"记成"人点过了"——那正是
-    /// 这条防线要防的事。
+    /// 人必须重新确认：上一次询问发生在上一个进程，且未获答复。审查员
+    /// 代替人批准，会把"人未确认"记为"人已确认"，而这条防线就是为避免
+    /// 这种情况。
     #[tokio::test]
     async fn a_resumed_request_goes_straight_to_the_human() {
         let reviewer = Arc::new(ScriptedReviewer::new(vec![

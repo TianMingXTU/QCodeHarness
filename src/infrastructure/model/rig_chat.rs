@@ -1,10 +1,10 @@
-//! Rig 客户端封装 + rig ↔ domain 类型翻译（防腐层）。
+//! Rig 客户端封装与 rig ↔ domain 类型翻译（防腐层）。
 //!
-//! 这一层是唯一允许出现 `use rig::` 的地方之一（除测试外）。
-//! rig-core 0.45.0 把客户端重构成了 wire/transport/driver 三层，
-//! `DynModel<Completion>` 是擦掉 wire 与 transport 之后的稳定入口：
-//! 真实模型和 `MockCompletionModel` 擦除后是同一类型，所以
-//! 生产和测试走的是同一条代码路径。
+//! 本层是除测试外唯一允许出现 `use rig::` 的地方之一。rig-core 0.45.0
+//! 将客户端重构为 wire/transport/driver 三层，`DynModel<Completion>` 是
+//! 擦除 wire 与 transport 之后的稳定入口。真实模型与
+//! `MockCompletionModel` 擦除后为同一类型，生产与测试因此走同一条代码
+//! 路径。
 
 use std::future::Future;
 use std::sync::Arc;
@@ -32,28 +32,28 @@ use crate::domain::ids::CallId;
 use crate::domain::session::ContextSlice;
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 
-/// 单次模型调用的默认时限。慢模型的完整输出实测可达 60 秒以上，
-/// 取 300 秒兜底"连接挂死"而非"生成得慢"；预算的墙钟维度只在
-/// 轮与轮之间生效，覆盖不到挂死的单次调用，所以这层必须在网关兜住。
+/// 单次模型调用的默认时限。
+///
+/// 慢模型的完整输出实测可超过 60 秒。300 秒用于兜底连接挂死，不用于
+/// 限制生成速度。预算的墙钟维度只在轮与轮之间检查，覆盖不到挂死的
+/// 单次调用，因此必须在网关层兜底。
 const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 模型网关：包住一个已擦除的 rig 模型。
 #[derive(Clone, Debug)]
 pub struct RigChatGateway {
     model: DynModel<Completion>,
-    /// 单次调用的时限。reqwest 默认没有总超时：连接挂死时请求永远
-    /// 不返回，整个任务卡在"等模型回复"。
+    /// 单次调用时限。reqwest 默认没有总超时，连接挂死时请求不会返回，
+    /// 任务会一直等待模型回复。
     call_timeout: Duration,
-    /// 是否已就"provider 不支持某些生成选项"警告过一次。
+    /// 是否已就"provider 不支持某些生成选项"警告过。
     ///
-    /// `OnUnsupported::Ignore` 的降级是静默的——rig 只发一条
-    /// `tracing::warn!`，默认不装 subscriber 就什么也看不见。用户会
-    /// 以为缓存在生效，而实际上一个字段都没发出去。所以在第一次调用
-    /// 前用 `check()` 主动查一次并明说。
+    /// `OnUnsupported::Ignore` 的降级是静默的：rig 只发一条
+    /// `tracing::warn!`，未安装 subscriber 时不可见。用户会以为缓存生效，
+    /// 实际字段都没有发出。因此在第一次调用前用 `check()` 主动检查并告知。
     ///
-    /// 只警告一次：一次运行有几十轮，每轮刷屏只会让人学会忽略它。
-    /// 用 `AtomicBool` 而不是 `Mutex<bool>`：`complete` 拿的是 `&self`，
-    /// 而这个标记不需要和任何东西一起加锁。
+    /// 只警告一次：一次运行有几十轮，每轮重复输出会被忽略。使用
+    /// `AtomicBool`：`complete` 接收 `&self`，该标记无需与其他状态一起加锁。
     warned_unsupported: Arc<AtomicBool>,
 }
 
@@ -76,20 +76,21 @@ impl RigChatGateway {
         }
     }
 
-    /// 第一次调用前查一遍 provider 支不支持我们设的生成选项。
+    /// 第一次调用前检查 provider 是否支持已设置的生成选项。
     ///
-    /// `check()` 是本地预检（不请求服务端），把 wire 与模型目录能判定
-    /// 的拒绝项一次收齐。`OnUnsupported::Ignore` 下真实调用会静默丢掉
-    /// 这些字段，所以必须在这里替用户问出来。
+    /// `check()` 是本地预检，不请求服务端，可一次性收集 wire 与模型目录
+    /// 能判定的拒绝项。`OnUnsupported::Ignore` 下真实调用会静默丢弃这些
+    /// 字段，因此必须在此明确告知用户。
     ///
-    /// 只在第一次调用：`check()` 每次都要本地编码一遍请求，几十轮下来
-    /// 不是零成本，而结论不会变（同一会话的 provider 与模型不变）。
+    /// 仅第一次调用时检查：`check()` 每次都要在本地编码请求，几十轮下来
+    /// 有成本。检查对象是首次请求的模型与生成选项；后续步骤若换了角色
+    /// 模型，该模型的拒绝项不会再提示。
     fn warn_once_about_unsupported(&self, request: &CompletionRequest) {
         if self.warned_unsupported.swap(true, Ordering::Relaxed) {
             return;
         }
-        // `Invalid` 不是"某个选项不被支持"而是"这个请求压根建不起来"，
-        // 真正的调用会带着同样的错误失败，这里不用重复说一遍。
+        // `Invalid` 表示请求无法构建，不属于单个选项不受支持的情况。真实
+        // 调用会以同样的错误失败，这里无需重复提示。
         if let Err(rig::completion::CheckError::Unsupported(refused)) = self.model.check(request) {
             let details = refused
                 .iter()
@@ -113,9 +114,8 @@ impl ModelGateway for RigChatGateway {
         &'a self,
         request: ModelRequest<'a>,
     ) -> BoxFuture<'a, Result<ModelReply, ApplicationError>> {
-        // 请求在这里就拼好（而不是进 async 块再拼）：预检要读它的字段，
-        // 而 async 块里不能再借 self。拼装是纯函数，没有 IO，
-        // 提前做不改变任何时序。
+        // 请求在此处构建，不放入 async 块：预检需要读取其字段，而 async
+        // 块中无法再借用 self。构建是纯函数，无 IO，提前执行不改变时序。
         let built = build_request(
             &request.history,
             request.spec,
@@ -128,13 +128,16 @@ impl ModelGateway for RigChatGateway {
         };
         // 第一次调用前问一遍 provider 收不收我们设的选项。
         self.warn_once_about_unsupported(&request);
-        // DynModel::call 内部克隆 Arc，返回 'static future，
-        // 所以先取出模型再 move 进装箱的 future，不借用 self。
+        // DynModel::call 内部克隆 Arc 并返回 'static future。因此先取出
+        // 模型，再 move 进装箱的 future，不借用 self。
         let model = self.model.clone();
         let call_timeout = self.call_timeout;
         Box::pin(async move {
-            // 双层 ?：外层是调用时限（ModelTimeout），内层是 provider 错误（Model）。
-            let response = with_call_timeout(model.call(request), call_timeout).await??;
+            // 外层 ? 处理调用时限（ModelTimeout）；内层把 provider 错误转换
+            // 为应用层的 Model 错误，避免 rig 类型泄漏到上层。
+            let response = with_call_timeout(model.call(request), call_timeout)
+                .await?
+                .map_err(|error| ApplicationError::Model(error.to_string()))?;
             Ok(ModelReply {
                 turn: AgentTurn::from(&response),
                 usage: TokenUsage::from(&response.usage),
@@ -143,8 +146,8 @@ impl ModelGateway for RigChatGateway {
     }
 }
 
-/// 给一次模型调用套上时限：超时返回 [`ApplicationError::ModelTimeout`]，
-/// 不让挂死的连接把整个任务冻在"等模型回复"。
+/// 给一次模型调用设置时限。超时返回 [`ApplicationError::ModelTimeout`]，
+/// 避免挂死的连接让任务一直等待模型回复。
 async fn with_call_timeout<F, T>(future: F, limit: Duration) -> Result<T, ApplicationError>
 where
     F: Future<Output = T>,
@@ -156,15 +159,16 @@ where
         })
 }
 
-/// 把裁剪后的历史片段与规格翻译成 rig 的请求。
+/// 把裁剪后的历史片段与规格转换为 rig 请求。
 ///
-/// 消息顺序必须是 `[System, ...历史, 最后一条]`：`new()` 收下最后一条作为
-/// prompt，`messages()` 把其余历史插到它前面，`preamble()` 再插入系统提示。
+/// 消息顺序必须为 `[System, ...历史, 最后一条]`。`new()` 接收最后一条
+/// 作为 prompt，`messages()` 将其余历史插到它前面，`preamble()` 插入
+/// 系统提示。
 ///
-/// 工具规格从 `ModelRequest.tools` 来——注册表是工具的唯一清单，
-/// 不从 `AgentSpec` 取。
+/// 工具规格来自 `ModelRequest.tools`。注册表是工具的唯一清单，不从
+/// `AgentSpec` 获取。
 ///
-/// `cache_key` 是会话 ID，见 [`ModelRequest::cache_key`]。
+/// `cache_key` 为会话 ID，见 [`ModelRequest::cache_key`]。
 fn build_request(
     history: &[ContextSlice<'_>],
     spec: &AgentSpec,
@@ -172,9 +176,8 @@ fn build_request(
     cache_key: Option<&str>,
 ) -> Result<CompletionRequest, ApplicationError> {
     let mut messages = slices_to_messages(history);
-    // Session::new 总会把用户任务放进历史，所以这里必然取得到。
-    // 真取不到就报错而不是 panic：这个函数本来就返回 Result，
-    // 没有理由让一条畸形历史把整个进程带走。
+    // Session::new 总会把用户任务放入历史，因此这里应当能取到。取不到时
+    // 返回错误而不 panic：函数本来返回 Result，畸形历史不应终止整个进程。
     let prompt = messages.pop().ok_or(ApplicationError::EmptyHistory)?;
 
     let mut request = CompletionRequest::new(prompt)
@@ -182,11 +185,11 @@ fn build_request(
         .preamble(spec.system_prompt.clone())
         .tools(tools.iter().map(ToolDefinition::from))
         .options(generation_options(cache_key, spec.effort, spec.verbosity));
-    // 按请求覆盖模型名：`None` 时 provider 用自己的默认模型。
+    // 按请求覆盖模型名，`None` 时 provider 使用自己的默认模型。
     //
-    // rig 的 OpenAI Chat 编码器是 `request.model.clone().unwrap_or_else(
-    // || self.model.clone())`——一个客户端服务多个模型靠的就是这一行。
-    // 一个 `DynModel` 因此能服务多个角色，模型名来自配置而不是代码。
+    // rig 的 OpenAI Chat 编码器使用
+    // `request.model.clone().unwrap_or_else(|| self.model.clone())`。
+    // 一个 `DynModel` 因此可以服务多个角色，模型名来自配置。
     if let Some(model) = &spec.model {
         request.model = Some(model.clone());
     }
@@ -196,40 +199,37 @@ fn build_request(
 /// 一次请求的生成选项：缓存保留期、路由键、并行工具调用、降级策略、
 /// 推理档位与输出档位。
 ///
-/// **不设 `cache_points`，这不是遗漏。** rig-core 0.45 的
-/// `CompletionRequest.cache_points` 只有 Anthropic Messages 编码器会读
-/// （`providers/anthropic/completion.rs` 按位置倒序取点、超额丢弃）；
-/// 我们走的 OpenAI 兼容 Chat Completions 编码器
-/// （`providers/openai/wire/chat.rs`）通篇不碰这个字段——`grep -rn
-/// cache_points src/providers/openai/` 零匹配。给它赋值只会让读代码的
-/// 人以为配了缓存断点，而 wire 上一个字节都不会多发。真正在 Chat
-/// 路由上生效的是下面三个选项，它们由 `providers/openai/options.rs`
-/// 映射成 body 顶层的 `prompt_cache_retention` / `prompt_cache_key` /
-/// `parallel_tool_calls`。
+/// 不设置 `cache_points`。rig-core 0.45 中只有 Anthropic Messages 编码器
+/// 读取该字段（`providers/anthropic/completion.rs` 按位置倒序取点，超额
+/// 丢弃）；本项目使用的 OpenAI 兼容 Chat Completions 编码器
+/// （`providers/openai/wire/chat.rs`）不读该字段，
+/// `grep -rn cache_points src/providers/openai/` 无匹配。赋值只会让读者
+/// 误以为配置了缓存断点，wire 上不会多发任何字节。Chat 路由实际生效的
+/// 是以下三个选项，由 `providers/openai/options.rs` 映射为 body 顶层的
+/// `prompt_cache_retention`、`prompt_cache_key` 与 `parallel_tool_calls`。
 ///
-/// 保留期取 `Short`：任务中途有人长时间不回复审批时缓存可能过期，
-/// 长保留要多花钱，而 `Budget::max_wall_clock` 本来就是兜底。
-/// `Short` 在传统路径映射为 `prompt_cache_retention: "in_memory"`，
-/// 在走 `prompt_cache_options` 的模型上则不发字段（默认保留约 30 分钟）。
+/// 保留期取 `Short`：审批停顿较久时缓存可能过期，长保留费用更高，且
+/// `Budget::max_wall_clock` 已是兜底。`Short` 在传统路径映射为
+/// `prompt_cache_retention: "in_memory"`；在走 `prompt_cache_options` 的
+/// 模型上不发送该字段（默认保留约 30 分钟）。
 ///
-/// `parallel_tool_calls(true)` 是显式设置而不是依赖 provider 默认值：
-/// 一次回复里给多个调用能省掉整轮往返，而"默认开还是默认关"各 provider
-/// 说法不一，不该让吞吐取决于对端的默认配置。
+/// `parallel_tool_calls(true)` 显式设置，不依赖 provider 默认值。一次
+/// 回复返回多个调用可以省去整轮往返，而各 provider 的默认行为不一致，
+/// 吞吐不应取决于对端配置。
 ///
-/// `on_unsupported(Ignore)`：不是所有 provider 都认这些字段。选 `Error`
-/// 会让整个 agent 在只支持部分选项的 provider 上直接不可用——那比没有
-/// 缓存严重得多。代价是降级静默，所以网关在第一次调用前用 `check()`
-/// 主动查一遍并把结果告诉用户（见 [`RigChatGateway::warn_once_about_unsupported`]）。
+/// `on_unsupported(Ignore)`：有些 provider 不支持这些字段。选择 `Error`
+/// 会让 agent 在只支持部分选项的 provider 上不可用，后果比没有缓存严重。
+/// 代价是降级静默，因此网关在第一次调用前用 `check()` 检查并告知用户
+/// （见 [`RigChatGateway::warn_once_about_unsupported`]）。
 ///
-/// **`effort` / `verbosity` 也走同一个降级策略**：很多 provider 不认
-/// `verbosity`（OpenAI 之外的大多数），不认就丢掉这个字段继续跑——
-/// 让整个 agent 不可用比少一个字段糟糕得多。
+/// `effort` 与 `verbosity` 使用同一降级策略。多数非 OpenAI provider 不
+/// 支持 `verbosity`，不支持时丢弃该字段继续运行，避免整个 agent 不可用。
 ///
-/// **`None` 的 `cache_key` 是"这个请求压根不参与前缀缓存"**（摘要、AI 审查
-/// 这类一次性调用），此时**不发这个字段**。不能拿空字符串顶替：rig 只把
-/// `None` 映射成 `Mapping::Nothing`，`Some("")` 会映射成
+/// `cache_key` 为 `None` 表示请求不参与前缀缓存（摘要、AI 审查等一次性
+/// 调用），此时不发送该字段。不能用空字符串代替：rig 只把 `None` 映射为
+/// `Mapping::Nothing`，`Some("")` 会映射为
 /// `Mapping::Send({"prompt_cache_key": ""})`（见 rig-core 的
-/// `providers/openai/options.rs`），于是所有一次性请求共用一个固定的空键。
+/// `providers/openai/options.rs`），导致所有一次性请求共享固定的空键。
 fn generation_options(
     cache_key: Option<&str>,
     effort: Option<Effort>,
@@ -270,11 +270,11 @@ fn rig_verbosity(verbosity: Verbosity) -> RigVerbosity {
     }
 }
 
-/// 把历史片段翻译成 rig 的消息序列。
+/// 把历史片段转换为 rig 消息序列。
 ///
-/// 注意 User/Agent/Observation 的映射与配对：一条 `Round` 帧产出助手消息
-/// （含 tool_calls），紧跟的观察产出 tool 结果消息，
-/// 两者靠调用 ID 关联——顺序错了 OpenAI 兼容端点会直接 400。
+/// 注意 User、Agent、Observation 的映射与配对：一条 `Round` 帧生成助手
+/// 消息（含 tool_calls），紧随其后的观察生成 tool 结果消息，两者通过
+/// 调用 ID 关联。顺序错误会使 OpenAI 兼容端点返回 400。
 fn slices_to_messages(history: &[ContextSlice<'_>]) -> Vec<Message> {
     let mut messages = Vec::with_capacity(history.len() * 2);
     for slice in history {
@@ -301,8 +301,8 @@ fn slices_to_messages(history: &[ContextSlice<'_>]) -> Vec<Message> {
 /// 拼装助手消息：文本块 + 工具调用块。
 fn assistant_message(thought: &str, calls: &[ToolCall]) -> Message {
     let mut content = Vec::with_capacity(calls.len() + 1);
-    // 空文本不能进 content：rig 把空 text 块判为空白内容，
-    // 部分 provider 会拒收空 content 块的消息。
+    // 空文本不能放入 content：rig 将空 text 块视为空白内容，部分 provider
+    // 会拒收含空 content 块的消息。
     if !thought.trim().is_empty() {
         content.push(AssistantContent::text(thought));
     }
@@ -318,10 +318,10 @@ fn assistant_tool_call(call: &ToolCall) -> AssistantContent {
     ))
 }
 
-/// 领域观察 → rig 的 tool 结果。
+/// 领域观察 → rig tool 结果。
 ///
-/// 每条结果都从对应的调用取 ID 与工具名，而不是自己拼——rig 的文档明确
-/// 要求"用它所回答的调用来构造"，这样 ID 和名字才不会和调用对不上。
+/// 每条结果都从对应调用取 ID 与工具名。rig 文档要求用所回答的调用来
+/// 构造结果，这样 ID 和名称不会与调用不一致。
 fn observations_to_results(calls: &[ToolCall], observations: &[ToolOutcome]) -> Vec<ToolResult> {
     debug_assert_eq!(
         calls.len(),
@@ -359,10 +359,10 @@ fn domain_tool_call(call: &RigToolCall) -> ToolCall {
     ToolCall {
         id: CallId::new(call.id.wire().into_owned()),
         name: call.function.name.as_str().to_owned(),
-        // 模型给了非对象参数时，rig 把能读到的部分放进 arguments、原文放进
-        // invalid_arguments。这里取前者：后者会让工具收到一段无法反序列化的
-        // 文本，而前者至少能让参数校验给出"缺字段"这类可操作的错误，
-        // 模型据此重试即可。
+        // 模型提供非对象参数时，rig 将可解析部分放入 arguments，原文放入
+        // invalid_arguments。这里取前者：后者会让工具收到无法反序列化的
+        // 文本，前者至少能让参数校验返回"缺字段"这类可操作的错误，供模型
+        // 重试。
         arguments: call.function.arguments_value(),
     }
 }
@@ -372,14 +372,14 @@ impl From<&Usage> for TokenUsage {
         Self {
             input_tokens: usage.input_tokens.unwrap_or(0),
             output_tokens: usage.output_tokens.unwrap_or(0),
-            // 缓存命中与写入的 token 必须单独平移，不能并进 input_tokens：
-            // 并进去就看不出缓存有没有生效，而"缓存命中率"是判断提速
-            // 有没有到手的唯一直接证据。provider 不报告时是 0 而不是
-            // None——"没有缓存"与"没查到"在这里同义，都不影响合计。
+            // 缓存命中与写入的 token 必须单独保留，不能并入 input_tokens，
+            // 否则无法判断缓存是否生效；缓存命中率是判断提速是否实现的
+            // 唯一直接证据。provider 未报告时取 0：这里"没有缓存"与
+            // "未查到"同义，都不影响合计。
             cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
             cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-            // rig 的诚实策略照搬：无法定价时是 None，报表显示"未知"，
-            // 绝不折算成 0。
+            // 沿用 rig 的策略：无法定价时为 None，报表显示"未知"，
+            // 不折算成 0。
             cost_usd: usage.cost.map(|cost| cost.total),
         }
     }
@@ -398,8 +398,8 @@ impl From<&ToolSpec> for ToolDefinition {
 
 /// 领域注解 → rig 注解。
 ///
-/// rig 的取值带协议默认值（未设即"非只读、破坏性、开放世界"），
-/// 所以四个字段都要显式写进去，不能只设一半。
+/// rig 的取值带协议默认值（未设置即为非只读、破坏性、开放世界），
+/// 因此四个字段都要显式写入。
 fn rig_annotations(annotations: &ToolAnnotations) -> RigToolAnnotations {
     RigToolAnnotations::default()
         .with_read_only(annotations.read_only)
@@ -520,16 +520,15 @@ mod tests {
                 cost_usd: Some(0.75),
             }
         );
-        // provider 未报告成本 → None（报表显示"未知"，绝不折算成 0）。
+        // provider 未报告成本时为 None，报表显示"未知"，不折算成 0。
         assert_eq!(TokenUsage::from(&Usage::default()).cost_usd, None);
     }
 
-    /// 缓存计数器必须原样平移，不能并进 input_tokens。
+    /// 缓存计数器必须原样保留，不能并入 input_tokens。
     ///
-    /// 并进去的后果不是精度损失，是**缓存有没有生效直接看不出来**——
-    /// 而命中率是判断"省下的 prefill 时间有没有到手"的唯一直接证据。
-    /// rig 的契约：`cached + cache_creation <= input`，即 input 已含这三类，
-    /// 所以命中率的分母用 input、分子用 cached 是自洽的。
+    /// 并入后无法判断缓存是否生效；命中率是判断 prefill 时间是否节省的
+    /// 唯一直接证据。rig 的契约是 `cached + cache_creation <= input`，
+    /// input 已包含这两类，因此命中率以 input 为分母、cached 为分子。
     #[test]
     fn usage_translates_cache_counters_separately() {
         let mut usage = Usage::default();
@@ -546,8 +545,8 @@ mod tests {
             translated.input_tokens, 10_000,
             "input 是 provider 报的原值，不减掉缓存部分"
         );
-        // provider 不报告缓存计数时是 0：没有缓存与没查到在这里同义，
-        // 都不该让合计变成 None。
+        // provider 不报告缓存计数时取 0：没有缓存与未查到同义，都不应让
+        // 合计变成 None。
         let bare = TokenUsage::from(&Usage::default());
         assert_eq!(bare.cached_input_tokens, 0);
         assert_eq!(bare.cache_creation_input_tokens, 0);
@@ -555,8 +554,8 @@ mod tests {
 
     #[tokio::test]
     async fn hung_model_call_is_cut_off_at_the_timeout() {
-        // 永不完成的 future 模拟挂死的连接：时限一到必须报错，
-        // 而不是把任务永远冻在"等模型回复"。
+        // 永不完成的 future 模拟挂死的连接。时限到达时必须报错，不能让
+        // 任务一直等待模型回复。
         let error = with_call_timeout(std::future::pending::<CompletionResponse>(), Duration::from_millis(20))
             .await
             .unwrap_err();
@@ -578,10 +577,9 @@ mod tests {
 
     /// 请求必须带上缓存保留期、路由键与并行工具调用开关。
     ///
-    /// 这三项是 OpenAI 兼容 Chat 路由上**真正会发出**的缓存相关字段
-    /// （映射成 body 顶层的 `prompt_cache_retention` /
-    /// `prompt_cache_key` / `parallel_tool_calls`）。断言它们存在，
-    /// 是为了将来有人"顺手清理未使用的 options"时测试会拦下来。
+    /// 这三项是 OpenAI 兼容 Chat 路由上实际发送的缓存相关字段，分别映射为
+    /// body 顶层的 `prompt_cache_retention`、`prompt_cache_key` 与
+    /// `parallel_tool_calls`。断言其存在，防止后续清理未使用选项时误删。
     #[test]
     fn request_carries_the_cache_and_parallel_options() {
         let session = Session::new(SessionId::new("session-42"), "任务");
@@ -612,11 +610,10 @@ mod tests {
         );
     }
 
-    /// 路由键跟着会话走：换一个会话就是另一个键。
+    /// 路由键随会话变化：换一个会话就换一个键。
     ///
-    /// 这条守住的是"键必须稳定"的另一半——它还得**随会话变化**。
-    /// 所有会话共用一个键会让 provider 把互不相干的前缀混在一起，
-    /// 命中率与安全性双双落空。
+    /// 键既要稳定，也要随会话变化。所有会话共用一个键会让 provider 把
+    /// 互不相干的前缀混在一起，命中率与安全性都会下降。
     #[test]
     fn cache_key_follows_the_session() {
         let session = Session::new(SessionId::new("s1"), "任务");
@@ -627,14 +624,13 @@ mod tests {
         assert_eq!(second.options.cache_key.as_deref(), Some("session-b"));
     }
 
-    /// 一次性调用（摘要、AI 审查）不带路由键：不设这个字段，
-    /// 而不是设成一个空字符串。
+    /// 一次性调用（摘要、AI 审查）不设置路由键字段，不使用空字符串。
     ///
-    /// rig-core 0.45 只把 `None` 映射成 `Mapping::Nothing`；
-    /// `Some("")` 照样映射成 `Mapping::Send({"prompt_cache_key": ""})`
-    /// （见 `providers/openai/options.rs` 的 `prompt_cache_key`）。
-    /// 用空字符串表达"不带键"时，所有摘要与审查请求就共用一个固定的
-    /// 空键——注释说它们不参与前缀缓存，wire 上却句句都带着同一个键。
+    /// rig-core 0.45 只把 `None` 映射为 `Mapping::Nothing`；
+    /// `Some("")` 会映射为 `Mapping::Send({"prompt_cache_key": ""})`
+    /// （见 `providers/openai/options.rs` 的 `prompt_cache_key`）。用空字符串
+    /// 表示"不带键"时，所有摘要与审查请求会共用一个固定空键，wire 上每个
+    /// 请求都携带该键。
     #[test]
     fn a_one_off_call_sends_no_cache_key_at_all() {
         let session = Session::new(SessionId::new("s1"), "任务");
@@ -644,19 +640,19 @@ mod tests {
             request.options.cache_key, None,
             "不带键就是不设这个字段，空字符串会在 wire 上变成 prompt_cache_key: \"\""
         );
-        // 只少这一个字段：保留期与并行开关与主循环一致，
-        // 否则"一次性调用"会被做成"降级请求"。
+        // 只缺这一个字段：保留期与并行开关与主循环一致，否则一次性调用
+        // 会变成降级请求。
         assert_eq!(request.options.cache, Some(CacheRetention::Short));
         assert_eq!(request.options.parallel_tool_calls, Some(true));
     }
 
-    /// 不设 `cache_points`，这是查证过的决定而不是遗漏。
+    /// 不设置 `cache_points`，这是查证后的决定。
     ///
-    /// rig-core 0.45 里只有 Anthropic Messages 编码器读这个字段；
-    /// 我们走的 OpenAI 兼容 Chat 编码器通篇不碰它
-    /// （`grep -rn cache_points src/providers/openai/` 零匹配）。
-    /// 给它赋值只会让读代码的人以为配了缓存断点，而 wire 上一个字节
-    /// 都不会多发——所以这里断言它就是空的，把决定钉在测试里。
+    /// rig-core 0.45 中只有 Anthropic Messages 编码器读取该字段；项目使用的
+    /// OpenAI 兼容 Chat 编码器不读它
+    /// （`grep -rn cache_points src/providers/openai/` 无匹配）。赋值会让
+    /// 读者误以为配置了缓存断点，wire 上不会多发任何字节。测试断言该字段
+    /// 为空，固定这一决定。
     #[test]
     fn request_leaves_cache_points_empty_because_the_chat_wire_ignores_them() {
         let session = Session::new(SessionId::new("s1"), "任务");
@@ -671,12 +667,12 @@ mod tests {
 
     // ── 按角色分配模型与档位 ──────────────────────────────────────────
 
-    /// 规格里配了模型名时，请求的 `model` 字段被覆盖成它。
+    /// 规格配置了模型名时，请求的 `model` 字段被覆盖。
     ///
-    /// rig 的 OpenAI Chat 编码器是 `request.model.clone().unwrap_or_else(
-    /// || self.model.clone())`——一个客户端服务多个模型靠的就是这一行。
-    /// 断言它被覆盖，才算证明"按角色换模型"真的落到 wire 上，而不只是
-    /// 在配置里躺了一字段。
+    /// rig 的 OpenAI Chat 编码器使用
+    /// `request.model.clone().unwrap_or_else(|| self.model.clone())`。
+    /// 断言语义覆盖，确认"按角色换模型"确实落到请求上，不只是在配置里
+    /// 保存了一个字段。
     #[test]
     fn the_spec_model_overrides_the_request_model() {
         let session = Session::new(SessionId::new("s1"), "任务");
@@ -692,12 +688,11 @@ mod tests {
         );
     }
 
-    /// **没有配角色模型时行为保持不变**（回归保护）。
+    /// 未配置角色模型时行为保持不变（回归保护）。
     ///
-    /// 请求不带 `model` 字段时，由 provider 用自己配置的默认模型。按角色
-    /// 选模型最容易出的岔子就是"没配也发一个模型名"——那会让所有部署的
-    /// 默认模型悄悄失效。这条断言把"没配 = 不发"钉住：没配时
-    /// `request.model` 必须是 `None`。
+    /// 请求不带 `model` 字段时，provider 使用自己配置的默认模型。按角色
+    /// 选模型时容易出现"未配置也发送模型名"，这会让部署的默认模型失效。
+    /// 断言未配置时 `request.model` 必须为 `None`。
     #[test]
     fn without_a_configured_model_the_request_carries_none() {
         let session = Session::new(SessionId::new("s1"), "任务");
@@ -712,10 +707,10 @@ mod tests {
         );
     }
 
-    /// 推理档位与输出档位落到请求的生成选项上。
+    /// 推理档位与输出档位写入请求的生成选项。
     ///
-    /// 两者都是 provider 不一定认的字段，所以同时要断言降级策略还是
-    /// `Ignore`——档位一加进来，降级策略就跟着成了它们的最后一道防线。
+    /// 两者都是 provider 可能不支持的字段，因此同时断言降级策略为 `Ignore`。
+    /// 档位选项引入后，降级策略是它们的兜底。
     #[test]
     fn the_spec_tiers_reach_the_generation_options() {
         let session = Session::new(SessionId::new("s1"), "任务");
@@ -742,11 +737,10 @@ mod tests {
         );
     }
 
-    /// 没配档位时选项里不出现 reasoning / verbosity。
+    /// 未配置档位时，选项里不出现 reasoning 与 verbosity。
     ///
-    /// 与模型名同理：不配就是不设。硬塞一个 `None` 之外的默认值会让
-    /// provider 以为自己收到了一个明确的档位指令，从而覆盖它自己的默认
-    /// 行为——那正是"没配却变了"的形态。
+    /// 与模型名相同：未配置就不设置。填入 `None` 之外的默认值会让 provider
+    /// 认为收到了明确的档位指令，覆盖自身的默认行为。
     #[test]
     fn without_configured_tiers_no_tier_options_are_sent() {
         let session = Session::new(SessionId::new("s1"), "任务");

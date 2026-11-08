@@ -1,4 +1,4 @@
-//! 非 Windows 平台尚未实现进程沙箱，调用方应声明降级后继续执行。
+//! 非 Windows 平台未实现进程沙箱。调用方应报告降级后继续执行。
 
 use crate::domain::sandbox::SandboxPolicy;
 
@@ -13,9 +13,9 @@ impl JobGuard {
         Err(UNSUPPORTED.to_owned())
     }
 
-    /// 本平台无进程沙箱，无法把外部 PID 纳入任何边界。与 Windows 分支
-    /// 一样是 `JobGuard` 上的方法，让调用方不必为平台差异写 cfg 分支；
-    /// 实际上 `create` 在本平台恒失败，本方法没有可达的实例。
+    /// 本平台没有进程沙箱，无法把外部 PID 纳入边界。与 Windows 分支一样
+    /// 定义为 `JobGuard` 的方法，调用方无需为平台差异写 cfg 分支。
+    /// `create` 在本平台总是失败，因此不存在可达的实例。
     pub fn assign_pid(&self, _pid: u32) -> Result<(), String> {
         Err(UNSUPPORTED.to_owned())
     }

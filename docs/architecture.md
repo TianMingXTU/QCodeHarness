@@ -24,12 +24,9 @@ IO、`rig`、`toml`、`tokio`、`windows` 与文件操作，这条边界由验�
 `application/` 的新增代码只依赖 domain 与端口 trait；需要读文件系统或起进程
 的逻辑放 `infrastructure/`。
 
-仓库里还有若干**既有越层**，是待偿的债，新代码不要仿效，例如：
-`application/error.rs` 直接引用 rig 的 `ProviderError`、
-`application/benchmark.rs` 直接使用 `infrastructure` 并做基准 fixture 的文件
-拷贝、`interface/instructions.rs` 读项目指令文件、`interface/cli.rs` 直接使用
-`infrastructure` 的内存证据汇。它们先于扩展点改造存在，本轮的五个扩展点没有
-新增越层。
+生产代码遵守这条边界：`application/` 不引用具体实现，需要文件、进程或
+网络的模块放在 `infrastructure/`。单元测试可以用临时目录与 mock 网关，
+那是测试装配，不算越层。
 
 ## 扩展点
 

@@ -1,11 +1,11 @@
-//! 自定义 LLM 提供方：实现 `LlmProvider`，把自家的模型服务接进 Harness。
+//! 自定义 LLM 提供方：实现 `LlmProvider`，接入自有的模型服务。
 //!
 //! 运行：`cargo run --example custom-llm-provider`
 //!
-//! 提供方只回答"网关从哪来"——服务地址、凭据、默认模型归它管；一次调用
-//! 怎么拼请求、怎么读回复仍归 `ModelGateway`。这里用一个固定回复的网关
-//! 演示装配，不访问网络；接真实服务时把 `EchoGateway` 换成你的客户端实现
-//! （内置的 rig 网关见 `infrastructure/model/rig_chat.rs`）。
+//! `LlmProvider` 只负责网关的来源：服务地址、凭据与默认模型。请求构造
+//! 与回复解析由 `ModelGateway` 负责。示例网关返回固定文本，不访问网络；
+//! 接入真实服务时替换 `EchoGateway`（内置的 rig 网关见
+//! `infrastructure/model/rig_chat.rs`）。
 
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ impl ModelGateway for EchoGateway {
     }
 }
 
-/// 自定义提供方：声明标识，交出一份构造好的网关。
+/// 自定义提供方：声明标识并交出构造好的网关。
 struct MyProvider {
     gateway: Arc<dyn ModelGateway>,
 }

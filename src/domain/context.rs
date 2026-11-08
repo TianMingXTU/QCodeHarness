@@ -1,18 +1,17 @@
 //! 上下文预算与历史裁剪。
 //!
-//! 长任务的历史会无限增长：每轮都把完整历史发给模型，token 成本线性上升，
-//! 最终超出模型输入上限直接报错。裁剪是"发给模型时怎么看历史"的纯函数
-//! 变换——[`Session`] 本身不被修改，证据、审计与将来的恢复都依赖完整历史。
+//! 长任务的历史会持续增长：每轮都发送完整历史，token 成本线性上升，
+//! 最终超出模型输入上限。裁剪是发送前对历史做的一次纯函数变换，
+//! [`Session`] 本身不被修改；证据、审计与恢复都依赖完整历史。
 //!
-//! 被裁掉的历史有两种呈现：占位说明（确定性、零成本），或一段已生成的
-//! 摘要（信息量大，但摘要本身是一次模型调用，挂在 `Session` 上只做一次）。
-//! `compact` 不调模型——摘要文本由调用方喂进来，这里只负责"有就用"。
+//! 被裁掉的历史有两种呈现：占位说明（确定、零成本）或已生成的摘要
+//! （信息量大，但摘要本身是一次模型调用；覆盖范围不够时还会再生成）。
+//! `compact` 不调模型，摘要文本由调用方传入，这里只负责有则用之。
 //!
-//! **上下文与证据分开。** 历史被裁掉之后，模型仍然需要知道
-//! "这个任务动过什么"：读过哪些文件、写过哪些文件、跑过哪些命令、哪些
-//! 调用没成功。这些事实由 [`EvidenceIndex`] 从会话历史**算**出来（不是另记
-//! 一份账——另记一份就会与历史分叉），在占位说明之后呈现给模型；用户也能
-//! 通过 `--report` 取到同一份账。
+//! **上下文与证据分开。** 历史被裁掉后，模型仍要知道这个任务动过什么：
+//! 读过哪些文件、写过哪些文件、跑过哪些命令、哪些调用没成功。这些事实
+//! 由 [`EvidenceIndex`] 从会话历史**算**出来，另记一份会与历史分叉。
+//! 台账在占位说明之后呈现给模型；用户也能通过 `--report` 取到同一份账。
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -32,10 +31,9 @@ pub struct Summary {
     pub text: String,
     /// 摘要覆盖的步骤号（1-based），由代码从会话算出。
     ///
-    /// 步骤边界是**代码**知道的：历史里每条非交接的用户消息就是一步的
-    /// 交代，数一遍就知道每轮属于第几步。模型可能漏写、可能写错编号，
-    /// 而"这份摘要讲的是哪几步"必须准确——下一步的模型要靠它对上自己
-    /// 的进度。
+    /// 步骤边界由**代码**确定：历史里每条非交接的用户消息是一步的交代，
+    /// 数一遍就知道每轮属于第几步。模型可能漏写或写错编号，而摘要覆盖
+    /// 哪几步必须准确，下一步的模型要靠它核对进度。
     ///
     /// `#[serde(default)]` 保持旧版快照可反序列化。
     #[serde(default)]
@@ -50,7 +48,7 @@ impl Summary {
             .all(|round| *round >= self.covers.0 && *round <= self.covers.1)
     }
 
-    /// 覆盖的步骤范围（1-based，含端点）。一个都没覆盖时为 `None`。
+    /// 覆盖的步骤范围（1-based，含端点）。未覆盖任何步骤时为 `None`。
     pub fn step_range(&self) -> Option<(u32, u32)> {
         let first = self.steps.first().copied()?;
         let last = self.steps.last().copied()?;
@@ -58,11 +56,11 @@ impl Summary {
     }
 }
 
-/// 摘要策略：控制"被裁掉多少轮才值得再花一次模型调用"。
+/// 摘要策略：控制被裁掉多少轮才值得再花一次模型调用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SummarizePolicy {
-    /// 被裁轮次达到这个数才生成/更新摘要。调太高会一直用占位说明，
-    /// 调太低则摘要调用太频繁；1-2 适合短上下文预算，默认给 2。
+    /// 被裁轮次达到这个数才生成或更新摘要。太高会一直用占位说明，
+    /// 太低则摘要调用过频。1-2 适合短上下文预算。
     pub min_dropped_to_summarize: usize,
 }
 
@@ -70,23 +68,22 @@ pub struct SummarizePolicy {
 ///
 /// **token 优先，轮数只作兜底。** 轮数不是好的上限：同样一轮，读一个
 /// 10 行文件与跑一条输出 5 万字的命令，token 量差三个数量级。轮数相同
-/// 的两个会话，一个早就该裁、一个还远没到上限——按轮数裁要么白裁、
-/// 要么照旧爆窗。
+/// 的两个会话，一个早该裁，一个远未到上限，按轮数裁要么多裁，要么
+/// 仍然爆窗。
 ///
-/// 代价是 token 数要**估算**（见 [`estimate_tokens`]）。真要用精确数就得
-/// 引入分词器，那是一个新依赖，而且各家模型的分词器还不一样。
+/// 代价是 token 数需要**估算**（见 [`estimate_tokens`]）。精确数需要
+/// 分词器，这是新依赖，而且各家模型的分词器不同。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextBudget {
     /// 历史最多占多少 token。`None` 表示不按 token 裁剪。
     pub max_tokens: Option<usize>,
     /// 至少保留最近多少轮。
     ///
-    /// 这是**下限**：token 预算再紧，最近这几轮也留着。模型连着几轮
-    /// 看不到自己刚做过什么，就会重新问一遍、重新读一遍；而它要的
-    /// 恰恰是"刚才那次调用结果是什么"。
+    /// 这是**下限**：token 预算再紧，最近几轮也保留。模型连续几轮看不到
+    /// 自己刚做过什么，会重新问、重新读，它需要的是上一次调用的结果。
     pub min_recent_rounds: usize,
-    /// 是否始终保留最初的用户任务。强烈建议 true——模型忘了自己在干什么，
-    /// 后面每一轮都会跑偏。
+    /// 是否始终保留最初的用户任务。建议设为 true，模型忘了任务目标后，
+    /// 后续每轮都会跑偏。
     pub keep_task: bool,
     /// 被裁历史是否用摘要替代占位说明。`None` 表示只用占位说明。
     pub summarize: Option<SummarizePolicy>,
@@ -124,7 +121,7 @@ impl Default for ContextBudget {
             max_tokens: Some(DEFAULT_MAX_TOKENS),
             min_recent_rounds: DEFAULT_MIN_RECENT_ROUNDS,
             keep_task: true,
-            // 默认不开摘要：多一次模型调用是不可忽略的成本，显式开启。
+            // 默认不开摘要：多一次模型调用是额外成本，需要显式开启。
             summarize: None,
         }
     }
@@ -132,25 +129,25 @@ impl Default for ContextBudget {
 
 /// 默认的历史 token 预算。
 ///
-/// 16k 的取法：常见模型窗口至少 32k，扣掉系统提示词、工具定义与当前
-/// 轮之后，留给历史的空间就是这个量级。它比"16 轮"更贴近真实成本：
-/// 一轮读文件的观察可能几百 token，一轮跑测试的观察可能上万。
+/// 取 16k：常见模型窗口至少 32k，扣掉系统提示词、工具定义与当前轮，
+/// 留给历史的空间是这个量级。它比"16 轮"更贴近真实成本：一轮读文件的
+/// 观察可能几百 token，一轮跑测试的观察可能上万。
 pub const DEFAULT_MAX_TOKENS: usize = 16_000;
 
 /// 默认至少保留的近期轮数。
 ///
-/// 两轮是最低限度：一轮是"我刚做了什么"，一轮是"结果是什么"。
+/// 两轮是下限：一轮是刚做了什么，一轮是结果是什么。
 pub const DEFAULT_MIN_RECENT_ROUNDS: usize = 2;
 
 /// 估算一段文本占多少 token。
 ///
-/// **这是预算用的估算，不是计费口径。** 真实用量看 provider 报的
-/// `usage`；两者在中文上能差三四倍，所以这里的数字只用来决定"要不要
-/// 裁"，不用来算钱。
+/// **这是预算用的估算，不是计费口径。** 真实用量以 provider 报的
+/// `usage` 为准。两者在中文上能差三四倍，这里的数字只用于决定是否
+/// 裁剪，不用于算钱。
 ///
 /// 口径：CJK 字符按 1 个 token 记，其余字符按 4 个字符 1 个 token 记。
-/// 纯"字符数 ÷ 4"（英文的通用近似）会把中文低估三到四倍——本项目的
-/// 提示词、历史与工具输出绝大多数是中文，用那个口径等于预算形同虚设。
+/// 纯"字符数 ÷ 4"是英文的通用近似，会把中文低估三到四倍。本项目的
+/// 提示词、历史与工具输出以中文为主，用那个口径预算会形同虚设。
 pub fn estimate_tokens(text: &str) -> usize {
     let mut cjk = 0usize;
     let mut other = 0usize;
@@ -164,10 +161,10 @@ pub fn estimate_tokens(text: &str) -> usize {
     cjk + other.div_ceil(4)
 }
 
-/// 这个字符算不算 CJK（含中日韩标点与全角形式）。
+/// 这个字符是否属于 CJK（含中日韩标点与全角形式）。
 ///
-/// 全角与 CJK 标点一并算进来：它们在中文文本里密度很高（每句话都带
-/// 逗号句号），漏掉它们会让估算再偏一截。
+/// 全角与 CJK 标点一并计入：它们在中文文本里密度很高，漏掉会让估算
+/// 再偏低。
 fn is_cjk(ch: char) -> bool {
     matches!(
         ch as u32,
@@ -207,9 +204,9 @@ fn slice_tokens(slice: &ContextSlice<'_>) -> usize {
 
 /// 会话的证据台账：这个任务动过什么。
 ///
-/// **它是从会话历史算出来的，不是另记一份账。** 另记一份就会与历史
-/// 分叉：模型改了主意、工具被拒绝、恢复时重跑了某个调用——账本不会
-/// 跟着变，而模型看到的"我做过什么"必须是真相。
+/// **从会话历史算出，不另记一份账。** 另记一份会与历史分叉：模型改了
+/// 主意、工具被拒绝、恢复时重跑了调用，账本不会跟着变，而模型看到的
+/// "我做过什么"必须与历史一致。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceIndex {
     /// 读过的文件（去重，按首次出现排序）。
@@ -220,10 +217,9 @@ pub struct EvidenceIndex {
     pub commands_run: Vec<String>,
     /// 没有成功的调用：`工具(参数) → 原因`。
     ///
-    /// 这是"未完成事项"的**唯一**来源：哪些调用没成功，代码知道得比
-    /// 模型准——让模型自己列一份，它会漏，而漏掉的正是最要紧的
-    /// "上一步那条命令到底跑没跑成"。所以模型不参与这一份，
-    /// 它由代码从调用记录里拼出来。
+    /// 这是"未完成事项"的**唯一**来源。哪些调用没成功，代码比模型清楚；
+    /// 让模型自己列会漏，漏掉的往往是"上一步那条命令到底跑没跑成"。
+    /// 这一份由代码从调用记录拼出。
     pub unfinished_calls: Vec<String>,
 }
 
@@ -236,7 +232,7 @@ impl EvidenceIndex {
             let Turn::Agent(agent) = turn else {
                 continue;
             };
-            // 观察紧跟在带调用的那一轮之后（`commit_round` 保证配对）。
+            // 观察紧跟在带调用的轮次之后，`commit_round` 保证配对。
             let Some(Turn::Observation(outcomes)) = turns.next() else {
                 continue;
             };
@@ -249,9 +245,9 @@ impl EvidenceIndex {
 
     /// 从证据事件算出台账。
     ///
-    /// 事件的来源与会话不同，但**判定规则只有一份**（[`Self::add_call`]）：
-    /// 两处各写一套判定，同一个调用在会话视图与报表视图里就会被分成
-    /// 不同的类，用户对着报表与模型看到的对不上。
+    /// 事件来源与会话不同，但**判定规则只有一份**（[`Self::add_call`]）。
+    /// 两处各写一套，同一个调用在会话视图与报表视图里会归入不同类别，
+    /// 用户看到的报表与模型看到的台账就对不上。
     pub fn from_events<'a>(events: impl IntoIterator<Item = &'a AuditEvent>) -> Self {
         let mut index = Self::default();
         for event in events {
@@ -264,8 +260,8 @@ impl EvidenceIndex {
 
     /// 记一次调用。
     ///
-    /// `outcome` 为 `None` 表示"还不知道结果"（调用已发起、结果未知）。
-    /// 这种调用算未完成——它可能已经产生了副作用。
+    /// `outcome` 为 `None` 表示结果未知（调用已发起）。这种调用算未完成，
+    /// 它可能已经产生副作用。
     pub fn add_call(&mut self, call: &ToolCall, outcome: Option<&ToolOutcome>) {
         let succeeded = outcome.is_some_and(|outcome| outcome.status == OutcomeStatus::Success);
         if succeeded {
@@ -298,12 +294,12 @@ impl EvidenceIndex {
             && self.unfinished_calls.is_empty()
     }
 
-    /// 渲染成台账正文（不含抬头）。
+    /// 渲染成台账正文，不含抬头。
     ///
-    /// 抬头由调用方给：给模型看的抬头得说明"这是裁剪之后的账"，
-    /// 给用户看的抬头得说明"这是这个任务动过什么"——不是同一句话。
+    /// 抬头由调用方提供：给模型的抬头要说明"这是裁剪之后的账"，给用户的
+    /// 抬头要说明"这个任务动过什么"，两者措辞不同。
     ///
-    /// 空账本渲染成空串：没有内容就不该占模型的注意力，也不该占 token。
+    /// 空账本渲染成空串：没有内容就不占模型注意力，也不占 token。
     pub fn render(&self) -> String {
         if self.is_empty() {
             return String::new();
@@ -330,13 +326,13 @@ impl EvidenceIndex {
 
 /// 内置工具的分类。
 ///
-/// 分类靠工具名：领域层拿不到工具的注解（注解在注册表里，注册表在应用
-/// 层），而"读过的文件"与"写过的文件"必须分开——台账的全部价值就在于
-/// 模型能看出哪些是它读过的、哪些是它改过的。
+/// 分类依据工具名：领域层拿不到工具注解（注解在注册表里，注册表在应用
+/// 层），而"读过的文件"与"写过的文件"必须分开，台账的价值在于模型能
+/// 看出哪些读过、哪些改过。
 ///
-/// 代价是内置工具名在这里出现了一次。名单由 [`known_tool_names`] 给出，
-/// 应用层有一条测试拿它与真实注册表对照：名字拼错时台账会静默少一项，
-/// 那条测试让它当场变红，而不是等到某次长任务里模型重读一遍文件才发现。
+/// 代价是内置工具名在这里出现两次：[`known_tool_names`] 供应用层与真实
+/// 注册表对照，[`classify`] 的 match 做实际分类。两者独立维护，改名时
+/// 必须同步（这是领域层拿不到工具注解的代价，见[`classify`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolKind {
     /// 读文件。
@@ -349,7 +345,7 @@ enum ToolKind {
 
 /// 台账认识的工具名。
 ///
-/// 用途只有一个：让应用层能拿它与真实注册表对照（见
+/// 唯一的用途是让应用层与真实注册表对照（见
 /// `application::tool_registry` 的测试）。
 pub fn known_tool_names() -> &'static [&'static str] {
     &["read_file", "read_files", "write_file", "edit_file", "run_command"]
@@ -365,10 +361,10 @@ fn classify(tool: &str) -> Option<ToolKind> {
     }
 }
 
-/// 这次调用的"对象"：文件路径或命令文本。
+/// 这次调用的对象：文件路径或命令文本。
 ///
-/// 批量读给的是路径数组，逐个返回——台账里要是一文件一项，
-/// 去重才认得出来（"a.rs、b.rs" 之后再单独读 a.rs 会变成两项）。
+/// 批量读给出路径数组，这里逐个返回。台账按文件一项才认得出重复：
+/// 若记成"a.rs、b.rs"一项，之后再单独读 a.rs 会变成两项。
 fn subject(call: &ToolCall) -> Vec<String> {
     if let Some(path) = call.arguments.get("path").and_then(|value| value.as_str()) {
         return vec![path.to_owned()];
@@ -388,7 +384,8 @@ fn subject(call: &ToolCall) -> Vec<String> {
     vec![call.name.clone()]
 }
 
-/// 调用参数的简短形式：只留关键参数，不把整份 JSON 塞进台账。
+/// 调用参数的逐项展开：`key=value` 逗号连接。台账只用于诊断展示，不做
+/// 筛选或截断；`content` 这类长参数会整段进入台账。
 fn brief_arguments(call: &ToolCall) -> String {
     let object = call.arguments.as_object().map(|map| {
         map.iter()
@@ -420,7 +417,7 @@ fn push_all_unique(list: &mut Vec<String>, items: Vec<String>) {
     }
 }
 
-/// 一次裁剪的结果，报告丢掉了什么，供证据与调试使用。
+/// 一次裁剪的结果，记录丢弃内容，供证据与调试使用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionReport {
     /// 裁剪前的完整轮数。
@@ -433,22 +430,22 @@ pub struct CompactionReport {
     pub tokens_before: usize,
     /// 裁剪后**实际发出**的 token 估算。
     ///
-    /// 它不小于"原历史减去被裁轮次"：占位说明与证据台账是新增的内容。
+    /// 它不小于"原历史减去被裁轮次"，因为占位说明与证据台账是新增内容。
     pub tokens_after: usize,
-    /// 净减掉的 token 数。
+    /// 净减少的 token 数。
     ///
-    /// 净值为 0 说明这一轮裁剪没省下东西（台账比被裁的还长）——那正是
-    /// 值得看见的一个数。
+    /// 净值为 0 说明这次裁剪没有省下东西（台账比被裁内容还长），这个数
+    /// 值得展示。
     pub dropped_tokens: usize,
 }
 
 impl CompactionReport {
     /// 对照完整历史与实际视图，测出这次裁剪丢掉了什么。
     ///
-    /// 上下文策略只交出"要发什么"，不交报告；证据里"裁了几轮、省了多少
-    /// token"由这里按视图重新测一遍。对默认策略，结果与 [`compact`] 的
-    /// 报告逐字段相同；换一种视图生成方式时，测到的仍是实际发出的内容
-    /// 与完整历史之差，证据不会说谎。
+    /// 上下文策略只交视图，不交报告；证据里的"裁了几轮、省了多少 token"
+    /// 由这里按视图重新测量。默认策略下结果与 [`compact`] 的报告逐字段
+    /// 相同。换用其他视图生成方式时，测到的仍是实际发出内容与完整历史
+    /// 之差，证据不依赖具体算法。
     pub fn measure(session: &Session, view: &[ContextSlice<'_>]) -> Self {
         let all = session.slices();
         let tokens_before: usize = all.iter().map(slice_tokens).sum();
@@ -473,17 +470,18 @@ impl CompactionReport {
 
 /// 把会话历史裁剪到预算内，返回保留的片段与裁剪报告。
 ///
-/// 纯函数：不读时钟、不做 IO、不改 `session`。裁剪以"轮"为最小单位——
-/// 半轮历史（有调用没观察）会让 OpenAI 兼容端点直接 400，所以
-/// 预算之外的轮次连同它们的观察一起整体丢弃。
+/// 纯函数：不读时钟、不做 IO、不改 `session`。裁剪以"轮"为最小单位，
+/// 半轮历史（有调用没观察）会让 OpenAI 兼容端点直接 400，因此预算之外
+/// 的轮次连同观察整体丢弃。
 ///
-/// **裁剪顺序**：先按 token 总量判断要不要裁；要裁就**从最老的轮次
-/// 开始丢**，但最近 [`ContextBudget::min_recent_rounds`] 轮一定留着。
-/// 用户消息（任务交代、步骤边界、结论交接）永远不丢：它们是"现在在
-/// 第几步""前面查出了什么"的唯一来源，丢了模型就会跑偏。
+/// **裁剪顺序**：先按 token 总量判断是否需要裁剪；需要时**从最老的轮次
+/// 开始丢**，但最近 [`ContextBudget::min_recent_rounds`] 轮一定保留。
+/// 步骤边界与结论交接这类用户消息永不丢弃，它们是"现在在第几步""前面
+/// 查出了什么"的唯一来源，丢了模型会跑偏。最初的用户任务由
+/// [`ContextBudget::keep_task`] 决定去留。
 ///
-/// 被裁掉之后，占位说明之后紧跟一条**证据台账**：做过什么由代码从
-/// 历史算出，不靠模型记得。
+/// 被裁掉的位置先放占位说明，其后紧跟一条**证据台账**：做过什么由代码
+/// 从历史算出，不靠模型记忆。
 pub fn compact<'a>(
     session: &'a Session,
     budget: &ContextBudget,
@@ -493,8 +491,8 @@ pub fn compact<'a>(
 
 /// 同 [`compact`]，但摘要由调用方显式给出。
 ///
-/// 拆开是为了让上层的上下文策略能带着它刚生成的摘要来裁，而不必先把
-/// 摘要写回会话；`None` 表示没有可用摘要，被裁位置退回占位说明。
+/// 拆开是为了让上下文策略带着刚生成的摘要来裁剪，不必先写回会话。
+/// `None` 表示没有可用摘要，被裁位置退回占位说明。
 pub fn compact_with_summary<'a>(
     session: &'a Session,
     budget: &ContextBudget,
@@ -529,7 +527,8 @@ pub fn compact_with_summary<'a>(
         .filter_map(|(index, slice)| round_number(slice).map(|number| (number, index)))
         .collect();
 
-    // 用户消息永远保留，它们的代价先从预算里扣掉。
+    // 所有用户消息的代价先从预算里扣掉。步骤边界与交接消息不会被裁；
+    // 任务消息的去留由 keep_task 决定，代价同样计入。
     let mandatory_tokens: usize = slices
         .iter()
         .zip(&costs)
@@ -561,32 +560,34 @@ pub fn compact_with_summary<'a>(
     let dropped_set: HashSet<u32> = dropped.iter().copied().collect();
 
     let mut kept: Vec<ContextSlice<'a>> = Vec::with_capacity(slices.len() + 2);
-    // 任务消息是历史的第一条用户消息。先它、后占位说明与台账、再保留的
-    // 轮次，顺序与"人先交代任务、再补一句摘要、然后是近期工作"一致。
+    // 顺序：任务消息、占位说明与台账、保留的轮次。与人先交代任务、
+    // 再读摘要、然后看近期工作的顺序一致。
     if budget.keep_task {
         if let Some(ContextSlice::User(task)) = slices.first() {
             kept.push(ContextSlice::User(task.clone()));
         }
     }
-    kept.push(ContextSlice::User(Cow::Owned(omitted_text(summary, &dropped))));
-    // 台账：上下文被裁了，"做过什么"不能跟着没。
-    let index = EvidenceIndex::from_session(session);
-    if !index.is_empty() {
-        kept.push(ContextSlice::User(Cow::Owned(format!(
-            "【本会话的证据台账】前面的对话历史被裁剪了，但下列事实仍然成立：\n{}",
-            index.render()
-        ))));
+    // 只有真的裁掉轮次才需要占位说明与台账。没裁却写"已省略第 0-0 轮"，
+    // 会让模型以为漏看了不存在的历史。
+    if !dropped.is_empty() {
+        kept.push(ContextSlice::User(Cow::Owned(omitted_text(summary, &dropped))));
+        let index = EvidenceIndex::from_session(session);
+        if !index.is_empty() {
+            kept.push(ContextSlice::User(Cow::Owned(format!(
+                "【本会话的证据台账】前面的对话历史被裁剪了，但下列事实仍然成立：\n{}",
+                index.render()
+            ))));
+        }
     }
     for (position, slice) in slices.iter().enumerate() {
         match slice {
-            // 任务消息已在最前面钉住（或按 keep_task 主动裁掉），原样再放
-            // 一遍只会让模型把同一件事看两遍。
+            // 任务消息已放在最前面（或按 keep_task 裁掉），原样再放一遍
+            // 会让模型把同一件事看两遍。
             ContextSlice::User(_) if position == 0 => {}
-            // 其余用户消息是步骤边界（单会话编排的产物）：它们是"现在在
-            // 第几步"的唯一来源，不是历史轮次。裁掉它模型就不知道自己
-            // 进行到哪了——而裁剪恰恰发生在步数最多的长任务上，正是最
-            // 需要这一步信息的时候。按原位置保留，不跳到前面：把第 3 步
-            // 的交代挪到第 1 步的观察之前，等于给模型一份假时间线。
+            // 其余用户消息是步骤边界（单会话编排的产物），是"现在在第几步"
+            // 的唯一来源，不是历史轮次。裁掉它模型就不知道进度，而裁剪
+            // 通常发生在步数最多的长任务上。按原位置保留：把第 3 步的
+            // 交代挪到第 1 步的观察之前，会给出错误的时间线。
             ContextSlice::User(_) => kept.push(slice.clone()),
             ContextSlice::Round { number, .. } if !dropped_set.contains(number) => {
                 kept.push(slice.clone())
@@ -611,8 +612,8 @@ fn round_number(slice: &ContextSlice<'_>) -> Option<u32> {
 }
 
 /// 被省略历史处显示的文本：有覆盖全部被裁轮次的摘要就用摘要，否则用
-/// 占位说明。摘要没覆盖全时宁可保守——把没被摘要的那几轮说成"已概括"
-/// 会诱导模型把没看过的内容当成看过的。
+/// 占位说明。摘要未完全覆盖时选择保守做法，把没摘要的轮次说成"已概括"
+/// 会诱导模型把没看过的内容当成看过。
 fn omitted_text(summary: Option<&Summary>, dropped: &[u32]) -> String {
     match summary {
         Some(summary) if summary.covers_all(dropped) => summary.text.clone(),
@@ -622,8 +623,8 @@ fn omitted_text(summary: Option<&Summary>, dropped: &[u32]) -> String {
 
 /// 被省略历史的占位说明。
 ///
-/// 要写清省略了哪些轮、去哪找回来：模型看到历史缺口时最常见的错是
-/// 凭想象补全被删掉的内容，指路能压住这个倾向。
+/// 写明省略了哪些轮、去哪里找回。模型看到历史缺口时容易凭想象补全，
+/// 指路可以抑制这个倾向。
 fn omitted_notice(dropped: &[u32]) -> String {
     let first = dropped.first().copied().unwrap_or_default();
     let last = dropped.last().copied().unwrap_or_default();
@@ -642,7 +643,7 @@ mod tests {
     use serde_json::json;
 
     /// 建一个带 `n` 轮历史的会话：第 `i` 轮读 `r{i}.txt`，观察文本带轮次号，
-    /// 供断言"某轮的观察是否出现在裁剪结果里"。
+    /// 用于断言某轮的观察是否出现在裁剪结果里。
     fn session_with_rounds(n: u32) -> Session {
         let mut session = Session::new(SessionId::new("s1"), "任务");
         for index in 1..=n {
@@ -692,8 +693,7 @@ mod tests {
 
     /// 用户消息（任务交代、步骤交代）的 token 代价。
     ///
-    /// 它们永远保留，所以永远占预算——算上限时得把它们算进去，否则
-    /// 它们会挤掉一轮。
+    /// 计算上限时要把它们算进去，否则会挤掉一轮。
     fn mandatory_tokens(session: &Session) -> usize {
         session
             .slices()
@@ -729,7 +729,7 @@ mod tests {
     fn over_budget_drops_the_oldest_rounds() {
         let session = session_with_rounds(6);
         // 只够装两轮：把上限压到刚好容纳两轮的量。任务消息也占 token，
-        // 所以上限得把它算进去——不算它就会挤掉一轮。
+        // 上限要把它算进去，否则会挤掉一轮。
         let one_round = slice_tokens(&session.slices()[2]);
         let limit = one_round * 2 + mandatory_tokens(&session);
         let (slices, report) = compact(&session, &budget(limit));
@@ -743,8 +743,8 @@ mod tests {
 
     /// 按实际视图测出的报告与裁剪自带的报告逐字段一致。
     ///
-    /// 上层策略只交视图；证据靠 `measure` 重新测。这条测试钉住两条路径
-    /// 不会各说各话——默认策略下它们必须完全等价。
+    /// 上层策略只交视图，证据靠 `measure` 重新测量。这条测试保证两条
+    /// 路径结果一致：默认策略下必须完全等价。
     #[test]
     fn measuring_a_view_matches_the_compaction_report() {
         // 超预算：真的裁掉几轮。
@@ -770,7 +770,7 @@ mod tests {
         );
         assert!(matches!(&slices[1], ContextSlice::User(_)), "第二位是占位说明");
 
-        // 关掉 keep_task：任务也被裁掉，占位说明顶到第一位。
+        // 关掉 keep_task：任务也被裁掉，占位说明排到第一位。
         let no_task = ContextBudget {
             max_tokens: Some(1),
             min_recent_rounds: 0,
@@ -782,6 +782,51 @@ mod tests {
             panic!("第一位应当是用户消息");
         };
         assert_ne!(first.as_ref(), "任务", "keep_task=false 时任务消息不应保留");
+    }
+
+    /// 超预算但没有可裁轮次时，不写占位说明，也不写证据台账。
+    ///
+    /// 触发条件是任务消息本身超过预算，或所有轮次都在
+    /// `min_recent_rounds` 的保护范围内。此时历史一个字都没少，
+    /// "已省略第 0-0 轮"与"历史被裁剪了"都不成立。
+    #[test]
+    fn over_budget_without_droppable_rounds_adds_no_omitted_notice() {
+        let session = session_with_rounds(0);
+        let (slices, report) = compact(&session, &budget(1));
+
+        assert!(report.dropped.is_empty());
+        assert_eq!(user_texts(&slices), ["任务"], "只保留任务消息");
+
+        // 轮次全被 min_recent_rounds 保住：同样不该出现占位说明或台账。
+        let session = session_with_rounds(2);
+        let floor_budget = ContextBudget {
+            max_tokens: Some(1),
+            min_recent_rounds: 5,
+            keep_task: true,
+            summarize: None,
+        };
+        let (slices, report) = compact(&session, &floor_budget);
+
+        assert!(report.dropped.is_empty());
+        assert_eq!(report.rounds_after, 2);
+        assert_eq!(user_texts(&slices), ["任务"], "保住的两轮之外不追加用户消息");
+    }
+
+    /// 没有裁剪时，摘要也不进入视图。
+    ///
+    /// `Summary::covers_all(&[])` 对空集合恒为真。旧实现据此把摘要当成
+    /// "被裁历史的替代品"插入，即使没有任何历史被裁。
+    #[test]
+    fn a_summary_is_not_injected_when_nothing_was_dropped() {
+        let session = session_with_rounds(0);
+        let summary = Summary {
+            covers: (1, 1),
+            text: "摘要正文".to_owned(),
+            steps: Vec::new(),
+        };
+        let (slices, _) = compact_with_summary(&session, &budget(1), Some(&summary));
+
+        assert_eq!(user_texts(&slices), ["任务"]);
     }
 
     #[test]
@@ -854,9 +899,9 @@ mod tests {
     #[test]
     fn step_boundaries_survive_compaction_in_their_original_order() {
         let session = session_with_steps(2);
-        // 只够装两轮：第 1、2、3 步各两轮里只有最后两轮活下来，
-        // 但三条步骤交代一条都不能丢。步骤交代是用户消息，永远保留，
-        // 也一定占 token——上限要把它算进去。
+        // 只够装两轮：三步各两轮里只有最后两轮保留，但每条步骤交代
+        // 都不能丢。步骤交代是用户消息，永远保留，也占 token，计算上限
+        // 时要算进去。
         let costs = round_costs(&session);
         let limit = costs[4] + costs[5] + mandatory_tokens(&session);
         let (slices, report) = compact(&session, &budget(limit));
@@ -865,7 +910,7 @@ mod tests {
         let texts = user_texts(&slices);
         assert_eq!(texts[0], "任务", "任务交代钉在最前");
         assert!(texts[1].contains("已省略第 1-4 轮"), "第二位是占位说明: {texts:?}");
-        // 第 1 步没有独立交代——任务消息就是第 1 步的交代。
+        // 第 1 步没有独立交代，任务消息就是第 1 步的交代。
         for step in 2..=3 {
             assert!(
                 texts.contains(&format!("[第 {step}/3 步] 第 {step} 步的交代")),
@@ -956,10 +1001,9 @@ mod tests {
         assert!(!text.contains("摘要"), "部分覆盖时不得把没摘要的轮次说成已概括: {text}");
     }
 
-    /// 显式传入的摘要不必先写回会话，也能顶替占位说明。
+    /// 显式传入的摘要不必先写回会话，也能替代占位说明。
     ///
-    /// 上层的上下文策略就是这样用的：刚生成的摘要直接带进裁剪，
-    /// 会话本身保持只读。
+    /// 上下文策略就是这样用的：刚生成的摘要直接带进裁剪，会话保持只读。
     #[test]
     fn an_explicit_summary_is_used_without_writing_it_into_the_session() {
         let session = session_with_rounds(6);
@@ -978,8 +1022,7 @@ mod tests {
     #[test]
     fn compact_stays_pure_when_a_summary_is_set() {
         let mut session = session_with_rounds(5);
-        // 摘要要覆盖全部被裁轮次才会被用上：预算压到 1 时五轮全被裁，
-        // 摘要只覆盖前三轮就得退回占位说明。
+        // 摘要覆盖全部五轮。预算压到 1 时五轮全被裁，摘要会被用上。
         with_summary(&mut session, 1, 5);
         let summary_before = session.summary().cloned();
         let turns_before = session.turns().len();
@@ -1066,19 +1109,19 @@ mod tests {
         session
     }
 
-    /// 裁剪由 token 决定，不由轮数决定：同样的轮数、同样的上限，带大
-    /// 观察的那个会话留不下那么多轮。
+    /// 裁剪由 token 决定，不由轮数决定：轮数与上限相同，带大观察的会话
+    /// 保留的轮次更少。
     ///
-    /// 这是"token 优先于轮数"的理由：一轮读小文件与一轮读大文件的
-    /// token 量差三个数量级。按轮数裁时两个会话会得到同样的结果，
-    /// 一个白裁、一个照旧爆窗。
+    /// 这是"token 优先于轮数"的理由：一轮读小文件与一轮读大文件的 token
+    /// 量差三个数量级。按轮数裁时两个会话结果相同，一个被多裁，一个仍然
+    /// 爆窗。
     #[test]
     fn the_budget_is_driven_by_tokens_not_by_round_count() {
         let plain = session_with_rounds(4);
         let fat = session_with_a_fat_round();
 
         // 同一个 token 上限：够装下 plain 的三轮，装不下 fat 的三轮。
-        // 按轮数算的话，两个会话都会留下三轮。
+        // 若按轮数计算，两个会话都会留下三轮。
         let limit = round_costs(&plain)[0] * 3 + mandatory_tokens(&plain);
         let (_, plain_report) = compact(&plain, &budget(limit));
         let (_, fat_report) = compact(&fat, &budget(limit));
@@ -1155,7 +1198,7 @@ mod tests {
         assert!(index.unfinished_calls.is_empty());
     }
 
-    /// 没成功的调用进"未完成"清单——这一份是代码拼的，不是模型写的。
+    /// 没成功的调用进入"未完成"清单，这一份由代码拼出，不由模型编写。
     #[test]
     fn failed_calls_land_in_the_unfinished_list() {
         let mut session = Session::new(SessionId::new("s1"), "任务");
@@ -1204,7 +1247,7 @@ mod tests {
         assert_eq!(EvidenceIndex::from_session(&session).files_read, vec!["a.txt"]);
     }
 
-    /// 批量读一文件一项：台账里要能逐个认出读过哪些文件。
+    /// 批量读按一文件一项记录：台账里能逐个认出读过哪些文件。
     #[test]
     fn a_batch_read_lists_each_file_separately() {
         let mut session = Session::new(SessionId::new("s1"), "任务");
@@ -1254,7 +1297,7 @@ mod tests {
         assert!(texts[2].contains("a.txt"), "台账里应列出读过的文件: {texts:?}");
     }
 
-    /// 没裁剪时不塞台账：模型看到的历史是完整的，没必要多这一段。
+    /// 没裁剪时不加台账：模型看到的历史完整，不需要这一段。
     #[test]
     fn no_ledger_without_compaction() {
         let session = session_with_rounds(2);
@@ -1263,10 +1306,10 @@ mod tests {
         assert_eq!(slices.len(), 3, "任务 + 两轮，没有台账");
     }
 
-    /// 同一份台账从证据事件算出来，与从会话算出来的一致。
+    /// 从证据事件算出的台账与从会话算出的一致。
     ///
-    /// 两处判定规则必须一致：用户在 `--report` 里看到的账，与模型在
-    /// 上下文里看到的账，不是两份数据。
+    /// 两处判定规则必须一致：用户在 `--report` 里看到的账与模型在上下文
+    /// 里看到的账出自同一份数据。
     #[test]
     fn the_index_from_events_matches_the_one_from_the_session() {
         let mut session = Session::new(SessionId::new("s1"), "任务");

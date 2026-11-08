@@ -1,13 +1,14 @@
 //! 文本搜索工具：在 workspace 内递归查找文本，支持正则与扩展名过滤。
 //!
-//! 遍历用 `ignore` crate：自动读 workspace 根与嵌套目录的 `.gitignore`，
-//! 被 ignore 的文件不搜；再叠一层显式目录名单兜底（`.git`/`.qcodeharness`
-//! /`target`/`node_modules`——.git 本身不受 gitignore 规则管，target 是否
-//! 被 ignore 取决于项目的 .gitignore，不能赌）。
+//! 遍历使用 `ignore` crate，自动读取 workspace 根与嵌套目录的
+//! `.gitignore`，被 ignore 的文件不搜索。另加显式目录名单兜底
+//! （`.git`/`.qcodeharness`/`target`/`node_modules`）：`.git` 不受
+//! gitignore 规则管理；`target` 是否被 ignore 取决于项目的 .gitignore，
+//! 不能依赖。
 //!
-//! 语义边界：`.gitignore` 只影响"搜索什么"，不影响"能不能读某个路径"——
-//! `read_file` 读被 ignore 的文件仍然允许。ignore 状态是给"全文翻找"降噪
-//! 的，不是又一层读权限闸门。
+//! `.gitignore` 只影响搜索范围，不影响读权限：`read_file` 仍可读取被
+//! ignore 的文件。ignore 状态用于降低全文搜索的噪声，不是额外的读权限
+//! 检查。
 
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -28,23 +29,24 @@ const DEFAULT_MAX_RESULTS: usize = 50;
 /// `max_results` 的硬上限：再大也只会拖长响应，对模型没有额外价值。
 const HARD_MAX_RESULTS: usize = 200;
 
-/// 递归遍历时要显式跳过的目录名。任意深度下命中都跳过。
+/// 递归遍历时显式跳过的目录名，任意深度命中都跳过。
 ///
-/// `.git` 里的文件不在 gitignore 规则覆盖范围内（git 从不跟踪它），
-/// `.qcodeharness` 是会话证据；`target`/`node_modules` 通常被 ignore，
-/// 但万一项目没写这条规则，全文索引会把响应撑爆——这里显式兜底。
+/// `.git` 不在 gitignore 规则覆盖范围内（git 从不跟踪它），
+/// `.qcodeharness` 存放会话证据。`target`/`node_modules` 通常被 ignore，
+/// 但项目可能没有写这条规则，全文搜索会产生大量无关结果，这里显式
+/// 兜底。
 const SKIPPED_DIRS: [&str; 4] = [".git", "target", "node_modules", ".qcodeharness"];
 
-/// 凭据文件名：遍历时整个跳过，不当成普通文本读。
+/// 凭据文件名：遍历时整体跳过，不当作普通文本读取。
 ///
-/// `.env` / `.env.*` 在 `read_file` 侧是受保护路径，直接拒。但搜索走
-/// 的是"遍历 + 读每行"这条路，`read_file` 的保护够不着它——
+/// `.env` / `.env.*` 在 `read_file` 侧是受保护路径，直接拒绝。但搜索
+/// 走"遍历 + 读每行"的路径，`read_file` 的保护覆盖不到：
 /// `search_text({"pattern":"API_KEY"})` 会把 `.env` 里的凭据行连同行号
-/// 一起打印出来。同一份秘密换条路就能读到，保护就是半套。
+/// 一起输出。同一份秘密换条路径仍能读到，保护就不完整。
 ///
-/// 这条判断**先于一切**：.gitignore 感知、扩展名过滤都不构成跳过它的理由。
-/// `.env` 通常不被 git 跟踪，反而常被写进 ignore 名单之外；凭据保护靠的
-/// 是文件名本身，不靠 gitignore 的好心。
+/// 这条判断优先于其他所有过滤：.gitignore 感知与扩展名过滤都不能跳过
+/// 凭据检查。`.env` 通常不被 git 跟踪，常落在 ignore 名单之外，凭据
+/// 保护依靠文件名本身。
 ///
 /// 大小写不敏感：Windows 上 `.ENV` 与 `.env` 是同一个文件。
 fn is_credential_file(name: &str) -> bool {
@@ -97,8 +99,8 @@ struct SearchArgs {
     pattern: String,
     path: Option<String>,
     max_results: Option<u64>,
-    /// 正则开关而不是 `pattern_kind` 字符串枚举：绝大多数调用仍是子串
-    /// 匹配，布尔缺省即旧语义，模型侧也少一个要记对的字面量。
+    /// 使用布尔开关而非 `pattern_kind` 字符串枚举：多数调用仍是子串匹配，
+    /// 布尔缺省即原语义，模型也少一个需要记对的字面量。
     #[serde(default)]
     regex: bool,
     #[serde(default)]
@@ -114,10 +116,9 @@ fn normalize_ext(raw: &str) -> String {
 
 /// 扩展名过滤器。
 ///
-/// include 与 exclude 同时给时 **include 优先**：include 表达的是"我要找
-/// 的"（正向、具体），exclude 是"我不要的"（负向、排除噪音）。两者冲突
-/// 时以更具体的正向选择为准——用户写了 include 就别再被 exclude 拦掉，
-/// 否则正反两张名单一叠，行为无从解释。
+/// include 与 exclude 同时给出时 include 优先：include 表达要找的内容，
+/// 正向且具体；exclude 表达要排除的噪声，负向。冲突时以具体的正向选择
+/// 为准，否则两张名单叠加后行为难以解释。
 #[derive(Debug, Default)]
 struct ExtFilter {
     include: Vec<String>,
@@ -130,12 +131,11 @@ impl ExtFilter {
         !self.include.is_empty() || !self.exclude.is_empty()
     }
 
-    /// `include` 只搜这些扩展名；`exclude` 跳过这些；冲突时 include 优先。
+    /// `include` 只搜这些扩展名，`exclude` 跳过这些，冲突时 include 优先。
     ///
-    /// 没有扩展名的文件（Makefile、LICENSE、Dockerfile）：给 include 时
-    /// 一律排除——include 是按扩展名收窄的，无扩展名文件不属于任何扩展
-    /// 名，收窄语义下不该混进来；只给 exclude 时放行——用户点名排除的
-    /// 是具体扩展名，一个无扩展名文件不在其列，默认它仍可搜。
+    /// 无扩展名文件（Makefile、LICENSE、Dockerfile）：给出 include 时排除，
+    /// 因为 include 按扩展名收窄，无扩展名文件不属于任何扩展名；只给
+    /// exclude 时放行，用户排除的是具体扩展名，无扩展名文件不在其中。
     fn allows(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -156,11 +156,10 @@ struct WalkResult {
     total: usize,
 }
 
-/// 行匹配器：子串与正则共用这一个 trait 口径——"这一行算不算匹配"。
+/// 行匹配器：子串与正则共用同一判定口径，即"这一行是否匹配"。
 ///
-/// 子串实现用 `contains`，行内多次出现只算一处；正则实现用
-/// `Regex::is_match`，同样按行整体判定，不是按出现次数计。两种模式
-/// 共享同一个计数口径，截断说明对两者含义一致。
+/// 子串使用 `contains`，行内多次出现只算一处；正则使用 `Regex::is_match`，
+/// 同样按行整体判定。两种模式的计数口径一致，截断说明含义相同。
 enum Matcher {
     Substring(String),
     Regex(Regex),
@@ -175,7 +174,8 @@ impl Matcher {
     }
 }
 
-/// 编译正则：失败时给出模型能自己修正的错误——原模式 + regex 库的定位说明。
+/// 编译正则。失败时返回模型可自行修正的错误：原模式与 regex 库的
+/// 定位说明。
 fn compile_regex(pattern: &str) -> Result<Matcher, String> {
     Regex::new(pattern)
         .map(Matcher::Regex)
@@ -218,8 +218,8 @@ impl ToolInvoker for SearchText {
                 .unwrap_or(DEFAULT_MAX_RESULTS as u64)
                 .clamp(1, HARD_MAX_RESULTS as u64) as usize;
 
-            // 同步遍历放到阻塞线程池：递归走整个目录树是典型的阻塞操作，
-            // 占着异步线程会拖慢同进程里的其他任务。
+            // 同步遍历放入阻塞线程池：递归整个目录树是阻塞操作，占用异步
+            // 线程会拖慢同进程的其他任务。
             let root = self.root.as_path().to_path_buf();
             let start_dir = start.as_path().to_path_buf();
             let result = tokio::task::spawn_blocking(move || {
@@ -252,22 +252,22 @@ impl ToolInvoker for SearchText {
     }
 }
 
-/// 遍历 `workspace` 全树，把 `start` 子树内文件的匹配行写进 `result`。
+/// 遍历 `workspace` 全树，把 `start` 子树内文件的匹配行写入 `result`。
 ///
-/// 用 `ignore::WalkBuilder` 遍历整个 workspace：它自动读 workspace 根与
-/// 各嵌套目录的 `.gitignore`（子目录的规则只约束自己的子树）。搜索起点
-/// 是子目录时按前缀裁剪，`hidden(false)` 让 `.gitignore` 这类点开头文件
-/// 仍可被搜——"隐藏即跳过"交给显式目录名单，`.git` 本身不在 gitignore
-/// 规则覆盖范围内，必须在这里拦。
+/// 使用 `ignore::WalkBuilder` 遍历整个 workspace，它自动读取 workspace
+/// 根与各嵌套目录的 `.gitignore`（子目录规则只约束自己的子树）。搜索
+/// 起点是子目录时按前缀裁剪。`hidden(false)` 让 `.gitignore` 这类点开头
+/// 文件仍可被搜索；隐藏文件的跳过交由显式目录名单处理。`.git` 不在
+/// gitignore 规则覆盖范围内，必须在这里拦截。
 ///
-/// 单线程遍历：文件系统操作本来就要排队，多线程抢遍历对这种小 workspace
-/// 只有复杂度没有收益，还会让结果的顺序不确定。
+/// 单线程遍历：文件系统操作本身需要排队，多线程遍历对小 workspace 只
+/// 增加复杂度，还会让结果顺序不确定。
 ///
-/// 单个文件/目录读不动（权限、非 UTF-8）时静默跳过：搜索是尽力而为的
-/// 探索性操作，一个读不了的文件不该让整次搜索失败。
+/// 单个文件或目录读不了（权限、非 UTF-8）时静默跳过。搜索是尽力而为的
+/// 探索操作，一个文件读不了不应让整次搜索失败。
 ///
-/// 达到条数上限后不提前退出：截断说明要报"共匹配 N 处"，
-/// 数完总数模型才知道自己漏看了多少。
+/// 达到条数上限后不提前退出：截断说明需要报告"共匹配 N 处"，数完总数
+/// 模型才知道漏看了多少。
 fn walk(
     workspace: &Path,
     start: &Path,
@@ -280,9 +280,9 @@ fn walk(
         .hidden(false)
         .git_ignore(true)
         .parents(true)
-        // 测试环境与临时目录往往没有 .git，而 ignore crate 默认
-        // require_git(true)：不在 git 仓库里就不读 .gitignore。搜索的
-        // 目标是"被 ignore 的文件不搜"，这条语义不该依赖仓库是否存在。
+        // 测试环境与临时目录通常没有 .git，而 ignore crate 默认
+        // require_git(true)，不在 git 仓库中就不读 .gitignore。搜索的目标
+        // 是"被 ignore 的文件不搜索"，这条语义不应依赖仓库是否存在。
         .require_git(false)
         .build();
     let Some(start_prefix) = start.strip_prefix(workspace).ok() else {
@@ -308,8 +308,8 @@ fn walk(
         }
         let child_rel = relative.to_string_lossy().replace('\\', "/");
         if is_credential_file(name) {
-            // 凭据文件整份跳过：读进来的每一行都可能带着密钥，而这一行
-            // 会原样进提示词。搜索是"找代码"的工具，不是"读秘密"的工具。
+            // 凭据文件整体跳过：其中每一行都可能带密钥，而匹配行会原样进入
+            // 提示词。搜索用于找代码，不用于读取秘密。
             continue;
         } else if filter.is_active() && !filter.allows(path) {
             continue;
@@ -357,10 +357,10 @@ mod tests {
         }
     }
 
-    /// 布置一个典型 workspace：两个文件有匹配，target 与 .git 里的不碰。
+    /// 布置一个典型 workspace：两个文件含匹配，target 与 .git 中的不参与。
     ///
-    /// 不写 .gitignore：这组测试要钉住的是"没有 .gitignore 时行为与
-    /// gitignore 感知版完全一致"。
+    /// 不写 .gitignore，用于验证没有 .gitignore 时行为与启用 gitignore
+    /// 感知时一致。
     fn plant(root: &Path) {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("target")).unwrap();
@@ -372,14 +372,13 @@ mod tests {
         fs::write(root.join("README.md"), "没有匹配的内容\n").unwrap();
     }
 
-    /// 凭据文件不能被全文搜索读到。
+    /// 凭据文件不能被全文搜索读取。
     ///
-    /// `.env` 在 `read_file` 侧是受保护路径，直接拒。但 `search_text`
-    /// 走的是另一条路——它按遍历读每行，于是 `search_text({"pattern":"API_KEY"})`
-    /// 能把 `.env` 里的凭据行连同行号一起打印出来。同一份秘密，换条路就能
-    /// 读到，那保护就是半套。
+    /// `.env` 在 `read_file` 侧被直接拒绝，但 `search_text` 按遍历读取
+    /// 每行，`search_text({"pattern":"API_KEY"})` 会输出 `.env` 中的凭据
+    /// 行连同其行号。保护必须覆盖这条路径。
     ///
-    /// 大小写同样要不敏感：Windows 上 `.ENV` 与 `.env` 是同一个文件。
+    /// 大小写不敏感：Windows 上 `.ENV` 与 `.env` 是同一个文件。
     #[tokio::test]
     async fn search_never_reads_credential_files() {
         let root = temp_workspace("env");
@@ -410,8 +409,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// .gitignore 感知不能成为凭据泄露的借口：.env 不在 gitignore 名单里
-    /// 也照样跳过，嵌套目录里的 .env 也在保护范围内。
+    /// 凭据跳过不受 .gitignore 影响：.env 不在 ignore 名单里也跳过，嵌套
+    /// 目录中的 .env 同样受保护。
     #[tokio::test]
     async fn credential_files_are_skipped_even_when_not_gitignored() {
         let root = temp_workspace("env-deep");
@@ -468,7 +467,7 @@ mod tests {
             .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Success);
-        // 共 3 处匹配（target 与 .git 已跳过），只显示 2 条，截断说明里带总数。
+        // 共 3 处匹配（target 与 .git 已跳过），只显示 2 条，截断说明含总数。
         assert!(outcome.content.contains("已截断，共匹配 3 处"), "{}", outcome.content);
         assert!(outcome.content.contains("显示前 2 处"), "{}", outcome.content);
         let _ = fs::remove_dir_all(&root);
@@ -531,7 +530,7 @@ mod tests {
 
     #[test]
     fn walk_counts_matches_without_emitting_past_the_cap() {
-        // 按行匹配：每行要么算一处，要么不算——行内的多次出现不重复计。
+        // 按行匹配：每行计一处，行内多次出现不重复计数。
         let mut result = WalkResult::default();
         scan_file("x1\nplain\nx2\nx3\n", "f.txt", &Matcher::Substring("x".to_owned()), 2, &mut result);
 
@@ -567,8 +566,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 嵌套目录里的 .gitignore 也生效：ignore crate 从文件所在目录往上
-    /// 收集规则链，子目录的规则只约束子目录。
+    /// 嵌套目录的 .gitignore 同样生效：ignore crate 从文件所在目录向上
+    /// 收集规则链，子目录规则只约束子目录。
     #[tokio::test]
     async fn nested_gitignore_applies_to_its_subtree() {
         let root = temp_workspace("gi-nested");
@@ -590,10 +589,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 没有 .gitignore 时行为与升级前一致：所有普通文件照常可搜。
-    /// （`plant` 就是不带 .gitignore 的布置，这条直接复用。）在 workspace
-    /// 根随便放个非 ignore 的隐藏文件也照搜——hidden(false) 只豁免
-    /// "隐藏即跳过"，不豁免显式名单与凭据保护。
+    /// 没有 .gitignore 时行为与升级前一致，所有普通文件照常可搜。
+    /// 使用 `plant` 的布置（不带 .gitignore）。
     #[tokio::test]
     async fn without_gitignore_behaviour_is_unchanged() {
         let root = temp_workspace("gi-absent");
@@ -611,8 +608,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// gitignore 只影响搜索，不影响读权限：read_file 对被 ignore 的文件
-    /// 仍然放行。这条钉住两个工具的语义分工（注释在模块头）。
+    /// gitignore 只影响搜索，不影响读权限：`read_file` 仍可读取被 ignore 的
+    /// 文件。这条测试固定两个工具的语义分工（见模块注释）。
     #[tokio::test]
     async fn read_file_still_allows_gitignored_files() {
         let root = temp_workspace("gi-read");
@@ -632,8 +629,8 @@ mod tests {
 
     // ── 正则 ──────────────────────────────────────────────────────────
 
-    /// regex=true 时按正则匹配；默认仍是子串（`TODO|todo` 作为子串在
-    /// 大写文件里搜不到，作为正则能搜到）。
+    /// `regex=true` 时按正则匹配，默认仍是子串。`TODO|todo` 作为子串
+    /// 搜不到，作为正则可以搜到。
     #[tokio::test]
     async fn regex_mode_matches_pattern_syntax() {
         let root = temp_workspace("regex");
@@ -641,7 +638,7 @@ mod tests {
         fs::write(root.join("src/main.rs"), "TODO fix\nfn main() {}\ntodo later\n").unwrap();
         let tool = SearchText::new(WorkspaceRoot::new(&root));
 
-        // 子串语义下 `TODO|todo` 是字面量，搜不到（大小写敏感）。
+        // 子串语义下 `TODO|todo` 是字面量，且大小写敏感，搜不到。
         let substring = tool.invoke(&call(json!({"pattern": "TODO|todo"}))).await;
         assert_eq!(substring.content, "未找到匹配", "不带 regex 时应按子串字面匹配");
 
@@ -652,7 +649,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 正则编译失败要报得清楚：带原模式与修正建议，模型能自己改。
+    /// 正则编译失败时返回原模式与修正建议，模型可以自行修改。
     #[tokio::test]
     async fn invalid_regex_fails_with_actionable_message() {
         let root = temp_workspace("badregex");
@@ -685,7 +682,7 @@ mod tests {
         assert!(!only_rs.content.contains("notes.md"), "include 应排除非 rs 文件: {}", only_rs.content);
         assert!(!only_rs.content.contains("Cargo.toml"), "{}", only_rs.content);
 
-        // 大小写不敏感：".RS" 与 "rs" 是同一批文件。
+        // 大小写不敏感：`.RS` 与 `rs` 匹配同一批文件。
         let upper = tool.invoke(&call(json!({"pattern": "MARK", "include": [".RS"]}))).await;
         assert!(upper.content.contains("src/main.rs"), "扩展名匹配应大小写不敏感: {}", upper.content);
 
@@ -694,14 +691,14 @@ mod tests {
         assert!(no_md.content.contains("Cargo.toml"), "exclude 只应排除 md: {}", no_md.content);
         assert!(!no_md.content.contains("notes.md"), "exclude 应排除 md 文件: {}", no_md.content);
 
-        // 带点写法（".md"）与不带点写法（"md"）等价。
+        // 带点写法（`.md`）与不带点写法（`md`）等价。
         let dotted = tool.invoke(&call(json!({"pattern": "MARK", "exclude": [".md"]}))).await;
         assert!(!dotted.content.contains("notes.md"), "{}", dotted.content);
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// include 与 exclude 同时给时 include 优先：exclude 拦不住 include
-    /// 已放行的扩展名，正向选择是更具体的意图。
+    /// include 与 exclude 同时给出时 include 优先：正向选择更具体，
+    /// exclude 不能拦掉 include 已放行的扩展名。
     #[tokio::test]
     async fn include_wins_over_exclude() {
         let root = temp_workspace("ext-both");
@@ -724,8 +721,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 无扩展名文件：include 存在时排除（收窄语义下不属于任何扩展名），
-    /// 只有 exclude 时放行（不在被点名排除的扩展名之列）。
+    /// 无扩展名文件：有 include 时排除（不属于任何扩展名），只有 exclude
+    /// 时放行（不在被点名排除的扩展名之列）。
     #[test]
     fn extensionless_files_follow_include_narrows_exclude_passes() {
         let only_ext = ExtFilter {

@@ -1,7 +1,7 @@
-//! 证据基础设施：内存存储。
+//! 内存证据汇：`EvidenceSink` 的内存实现。
 //!
-//! 事件类型在领域层定好，所以换存储实现不用改产生事件的代码——
-//! 这正是先把 `AuditEvent` 放进 domain 的原因。
+//! 不访问文件、进程或网络，因此留在应用层，与端口 trait 同层。
+//! 生产路径用 JSONL 落盘；这里保存的是测试与 CLI 记录所需的副本。
 
 use std::sync::Mutex;
 
@@ -22,15 +22,14 @@ impl MemoryEvidenceSink {
 
     /// 已记录的事件，按发生顺序。
     ///
-    /// 只给测试用：生产的证据汇是 JSONL，查询证据应该去读文件，
-    /// 而不是从内存里捞——进程退出就没了。
+    /// 仅测试使用。生产证据汇是 JSONL，读取证据应查文件；内存副本
+    /// 随进程退出丢失。
     #[cfg(test)]
     pub fn events(&self) -> Vec<Evidence> {
         self.lock().clone()
     }
 
-    /// 锁被毒化时照样取出内容：毒化只说明某个持有者 panic 了，
-    /// 不影响里面已经写好的记录。
+    /// 锁毒化时仍取出内容。毒化只说明某个持有者 panic 过，不影响已写入的记录。
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Evidence>> {
         self.events
             .lock()

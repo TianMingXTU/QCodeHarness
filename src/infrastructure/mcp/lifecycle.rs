@@ -1,17 +1,17 @@
-//! 同一 Server 的连接状态与显式恢复入口；没有自动调用重试队列。
+//! 同一 Server 的连接状态与显式恢复入口；没有自动重试队列。
 //!
-//! 状态机的边界是本文件的全部要点，每条都对应一条不许的承诺：
+//! 状态机边界如下：
 //!
-//! - **调用超时/断连只放弃请求，不承诺取消。** 请求发出后的故障一律
-//!   `result_unknown = true`，原调用绝不自动重放（副作用可能已经发生）；
-//! - **`isError` 是业务错误，不弄死连接。** 分类里 ServerError 与
-//!   Disconnected/Protocol 分开，一条连接的生死只由传输事实决定；
-//! - **一个 Server 一条连接，断连只记一次。** 多个工具共享状态机，
-//!   断开事件按"连接"落账而不是按"工具"复读；
+//! - **调用超时或断连只放弃请求，不承诺取消。** 请求发出后的故障一律
+//!   `result_unknown = true`，原调用不会自动重放，因为副作用可能已经发生。
+//! - **`isError` 是业务错误，不关闭连接。** ServerError 与
+//!   Disconnected / Protocol 分开分类，连接存亡只由传输事实决定。
+//! - **一个 Server 一条连接，断连只记录一次。** 多个工具共享状态机，
+//!   断开事件按连接记录，不按工具重复。
 //! - **恢复是有界的单次尝试。** 并发请求共享同一次结果（包括失败），
-//!   不会各起一个实例；恢复只重建通信，不重放、不绕过注册与审批；
-//! - **工具清单变化不能悄悄改契约。** 首次注册的规格永不热更新，
-//!   重连后的再发现只用于比对；定义变了或消失了，按旧定义拒调。
+//!   不会各自启动实例。恢复只重建通信，不重放调用，也不绕过注册与审批。
+//! - **工具清单变化不能静默改变契约。** 首次注册的规格不会热更新，
+//!   重连后的再次发现只用于比对。定义变化或工具消失时按旧定义拒绝调用。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -58,16 +58,16 @@ pub(crate) struct ManagedServer {
     recorder: Option<Arc<McpLifecycleRecorder>>,
     timeouts: McpTimeouts,
     state: Mutex<State>,
-    /// 恢复波次代号：一次恢复把结果交给同波次内排队的后来者共享。
+    /// 恢复轮次编号。同一次恢复的结果由后来排队的请求共享。
     recovery_revision: AtomicU64,
     watcher: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl ManagedServer {
-    /// 建立一条全新连接：有界握手 + 发现，握手失败也要留下事实。
+    /// 建立新连接：有界握手与工具发现；握手失败也要记录事实。
     ///
-    /// `generation: 0` 专给"连接没能成为任何一代实例"的失败——进程
-    /// 连握手都没完成，没有代可数；发现失败的则是第 1 代（握手已完成）。
+    /// `generation: 0` 用于连接未成为任何一代实例的失败，此时进程连
+    /// 握手都没完成。发现失败记为第 1 代，因为握手已完成。
     pub(crate) async fn establish(
         server: &str,
         connector: Arc<dyn Connector>,
@@ -165,7 +165,8 @@ impl ManagedServer {
         }
     }
 
-    /// 监视器只有 Weak 与通知 Receiver，不持 service/transport/Job，不续命旧连接。
+    /// 监视器只持有 Weak 与通知 Receiver，不持有 service / transport / Job，
+    /// 不会延长旧连接的生命周期。
     fn watch(self: &Arc<Self>, state: &State) {
         self.stop_watcher();
         let Connection::Ready(client) = &state.connection else {
@@ -229,8 +230,8 @@ impl ManagedServer {
         }
         let client = match &state.connection {
             Connection::Ready(client) => client,
-            // 短路的失败没有发出任何请求：没有执行边界可交代，也没有
-            // 结果未知可声张，只有一条"连接没了"的事实与恢复指引。
+            // 短路失败没有发出请求：没有执行边界，也没有结果未知，
+            // 只有连接不可用的事实与恢复指引。
             Connection::Disconnected => {
                 return self.failure(
                     state.generation,
@@ -269,8 +270,8 @@ impl ManagedServer {
         match result {
             Ok(text) => ToolOutcome::success(text).with_execution(ExecutionBoundary::mcp(active)),
             Err(mut error) => {
-                // 请求确已在本连接上发出：超时或断连都证明不了远端没执行。
-                // 下层只做分类、不判"发出过没有"，发出的事实只有调用点知道。
+                // 请求已在本连接发出：超时或断连无法证明远端未执行。
+                // 下层只做分类，不判断请求是否发出；该事实只有调用点知道。
                 if matches!(error.kind, McpFaultKind::CallTimeout | McpFaultKind::Disconnected) {
                     error.result_unknown = true;
                 }
@@ -295,8 +296,8 @@ impl ManagedServer {
             text.push_str("；原调用已发出，远端可能仍在执行，结果未知。");
         }
         if error.kind == McpFaultKind::Disconnected {
-            // 恢复是显式的运维动作，不是模型手里能点的工具，也不会有
-            // 任何自动重试——指引里必须把这两件事都说死。
+            // 恢复是显式运维动作，不是模型可调用的工具，也不会自动重试。
+            // 提示里必须说明这两点。
             text.push_str(&format!(
                 "；可在命令行用 `--mcp-reconnect {}` 显式尝试恢复通信，原调用不会自动重放。",
                 self.server
@@ -320,10 +321,10 @@ impl ManagedServer {
         outcome
     }
 
-    /// 只恢复通信能力；不接收原工具参数，不发送 tools/call，也不重放原调用。
+    /// 只恢复通信能力，不接收原工具参数，不发送 tools/call，也不重放调用。
     ///
-    /// 本轮的触发面是会话外的显式 CLI 动作（README"MCP 生命周期"一节），
-    /// 运行中的会话没有自动重试。恢复成功只重建通信：后续调用照常走
+    /// 触发入口是会话外的显式 CLI 动作（见 README 的 "MCP 生命周期"），
+    /// 运行中的会话不会自动重试。恢复成功只重建通信；后续调用仍需通过
     /// 注册比对、角色授权与审批。
     pub(crate) async fn reconnect(
         self: &Arc<Self>,
@@ -337,8 +338,8 @@ impl ManagedServer {
         }
         match &state.connection {
             Connection::Closed => return Err(McpError::new(McpFaultKind::Closed, false)),
-            // 连接还活着：恢复无事可做。这也是"串行到达的第二个请求
-            // 不会多起实例"的兜底——前一次恢复已把连接交回 Ready。
+            // 连接仍可用，恢复无事可做。前一次恢复已把连接交回 Ready，
+            // 串行到达的第二个请求因此不会另起实例。
             Connection::Ready(_) => return Ok(false),
             _ => {}
         }
@@ -406,8 +407,8 @@ impl ManagedServer {
         result
     }
 
-    /// 当前连接的真实进程保护状态。断连/关闭后没有活着的进程可谈保护，
-    /// 返回 false；供诚实断言与展示用，不参与任何分类。
+    /// 当前连接的实际进程保护状态。断连或关闭后没有存活进程，返回 false。
+    /// 该值用于断言与展示，不参与分类。
     pub(crate) async fn process_isolation(&self) -> bool {
         let state = self.state.lock().await;
         match &state.connection {
@@ -449,8 +450,8 @@ impl Drop for ManagedServer {
 }
 
 impl std::fmt::Debug for ManagedServer {
-    // 异步锁里的状态与连接句柄都没法同步派生；调试信息给名字与钉住的
-    // 清单就够定位问题（`Result::expect_err` 一类断言要求 Debug）。
+    // 异步锁内的状态与连接句柄无法同步派生。调试信息包含名字与固定的
+    // 工具清单即可定位问题；`Result::expect_err` 等断言要求实现 Debug。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManagedServer")
             .field("server", &self.server)

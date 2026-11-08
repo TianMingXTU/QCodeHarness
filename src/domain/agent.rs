@@ -1,15 +1,16 @@
 //! Agent 抽象：ReAct 循环中的参与者角色与状态。
 //!
-//! 领域层的 Agent 类型表达"一轮交互"的完整信息，不依赖 rig 的消息类型——
-//! rig 的 `AssistantContent` 是协议层的表示，会随框架版本变，不能渗进领域。
+//! 领域层的 Agent 类型表达一轮交互的完整信息，不依赖 rig 的消息类型。
+//! rig 的 `AssistantContent` 是协议层表示，随框架版本变化，不进入领域层。
 
 use serde::{Deserialize, Serialize};
 
 use super::tool::ToolCall;
 
-/// Agent 角色。不同角色按职责分化行为——
-/// 不同角色看到不同的系统提示词、拿到不同的工具子集（见
-/// `domain::agent_profile`），编排器按步骤的角色分派。
+/// Agent 角色。
+///
+/// 不同角色的系统提示词与工具子集不同（见 `domain::agent_profile`），
+/// 编排器按步骤的角色分派。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentRole {
     /// 规划者：理解目标、拆解任务。只读工具。
@@ -35,9 +36,8 @@ impl AgentRole {
 
     /// 这个角色用的模型环境变量名。
     ///
-    /// 四个角色的模型名各自独立：规划要强推理、测试跑命令读输出就行，
-    /// 用同一个模型是浪费。变量名按 `LLM_MODEL_<角色>` 的规律拼，
-    /// 用户看一眼就知道怎么配。
+    /// 四个角色的模型可独立配置：规划需要强推理，测试只需跑命令读输出，
+    /// 共用一个模型是浪费。变量名按 `LLM_MODEL_<角色>` 拼写。
     pub fn model_env_name(&self) -> &'static str {
         match self {
             Self::Planner => "LLM_MODEL_PLANNER",
@@ -69,7 +69,7 @@ impl AgentRole {
 
     /// 全部四个角色。
     ///
-    /// 配置装配要遍历所有角色——少一个，那个角色的专属配置就静默失效。
+    /// 配置装配要遍历所有角色，遗漏会让该角色的专属配置静默失效。
     pub fn all() -> [AgentRole; 4] {
         [
             Self::Planner,
@@ -86,8 +86,8 @@ mod tests {
 
     #[test]
     fn role_round_trips_through_serde() {
-        // 角色要进快照（AgentSpec 可序列化），扩展变体后每个变体都必须
-        // 能无损往返——漏掉任何一个，恢复时就报反序列化错误。
+        // 角色进快照（AgentSpec 可序列化），每个变体都必须无损往返，
+        // 漏掉会在恢复时反序列化失败。
         for role in [
             AgentRole::Planner,
             AgentRole::Coder,
@@ -111,16 +111,16 @@ mod tests {
 
     // ── 模型与档位 ─────────────────────────────────────────────────────
 
-    /// 档位短名能往返解析。
+    /// 档位短名可往返解析。
     ///
-    /// 档位从环境变量来，是人手写的：`High` 与 `high` 不该是两回事，
-    /// 拼错则必须当场报错而不是静默退回默认值。
+    /// 档位来自人手写的环境变量：`High` 与 `high` 等价，拼错必须当场
+    /// 报错，不能静默退回默认值。
     #[test]
     fn effort_names_round_trip() {
         for effort in [Effort::Minimal, Effort::Low, Effort::Medium, Effort::High] {
             assert_eq!(Effort::parse(effort.name()).unwrap(), effort);
         }
-        // 大小写与首尾空白都不该改变含义。
+        // 大小写与首尾空白不影响解析。
         assert_eq!(Effort::parse(" HIGH ").unwrap(), Effort::High);
         assert!(Effort::parse("最大").is_err(), "认不出的档位要报错");
     }
@@ -134,11 +134,11 @@ mod tests {
         assert!(Verbosity::parse("verbose").is_err(), "认不出的档位要报错");
     }
 
-    /// 规格里的模型与档位要能无损往返（快照要存它）。
+    /// 规格里的模型与档位可无损往返（快照要存它）。
     ///
-    /// `AgentSpec` 进快照：恢复会话时要用回同一份系统提示词与模型。
-    /// 模型与档位一起存，才不会在恢复时悄悄换成一个不一样的模型——
-    /// 恢复出来的会话跑出了另一种结果，还以为是模型不稳定。
+    /// `AgentSpec` 进快照，恢复时要用回同一份系统提示词与模型。模型与
+    /// 档位一起存，恢复时才不会换成另一个模型，导致结果不同却误判为
+    /// 模型不稳定。
     #[test]
     fn the_spec_round_trips_through_serde() {
         let spec = AgentSpec {
@@ -158,10 +158,10 @@ mod tests {
         assert_eq!(restored.verbosity, Some(Verbosity::Low));
     }
 
-    /// 空的模型与档位也要能往返。
+    /// 空的模型与档位也能往返。
     ///
-    /// 默认形态（`None`）是绝大多数部署的样子，它也得能存能取——
-    /// 往返失败会让"没配"的会话存不进快照。
+    /// 默认形态（`None`）是多数部署的样子，必须能存能取，否则没配档位
+    /// 的会话存不进快照。
     #[test]
     fn a_spec_without_tiers_round_trips_through_serde() {
         let spec = AgentSpec::new(AgentRole::Tester, "测试者");
@@ -176,26 +176,25 @@ mod tests {
 
 /// Agent 规格：一次运行所需的全部静态配置。
 ///
-/// 把配置收敛成一个不可变值对象，`AgentRunner` 就不必各自持有
-/// prompt——少了一处可能不同步的状态。预算不在其中：它是每次运行
-/// 可调的外部输入，由 `AgentRunner::run` 传入。
+/// 配置收敛为一个不可变值对象，`AgentRunner` 不必各自持有 prompt，
+/// 少一处可能不同步的状态。预算不在其中：它是每次运行可调的外部输入，
+/// 由 `AgentRunner::run` 传入。
 ///
-/// 工具规格也不在这里：模型可见的工具由 `ToolRegistry` 提供，
-/// 与执行入口绑在一起（`ModelRequest.tools`），避免"spec 声明了工具
-/// 却没人执行它"的双源头漂移。
+/// 工具规格也不在这里。模型可见的工具由 `ToolRegistry` 提供，与执行
+/// 入口绑在一起（`ModelRequest.tools`），避免 spec 声明了工具却无人
+/// 执行的双源头漂移。
 ///
-/// 可序列化：快照要把它一起存，恢复时才能用回同一份系统提示词。
+/// 可序列化，快照会一起存，恢复时用回同一份系统提示词。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSpec {
     /// 角色。
     pub role: AgentRole,
     /// 系统提示词，说明 ReAct 工作方式与约束。
     pub system_prompt: String,
-    /// 这个角色用的模型名。`None` = 用运行时的默认模型。
+    /// 这个角色用的模型名。`None` 表示使用运行时默认模型。
     ///
-    /// 模型是**运行时**的属性而不是 agent 规格的一部分——同一个角色在
-    /// 不同部署里该用不同的模型。但规格要能带它，因为编排器按角色装配
-    /// runner 时才决定用哪个模型。
+    /// 模型是运行时的属性，同一角色在不同部署里用不同模型。规格仍需
+    /// 携带它，因为编排器按角色装配 runner 时才决定模型。
     pub model: Option<String>,
     /// 推理档位。`None` = provider 默认。
     pub effort: Option<Effort>,
@@ -204,10 +203,9 @@ pub struct AgentSpec {
 }
 
 impl AgentSpec {
-    /// 造一份不带模型与档位的规格：都用运行时的默认。
+    /// 造一份不带模型与档位的规格，全部使用运行时默认。
     ///
-    /// 三个可选字段各有各的默认值，逐处写 `None` 容易漏、也读不出
-    /// "这里就是默认"的意思。
+    /// 显式构造比逐处写 `None` 更清楚，也不容易漏字段。
     pub fn new(role: AgentRole, system_prompt: impl Into<String>) -> Self {
         Self {
             role,
@@ -219,14 +217,14 @@ impl AgentSpec {
     }
 }
 
-/// 推理档位：模型在回答前多想多少。
+/// 推理档位：模型回答前的推理量。
 ///
-/// **领域层自有这个类型，而不是用 rig 的 `rig_core::completion::options::Effort`。**
-/// 理由与 `ToolAnnotations` 同款：domain 不依赖 rig，框架换版本时领域
-/// 类型不变；基础设施层负责翻译（见 `infrastructure::model::rig_chat`）。
+/// 领域层自有该类型，不使用 rig 的 `rig_core::completion::options::Effort`。
+/// 理由与 `ToolAnnotations` 相同：domain 不依赖 rig，框架升级时领域类型
+/// 不变；翻译由基础设施层负责（见 `infrastructure::model::rig_chat`）。
 ///
-/// 档位从低到高。命名对齐 OpenAI 的 `reasoning.effort`（minimal / low /
-/// medium / high），provider 不认某个档位时由 rig 的降级策略处理。
+/// 档位从低到高，命名对齐 OpenAI 的 `reasoning.effort`（minimal / low /
+/// medium / high）。provider 不认某个档位时由 rig 的降级策略处理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Effort {
     /// 最少的推理。
@@ -250,9 +248,9 @@ impl Effort {
         }
     }
 
-    /// 从短名解析档位。配置写错时给出可操作的说明。
+    /// 从短名解析档位。配置写错时返回可操作的错误说明。
     ///
-    /// 大小写不敏感：配置是人手写的，`High` 与 `high` 不该是两回事。
+    /// 大小写不敏感：配置由人手写，`High` 与 `high` 等价。
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "minimal" => Ok(Self::Minimal),
@@ -266,10 +264,10 @@ impl Effort {
     }
 }
 
-/// 输出详略档位：回答该多长。
+/// 输出详略档位：回答的详细程度。
 ///
-/// 同样自有类型，理由见 [`Effort`]。命名对齐 OpenAI 的
-/// `verbosity`（low / medium / high）。
+/// 自有类型的理由见 [`Effort`]。命名对齐 OpenAI 的 `verbosity`
+/// （low / medium / high）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verbosity {
     /// 尽量简短。
@@ -305,8 +303,8 @@ impl Verbosity {
 
 /// 模型一轮回复的领域表示。
 ///
-/// 刻意不是 rig 的 `AssistantContent`：领域只关心"想了什么、想调什么"，
-/// 不关心协议里还有哪些内容块类型。
+/// 不使用 rig 的 `AssistantContent`：领域只关心想了什么、调什么，不关心
+/// 协议中的其他内容块类型。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentTurn {
     /// 模型本轮输出的文本，即"思考"；部分模型直接给调用而文本为空。

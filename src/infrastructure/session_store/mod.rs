@@ -1,7 +1,7 @@
 //! 会话快照存储。
 //!
-//! 目录下目前只有一种实现：单文件 JSON（[`json::JsonSessionStore`]）。
-//! 快照是"整体读写"的数据，不像证据那样逐条追加，所以不用 JSONL。
+//! 目前只有单文件 JSON 实现（[`json::JsonSessionStore`]）。快照整体读写，
+//! 不像证据逐条追加，因此不用 JSONL。
 
 pub mod json;
 

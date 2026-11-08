@@ -1,15 +1,14 @@
-//! 长任务基准的两段式跑法：集成验收。
+//! 长任务基准两段式跑法的集成验收。
 //!
-//! 走的是与 `--benchmark-long` 完全相同的路径：真的两段运行、真的
-//! 任务快照落盘、真的恢复。验收的四件事——
+//! 路径与 `--benchmark-long` 相同：真实执行两段运行、真实写任务快照、
+//! 真实恢复。验收四项行为：
 //!
-//! - **第一次运行必然被故意设小的预算打断**（失败是设计好的实验条件，
-//!   不是事故）；
-//! - **恢复从任务快照继续，已完成的步骤不重做**；
-//! - **恢复段的上下文被裁剪，压缩判据有数据可核对**；
-//! - **判据按两段合计的账核对**（轮数累计、重复命令跨段可查）。
+//! - 第一次运行会被故意设小的预算打断，失败是设计好的实验条件；
+//! - 恢复从任务快照继续，已完成的步骤不重做；
+//! - 恢复段的上下文被裁剪，压缩判据有数据可核对；
+//! - 判据按两段合计核对（轮数累计、重复命令跨段可查）。
 //!
-//! 不走网络：模型用 `MockCompletionModel` 脚本化。
+//! 不访问网络，模型由 `MockCompletionModel` 脚本化。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +16,7 @@ use std::sync::Arc;
 
 use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::agent_run::AgentDependencies;
-use qcode_harness::application::benchmark::{run_long_benchmark, run_benchmark};
+use qcode_harness::infrastructure::benchmark_runner::{run_long_benchmark, run_benchmark};
 use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::port::{ApprovalGate, EvidenceSink, NoopHooks};
 use qcode_harness::application::tool_registry::ToolRegistry;
@@ -25,13 +24,13 @@ use qcode_harness::domain::budget::Budget;
 use qcode_harness::domain::policy::PolicyEngine;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::clock::SystemClock;
-use qcode_harness::infrastructure::evidence::memory::MemoryEvidenceSink;
+use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 
 use rig::test_utils::{MockCompletionModel, MockTurn};
 use serde_json::json;
 
-/// 每次测试用独立的临时目录，避免并行测试互相踩。
+/// 每次测试使用独立的临时目录，避免并行测试互相影响。
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qch-long-bench-{}-{}", name, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -39,7 +38,7 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// 装配模板：模型用脚本化 mock，工具由运行器按任务重建。
+/// 装配模板：模型使用脚本化 mock，工具由运行器按任务重建。
 fn bench_deps(mock: &MockCompletionModel) -> AgentDependencies {
     AgentDependencies {
         model: Arc::new(RigChatGateway::new(mock.clone().erase())),
@@ -57,10 +56,10 @@ fn bench_deps(mock: &MockCompletionModel) -> AgentDependencies {
     }
 }
 
-/// 在基准根目录写一个长任务：一个 notes.txt fixture + task.toml。
+/// 在基准根目录写入一个长任务：notes.txt fixture 与 task.toml。
 ///
-/// 工作流是 bug-fix 四步（规划 → 动手 → 验证 → 汇总）。模型脚本让
-/// 每步至少消耗两轮（先读、再答），第一次运行必然停在预算上。
+/// 工作流为 bug-fix 四步（规划 → 动手 → 验证 → 汇总）。模型脚本让每步
+/// 至少消耗两轮（先读再答），第一次运行会停在预算上。
 fn write_long_task(root: &Path, id: &str, exhaust_turns: u32, min_turns: u32) {
     let dir = root.join(id);
     fs::create_dir_all(dir.join("repo")).expect("建任务目录");
@@ -71,11 +70,11 @@ fn write_long_task(root: &Path, id: &str, exhaust_turns: u32, min_turns: u32) {
     fs::write(dir.join("task.toml"), toml).expect("写 task.toml");
 }
 
-/// 一个跨步骤的模型脚本：每步"先读文件、再给结论"，四步共 8 轮。
+/// 跨步骤的模型脚本：每步先读文件再给结论，第 2 步额外写一次文件，
+/// 共 9 轮。
 ///
-/// 步骤之间用 begin_step 的文本判断衔接——脚本只管按顺序给轮，
-/// 编排器负责换步。第 2 步写文件：`requires_changes` 判据要的
-/// "实际改动"由它产生。
+/// 脚本按顺序提供轮次，步骤之间由 `begin_step` 衔接，编排器负责换步。
+/// 第 2 步写入文件，产生 `requires_changes` 判据所需的实际改动。
 fn multi_step_script() -> MockCompletionModel {
     let mut turns = Vec::new();
     for step in 1..=4 {
@@ -145,7 +144,7 @@ async fn the_long_benchmark_exhausts_then_resumes_without_redoing_steps() {
         "恢复后所有步骤都该完成: {result:?}"
     );
     // 已完成的步骤不重做：两段合计的轮数恰好是脚本的 9 轮
-    // （每步一轮读，第 2 步多一轮写）。若第一步重做，恢复段会多消耗轮数。
+    // （每步一次读取，第 2 步多一次写入）。若第一步重做，恢复段会多消耗轮数。
     assert_eq!(
         result.total_turns, 9,
         "两段合计恰好是脚本的 9 轮——步骤没有被重做: {result:?}"
@@ -158,10 +157,10 @@ async fn the_long_benchmark_exhausts_then_resumes_without_redoing_steps() {
 
 #[tokio::test]
 async fn the_long_benchmark_fails_when_the_resume_redoes_completed_work() {
-    // 对照实验：把轮数下限抬到 12——两段合计只有 9 轮，过不了。
-    // 这证明 min_turns 判据真的在数两段合计的账，而不是只数恢复段。
-    // (重做本身被 the_long_benchmark_exhausts_then_resumes_without_redoing_steps
-    // 里的 total_turns == 9 精确断言抓住：重做会让它变成 11。)
+    // 对照实验：轮数下限提到 12，两段合计只有 9 轮，无法通过。
+    // 这表明 min_turns 统计的是两段合计，不只是恢复段。
+    // 重做由 the_long_benchmark_exhausts_then_resumes_without_redoing_steps
+    // 中的 total_turns == 9 精确捕获：重做会使它变成 11。
     let benchmarks = temp_dir("min-turns");
     let workspace = temp_dir("min-turns-ws");
     write_long_task(&benchmarks, "demo-long", 4, 12);
@@ -188,10 +187,10 @@ async fn the_long_benchmark_fails_when_the_resume_redoes_completed_work() {
 
 #[tokio::test]
 async fn a_long_task_whose_first_run_never_fails_is_reported_honestly() {
-    // 配置的 exhaust_turns 比脚本的总轮数还大：一遍跑完了，没有中断。
-    // 结果必须如实说"没测到中断恢复"，而不是把它当成一次通过的恢复——
-    // 任务的判据（改动、轮数）它可能都满足，但"第一次运行失败 → 恢复"
-    // 这个链路没有发生，长任务基准要测的就是这个链路。
+    // exhaust_turns 大于脚本总轮数，一遍跑完，没有中断。结果必须明确
+    // 记录未测到中断恢复，不能当作恢复成功。任务判据（改动、轮数）可能
+    // 满足，但"第一次运行失败 → 恢复"链路没有发生，而这是长任务基准
+    // 要测的内容。
     let benchmarks = temp_dir("no-fail");
     let workspace = temp_dir("no-fail-ws");
     write_long_task(&benchmarks, "demo-long", 30, 6);
@@ -221,8 +220,8 @@ async fn a_long_task_whose_first_run_never_fails_is_reported_honestly() {
 
 #[tokio::test]
 async fn the_short_benchmark_ignores_long_tasks() {
-    // 套件划分：短任务基准不跑 long 套件的任务，反之亦然。
-    // 两个目录混在一起，各自只看到自己的那一个。
+    // 套件划分：短任务基准不跑 long 套件的任务，长任务基准反之。
+    // 两个任务放在同一目录，各自只看到自己套件中的任务。
     let benchmarks = temp_dir("suite-split");
     let workspace = temp_dir("suite-split-ws");
     fs::create_dir_all(benchmarks.join("short-task/repo")).expect("建短任务目录");

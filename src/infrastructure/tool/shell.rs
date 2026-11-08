@@ -1,21 +1,21 @@
-//! 命令执行工具：最危险的一个。
+//! 命令执行工具。
 //!
-//! 设计要点（每一条都对应一次真实事故形态）：
-//! - **超时必须真杀子进程**：不杀的话 `cargo build` 之类的长命令会留下
-//!   孤儿进程继续吃 CPU，超时只是让模型"以为"停了。
-//! - **并发读 stdout/stderr**：先读完一个再读另一个，另一个的管道缓冲区
-//!   （Windows 上约 4KB）写满后子进程会永久阻塞——这是经典的死锁形态。
-//! - **环境脱敏**：dotenvy 把 `.env` 里的密钥放进了本进程环境，
-//!   子进程默认全盘继承，不清洗等于任何命令都能 `env | grep KEY`。
-//! - **退出码非 0 也是 failed 但输出照回**：测试失败的线索全在输出里，
-//!   模型要靠它修 bug。
-//! - **Windows 沙箱创建失败 → 拒绝执行**（fail-closed）：JobObject 是
-//!   最后一道机械防线，创建失败说明这道防线没了，让命令裸跑等于把
-//!   "有沙箱"的假设骗过去。降级只在"平台本来没实现"（非 Windows）
-//!   与"纳沙箱失败"（子进程已启动的窄边缘）两处允许。
-//! - **文件系统边界检查**：命令参数里出现指向 workspace
-//!   外的绝对路径 / UNC / `..` 穿越时**直接拒绝**，不再升级审批。
-//!   升级流程仍保留在策略层作为纵深，这里的拒绝是最后一道。
+//! 设计要点（每一条对应一种真实故障）：
+//! - **超时必须终止子进程**：否则 `cargo build` 等长命令会留下孤儿进程
+//!   继续占用 CPU，超时只让模型以为进程已停止。
+//! - **并发读取 stdout / stderr**：先读完一个再读另一个时，另一个的管道
+//!   缓冲区（Windows 上约 4KB）写满会导致子进程永久阻塞。
+//! - **环境脱敏**：dotenvy 把 `.env` 中的密钥放进了本进程环境，子进程
+//!   默认继承全部变量；不清洗时任何命令都能通过 `env | grep KEY` 读取。
+//! - **退出码非 0 记为 failed，但输出照常返回**：测试失败的线索在输出中，
+//!   模型需要依靠它修复问题。
+//! - **Windows 沙箱创建失败时拒绝执行**（fail-closed）：JobObject 是最后
+//!   一道机械防线，创建失败后让命令裸跑会掩盖"有沙箱"的错误假设。只有
+//!   平台本来未实现沙箱（非 Windows）和纳沙箱失败（子进程已启动的边界
+//!   情况）允许降级。
+//! - **文件系统边界检查**：命令参数中出现指向 workspace 外的绝对路径、
+//!   UNC 路径或 `..` 穿越时**直接拒绝**，不进入审批升级。策略层的升级
+//!   流程仍作为纵深保留，这里的拒绝是最后一道。
 
 use serde::Deserialize;
 use serde_json::json;
@@ -39,7 +39,7 @@ const RUN_COMMAND: &str = "run_command";
 
 /// 未指定时的超时秒数。
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-/// 超时硬上限：再长也不允许，失控命令最多拖 5 分钟。
+/// 超时硬上限。失控命令最长运行 5 分钟。
 const HARD_MAX_TIMEOUT_SECS: u64 = 300;
 /// 合并输出的字符数上限，超出截断。
 const MAX_OUTPUT_CHARS: usize = 8000;
@@ -47,12 +47,12 @@ const MAX_OUTPUT_CHARS: usize = 8000;
 /// 在 workspace 根下执行一条 shell 命令。
 pub struct RunCommand {
     root: WorkspaceRoot,
-    // 生产入口固定使用默认策略；测试可在实例内注入失败策略，不改全局状态。
+    // 生产入口使用默认策略；测试可在实例内注入失败策略，不修改全局状态。
     policy: SandboxPolicy,
 }
 
 impl RunCommand {
-    /// 以 `root` 为命令的工作目录构造。
+    /// 以 `root` 作为命令的工作目录构造。
     pub fn new(root: WorkspaceRoot) -> Self {
         Self { root, policy: SandboxPolicy::default() }
     }
@@ -88,21 +88,21 @@ struct RunArgs {
     timeout_seconds: Option<u64>,
 }
 
-/// 一次命令执行的原始产出。
+/// 一次命令执行的原始输出。
 pub(crate) struct RawOutput {
     /// 退出码。进程被信号杀死等拿不到码的情况记为 -1。
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
-    /// 沙箱是否实际生效。false 时调用方要在模型可见文本前加一行说明——
-    /// 模型应当知道自己跑在无沙箱环境里，行为要更保守；这段文本随
-    /// `ToolObserved` 进证据，审计链因此完整。
+    /// 沙箱是否实际生效。false 时调用方需在模型可见文本前加说明，让模型
+    /// 知道自己运行在无沙箱环境中并采取更保守的行为。该文本随
+    /// `ToolObserved` 进入证据，保持审计链完整。
     pub sandbox_active: bool,
 }
 
-/// 把输出文本截到上限内，超出时带说明。
+/// 把输出截到上限内，超出时附加说明。
 ///
-/// 按字符而不是字节截：模型读的是文本，半个 UTF-8 序列只会变成乱码。
+/// 按字符截断：模型读取文本，截断在 UTF-8 序列中间会产生乱码。
 pub(crate) fn clamp_output(text: String, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text;
@@ -112,20 +112,20 @@ pub(crate) fn clamp_output(text: String, max_chars: usize) -> String {
     format!("{head}\n…（共 {total} 字符，已截断）")
 }
 
-/// 环境变量名是否疑似携带密钥。
+/// 判断环境变量名是否疑似携带密钥。
 ///
-/// 用"名字包含"而不是"名字等于"：密钥变量的命名五花八门
-/// （`LLM_API_KEY`、`OPENAI_TOKEN`、`DB_PASSWORD`…），枚举不完；
-/// 宁可错杀 `MONKEY_PATCH` 这类无辜变量，也不能漏放一个真密钥。
+/// 按名字包含匹配，不要求完全相等：密钥变量命名多样（`LLM_API_KEY`、
+/// `OPENAI_TOKEN`、`DB_PASSWORD` 等），无法穷举。宁可多移除
+/// `MONKEY_PATCH` 这类变量，也不能漏掉真实密钥。
 fn looks_like_secret(name_lowercase: &str) -> bool {
     ["key", "token", "secret", "password", "credential"]
         .iter()
         .any(|needle| name_lowercase.contains(needle))
 }
 
-/// 组装命令：Windows 用 cmd /C，其他平台用 sh -c。
+/// 组装命令：Windows 使用 cmd /C，其他平台使用 sh -c。
 ///
-/// `cfg!` 是编译期判断——本项目的目标平台在构建时已定，不需要运行时探测。
+/// `cfg!` 是编译期判断，目标平台在构建时已确定，无需运行时探测。
 fn shell_program(command: &str) -> (String, Vec<String>) {
     if cfg!(windows) {
         ("cmd".to_owned(), vec!["/C".to_owned(), command.to_owned()])
@@ -134,7 +134,7 @@ fn shell_program(command: &str) -> (String, Vec<String>) {
     }
 }
 
-/// 保留启动前拒绝、启动失败和启动后失败的区别，供所有进程工具共用。
+/// 区分启动前拒绝、启动失败和启动后失败，供进程工具共用。
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RunError {
     #[error("{0}")]
@@ -161,7 +161,7 @@ impl RunError {
 }
 
 impl RawOutput {
-    /// 成功与非零退出共用边界交接，避免错误分支漏掉降级说明。
+    /// 成功与非零退出共用边界交接，避免错误分支遗漏降级说明。
     pub(crate) fn into_outcome(self, body: String, boundary_checked: bool) -> ToolOutcome {
         let outcome = if self.code == 0 {
             ToolOutcome::success(body)
@@ -183,20 +183,20 @@ fn with_process_boundary(
     outcome.with_execution(ExecutionBoundary::process(sandbox_active, boundary_checked))
 }
 
-/// 在 `root` 下执行命令，捕获输出。供本模块与 git 工具复用。
+/// 在 `root` 下执行命令并捕获输出，供命令工具与 git 工具复用。
 ///
-/// 命令在进程沙箱（Windows Job Object，见 `infrastructure::sandbox`）
-/// 内执行：整树内存/进程数受限、超时或句柄关闭时整树终止。
+/// 命令在进程沙箱（Windows Job Object，见 `infrastructure::sandbox`）中
+/// 执行：整树内存与进程数受限，超时或句柄关闭时终止整树。
 ///
-/// 沙箱拿不到时的取向：
-/// - **平台没实现**（非 Windows）或 **assign 失败** → 降级不阻断，
-///   `sandbox_active` 带回 false，由调用方在模型可见文本里声明"未受保护"；
-/// - **Windows 上创建失败** → 命令不执行，返回 [`RunError::Refused`]。
+/// 沙箱不可用时的处理：
+/// - 平台未实现（非 Windows）或 assign 失败：降级执行，不阻断命令。
+///   `sandbox_active` 返回 false，调用方在模型可见文本中声明未受保护。
+/// - Windows 上创建失败：不执行命令，返回 [`RunError::Refused`]。
 ///
 /// # Errors
 ///
-/// 启动前拒绝返回 `Refused`，启动失败返回 `NotStarted`；
-/// 启动后的超时或 I/O 错误返回携带实际沙箱状态的 `Failed`。
+/// 启动前拒绝返回 `Refused`，启动失败返回 `NotStarted`。启动后的超时
+/// 或 I/O 错误返回 `Failed`，其中携带实际沙箱状态。
 pub(crate) async fn run_in_workspace(
     root: &WorkspaceRoot,
     command: &str,
@@ -214,23 +214,23 @@ pub(crate) async fn run_with_policy(
     let (program, args) = shell_program(command);
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
-        // 命令的 cwd 显式定为 workspace 根：进程 cwd 恰好也是它，但显式
-        // 设置不依赖这个巧合（集成测试里 workspace 是临时目录）。
+        // 显式设置 cwd 为 workspace 根。进程 cwd 恰好相同时也不依赖这个
+        // 巧合；集成测试中 workspace 是临时目录。
         .current_dir(root.as_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // 脱敏：从继承的环境里删掉疑似密钥的条目。
-    // env_remove 用原始名字（大小写敏感的注册名），
-    // 匹配用小写后的名字（Windows 环境变量名不区分大小写）。
+    // 从继承的环境中移除疑似密钥的变量。
+    // env_remove 使用原始名字（注册名大小写敏感），匹配时使用小写名字
+    // （Windows 环境变量名不区分大小写）。
     for (name, _) in std::env::vars() {
         if looks_like_secret(&name.to_lowercase()) {
             cmd.env_remove(&name);
         }
     }
 
-    // 必须先创建 Job：先 spawn 再拒绝无法撤回副作用，也可能遗留孙进程。
+    // 必须先创建 Job 再 spawn，否则拒绝执行时无法撤回副作用，还可能遗留孙进程。
     let sandbox = match JobGuard::create(policy) {
         Ok(job) => Some(job),
         Err(error) if !PlatformCapabilities::detect().has_process_sandbox => {
@@ -245,8 +245,8 @@ pub(crate) async fn run_with_policy(
         RunError::NotStarted(format!("启动 `{program}` 失败: {error}"))
     })?;
 
-    // 纳入失败仍按已批准的降级策略执行；所有退出路径都交回这个事实。
-    // spawn 到 assign 之间仍有窗口，这里不承诺 OS 级隔离。
+    // 纳沙箱失败时按降级策略执行，所有退出路径都返回该事实。
+    // spawn 与 assign 之间存在窗口，这里不承诺 OS 级隔离。
     let sandbox = sandbox.and_then(|job| match assign_child(&job, &child) {
         Ok(()) => Some(job),
         Err(error) => {
@@ -260,8 +260,8 @@ pub(crate) async fn run_with_policy(
     let mut stdout_pipe = child.stdout.take().expect("stdout 已配置为 piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr 已配置为 piped");
 
-    // 三个 future 并发跑：两个管道同时排空（防死锁），wait 等退出。
-    // timeout 包住整体——任何一个先卡住都不会拖过死线。
+    // 三个 future 并发执行：两个管道同时排空以防死锁，wait 等待退出。
+    // timeout 包住整体，避免任一环节卡住超过时限。
     let run = async {
         let read_stdout = async {
             let mut buf = Vec::new();
@@ -283,7 +283,7 @@ pub(crate) async fn run_with_policy(
             let stdout = stdout.map_err(execution_error)?;
             let stderr = stderr.map_err(execution_error)?;
             let code = status.map_err(execution_error)?.code().unwrap_or(-1);
-            // 关闭 Job 时清理残留后代；RawOutput 只保留执行时的边界事实。
+            // 关闭 Job 清理残留后代。RawOutput 只保留执行时的边界事实。
             drop(sandbox);
             Ok(RawOutput {
                 code,
@@ -293,9 +293,9 @@ pub(crate) async fn run_with_policy(
             })
         }
         Err(_elapsed) => {
-            // 超时杀整树：先 Job 层终止（覆盖全部后代），再 child.kill()
-            // 兜底直接子进程（沙箱降级时它是唯一手段）。杀完 wait 回收，
-            // 管道随进程关闭，资源彻底落定。
+            // 超时终止整树：先在 Job 层终止，覆盖全部后代；再用 child.kill()
+            // 兜底直接子进程，沙箱降级时这是唯一手段。随后 wait 回收，
+            // 管道随进程关闭。
             if let Some(job) = &sandbox {
                 job.terminate_tree();
             }
@@ -314,7 +314,7 @@ pub(crate) async fn run_with_policy(
     }
 }
 
-/// 把一次执行的产出渲染成给模型看的观察文本。
+/// 把执行产出渲染成模型可见的观察文本。
 fn render_output(output: &RawOutput) -> String {
     let mut text = format!("退出码: {}\n", output.code);
     text.push_str("── stdout ──\n");
@@ -334,13 +334,13 @@ impl ToolInvoker for RunCommand {
             if args.command.trim().is_empty() {
                 return ToolOutcome::failed("command 不能为空");
             }
-            // 边界检查：命令参数里出现指向 workspace 外的路径直接拒。
+            // 命令参数指向 workspace 外时直接拒绝。
             //
-            // 用的是**根感知**判据（`write_escape_beyond` 而不是
-            // `write_escape_suspect`）：模型最常写 `type D:\repo\src\main.rs`
-            // 这类根内的绝对路径，无根判据会把这些正常命令一起拒掉。
-            // 与策略层的升级审批不同——那条给"人再决定"的口子，这条
-            // 是最后一道机械防线：人审过了、策略放行了，越界仍然被拦。
+            // 使用**根感知**判据 `write_escape_beyond`，不用
+            // `write_escape_suspect`。模型常写 `type D:\repo\src\main.rs`
+            // 这类根内绝对路径，无根判据会把正常命令一并拒绝。
+            // 策略层的升级审批把决定权交给用户；这里是最后一道机械防线，
+            // 即使人已批准、策略已放行，越界仍会被拦。
             if let Some(violation) = write_escape_beyond(&args.command, self.root.as_path()) {
                 return ToolOutcome::refused(format!(
                     "命令越出 workspace 边界：{violation}。当前 workspace 根：{}。\
@@ -399,8 +399,8 @@ mod tests {
 
     #[tokio::test]
     async fn successful_command_runs_with_the_sandbox_active() {
-        // 回归保护：沙箱接入不能把正常命令弄坏，且成功路径必须带回
-        // "沙箱已生效"的事实（不带未生效前缀）。
+        // 回归保护：沙箱接入不能破坏正常命令，成功路径必须返回沙箱已生效
+        // 的事实，且不带未生效说明。
         let root = temp_workspace("sandbox-ok");
         let cmd = tool(&root);
 
@@ -421,10 +421,10 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_kills_the_whole_process_tree() {
-        // 核心验收：整树终止。受害进程 parent 再拉 child（真实孙进程
-        // 形态），两代都写日志；1.5 秒超时后日志必须停止增长——没有
-        // Job 时 child 会作为孤儿继续写（这正是旧实现的缺陷形态）。
-        // 探针是 examples/sandbox-victim.rs（无参=parent+拉 child）。
+        // 核心验收：整树终止。受害进程 parent 再创建 child，两代都写
+        // 日志；1.5 秒超时后日志必须停止增长。没有 Job 时 child 会成为
+        // 孤儿继续写，这是旧实现的缺陷。
+        // 探针为 examples/sandbox-victim.rs（无参数表示 parent 加 child）。
         let root = temp_workspace("killtree");
         let log = root.join("victim.log");
 
@@ -439,7 +439,7 @@ mod tests {
             "受害进程必须被超时收口"
         );
 
-        // 给"假死但没被杀"的进程留足再写两轮的机会，然后验证日志停了。
+        // 给未被终止的进程留出两轮写入时间，再验证日志停止增长。
         tokio::time::sleep(Duration::from_millis(700)).await;
         let lines_after_kill = count_lines(&log);
         assert!(lines_after_kill > 0, "超时前 victim 应已写过日志");
@@ -452,8 +452,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 受害探针的可执行路径。测试进程的兄弟目录（examples 与 lib 同一
-    /// target），测试前由构建系统编译（examples 是 dev-target 的一部分）。
+    /// 受害探针的可执行文件路径。examples 与 lib 位于同一 target 的兄弟
+    /// 目录，测试前由构建系统编译（examples 属于 dev target）。
     fn victim_exe() -> std::path::PathBuf {
         let path = std::env::current_exe()
             .expect("测试进程路径")
@@ -471,11 +471,11 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Windows：沙箱创建失败 → 拒绝执行（fail-closed）。
+    /// Windows：沙箱创建失败时拒绝执行（fail-closed）。
     ///
-    /// 用明确未实现的 `cpu_time` 限额稳定触发创建失败，不依赖宿主机权限
-    /// 或资源耗尽。降级裸跑会让模型和策略都以为有沙箱，
-    /// 所以 Windows 上跑不了就别跑，非 Windows 平台没实现才降级。
+    /// 使用明确未实现的 `cpu_time` 限额稳定触发创建失败，不依赖宿主机
+    /// 权限或资源耗尽。降级裸跑会让模型和策略误以为有沙箱，因此 Windows
+    /// 上无法创建沙箱就不执行；非 Windows 平台未实现时才降级。
     #[cfg(windows)]
     #[tokio::test]
     async fn sandbox_creation_failure_refuses_the_command() {
@@ -487,15 +487,14 @@ mod tests {
             .invoke(&call(run_args("echo should_not_run > ran.txt")))
             .await;
 
-        // 拒绝而不是失败：命令压根没跑，与"跑了但没成"是两种结局，
-        // 证据要能分辨——`SandboxApplied` 只给真跑过的命令记账。
+        // 拒绝与失败是两种结局：命令没有运行，失败表示跑过但未成功。
+        // 证据必须能分辨；`SandboxApplied` 只为实际执行的命令记录。
         assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
         assert!(outcome.content.contains("沙箱创建失败"), "{}", outcome.content);
         assert!(outcome.content.contains("fail-closed"), "{}", outcome.content);
         assert!(outcome.execution.is_none(), "没启动进程就不能发边界证据");
         assert!(!root.join("ran.txt").exists(), "创建失败时命令不得执行");
-        // 拒绝执行与降级执行是两件事，不能同时说：前者是"没跑"，
-        // 后者才是"跑了但没保护"。
+        // 拒绝执行与降级执行不能同时出现：前者表示没跑，后者表示跑过但无保护。
         assert!(
             !outcome.content.contains("进程沙箱未生效"),
             "拒绝执行时不该再给降级说明: {}",
@@ -513,10 +512,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 非 Windows：平台没有实现进程沙箱 → 降级但命令照跑，且开头声明。
+    /// 非 Windows：平台未实现进程沙箱时降级执行，并在输出开头说明。
     ///
-    /// "平台本来没这个能力"与"有能力却创建失败"必须走不同分支：前者拒绝
-    /// 执行就等于在该平台上完全不能跑命令，后者拒绝执行才是正确取向。
+    /// "平台本来没有能力"与"有能力但创建失败"必须走不同分支。前者若拒绝
+    /// 执行，该平台将完全无法运行命令；后者拒绝执行才是正确行为。
     #[cfg(not(windows))]
     #[tokio::test]
     async fn unsupported_platform_degrades_with_a_visible_notice() {
@@ -556,9 +555,9 @@ mod tests {
         let escaping = [
             // 重定向到别的盘。
             r"echo x > C:\Windows\temp\y",
-            // 读越界同样要拦：外传与读取都靠这一条机械防线兜。
+            // 读取越界同样拦截：外传与读取都依赖这一道机械防线。
             r"type ..\outside",
-            // 基线放行的 `git diff *` 一族用 --output 往外卖内容。
+            // 基线放行的 `git diff *` 可通过 --output 把内容写到外部。
             r"git diff --output=D:\x",
             // UNC。
             r"copy inside.txt \\server\share\x",
@@ -583,8 +582,8 @@ mod tests {
         assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
         assert!(outcome.execution.is_some(), "真启动的命令要带边界事实");
 
-        // 根内的绝对路径同样放行：模型常写 `type D:\repo\src\main.rs` 这种
-        // 命令，硬拒绝必须认得"它其实在根里面"。
+        // 根内绝对路径同样放行。模型常写 `type D:\repo\src\main.rs`，
+        // 硬拒绝必须识别出该路径位于根内。
         let absolute = root.join("inside.txt");
         let outcome = cmd
             .invoke(&call(run_args(&format!("type {}", absolute.display()))))
@@ -596,9 +595,8 @@ mod tests {
             outcome.content
         );
 
-        // 结构化分段后的收窄与放行：
-        // 越界藏在第二段照样拒，且理由点名那一段——整串扫描也能抓到，
-        // 但理由指向的动词/段号必须准确。
+        // 分段后的收窄与放行：越界藏在第二段仍会被拒绝，且理由要点名
+        // 该段。整串扫描也能发现越界，但理由中的动词与段号必须准确。
         let chained = format!("type inside.txt && echo x > {}", outside_target());
         let outcome = cmd.invoke(&call(run_args(&chained))).await;
         assert_eq!(
@@ -632,8 +630,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 通用越界目标（不依赖具体 workspace 根）：落在系统临时目录里，
-    /// 拒绝路径不会真的写它。
+    /// 通用越界目标，不依赖具体 workspace 根。它位于系统临时目录，
+    /// 拒绝路径不会真正写入。
     fn outside_target() -> String {
         std::env::temp_dir()
             .join("qch-shell-slice4-out.txt")
@@ -641,9 +639,9 @@ mod tests {
             .into_owned()
     }
 
-    /// 拒绝发生在执行之前，不是执行之后：越界命令一个字都不该落盘。
+    /// 拒绝发生在执行之前，越界命令不应产生任何落盘结果。
     ///
-    /// 这是"拦截"与"报错"的差别——先跑了再判失败，副作用已经出去了。
+    /// 这是拦截与报错的差别：先执行再判失败时，副作用已经发生。
     #[tokio::test]
     async fn refused_command_leaves_no_side_effect() {
         let root = temp_workspace("boundary-noop");
@@ -690,7 +688,7 @@ mod tests {
         let root = temp_workspace("cwd");
         let cmd = tool(&root);
 
-        // 打印当前目录，确认子进程落在 workspace 里而不是进程 cwd。
+        // 打印当前目录，确认子进程的 cwd 是 workspace 根。
         let command = if cfg!(windows) { "cd" } else { "pwd" };
         let outcome = cmd.invoke(&call(run_args(command))).await;
 
@@ -721,7 +719,7 @@ mod tests {
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
         assert!(outcome.content.contains("退出码: 7"), "{}", outcome.content);
-        // 失败的线索必须在输出里，模型靠它修 bug。
+        // 失败线索必须在输出中，模型依靠它修复问题。
         assert!(
             outcome.content.contains("before_fail"),
             "stdout 应随观察回填: {}",
@@ -754,9 +752,9 @@ mod tests {
             .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
-        // Windows 上 cmd /C 对不存在的命令：cmd 本身启动成功（spawn 不报错），
-        // 错误以"退出码非 0 + stderr 报错文本"回来——这正好符合
-        // "非 0 也算 failed 但输出必须回填"的约定，模型能读到原因。
+        // Windows 上 cmd /C 执行不存在的命令时，cmd 本身启动成功，
+        // 错误以非 0 退出码和 stderr 文本返回。这符合"非 0 记为 failed
+        // 但必须返回输出"的约定，模型能读到原因。
         assert!(outcome.content.contains("退出码: 1"), "{}", outcome.content);
         assert!(!outcome.content.trim().ends_with("── stderr ──"), "stderr 应有报错文本");
         let _ = std::fs::remove_dir_all(&root);
@@ -767,8 +765,8 @@ mod tests {
         let root = temp_workspace("kill");
         let cmd = tool(&root);
 
-        // 命令睡 3 秒后写一个标记文件。若超时只是"返回错误"而进程活着，
-        // cmd 会活到 3 秒结束把标记写出来；真的被杀，标记永远不会出现。
+        // 命令休眠 3 秒后写标记文件。若超时只返回错误而进程仍存活，
+        // 标记会在 3 秒后写出；进程被终止时标记不会出现。
         let command = if cfg!(windows) {
             "ping -n 3 127.0.0.1 >nul & echo done > killed_marker.txt"
         } else {
@@ -785,7 +783,7 @@ mod tests {
             "超时前已启动进程，必须留下真实执行边界"
         );
 
-        // 给"假死但没被杀"的进程留足完成时间，再验证标记不存在。
+        // 给未被终止的进程留出完成时间，再验证标记不存在。
         tokio::time::sleep(Duration::from_millis(4500)).await;
         assert!(
             !root.join("killed_marker.txt").exists(),
@@ -799,8 +797,8 @@ mod tests {
         let root = temp_workspace("in-time");
         let cmd = tool(&root);
 
-        // 对照组：同样的"睡后写标记"，但给足超时——证明标记机制本身可靠，
-        // 上一个测试里标记缺席确实归因于"被杀"而不是"命令从没跑起来"。
+        // 对照组：同样休眠后写标记，但给足超时。这证明标记机制本身可靠，
+        // 上一个测试中标记缺席是因为进程被终止；命令已经启动。
         let command = if cfg!(windows) {
             "ping -n 2 127.0.0.1 >nul & echo done > alive_marker.txt"
         } else {
@@ -820,8 +818,8 @@ mod tests {
         let root = temp_workspace("env");
         let cmd = tool(&root);
 
-        // 测试进程自己把两个变量放进环境：一个疑似密钥，一个普通变量。
-        // edition 2024 里 set_var 是 unsafe：测试进程独占启动，无并发读。
+        // 测试进程自行设置两个环境变量：一个疑似密钥，一个普通变量。
+        // edition 2024 中 set_var 是 unsafe；测试进程独占启动，无并发读取。
         unsafe {
             std::env::set_var("LLM_API_KEY", "super-secret-value-123");
             std::env::set_var("QCH_PLAIN_VAR", "visible-plain-value");

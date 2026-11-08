@@ -1,15 +1,14 @@
-//! 工具守卫链：把"这个调用能不能直接执行"的裁决从 Runner 的内联逻辑
-//! 里抽出来，变成一条可扩展的责任链。
+//! 工具守卫链：判断一次调用能否直接执行，从 Runner 的内联逻辑中抽成
+//! 可扩展的责任链。
 //!
-//! 链上每个守卫回答同一道题：[`GuardVerdict`]——放行、直接拒绝、
-//! 或要求人过目。Runner 按序执行整条链，然后按**最严格者胜**的原则
-//! 合并结论：任一守卫 `Deny` 就拒绝；否则任一 `RequireApproval` 就进
-//! 审批；全部 `Pass` 才直接执行。这个合并次序是有意的：守卫之间不
-//! 互相覆盖，后来者不能替先到者放行。
+//! 每个守卫返回一个 [`GuardVerdict`]：放行、直接拒绝或要求人工审批。
+//! Runner 按顺序执行整条链，按最严格者胜的规则合并：任一 `Deny` 则拒绝；
+//! 否则任一 `RequireApproval` 则进入审批；全部 `Pass` 才直接执行。守卫
+//! 之间不互相覆盖，后出现的守卫不能替前面的守卫放行。
 //!
-//! 内置两个守卫照搬原先 Runner 的内联顺序：[`PolicyGuard`]（策略
-//! 裁决）在前，[`BoundaryEscalationGuard`]（越界写入升级）在后——
-//! 升级只对策略放行的调用生效，审计里记的仍是策略的原判。
+//! 内置守卫保持原 Runner 的内联顺序：[`PolicyGuard`]（策略裁决）在前，
+//! [`BoundaryEscalationGuard`]（越界写入升级）在后。升级只对策略放行的
+//! 调用生效，审计中记录的仍是策略原判。
 
 use std::sync::Arc;
 
@@ -21,59 +20,60 @@ use serde_json::Value;
 /// 单个守卫对一次调用的裁决。
 #[derive(Debug, Clone, PartialEq)]
 pub enum GuardVerdict {
-    /// 不拦，交给链上下一个守卫；链走完仍无反对即直接执行。
+    /// 不拦截，交给下一个守卫；整条链无反对时直接执行。
     Pass,
-    /// 直接拒绝，理由会原样进拒绝观察——连审批闸门都不问。
+    /// 直接拒绝。理由原样进入拒绝观察，不经过审批闸门。
     Deny(String),
-    /// 要求人工审批。理由的去向由投出这一票的守卫决定：越界升级这类
-    /// **复核**会把嫌疑文本放进
+    /// 要求人工审批。理由的用途由投票守卫决定：越界升级这类复核会把
+    /// 嫌疑文本放入
     /// [`ApprovalRequest::reason`](crate::application::port::ApprovalRequest)，
-    /// 从而禁用会话信任；策略守卫的常规审批理由只落在 `PolicyEvaluated`
-    /// 审计事件里，不进 `reason`——否则普通审批会被当成升级复核。
+    /// 闸门据此禁用会话信任。策略守卫的常规理由只写入 `PolicyEvaluated`
+    /// 审计事件，不进入 `reason`，否则普通审批会被当作升级复核。
     RequireApproval(String),
 }
 
-/// 一次守卫裁决的上下文：调用本身与被调工具的登记规格。
+/// 守卫裁决的上下文：被调工具的登记规格。
 ///
-/// 规格里带风险注解（只读与否），守卫按它取舍口径。
+/// 规格包含风险注解（是否只读），守卫据此选择判定规则。
 pub struct GuardContext<'a> {
     /// 被调工具的登记规格。
     pub spec: &'a ToolSpec,
 }
 
 impl<'a> GuardContext<'a> {
-    /// 一次调用加它的规格。
+    /// 用被调工具的规格构造。
     pub fn new(spec: &'a ToolSpec) -> Self {
         Self { spec }
     }
 }
 
-/// 工具守卫：对一次即将执行的调用给出一票结论。
+/// 工具守卫：对即将执行的调用给出一个结论。
 ///
-/// 与 [`crate::application::port::ApprovalGate`] 的分工：守卫是
-/// **自动裁决**（纯函数、无 IO、同步），闸门是**人的决定**（可能
-/// 停下来等输入、异步）。守卫链的结论决定"要不要去问闸门"。
+/// 与 [`crate::application::port::ApprovalGate`] 的分工：守卫做自动裁决，
+/// 纯函数、无 IO、同步；闸门执行人的决定，可能等待输入，异步。守卫链的
+/// 结论决定是否需要询问闸门。
 pub trait ToolGuard: Send + Sync {
-    /// 守卫名，供测试与诊断标识。
+    /// 守卫名，用于测试与诊断。
     ///
-    /// 不参与裁决合并（合并按链序与严重级），也不用于识别守卫类型：
-    /// Runner 按具体类型判断策略守卫，重名不会改变任何语义。
+    /// 不参与裁决合并（合并按链序与严重级），也不用于识别类型。Runner
+    /// 按具体类型判断策略守卫，重名不影响语义。
     fn name(&self) -> &str;
 
-    /// 对一次调用给出一票结论。
+    /// 对一次调用给出结论。
     fn inspect(&self, call: &ToolCall, ctx: &GuardContext<'_>) -> GuardVerdict;
 
-    /// 按具体类型借用守卫，供 Runner 取回链上特定守卫的附加能力
-    /// （例如策略守卫的原始裁决）。默认返回 `None`。
+    /// 按具体类型借用守卫，供 Runner 获取特定守卫的附加能力，例如策略
+    /// 守卫的原始裁决。默认返回 `None`。
     fn as_policy_guard(&self) -> Option<&PolicyGuard> {
         None
     }
 }
 
-/// 策略守卫：把 [`PolicyEngine`] 的裁决翻译成守卫的一票。
+/// 策略守卫：把 [`PolicyEngine`] 的裁决映射为守卫结论。
 ///
-/// 裁决映射是直译：`Allow` → `Pass`，`RequireApproval` → `RequireApproval`，
-/// `Deny` → `Deny`。命中规则的理由原样随行，模型与审计都靠它定位规则。
+/// 映射关系：`Allow` 对应 `Pass`，`RequireApproval` 对应
+/// `RequireApproval`，`Deny` 对应 `Deny`。命中规则的理由原样传递，模型与
+/// 审计据此定位规则。
 pub struct PolicyGuard {
     engine: PolicyEngine,
 }
@@ -84,8 +84,8 @@ impl PolicyGuard {
         Self { engine }
     }
 
-    /// 策略裁决的原始结论。Runner 要把它记进 `PolicyEvaluated` 证据，
-    /// 所以除了守卫一票，这里还留原判可取。
+    /// 策略裁决的原始结论。Runner 需要写入 `PolicyEvaluated` 证据，因此
+    /// 除守卫结论外还提供原判。
     pub fn evaluate(&self, call: &ToolCall, spec: &ToolSpec) -> PolicyDecision {
         self.engine.evaluate(call, spec)
     }
@@ -110,16 +110,16 @@ impl ToolGuard for PolicyGuard {
     }
 }
 
-/// 越界写入升级守卫：策略放行了，但命令看着像把写操作伸到 workspace
-/// 外时，追加一票"要人过目"。
+/// 越界写入升级守卫：策略已放行，但命令疑似向 workspace 外写入时，
+/// 追加一条要求人工审批的结论。
 ///
-/// 投票理由是嫌疑文本本身，不加解释性前缀：`ApprovalRequest.reason`
-/// 的 `Some` 就是"这是策略之外的复核"，闸门据此禁用会话信任；理由
-/// 只是给人看的那句话，形状与改造前保持一致。
+/// 投票理由为嫌疑文本本身，不加前缀。`ApprovalRequest.reason` 为 `Some`
+/// 表示这是策略之外的复核，闸门据此禁用会话信任。理由仅用于展示，输出
+/// 格式保持不变。
 ///
-/// 与硬拒绝（`write_escape_beyond`）共用同一套词法解析，口径刻意不同：
-/// 这里没有根可看，所有盘符绝对路径都算嫌疑——它是**兜底**，宁可多问；
-/// 硬拒绝是机械边界，必须准。两道防线的落差见 README"安全边界"。
+/// 与硬拒绝（`write_escape_beyond`）共用词法解析，但口径不同。此守卫
+/// 没有 workspace 根可参考，所有盘符绝对路径都算嫌疑，宁可多问；硬拒绝
+/// 是机械边界，必须准确。两道防线的差异见 README 的"安全边界"。
 pub struct BoundaryEscalationGuard;
 
 impl ToolGuard for BoundaryEscalationGuard {
@@ -128,8 +128,8 @@ impl ToolGuard for BoundaryEscalationGuard {
     }
 
     fn inspect(&self, call: &ToolCall, _ctx: &GuardContext<'_>) -> GuardVerdict {
-        // 只有带 command 参数的调用（即 run_command）走得进这个启发式，
-        // 其他工具没有命令文本可看。
+        // 只有带 `command` 参数的调用（`run_command`）进入此启发式，
+        // 其他工具没有命令文本。
         let Some(command) = call.arguments.get("command").and_then(Value::as_str) else {
             return GuardVerdict::Pass;
         };
@@ -140,15 +140,13 @@ impl ToolGuard for BoundaryEscalationGuard {
     }
 }
 
-/// 合并整条链的一票：**最严格者胜**。
+/// 合并整条链的结论，最严格者胜。
 ///
-/// 顺序遍历、先到先记 `Deny` / `RequireApproval`，但不提前返回——
-/// 返回值还带上"投出这一票的守卫在链上的下标"，供调用方按身份回查
-/// 类型；用下标而不是名字，是因为名字可以重名，不能承担语义判别。
-/// 链上后面的守卫仍会被询问（它们可能还要据此记账）。追求的是与旧
-/// 内联逻辑逐步一致：策略 `Deny` 时旧逻辑连升级检查都不做，但升级
-/// 守卫对 `Deny` 的调用本来就不会再投 `RequireApproval` 之外的票……
-/// 为避免行为分歧，合并**只看最高严重级**，同级的先到者胜。
+/// 按顺序遍历，记录首个 `Deny` 或 `RequireApproval`，但不提前返回。返回值
+/// 同时给出发出该结论的守卫下标，供调用方按身份查询类型；不使用名称，
+/// 因为名称可能重复，不能承担语义判别。后续守卫仍会被调用，它们可能需要
+/// 记录审计。守卫互不感知彼此的裁决（[`BoundaryEscalationGuard`] 就不读
+/// 策略结果），合并只看最高严重级，同级取先到者。
 pub fn run_guard_chain(
     guards: &[Arc<dyn ToolGuard>],
     call: &ToolCall,

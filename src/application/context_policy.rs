@@ -1,30 +1,30 @@
 //! 上下文策略：决定发给模型的历史视图。
 //!
-//! 循环只负责把视图发出去，"视图怎么来"归这个扩展点。默认策略就是现有
-//! 的预算裁剪；自定义策略（按相关性挑选、保留固定前缀等）实现
-//! [`ContextPolicy`] 即可，不需要改循环。
+//! 循环只负责发送视图，视图的生成归这个扩展点。默认策略是现有的预算
+//! 裁剪；自定义策略（按相关性挑选、保留固定前缀等）实现
+//! [`ContextPolicy`] 即可，循环不用改。
 //!
-//! 裁剪报告不放进 trait：策略只交视图，"裁了几轮、省了多少 token"由
+//! 裁剪报告不属于 trait：策略只交视图，"裁了几轮、省了多少 token"由
 //! [`CompactionReport::measure`](crate::domain::context::CompactionReport::measure)
-//! 按"实际视图 vs 完整历史"现测。自定义策略下，报告仍然描述真正发出的
-//! 内容，而不是某一套固定算法的假设；是否落审计事件由循环按"有没有整轮
-//! 被裁"决定（沿用既有口径）。
+//! 按实际视图与完整历史现测。自定义策略下，报告仍描述真正发出的内容，
+//! 不依赖具体算法。是否落审计事件由循环按"有没有整轮被裁"决定，沿用
+//! 既有口径。
 
 use crate::domain::context::{compact_with_summary, ContextBudget, Summary};
 use crate::domain::session::{ContextSlice, Session};
 
 /// 模型可见历史的生成策略。
 ///
-/// 实现方只读会话、不改会话：返回的片段借用 `session`，需要新增文本
-/// （摘要、占位说明、台账）时自己持有 `Cow::Owned`。
+/// 实现只读会话，不改会话：返回的片段借用 `session`，新增文本（摘要、
+/// 占位说明、台账）时自己持有 `Cow::Owned`。
 ///
-/// `view` 在一轮内可能被调用两次（先探测哪些轮次会被裁掉、补摘要后再
-/// 生成正式视图），实现必须是纯函数，不依赖调用次数、不产生副作用。
+/// `view` 在一轮内可能被调用两次（先探测哪些轮次会被裁掉，补摘要后再
+/// 生成正式视图）。实现必须是纯函数，不依赖调用次数，不产生副作用。
 pub trait ContextPolicy: Send + Sync {
     /// 生成本次要发给模型的历史视图。
     ///
-    /// `summary` 是调用方刚生成的摘要（可能为 `None`）。显式传入而不是
-    /// 让策略去会话里找，是为了让"刚生成、尚未写回"的摘要也能立刻生效。
+    /// `summary` 是调用方刚生成的摘要，可能为 `None`。显式传入是为了让
+    /// 尚未写回会话的摘要也能立刻生效。
     fn view<'a>(
         &self,
         session: &'a Session,
@@ -35,8 +35,8 @@ pub trait ContextPolicy: Send + Sync {
 
 /// 默认策略：按 token 预算裁剪，摘要优先于占位说明。
 ///
-/// 行为与 [`compact_with_summary`] 完全一致——扩展点只是把这段既有逻辑
-/// 挪到了接口后面。
+/// 行为与 [`compact_with_summary`] 完全一致，只是把既有逻辑移到了接口
+/// 后面。
 pub struct DefaultContextPolicy;
 
 impl ContextPolicy for DefaultContextPolicy {
@@ -89,7 +89,7 @@ mod tests {
         }
     }
 
-    /// 默认策略交出的视图与直接裁剪逐片相同，报告也测得一致。
+    /// 默认策略交出的视图与直接裁剪逐片相同，报告也一致。
     #[test]
     fn the_default_policy_matches_direct_compaction() {
         let session = session_with_rounds(6);
@@ -102,7 +102,7 @@ mod tests {
         assert_eq!(CompactionReport::measure(&session, &view), report);
     }
 
-    /// 自定义策略可以完全不裁：视图就是完整历史，报告如实测出"没丢"。
+    /// 自定义策略可以不裁剪：视图是完整历史，报告测出没有丢失。
     #[test]
     fn a_custom_policy_can_keep_the_whole_history() {
         struct KeepEverything;

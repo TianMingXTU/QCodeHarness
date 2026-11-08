@@ -1,13 +1,13 @@
 //! ReAct（Reason + Act）循环的入口：薄壳。
 //!
 //! 分工：
-//! - rig 负责模型协议适配（OpenAI 兼容的 `/chat/completions`）
-//!   与工具定义的序列化，封装在 `infrastructure::model`；
-//! - ReAct 循环本身在 `application::agent_run::AgentRunner`；
-//! - 本文件只做三件事：读环境变量、把各层实现组装起来、把结果打印出去。
+//! - rig 负责模型协议适配（OpenAI 兼容的 `/chat/completions`）与工具
+//!   定义的序列化，封装在 `infrastructure::model`；
+//! - ReAct 循环在 `application::agent_run::AgentRunner`；
+//! - 本文件读取环境变量、组装各层实现、打印结果。
 //!
-//! 全部逻辑在库目标（`src/lib.rs`）里，本文件只消费它——
-//! 集成测试因此能用与生产完全相同的装配路径。
+//! 全部逻辑在库目标（`src/lib.rs`）中，本文件只消费它，因此集成测试
+//! 使用与生产相同的装配路径。
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -19,7 +19,7 @@ use qcode_harness::application::agent_run::{
     new_session_id, AgentDependencies, AgentRunner, RunState,
 };
 use qcode_harness::application::agent_roster::AgentRoster;
-use qcode_harness::application::benchmark::{run_benchmark, run_long_benchmark};
+use qcode_harness::infrastructure::benchmark_runner::{run_benchmark, run_long_benchmark};
 use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::mcp_lifecycle::McpLifecycleRecorder;
@@ -42,7 +42,7 @@ use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
 use qcode_harness::infrastructure::clock::SystemClock;
 use qcode_harness::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
-use qcode_harness::infrastructure::evidence::memory::MemoryEvidenceSink;
+use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::infrastructure::evidence::reader;
 use qcode_harness::infrastructure::mcp;
 use qcode_harness::infrastructure::mcp::config::McpConfig;
@@ -53,13 +53,13 @@ use qcode_harness::infrastructure::task_store::JsonTaskStore;
 use qcode_harness::infrastructure::tool::BuiltinToolSource;
 use qcode_harness::infrastructure::worktree::RootedWorktreeScanner;
 use qcode_harness::interface::cli::{self, ConsoleReporter};
-use qcode_harness::interface::instructions;
+use qcode_harness::infrastructure::instructions;
 
 /// `LLM_MAX_TURNS` 未设置时的默认最大轮数。
 const DEFAULT_MAX_TURNS: u32 = 20;
 
-// 系统提示词随角色分发：各角色的提示词集中在 `AgentProfile::builtin()`
-// 里（按角色提供"能做什么、不许做什么"），这里没有全局提示词。
+// 系统提示词按角色分发，集中在 `AgentProfile::builtin()` 中（按角色
+// 说明可用与禁止的操作），这里没有全局提示词。
 
 /// 运行所需的模型服务配置，来自 `.env` 或进程环境变量。
 #[derive(Debug, Clone)]
@@ -76,8 +76,9 @@ struct LlmConfig {
     policy_path: Option<PathBuf>,
     /// 是否跳过人工审批。`--yes` 或 `QCH_AUTO_APPROVE=1` 时为真。
     auto_approve: bool,
-    /// 墙钟上限（秒）。编排模式下一个任务一个会话，它就是整个任务的
-    /// 上限；`--resume` 时是本次恢复运行的上限。未设置时不限时。
+    /// 墙钟上限（秒）。编排模式下一个任务一个会话，该值即整个任务的
+    /// 上限；恢复运行从快照延续累计耗时，跨多次 `--resume` 仍按同一
+    /// 上限比较。未设置时不限。
     max_wall_clock: Option<Duration>,
     /// 被裁历史累积到多少轮才生成一次 LLM 摘要。未设置时不做摘要，
     /// 被裁历史一律退回占位说明。
@@ -148,26 +149,25 @@ impl LlmConfig {
 
 /// 读各角色专属的模型名。
 ///
-/// 变量名按 `LLM_MODEL_<角色>` 的规律拼（见
-/// [`AgentRole::model_env_name`]）。没设置的角色不进表——编排器据此
-/// 用运行时的默认模型，请求里不出现 `model` 字段。
+/// 变量名按 `LLM_MODEL_<角色>` 规则拼接（见
+/// [`AgentRole::model_env_name`]）。未设置的角色不进入映射，编排器
+/// 据此使用运行时默认模型，请求中不出现 `model` 字段。
 fn read_role_models() -> HashMap<AgentRole, String> {
     read_role_models_from(|name| std::env::var(name).ok())
 }
 
 /// 从任意取值源读各角色专属的模型名。
 ///
-/// 逻辑与读环境变量分开，是为了能测：进程环境变量是全局状态，测试
-/// 里改它会与并行跑的其他测试互相污染。取值源做成参数，测试就能喂
-/// 一张假的变量表。
+/// 与读取环境变量的逻辑分开以便测试。进程环境变量是全局状态，测试
+/// 中修改会与并行运行的其他测试互相影响。取值源作为参数后，测试可以
+/// 传入模拟的变量表。
 fn read_role_models_from(lookup: impl Fn(&str) -> Option<String>) -> HashMap<AgentRole, String> {
     let mut models = HashMap::new();
     for role in AgentRole::all() {
         if let Some(name) = lookup(role.model_env_name()) {
             let name = name.trim().to_owned();
-            // 空串当作没配：环境变量存在但留空（`LLM_MODEL_CODER= `）是
-            // 很常见的写法，把它当成一个叫空串的模型会让请求打到一个
-            // 不存在的模型上。
+            // 空串视为未配置。环境变量留空（`LLM_MODEL_CODER=`）很常见，
+            // 当成空串模型名会让请求发往不存在的模型。
             if !name.is_empty() {
                 models.insert(role, name);
             }
@@ -178,8 +178,8 @@ fn read_role_models_from(lookup: impl Fn(&str) -> Option<String>) -> HashMap<Age
 
 /// 读各角色专属的推理档位。
 ///
-/// 档位写错必须让进程停下来：一个静默失效的档位配置等于"配了但没生效"，
-/// 用户会以为强推理已经开上了。
+/// 档位值非法时进程必须退出。静默失效的档位配置会让用户以为强推理
+/// 已启用。
 fn read_role_efforts() -> Result<HashMap<AgentRole, Effort>, String> {
     read_role_efforts_from(|name| std::env::var(name).ok())
 }
@@ -221,14 +221,14 @@ fn read_role_verbosities_from(
     Ok(verbosities)
 }
 
-/// 按配置装配内置花名册：给每个角色带上自己的模型与档位。
+/// 按配置装配内置花名册，为每个角色设置模型与档位。
 ///
-/// **模型与档位只影响"用哪个模型"，不影响"能干什么"。** 工具白名单
-/// 在 [`AgentRoster::builtin`] 里定死，这里不碰——给 Tester 配一个更
-/// 强的模型不等于让它能改文件。
+/// 模型名与档位只决定请求使用的模型，不影响可用工具。工具白名单在
+/// [`AgentRoster::builtin`] 中定义，此处不修改。为 Tester 配置更强的
+/// 模型不会允许它修改文件。
 ///
-/// 没配到的角色保持 `None`：请求里不出现 `model` 字段，档位由
-/// provider 取默认。
+/// 未配置的角色保持 `None`，请求中不出现 `model` 字段，档位由
+/// provider 取默认值。
 fn roster_with_role_models(config: &LlmConfig) -> AgentRoster {
     AgentRoster::builtin().with_role_models(
         &config.role_models,
@@ -266,29 +266,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return render_report(&workspace, args.report_dir.as_deref(), args.json);
     }
 
-    // 恢复探测同样不需要模型配置：它只回答"这个 MCP Server 现在能不能
-    // 说上话"，不跑任务、不碰审批、不读会话历史。
+    // 恢复探测同样不需要模型配置：只确认这个 MCP Server 能否通信，
+    // 不执行任务、不涉及审批、不读会话历史。
     if let Some(server) = &args.mcp_reconnect {
         return mcp_probe(&workspace, server).await;
     }
 
     let config = LlmConfig::from_env()?;
 
-    // 命令行开关优先于环境变量：显式敲 --yes 的意图比配置文件里的默认值更强。
+    // 命令行开关优先于环境变量：显式 --yes 覆盖配置默认值。
     let auto_approve = args.auto_approve || config.auto_approve;
 
-    // 策略配置读失败要让进程停下来：一个没人看懂的策略文件比没有策略更危险。
+    // 策略配置读取失败时进程退出。无法理解的策略文件比没有策略更危险。
     let policy = policy::load(config.policy_path.as_deref())
         .map_err(|error| format!("策略配置加载失败: {error}"))?;
 
-    // 模型接入走提供方注册表：默认（也是唯一）提供方是 OpenAI 兼容
-    // chat 端点。换一家服务商 = 实现 LlmProvider 并在这里登记，
-    // 循环、审批与下面的装配都不感知具体供应商。
+    // 模型接入使用提供方注册表：默认（也是唯一）提供方是 OpenAI 兼容
+    // chat 端点。更换服务商时实现 LlmProvider 并在此登记，循环、审批
+    // 与装配不感知具体供应商。
     //
-    // OpenAI 兼容端点必须走 chat()（/chat/completions）。不要用
-    // completion()：它对 OpenAI 方言默认指向 Responses API（/responses），
-    // DeepSeek 等兼容网关并不支持。这条约束封装在
-    // OpenAiCompatProvider::new 里，装配方不需要知道。
+    // OpenAI 兼容端点必须使用 chat()（/chat/completions），不要使用
+    // completion()：它对 OpenAI 方言默认指向 Responses API
+    // （/responses），DeepSeek 等兼容网关不支持。该约束封装在
+    // OpenAiCompatProvider::new 中，装配方无需了解。
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(OpenAiCompatProvider::new(
         config.base_url.as_str(),
@@ -300,20 +300,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .expect("内置提供方已登记")
         .gateway();
 
-    // 上下文预算：默认只做确定性裁剪（占位说明）；设了阈值才为被裁
-    // 历史花摘要调用——摘要是多花一次模型调用的可选项，默认关。
-    // 基准与普通运行共用同一套预算口径。
+    // 上下文预算：默认只做确定性裁剪（占位说明）。设置阈值后才为被裁
+    // 历史调用模型生成摘要，摘要是额外一次模型调用，默认关闭。基准与
+    // 普通运行使用同一套预算口径。
     let context_budget = config
         .summarize_min_dropped
         .map_or(ContextBudget::default(), |min| {
             ContextBudget::default().with_summarize(min)
         });
 
-    // ── 基准模式：跑 benchmarks/ 下的任务集并打分。放在全局工具装配
-    // 之前——运行器为每个任务重建以 fixture 拷贝为根的注册表，全局
-    // 注册表与 MCP 连接在这里用不上。──
+    // ── 基准模式：运行 benchmarks/ 下的任务集并打分。位于全局工具
+    // 装配之前：运行器为每个任务重建以 fixture 拷贝为根的注册表，
+    // 全局注册表与 MCP 连接在此用不上。──
     if args.benchmark || args.benchmark_long {
-        // 基准无人值守：交互式审批会把整场运行挂住，强制自动放行。
+        // 基准无人值守：交互式审批会阻塞整个运行，强制自动放行。
         let deps = AgentDependencies {
             model: Arc::clone(&model),
             tools: ToolRegistry::new(vec![]),
@@ -323,10 +323,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             roster: roster_with_role_models(&config),
             context_budget,
             evidence: Arc::new(MemoryEvidenceSink::new()),
-            // 短任务基准不留快照：恢复它们只会把任务跑回当前工作区，
-            // 而不是当时的 fixture 拷贝。证据照常落盘，--report 统计得到。
-            // 长任务基准的运行器会在每段装配自己的快照存储（恢复是
-            // 它流程的一部分），这里的 None 只是装配模板的占位。
+            // 短任务基准不保存快照：恢复时任务会运行在当前工作区，而非
+            // 当时的 fixture 拷贝。证据照常写入磁盘，--report 可统计。
+            // 长任务基准的运行器在每段装配自己的快照存储（恢复是其流程
+            // 的一部分），这里的 None 只是装配模板的占位。
             session_store: None,
             hooks: Arc::new(NoopHooks),
             context_policy: Arc::new(DefaultContextPolicy),
@@ -353,24 +353,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let passed = results.iter().filter(|result| result.passed).count();
         println!("\n通过 {passed}/{} 个任务", results.len());
         if passed < results.len() {
-            // 基准是打分工具：有任务未通过就用非 0 退出码说话，
-            // 自动化流水线才能感知。
+            // 基准是打分工具：存在未通过的任务时使用非 0 退出码，
+            // 自动化流水线可据此感知失败。
             std::process::exit(1);
         }
         return Ok(());
     }
 
-    // 工具注册表按来源装配：内置工具是一个来源，每个接上的 MCP Server
-    // 也是一个来源。配置了 QCH_MCP_CONFIG 才连接，缺文件即 MCP 关闭。
+    // 工具注册表按来源装配：内置工具与每个 MCP Server 各为一个来源。
+    // 仅当配置了 QCH_MCP_CONFIG 时连接，缺文件则关闭 MCP。
     let workspace_root = WorkspaceRoot::new(workspace.clone());
     let mut tool_sources: Vec<Arc<dyn ToolSource>> =
         vec![Arc::new(BuiltinToolSource::new(workspace_root))];
-    // 连接归拢到这里，三条正常结束路径都要显式关闭它们（见
-    // close_mcp_connections）；未配置 MCP 时就是空表。
+    // 所有连接汇总于此，三条正常结束路径都显式关闭（见
+    // close_mcp_connections）。未配置 MCP 时为空。
     let mut mcp_sources: Vec<mcp::McpToolSource> = Vec::new();
     if let Some(config_path) = std::env::var_os("QCH_MCP_CONFIG").map(PathBuf::from) {
-        // 配置文件存在但非法要让进程停下来：用户明确想接 MCP，静默跳过
-        // 会让模型拿着残缺的工具清单跑任务（与策略配置同一哲学）。
+        // 配置文件存在但非法时进程退出。用户明确要接入 MCP，静默跳过会让
+        // 模型使用残缺的工具清单运行（与策略配置同一原则）。
         let mcp_config = McpConfig::load(&config_path)
             .map_err(|error| format!("{error}（文件: {}）", config_path.display()))?;
         if let Some(mcp_config) = mcp_config {
@@ -389,8 +389,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             mcp_sources = sources;
         }
     }
-    // 来源顺序即工具顺序：内置在前，MCP 在后；同名工具后到的来源胜出
-    // （MCP 前缀 `mcp__<server>__` 保证正常运行时不与内置撞名）。
+    // 来源顺序即工具顺序：内置在前，MCP 在后，同名工具由后到的来源
+    // 覆盖（MCP 前缀 `mcp__<server>__` 使正常运行时不会与内置工具重名）。
     tool_sources.extend(
         mcp_sources
             .iter()
@@ -402,14 +402,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //   --yes                恒放行（基准与脚本化场景）
     //   --ai-review          模型先审，拿不准的退回交互式闸门
     //   默认                 交互式闸门
-    // --yes 与 --ai-review 同时给出时走 --yes：用户已经声明"不用人管"，
-    // 再插一个模型审查只是白花一次调用。
+    // --yes 与 --ai-review 同时给出时采用 --yes：用户已声明无需人工
+    // 确认，再插入模型审查只会多一次无效调用。
     let approvals: Arc<dyn ApprovalGate> = if auto_approve {
         Arc::new(AutoApproveGate)
     } else if args.ai_review {
-        // 审查员的退路必须是交互式闸门：模型说"拿不准"时得有人接。
-        // 与主循环共用同一个模型实例——审查就是一次普通的模型调用。
-        // clone 再 erase：同一个模型实例后面主循环还要用，erase() 会移走它。
+        // 模型审查不确定时必须退回交互式闸门，由人工决定。审查与主循环
+        // 共用同一个模型实例，审查本身是一次普通模型调用；克隆 Arc，不
+        // 移走主循环持有的实例。
         Arc::new(AiReviewGate::new(
             Arc::clone(&model),
             Box::new(CliApprovalGate::new()),
@@ -448,13 +448,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             rounds_of(&snapshot),
             state_label(&snapshot.state),
         );
-        // 恢复的会话属于某个角色，工具集必须按同一份档案裁剪——
-        // 白名单是硬边界，编排与恢复两条路径共用一条滤网（AgentRoster）。
-        // 不裁的话，中断的只读步骤恢复后会带着全量注册表上场，
-        // 提示词说"你没有写能力"，模型手里却握着 write_file。
-        // 工具定义给全量：模型看到的工具定义对所有步骤统一（前缀缓存
-        // 才命得中），角色边界由 runner 按花名册在调用层校验——恢复路径
-        // 与编排路径走的是同一道校验，不因入口不同而松动。
+        // 恢复的会话属于某个角色，角色可用的工具按同一份档案约束。工具
+        // 定义用全量（所有步骤一致，前缀缓存才能命中），白名单由 runner
+        // 按花名册在调用层校验：装配期不按角色过滤，越权调用会被拒绝。
         let runner = match AgentRunner::resume(
             snapshot,
             AgentDependencies {
@@ -503,13 +499,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             snapshot.task.current_index(),
             snapshot.task.steps().len(),
         );
-        // 工作区检查由编排器在恢复前做（快照里存着"当时的样子"）。
-        // CLI 这边先把差异打出来，让人看得见到底改了什么——
-        // 编排器默认拒绝恢复，用户看完可以加 --force-worktree 放行。
+        // 工作区检查由编排器在恢复前执行，快照中保存了当时的状态。
+        // CLI 先打印差异，用户确认改动后可加 --force-worktree 放行；
+        // 编排器默认拒绝恢复。
         //
-        // 快照里没有清单时不比对：空清单 vs 当前清单，每个文件都是
-        // "新增"，全量误报。"这一道检查没有跑"由编排器统一出声，
-        // CLI 只负责把查到的差异打印出来，两处各报一遍是噪音。
+        // 快照中没有清单时不比对：空清单与当前清单相比，每个文件都会被
+        // 视为新增，产生全量误报。"检查未执行"由编排器统一提示，CLI
+        // 只打印查到的差异，两处各报一次会造成噪音。
         let scanner = RootedWorktreeScanner::new(&workspace);
         if let Some(ResumeCheck::WorktreeChanged { changes }) = (!snapshot.worktree.is_empty())
             .then(|| task_resume::check_worktree(&snapshot.worktree, &scanner))
@@ -577,10 +573,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     };
 
-    // 项目指令：workspace 根上的 QCODEHARNESS.md（次级位置
-    // .qcodeharness/instructions.md 在受保护路径里，模型读写都会被拒，
-    // 放那里的约定不会被一次失控的 write_file 抹掉）。两个位置都没有
-    // 时花名册就是内置档案，行为与没有这个特性时逐字相同。
+    // 项目指令：workspace 根上的 QCODEHARNESS.md。次级位置
+    // .qcodeharness/instructions.md 属于受保护路径，模型读写都会被拒，
+    // 放在那里的约定不会被失控的 write_file 清除。两个位置都不存在时，
+    // 花名册使用内置档案，行为与没有该特性时相同。
     let roster = match instructions::load_project_instructions(&workspace) {
         Some(loaded) => {
             for warning in &loaded.warnings {
@@ -614,14 +610,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if auto_approve {
         println!("审批: 自动放行（QCH_AUTO_APPROVE 或 --yes）");
     } else if args.ai_review {
-        // 说清退路：用户需要知道模型拿不准时仍然会来问他。
+        // 说明退路：模型不确定时仍会询问用户。
         println!("审批: AI 审查优先，拿不准时退回人工询问");
     } else {
         println!("审批: 交互式（每次副作用工具执行前询问）");
     }
 
-    // 每步一份证据：独立的 JSONL 文件（与会话 ID 同名）+ 一个新的控制台
-    // 播报器（轮次号每步从头计，复用旧播报器会丢步骤 2-4 的分隔线）。
+    // 证据汇工厂：一个任务一份 JSONL（与任务会话同名），整个任务所有
+    // 步骤共用。控制台播报随任务建，不随步骤建。
     let evidence_factory = evidence_factory_for(&workspace, config.max_turns);
 
     // 任务 ID 复用会话 ID 的生成策略：唯一、可读，证据/快照同名可互查。
@@ -635,8 +631,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         policy,
         roster: roster.clone(),
         context_budget,
-        // 编排器为任务另造证据汇（一个任务一份 JSONL），这个占位不会被
-        // 步骤用到；deps 的形状要求它有值。
+        // 编排器为任务另建证据汇（一个任务一份 JSONL），这个占位不会
+        // 被步骤使用；deps 的结构要求该字段有值。
         evidence: Arc::new(MemoryEvidenceSink::new()),
         // 快照落盘随运行自动开启；--resume 可从任一会话恢复。
         session_store: Some(store.clone()),
@@ -653,9 +649,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!("{error}");
-            // 失败时刻把会话 ID 与任务 ID 给出来：证据文件按会话 ID 命名，
-            // 任务快照按任务 ID 命名。拿到 ID 就能翻证据或 --resume-task，
-            // 不用再翻目录。
+            // 失败时输出会话 ID 与任务 ID：证据文件按会话 ID 命名，任务
+            // 快照按任务 ID 命名。拿到 ID 即可查看证据或执行 --resume-task，
+            // 无需浏览目录。
             if let ApplicationError::StepFailed { session_id, .. } = &error {
                 eprintln!("会话 {session_id} 的证据已写入 .qcodeharness/sessions/");
             }
@@ -748,8 +744,8 @@ fn state_label(state: &RunState) -> &'static str {
     }
 }
 
-/// 组装证据扇出：控制台播报给人看，JSONL 落盘给事后查。
-/// 新任务与恢复两条入口共用。
+/// 组装证据扇出：控制台播报给人看，JSONL 落盘给事后查。会话级
+/// `--resume` 入口使用；任务级路径走 `evidence_factory_for`。
 fn fanout_evidence(
     evidence_path: &Path,
     reporter: Arc<ConsoleReporter>,
@@ -763,7 +759,7 @@ fn fanout_evidence(
 
 /// 每任务的证据汇工厂：一个任务一份 JSONL + 一个控制台播报器。
 ///
-/// 独立成函数是因为新任务与任务级恢复两条入口都要用它——恢复路径上
+/// 独立成函数是因为新任务与任务级恢复两条入口都使用它。恢复路径上
 /// 证据要**追加**到同一个文件（复盘时一个 ID 看到全貌），所以工厂
 /// 每次都按会话 ID 打开同一个路径。
 fn evidence_factory_for(workspace: &Path, max_turns: u32) -> EvidenceFactory {
@@ -778,11 +774,12 @@ fn evidence_factory_for(workspace: &Path, max_turns: u32) -> EvidenceFactory {
     })
 }
 
-/// 跑到底并汇报结果。新任务与恢复两条入口共用的尾巴。
+/// 执行到底并汇报结果。会话级 `--resume` 入口的收尾；新任务与任务级
+/// 恢复在各自入口内联完成同样的事。
 async fn run_and_report(mut runner: AgentRunner, budget: &Budget, evidence_path: &Path) {
-    // 错误要按 Display 打印而不是交给 Box<dyn Error> 的 Debug：错误消息里的
-    // 对策指引（"调大 LLM_MAX_TURNS"这类）是写给用户看的，Debug 格式会把
-    // 它变成一个结构体转储。
+    // 错误按 Display 打印，不交给 Box<dyn Error> 的 Debug。错误消息中的
+    // 对策指引（如"调大 LLM_MAX_TURNS"）面向用户，Debug 格式会输出为
+    // 结构体转储。
     let outcome = match runner.run(budget).await {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -801,12 +798,12 @@ async fn run_and_report(mut runner: AgentRunner, budget: &Budget, evidence_path:
 
 /// MCP 连接事件专用审计汇：`.qcodeharness/sessions/mcp-lifecycle.jsonl`。
 ///
-/// 连接事件与工具事件分账：启动失败、断连、恢复尝试都不是工具调用，
-/// 混进会话日志会让"成功/失败会话数"失真。报表侧按"整份日志只有连接
-/// 事件"识别它并单列统计（application::report 的 mcp_summary）。
-/// 固定文件名、跨运行追加——序号从文件里最后一条接着走（与恢复运行
-/// 同一份证据文件的做法一致）。打开失败只警告不阻断：没有连接审计的
-/// 运行仍然是一次诚实的运行，只是复盘时少一本账。
+/// 连接事件与工具事件分开记录。启动失败、断连、恢复尝试都不是工具
+/// 调用，混入会话日志会使"成功/失败会话数"失真。报表按"整份日志只含
+/// 连接事件"识别该文件并单独统计（application::report 的 mcp_summary）。
+/// 文件名固定，跨运行追加，序号接续文件中最后一条（与恢复运行使用
+/// 同一证据文件的做法一致）。打开失败只警告：没有连接审计的运行仍然
+/// 有效，只是复盘时缺少这部分记录。
 fn mcp_lifecycle_recorder(workspace: &Path) -> Option<Arc<McpLifecycleRecorder>> {
     let path = session_path(workspace, "mcp-lifecycle");
     match JsonlEvidenceSink::open(&path) {
@@ -826,10 +823,9 @@ fn mcp_lifecycle_recorder(workspace: &Path) -> Option<Arc<McpLifecycleRecorder>>
 
 /// 收尾：正常结束的三条路径共用，显式关闭所有 MCP 连接。
 ///
-/// 失败路径靠 `std::process::exit` 离开，不经过这里——那时清理由
-/// 操作系统与 Job Object 兜底（子进程已纳入 Job，随父进程终止）。
-/// 这里走的是温和的一条：transport 先优雅收尾，再释放进程组兜底，
-/// 两侧都留下可查的证据。
+/// 失败路径通过 `std::process::exit` 离开，不经过这里。此时清理由
+/// 操作系统与 Job Object 处理（子进程已纳入 Job，随父进程终止）。
+/// 正常路径先优雅关闭 transport，再释放进程组兜底，两侧都留下记录。
 async fn close_mcp_connections(sources: &[mcp::McpToolSource]) {
     for source in sources {
         source.close().await;
@@ -838,10 +834,10 @@ async fn close_mcp_connections(sources: &[mcp::McpToolSource]) {
 
 /// `--mcp-reconnect <服务器名>`：独立探测模式。
 ///
-/// 只回答"这个 Server 现在能不能说上话"：按配置启动、握手、发现工具，
-/// 把事实写进连接审计，然后显式关闭退出。有界一次，不接任务、不重放
-/// 历史调用、不进任何会话；恢复出来的工具也不注入当前进程——工具要
-/// 进任务，照常带任务描述启动，走完整的注册、授权与审批。
+/// 只确认该 Server 当前能否通信：按配置启动、握手、发现工具，把结果
+/// 写入连接审计，然后显式关闭退出。执行一次即结束，不接任务、不重放
+/// 历史调用、不进入任何会话。探测到的工具不注入当前进程；要在任务中
+/// 使用工具，照常带任务描述启动，走完整的注册、授权与审批。
 async fn mcp_probe(workspace: &Path, server: &str) -> Result<(), Box<dyn Error>> {
     let Some(config_path) = std::env::var_os("QCH_MCP_CONFIG").map(PathBuf::from) else {
         return Err("未设置 QCH_MCP_CONFIG，没有可探测的 MCP 配置".into());
@@ -866,8 +862,8 @@ async fn mcp_probe(workspace: &Path, server: &str) -> Result<(), Box<dyn Error>>
     let source = mcp::McpToolSource::connect(server_config, mcp_lifecycle_recorder(workspace))
         .await
         .map_err(|error| {
-            // 失败要原样带出分类：这是这个模式存在的意义——用户看到的
-            // 应该就是"哪类故障、结果可知否"，不是一个被改写过的结论。
+            // 失败时原样输出分类，这是该模式的目的：用户需要看到具体
+            // 的故障分类与结果可知性，不需要改写过的结论。
             format!("MCP Server `{server}` 恢复失败: {error}")
         })?;
     let count = source.tool_count();
@@ -879,8 +875,8 @@ async fn mcp_probe(workspace: &Path, server: &str) -> Result<(), Box<dyn Error>>
 
 /// 把同一条事件分发给多个证据汇。
 ///
-/// 一个坏汇不能连累其他汇：JSONL 自身已经会降级（打警告后丢弃），
-/// 这里再包一层是防止将来某个汇 panic 把整个循环带崩。
+/// 单个汇失败不影响其他汇。JSONL 自身会降级（打印警告后丢弃），这里
+/// 再包一层，防止某个汇 panic 中断整个分发循环。
 struct FanoutEvidenceSink {
     sinks: Vec<Arc<dyn EvidenceSink>>,
 }
@@ -895,8 +891,8 @@ impl FanoutEvidenceSink {
 impl EvidenceSink for FanoutEvidenceSink {
     fn record(&self, at: qcode_harness::application::port::Timestamp, event: qcode_harness::domain::evidence::AuditEvent) {
         for sink in &self.sinks {
-            // catch_unwind 不能跨 await，但 record 是同步的，可以包住。
-            // 用一个汇的 panic 不该让任务和其余证据一起陪葬。
+            // catch_unwind 不能跨 await，record 是同步方法，可以包裹。
+            // 单个汇 panic 不应影响任务和其余证据。
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 sink.record(at, event.clone());
             }));
@@ -922,7 +918,7 @@ mod tests {
         }
     }
 
-    /// 每个角色读各自的环境变量，互不串味。
+    /// 每个角色读取各自的环境变量，互不干扰。
     #[test]
     fn role_models_come_from_their_own_variables() {
         let models = read_role_models_from(&table(&[
@@ -939,7 +935,7 @@ mod tests {
         assert_eq!(models[&AgentRole::Reviewer], "reviewer-model");
     }
 
-    /// 没配的角色不进表：编排器据此让该角色用运行时的默认模型。
+    /// 未配置的角色不进入映射，编排器据此使用运行时默认模型。
     #[test]
     fn an_unconfigured_role_is_absent_from_the_table() {
         let models = read_role_models_from(&table(&[("LLM_MODEL_CODER", "coder-model")]));
@@ -949,8 +945,8 @@ mod tests {
         assert!(!models.contains_key(&AgentRole::Tester));
     }
 
-    /// 一个角色都没配时，表是空的——请求里不会出现 `model` 字段，
-    /// 默认部署就是全角色共用运行时的默认模型。
+    /// 未配置任何角色时映射为空，请求中不出现 `model` 字段。默认部署
+    /// 下所有角色共用运行时默认模型。
     #[test]
     fn without_any_configuration_the_tables_are_empty() {
         assert!(read_role_models_from(&table(&[])).is_empty());
@@ -958,10 +954,10 @@ mod tests {
         assert!(read_role_verbosities_from(&table(&[])).unwrap().is_empty());
     }
 
-    /// 留空的值当作没配。
+    /// 留空的值视为未配置。
     ///
-    /// `LLM_MODEL_CODER=` 是很常见的写法（先占个位、以后再填）。当成一个
-    /// 叫空串的模型会让请求打到一个不存在的模型上，报错还难懂。
+    /// `LLM_MODEL_CODER=` 是常见写法（先占位后填写）。当成空串模型名
+    /// 会使请求发往不存在的模型，报错信息也难以理解。
     #[test]
     fn a_blank_value_counts_as_unset() {
         let models = read_role_models_from(&table(&[("LLM_MODEL_CODER", "   ")]));

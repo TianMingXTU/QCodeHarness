@@ -1,10 +1,10 @@
-//! 自定义工具来源：把一批工具接进 Harness 的注册表。
+//! 自定义工具来源：把一组工具接入 Harness 注册表。
 //!
 //! 运行：`cargo run --example custom-tool-source`
 //!
-//! `ToolSource` 只回答"这个来源提供哪些登记项"；登记项把模型可见的规格
-//! 与真正的执行入口绑在一起，注册表按来源顺序合并，同名工具后到的来源
-//! 胜出。这里给内置工具加一个只读的 `char_count`。
+//! `ToolSource` 提供一组登记项。每个登记项绑定模型可见的规格与执行入口。
+//! 注册表按来源顺序合并，同名工具由后到的来源覆盖。本示例在内置工具之外
+//! 增加只读的 `char_count`。
 
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::infrastructure::tool::BuiltinToolSource;
 use serde_json::json;
 
-/// 只读的演示工具：统计参数文本的字符数。
+/// 只读演示工具：统计参数文本的字符数。
 struct CharCount;
 
 impl ToolInvoker for CharCount {

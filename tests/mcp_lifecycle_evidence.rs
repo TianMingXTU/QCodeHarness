@@ -1,8 +1,8 @@
 //! MCP 生命周期证据的落盘与读回验收。
 //!
-//! 单元测试用内存事件流就够了，这里要验的是**磁盘契约**：新事件写进
-//! JSONL 之后旧 reader 读得回来、报表算得对、`--report` 不会因为多一份
-//! 连接日志就把任务判成败。这几件事只有真实文件能证明。
+//! 这里验证**磁盘契约**：新事件写入 JSONL 后旧 reader 能否读回、报表
+//! 统计是否正确、`--report` 是否会把连接日志误判为任务。单元测试的
+//! 内存事件流覆盖不到这些行为，只有真实文件能证明。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,7 +39,7 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// 固定时钟：连接事件的时刻要可断言，而不是"看测试跑多快"。
+/// 固定时钟，使连接事件的时刻可断言，不依赖测试执行速度。
 struct FixedClock(SystemTime);
 
 impl Clock for FixedClock {
@@ -48,7 +48,7 @@ impl Clock for FixedClock {
     }
 }
 
-/// 按文件名打开一份追加写的 JSONL 证据汇。
+/// 按文件名打开追加写的 JSONL 证据汇。
 fn open(dir: &Path, name: &str) -> Arc<dyn EvidenceSink> {
     Arc::new(JsonlEvidenceSink::open(&dir.join(name)).expect("打开证据文件"))
 }
@@ -73,10 +73,10 @@ fn call(name: &str) -> ToolCall {
     }
 }
 
-/// 经 `McpLifecycleRecorder` 写的连接事件，落盘后被旧 reader 原样读回。
+/// 经 `McpLifecycleRecorder` 写入的连接事件，落盘后可被旧 reader 原样读回。
 ///
-/// 这是"审计链闭环"的最小证据：执行层给的事实、写到磁盘的内容、报表读回
-/// 的统计必须是同一件事，中间没有靠输出文本反推的环节。
+/// 这是审计链闭环的最小证据：执行层给出的事实、磁盘内容与报表统计
+/// 必须一致，不依赖输出文本反推。
 #[test]
 fn lifecycle_recorder_events_survive_the_jsonl_round_trip() {
     let dir = temp_dir("recorder");
@@ -141,7 +141,7 @@ fn lifecycle_recorder_events_survive_the_jsonl_round_trip() {
     assert_eq!(summary.mcp_disconnects, 1);
     assert_eq!(summary.mcp_recoveries, 1);
     assert_eq!(summary.mcp_recovery_failures, 1);
-    // 启动失败没有工具调用：既不伪造工具结局，也不伪造执行边界记录。
+    // 启动失败没有工具调用，不应伪造工具结局或执行边界记录。
     assert_eq!(summary.tool_calls, 0);
     assert_eq!(
         (summary.succeeded, summary.failed, summary.refused),
@@ -158,10 +158,10 @@ fn lifecycle_recorder_events_survive_the_jsonl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// 一份连接日志 + 一份真会话：报表说"成功 1 份"，不说"失败 1 份"。
+/// 连接日志与真会话混合时，报表统计为成功 1 份、失败 0 份。
 ///
-/// 这是用户看得见的差别：MCP 没起来时 `--report` 不能同时告诉他"有个
-/// 任务挂了"，也不能因为连接日志没有成本数据就把整轮成本拖成未知。
+/// MCP 启动失败时，`--report` 不能报告任务失败；连接日志没有成本数据，
+/// 也不能把整轮成本变成未知。
 #[test]
 fn connection_only_log_does_not_distort_the_session_counts() {
     let dir = temp_dir("mixed");
@@ -209,9 +209,9 @@ fn connection_only_log_does_not_distort_the_session_counts() {
             AuditEvent::Thought {
                 turn: 2,
                 text: "交付答案".to_owned(),
-                // 必须是"已知为 0"：`TokenUsage::default()` 的 `cost_usd` 是
-                // `None`（未知），一次未知调用就把整份合计拖成未知，那样这条
-                // 断言测的就不是"连接日志被排除"，而是成本口径本身。
+                // 必须是已知的 0。`TokenUsage::default()` 的 `cost_usd` 为
+                // `None`（未知），一次未知调用会让整份合计变为未知；那样
+                // 该断言测的是成本口径，无法验证连接日志是否被排除。
                 usage: TokenUsage {
                     cost_usd: Some(0.0),
                     ..TokenUsage::default()
@@ -283,7 +283,7 @@ fn connection_only_log_does_not_distort_the_session_counts() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// 混写进同一份日志时，末尾那条关闭事件也不能把已交付的会话判成失败。
+/// 同一份日志混写时，末尾的关闭事件不能把已交付的会话判成失败。
 #[test]
 fn trailing_close_in_a_mixed_log_keeps_the_session_successful() {
     let dir = temp_dir("trailing");
@@ -320,10 +320,10 @@ fn trailing_close_in_a_mixed_log_keeps_the_session_successful() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// 旧格式的证据文件（没有这些新字段）照常读，MCP 统计落成 0。
+/// 旧格式证据文件（缺少新字段）仍可读取，MCP 统计为 0。
 ///
-/// `#[serde(default)]` 只在 JSON 层面兜底；真正要保证的是历史文件不会
-/// 因为新增事件类型而读不动——用户机器上还躺着 P9/P10 的证据。
+/// `#[serde(default)]` 只处理 JSON 层面；这里要保证历史文件不会因为新增
+/// 事件类型而无法读取，用户机器上仍有 P9/P10 的证据。
 #[test]
 fn legacy_evidence_file_still_reads_with_zero_mcp_counts() {
     let dir = temp_dir("legacy");
@@ -372,8 +372,8 @@ fn legacy_evidence_file_still_reads_with_zero_mcp_counts() {
 
 /// 落盘的观察保持旧的两字段形状。
 ///
-/// `mcp_failure` 是进程内交接的事实，一旦跟着 `ToolObserved` 进文件，
-/// 恢复路径与历史 reader 就要多认一种它们不认识的形状。
+/// `mcp_failure` 是进程内交接的事实。若跟随 `ToolObserved` 写入文件，
+/// 恢复路径与历史 reader 需要额外识别一种新形状。
 #[test]
 fn observed_outcome_keeps_the_legacy_two_field_shape() {
     let dir = temp_dir("shape");
@@ -411,10 +411,10 @@ fn observed_outcome_keeps_the_legacy_two_field_shape() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// 共享同一个写入器的多个 Server 并发写日志，序号不能撞车。
+/// 多个 Server 共享写入器并发写日志时，序号不得重复。
 ///
-/// 报表靠"序号连续"发现日志被截断或改写过；两条事件写成同一个序号，
-/// 这条自检就废了，用户拿到的是一份说不清是否完整的证据。
+/// 报表依赖序号连续发现日志被截断或改写。两条事件使用同一序号会使该
+/// 自检失效，用户无法判断证据是否完整。
 #[test]
 fn concurrent_servers_write_contiguous_sequences() {
     let dir = temp_dir("concurrent");

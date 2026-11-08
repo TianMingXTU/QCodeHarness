@@ -1,11 +1,11 @@
-//! 审批基础设施：从 stdin 读一行的人工审批。
+//! 审批基础设施：从 stdin 读取人工审批。
 //!
-//! 这是生产默认闸门。与 `auto` 的区别不只是"问一句"——它引入了
-//! 本会话内的信任记忆（`a` 选项），并且把"读不到答案"一律当作否决。
+//! 生产默认闸门。与 `auto` 的区别在于本会话内的信任记忆（`a` / `p`），
+//! 以及读不到答案时一律否决。
 //!
-//! fail-closed 是这里唯一的设计原则：空输入、无法识别的输入、stdin
-//! 关闭（EOF），全都走否决分支。宁可让模型多撞几次墙，也不能在
-//! "没人看着"的时候把 destructive 工具放过去。
+//! fail-closed 是这里的唯一原则：空输入、无法识别的输入、stdin 关闭
+//! （EOF）全部走否决分支。即使模型因此多试几次，也不能在无人看管时
+//! 放行 destructive 工具。
 
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
@@ -15,10 +15,9 @@ use crate::domain::policy::PolicyScope;
 
 /// 本会话内的一条信任记录。
 ///
-/// 信任的粒度跟后果对齐：信任只记一次调用，不按工具名记。一句"允许
-/// write_file"若连带放行之后所有 write_file，就包括写 `Cargo.toml` 的——
-/// 参数不同，后果不同。因此信任分两档：参数完全一致的精确信任，和参数
-/// 文本命中某个前缀的模式信任。
+/// 信任粒度与后果对齐：按调用记录，不按工具名记录。按工具名放行
+/// write_file 会连带放行写 `Cargo.toml` 的调用，参数不同，后果不同。
+/// 因此分两档：参数完全一致的精确信任，以及参数文本命中前缀的模式信任。
 enum TrustEntry {
     /// `a`：同工具且参数完全一致才放行。
     Exact {
@@ -31,7 +30,7 @@ enum TrustEntry {
     Prefix {
         /// 工具名。
         tool: String,
-        /// 用户给出的前缀模式，落在哪个字段取决于调用带的是 command 还是 path。
+        /// 用户给出的前缀模式。匹配 command 还是 path 取决于调用参数。
         scope: PolicyScope,
     },
 }
@@ -48,39 +47,39 @@ impl TrustEntry {
     }
 }
 
-/// 从标准输入读一行的人工审批闸门。
+/// 从标准输入读取一行的人工审批闸门。
 ///
-/// 内部持有本会话的信任记录，供 `a` / `p` 选项使用。放这里而不是放进
-/// 领域层或应用层：它是"人这次坐在终端前"的会话状态，属于交互基础设施，
-/// 且它随闸门实例生灭——正好和一次 `cargo run` 同寿。
+/// 内部保存本会话的信任记录，供 `a` / `p` 使用。它表示"人这次坐在终端前"
+/// 的会话状态，属于交互基础设施，生命周期与一次 `cargo run` 相同，
+/// 因此不放在领域层或应用层。
 pub struct CliApprovalGate {
-    /// 本会话内已被放行的调用，按授予顺序排列。
+    /// 本会话内已授予的信任记录，按授予顺序排列。
     ///
-    /// 用 `Vec` 而不是集合：前缀信任之间不互斥，用户可能为同一个工具
-    /// 授多个前缀；查询是线性扫，长度等同于用户按过几次 `a`/`p`。
+    /// 用 `Vec`，不用集合：前缀信任可以重叠，同一工具可能有多个前缀。
+    /// 查询是线性扫描，长度等于已授予的信任条数。
     trusted: Mutex<Vec<TrustEntry>>,
 }
 
 impl CliApprovalGate {
-    /// 构造一个空的交互式闸门。
+    /// 构造空的交互式闸门。
     pub fn new() -> Self {
         Self {
             trusted: Mutex::new(Vec::new()),
         }
     }
 
-    /// 从给定 reader 读答案，据此给出裁决。
+    /// 从给定 reader 读取答案并给出裁决。
     ///
-    /// 独立成函数是为了测试：测试不能抢进程的 stdin，
-    /// 但可以用 `&[u8]` 冒充几行输入来喂进去。
+    /// 独立成函数便于测试：测试不能抢占进程的 stdin，但可以用 `&[u8]`
+    /// 提供输入。
     fn decide_from(&self, reader: &mut dyn BufRead, writer: &mut dyn Write, request: &ApprovalRequest) -> Decision {
-        // 带 reason 的请求是策略之上追加的复核（典型是越界写入升级）。
-        // 它的全部意义就在于"这一次必须有人过目"，所以会话信任整体失效：
-        // 不查信任、不接受 `a`/`p`。否则模型把同一条越界命令再发一遍，
-        // 就会被第一次授出的信任无声放行。
+        // 带 reason 的请求是策略追加的复核，典型场景是越界写入升级。
+        // 这类请求必须每次由人过目，因此会话信任整体失效：不查信任，
+        // 也不接受 `a` / `p`。否则模型重发同一条越界命令时，会被第一次
+        // 授出的信任静默放行。
         //
-        // 恢复后重新问的请求同样不吃会话信任：上一次问的是上一个进程里
-        // 的人，那次没答复——把它当成"人点过了"正是这条防线要防的事。
+        // 恢复后重新询问的请求同样不适用会话信任。上一次的提问发生在
+        // 上一个进程里且未获答复，不能当作"人已批准"。
         let trustable = request.reason.is_none() && !request.resumed;
 
         if trustable {
@@ -91,8 +90,7 @@ impl CliApprovalGate {
             }
         }
 
-        // `p` 之后用户可能留空取消，此时要回到问题本身而不是直接否决，
-        // 所以这是一个循环而不是一次问答。
+        // `p` 之后用户可能留空取消，此时回到主问题，因此用循环处理。
         loop {
             let _ = writeln!(writer);
             let _ = writeln!(writer, "──── 审批请求 ────");
@@ -111,8 +109,7 @@ impl CliApprovalGate {
                 let _ = writeln!(writer, "复核:   {reason}");
             }
             if request.resumed {
-                // 重新询问必须点破"之前问过、那次没答复"：人被问第二遍时
-                // 最自然的反应是"怎么又问我"，而不是"上次那个还没答复"。
+                // 必须说明"上次已问过但未答复"，否则用户可能以为程序出错。
                 let _ = writeln!(
                     writer,
                     "注意:   这是恢复后的重新询问——这个审批请求之前问过，那时没答复。"
@@ -131,7 +128,7 @@ impl CliApprovalGate {
             let _ = write!(writer, "[q] 中止运行: ");
             let _ = writer.flush();
 
-            // 读不到行（EOF）时 line 为 Ok(0) 或 Err，两者都算否决。
+            // EOF 时 read_line 返回 Ok(0) 或 Err，两者都算否决。
             let mut line = String::new();
             let answer = match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => None,
@@ -150,11 +147,11 @@ impl CliApprovalGate {
                             self.trust_prefix(&request.call, scope);
                             return Ok(());
                         }
-                        // 空前缀或没有可匹配的参数：既不放行也不否决，重新问。
+                        // 空前缀或没有可匹配参数：不放行也不否决，重新询问。
                         None => continue,
                     }
                 }
-                // 复核请求不接受信任类答复：提示一句，重新问，不放行也不否决。
+                // 复核请求不接受信任类答复：提示后重新询问，不放行也不否决。
                 Some(Answer::Trust) | Some(Answer::Prefix) => {
                     let _ = writeln!(
                         writer,
@@ -164,16 +161,16 @@ impl CliApprovalGate {
                 }
                 Some(Answer::Deny) => return Err(ask_reason(reader, writer)),
                 Some(Answer::Abort) => return Err("用户中止了本次运行".to_owned()),
-                // fail-closed：空行、无法识别、EOF 全部落到这里。
+                // fail-closed：空行、无法识别或 EOF 都走这里。
                 None => return Err("未给出有效答复，按策略视为否决".to_owned()),
             }
         }
     }
 
-    /// 覆盖这个调用的信任记录的一行说明；没有则 `None`。
+    /// 覆盖该调用的信任记录说明；没有则返回 `None`。
     ///
-    /// 返回说明而不是记录本身：锁守卫是临时值，借不出引用；而调用方
-    /// 要的只是"凭什么放行"那句话。
+    /// 返回说明字符串：锁守卫是临时值，无法借出引用；调用方只需要
+    /// 放行依据的文字。
     fn trust_note(&self, call: &crate::domain::tool::ToolCall) -> Option<String> {
         let trusted = self
             .trusted
@@ -207,18 +204,18 @@ impl CliApprovalGate {
             });
     }
 
-    /// 追问要放行的前缀，返回它落在哪个作用域字段上。
+    /// 追问要放行的前缀，返回它落在哪个作用域字段。
     ///
-    /// `None` 表示用户取消（留空且没有建议值可接受），或这个调用根本没有
-    /// 可匹配的参数——两者都该退回重新问，而不是记一条覆盖不全的信任。
+    /// `None` 表示用户取消（留空且没有可接受的建议值），或该调用没有
+    /// 可匹配参数。两种情况都应退回重新询问，避免记录覆盖面不全的信任。
     fn ask_prefix(
         &self,
         reader: &mut dyn BufRead,
         writer: &mut dyn Write,
         call: &crate::domain::tool::ToolCall,
     ) -> Option<PolicyScope> {
-        // 没有可匹配的参数时连问都不要问：问了也给不出能用的信任，
-        // 只会让用户在前缀输入框里白填一个字符串。
+        // 没有可匹配参数时不要追问：问也得不到可用的信任，只会让用户
+        // 输入一个无效字符串。
         if matchable_argument(call).is_none() {
             let _ = writeln!(
                 writer,
@@ -227,8 +224,8 @@ impl CliApprovalGate {
             return None;
         }
 
-        // 前缀信任的便利不能引入额外询问：先算一个候选建议，作为预填的
-        // 默认值——用户敲了别的就以敲的为准，留空则接受它。
+        // 先计算候选建议作为默认值：用户输入其他内容时以输入为准，
+        // 直接回车则接受建议。
         let suggestion = suggested_prefix(call);
         let accept_hint = match &suggestion {
             Some(candidate) => format!("回车用 `{candidate}`，或输入别的"),
@@ -245,13 +242,13 @@ impl CliApprovalGate {
 
         let mut line = String::new();
         let input = match reader.read_line(&mut line) {
-            // EOF 与读取错误照旧算取消，不接受建议：fail-closed 的边界
-            // 不该被一次"省打字"的便利撬开。
+            // EOF 和读取错误仍视为取消，不接受建议。fail-closed 边界
+            // 不能为省一次输入而放宽。
             Ok(0) | Err(_) => return None,
             Ok(_) => line.trim().to_owned(),
         };
-        // 留空且给得出建议值：接受建议，省下的就是这次打字。
-        // 没有建议值时 `?` 直接返回 None，走的仍是"回车取消"老路。
+        // 留空且存在建议值时接受建议；没有建议值时 `?` 返回 None，
+        // 仍按回车取消处理。
         let input = if input.is_empty() { suggestion? } else { input };
         scope_for(call, &input)
     }
@@ -266,22 +263,21 @@ impl CliApprovalGate {
     }
 }
 
-/// 这个调用的参数里，哪个字段能被前缀信任匹配上。
+/// 返回该调用中可被前缀信任匹配的参数字段。
 ///
-/// shell 是威力最大的工具，优先按命令头匹配；文件类工具没有 `command`，
-/// 落到 `path`。两者都没有（git_status、多数 MCP 工具）时返回 `None`，
-/// 调用方据此判定"这个工具没法按前缀放行"——空作用域会匹配一切，
-/// 拿它当信任用等于放行整个工具。
+/// shell 类工具优先匹配命令头；文件类工具没有 `command`，退到 `path`。
+/// 两者都没有时返回 `None`（如 git_status、多数 MCP 工具），调用方据此
+/// 判定无法按前缀放行。空作用域会匹配一切，等同放行整个工具。
 fn matchable_argument(call: &crate::domain::tool::ToolCall) -> Option<&'static str> {
     ["command", "path"]
         .into_iter()
         .find(|key| call.arguments.get(*key).and_then(serde_json::Value::as_str).is_some())
 }
 
-/// 把用户输入的前缀装进调用实际带的那个参数字段。
+/// 把用户输入的前缀写入调用实际携带的参数字段。
 ///
-/// 末尾的 `*` 由这里补上：选了 `p` 就等于声明"这是前缀"，模式语言的
-/// 记法不该让使用者去记。用户已经写了 `*` 就不重复补。
+/// 末尾的 `*` 由这里补上：选择 `p` 即表示这是前缀，用户不需要记住模式
+/// 语法。输入已以 `*` 结尾时不重复添加。
 fn scope_for(call: &crate::domain::tool::ToolCall, input: &str) -> Option<PolicyScope> {
     let pattern = if input.ends_with('*') {
         input.to_owned()
@@ -301,28 +297,28 @@ fn scope_for(call: &crate::domain::tool::ToolCall, input: &str) -> Option<Policy
     }
 }
 
-/// 从一次调用推断一个保守的前缀信任候选，供 `p` 预填。
+/// 从一次调用推断保守的前缀信任候选，供 `p` 预填。
 ///
-/// `p` 的全部意义是少敲几次键盘，但候选绝不能比人愿意授的范围更宽，
-/// 所以"词数要够"是硬要求：`cargo` 这种裸程序名会让会话信任膨胀到该
-/// 程序的每一个子命令（包括 `cargo publish`），那不如不给建议。
+/// `p` 用于减少输入，但候选不能比用户愿意授予的范围更宽，因此词数必须
+/// 足够。裸程序名（如 `cargo`）会把会话信任扩大到该程序的每个子命令，
+/// 包括 `cargo publish`，这种情况不给建议。
 ///
 /// - `command`：取前两个词。`cargo test --lib` → `cargo test`，覆盖
-///   `cargo test --doc` 一族，但不碰 `cargo build`、`cargo publish`。
-///   本次特有的参数不进候选——带上它，这条信任就永远匹配不上下一条调用。
-///   带包装前缀的命令（`sudo cargo test`）取到的是 `sudo cargo`：范围仍以
-///   那个程序为界，不会扩到 `sudo` 的别的子命令，但确实也涵盖
-///   `sudo cargo publish`。所以候选只是**起点**——它原样印在提示框里，
-///   按回车之前看得见自己授的范围，嫌宽就自己敲窄的。
+///   `cargo test --doc` 一族，但不覆盖 `cargo build`、`cargo publish`。
+///   本次调用特有的参数不进入候选，否则该信任无法匹配后续调用。
+///   带包装前缀的命令（`sudo cargo test`）取到 `sudo cargo`：范围仍以该
+///   程序为界，不会扩到 `sudo` 的其他子命令，但会覆盖 `sudo cargo publish`。
+///   候选只是**起点**：它原样显示在提示框中，回车前用户能看到授予范围，
+///   过宽时可自行输入更窄的前缀。
 /// - `path`：取所在目录。`src/domain/policy.rs` → `src/domain/`。目录边界
-///   是天然的授权范围；不取"前两段路径"是因为前缀匹配不认词边界，
-///   `src/domain*` 会连 `src/domain.rs` 一起吞掉。
+///   是天然的授权范围。不取"前两段路径"，因为前缀匹配不认词边界，
+///   `src/domain*` 会同时匹配 `src/domain.rs`。
 ///
-/// 三种情况一律不给建议：少于两个词的命令、根目录下的文件、带 shell
-/// 链接符的命令。第一种让命令头宽到整个程序；第二种连一个目录边界都没有；
-/// 第三种是因为信任只覆盖命令头（`prefix_matches` 明确不让 `*` 吞 `&&`
-/// 之后的部分），而人眼前那条调用是一条链——建议一个只覆盖前半截的前缀，
-/// 会让人以为整条链都被记住了。
+/// 三种情况不给建议：少于两个词的命令、根目录下的文件、带 shell 链接符
+/// 的命令。第一种的命令头会宽到整个程序；第二种没有目录边界；第三种是
+/// 因为信任只覆盖命令头（`prefix_matches` 不让 `*` 匹配 `&&` 之后的部分），
+/// 而用户面前的调用是一条链，只覆盖前半截的前缀会让人误以为整条链都被
+/// 记住。
 fn suggested_prefix(call: &crate::domain::tool::ToolCall) -> Option<String> {
     if let Some(command) = call.arguments.get("command").and_then(serde_json::Value::as_str) {
         if crate::domain::policy::chains_another_command(command) {
@@ -341,10 +337,9 @@ fn suggested_prefix(call: &crate::domain::tool::ToolCall) -> Option<String> {
     Some(format!("{directory}/"))
 }
 
-/// 信任记录的一行摘要，打印在"自动通过"旁边。
+/// 信任记录的一行摘要，打印在"自动通过"旁。
 ///
-/// 用户需要知道这次放行是凭哪条记忆——尤其是前缀信任，放行范围比
-/// 他看到的那一条调用宽。
+/// 用户需要知道本次放行的依据。前缀信任的放行范围比眼前这条调用宽。
 fn trust_description(entry: &TrustEntry) -> String {
     match entry {
         TrustEntry::Exact { .. } => "精确信任：参数完全一致".to_owned(),
@@ -373,7 +368,7 @@ impl ApprovalGate for CliApprovalGate {
     }
 }
 
-/// 用户对一次审批的五种答复。
+/// 用户对审批的五种答复。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answer {
     /// `y`：仅放行这一次。
@@ -388,10 +383,10 @@ enum Answer {
     Abort,
 }
 
-/// 解析一行输入。`None` 表示无法识别——调用方按 fail-closed 处理。
+/// 解析一行输入。`None` 表示无法识别，调用方按 fail-closed 处理。
 ///
-/// 接受大小写与前后空白，但不接受 `yes`/`no` 全词：终端里多打一个
-/// 字符就可能毁掉一次 destructive 操作，宁可让用户重打。
+/// 接受大小写差异与首尾空白，不接受 `yes` / `no` 全词。多输入一个字符
+/// 可能误批破坏性操作，因此要求精确答复。
 fn parse_answer(line: &str) -> Option<Answer> {
     match line.trim().to_ascii_lowercase().as_str() {
         "y" => Some(Answer::Approve),
@@ -405,8 +400,8 @@ fn parse_answer(line: &str) -> Option<Answer> {
 
 /// 追问否决原因。
 ///
-/// 原因会作为拒绝观察回填给模型，所以空原因也要给个默认值——
-/// 模型看到"被拒绝"但不知道为什么，只会盲目重试同一个调用。
+/// 原因会作为拒绝观察回填给模型，空原因也必须有默认值。模型只看到
+/// "被拒绝"而不知道原因时，往往会重试同一个调用。
 fn ask_reason(reader: &mut dyn BufRead, writer: &mut dyn Write) -> String {
     let _ = write!(writer, "否决原因（回车使用默认）: ");
     let _ = writer.flush();
@@ -425,7 +420,7 @@ fn ask_reason(reader: &mut dyn BufRead, writer: &mut dyn Write) -> String {
     }
 }
 
-/// 把风险注解渲染成一行人能读的摘要。
+/// 把风险注解渲染成单行可读摘要。
 fn risk_summary(annotations: &crate::domain::tool::ToolAnnotations) -> String {
     let mut flags = Vec::new();
     if annotations.destructive {
@@ -470,7 +465,7 @@ mod tests {
         }
     }
 
-    /// 策略追加的复核请求：策略放行了调用，但对它有额外疑虑，要求人复核。
+    /// 策略追加的复核请求：策略已放行，但要求人再确认。
     fn escalated_request(command: &str) -> ApprovalRequest {
         ApprovalRequest {
             reason: Some(format!(
@@ -489,7 +484,7 @@ mod tests {
     }
 
 
-    /// 用内存 reader/writer 跑一次审批，拿到裁决。
+    /// 用内存 reader/writer 执行一次审批，返回裁决。
     fn decide(gate: &CliApprovalGate, input: &str, req: &ApprovalRequest) -> Decision {
         let mut reader = Cursor::new(input.as_bytes());
         let mut sink = Vec::new();
@@ -520,7 +515,7 @@ mod tests {
     #[test]
     fn empty_line_fails_closed() {
         let gate = CliApprovalGate::new();
-        // 用户直接回车，什么都没说。
+        // 用户直接回车，未输入内容。
         let decision = decide(&gate, "\n", &request("write_file"));
 
         let reason = decision.expect_err("空输入必须否决");
@@ -530,7 +525,7 @@ mod tests {
     #[test]
     fn unrecognized_input_fails_closed() {
         let gate = CliApprovalGate::new();
-        // "yes" 不是合法答复——见 parse_answer 的注释。
+        // "yes" 不是合法答复，见 parse_answer 的注释。
         let decision = decide(&gate, "yes\n", &request("write_file"));
 
         assert!(decision.is_err(), "无法识别的输入必须否决");
@@ -539,7 +534,7 @@ mod tests {
     #[test]
     fn eof_fails_closed() {
         let gate = CliApprovalGate::new();
-        // 空输入流 = stdin 已关闭。
+        // 空输入流表示 stdin 已关闭。
         let decision = decide(&gate, "", &request("write_file"));
 
         let reason = decision.expect_err("EOF 必须否决");
@@ -555,22 +550,21 @@ mod tests {
         assert!(reason.contains("中止"), "原因应说明是用户主动中止: {reason}");
     }
 
-    /// `a` 记住的是**这一次调用**，不是这个工具。
+    /// `a` 记录的是**这一次调用**，不是整个工具。
     ///
-    /// 按工具名记忆会让"允许 write_file"连带放行之后所有 write_file——
-    /// 包括写 `Cargo.toml`、写 `.env` 的那些。参数不同，
-    /// 后果不同，信任的粒度必须跟后果对齐。
+    /// 按工具名记录会让"允许 write_file"放行之后所有 write_file，
+    /// 包括写 `Cargo.toml`、`.env` 的调用。参数不同，后果不同。
     #[test]
     fn trust_a_remembers_the_exact_call_not_the_tool() {
         let gate = CliApprovalGate::new();
         let req = request("write_file");
 
-        // 第一次回答 a：本会话放行这一模一样的调用。
+        // 第一次回答 a：本会话放行完全相同的调用。
         assert!(decide(&gate, "a\n", &req).is_ok());
         assert_eq!(gate.trusted_entries(), 1);
 
-        // 参数完全一致的后续调用不再需要输入——reader 是空的（EOF），
-        // 如果它没记住，就会因为读不到答案而否决。
+        // 参数相同的后续调用不再需要输入。reader 为空（EOF），若未记住
+        // 则会被否决。
         assert!(decide(&gate, "", &req).is_ok(), "已信任的调用应自动放行");
 
         // 同一个工具、不同参数：仍然要问，且读不到输入时否决。
@@ -619,15 +613,14 @@ mod tests {
         );
     }
 
-    /// `p` 之后留空：既不否决也不记信任，回到批准问题本身。
+    /// `p` 之后留空：不放行也不记录信任，回到主审批问题。
     ///
-    /// 用户敲错键选了 `p` 却不能反悔，会被迫在前缀输入框里编一个字符串——
-    /// 那正是信任机制最不该有的用法。
+    /// 用户误选 `p` 后应能反悔，不应被迫在前缀输入框里编一个字符串。
     ///
-    /// 用根目录下的文件：它给不出候选建议，所以留空走的仍是"取消"这条
-    /// 老路。留空的含义取决于有没有建议值——有建议时留空是接受它（见
+    /// 这里用根目录下的文件，没有候选建议，留空按取消处理。留空的含义
+    /// 取决于是否存在建议值：有建议时留空表示接受（见
     /// `accepting_the_suggestion_with_enter_trusts_the_suggested_prefix`），
-    /// 那条路径上提示框已经把要授的范围原样印出来了。
+    /// 该路径的提示框已原样显示授予范围。
     #[test]
     fn empty_prefix_answer_re_asks_without_trusting() {
         let gate = CliApprovalGate::new();
@@ -641,14 +634,14 @@ mod tests {
         assert!(decide(&gate, "", &req).is_err());
     }
 
-    /// 没有 command 也没有 path 参数的工具（git_status、MCP 工具）无法按
-    /// 前缀放行：`p` 只能退回重新问，不能悄悄退化成"放行整个工具"。
+    /// 没有 command 或 path 参数的工具（git_status、MCP 工具）无法按
+    /// 前缀放行：`p` 退回重新询问，不能退化成放行整个工具。
     #[test]
     fn prefix_trust_is_unavailable_without_a_matchable_argument() {
         let gate = CliApprovalGate::new();
         let req = request_with("git_status", json!({}));
 
-        // p → 没有可匹配参数，直接退回重新问（不消费下一行）→ 答 y 放行这一次。
+        // p → 没有可匹配参数，退回重新询问（不消费下一行）；随后答 y 放行本次。
         assert!(decide(&gate, "p\ny\n", &req).is_ok());
         assert_eq!(gate.trusted_entries(), 0);
 
@@ -690,10 +683,10 @@ mod tests {
         assert!(printed.contains("[p]"), "应说明前缀信任选项");
     }
 
-    /// 前缀输入框要把后果说清楚：它放行的是一整类调用，不是这一次。
+    /// 前缀输入框要说明后果：放行的是一类调用，不是本次调用。
     ///
-    /// 用裸命令（`ls`）：它给不出候选建议，所以"回车取消"这条老路仍在。
-    /// 有建议时的提示语由 `prefix_prompt_shows_the_suggested_candidate` 守着。
+    /// 使用裸命令 `ls`，没有候选建议，因此仍会出现"回车取消"提示。
+    /// 有建议时的提示由 `prefix_prompt_shows_the_suggested_candidate` 覆盖。
     #[test]
     fn prefix_prompt_explains_the_scope_of_the_grant() {
         let gate = CliApprovalGate::new();
@@ -709,16 +702,16 @@ mod tests {
         assert!(printed.contains("回车取消"), "应说明可以取消: {printed}");
     }
 
-    /// 带 reason 的复核请求对会话信任免疫：一次都不能被 `a`/`p` 消掉。
+    /// 带 reason 的复核请求不受会话信任影响：`a` / `p` 均不能放行。
     ///
-    /// 升级的全部意义是"越界写入每次都要人过目"。若信任对它有效，
-    /// 模型把同一条命令重发一遍就会被无声放行——升级白做。
+    /// 升级要求每次越界写入都由人过目。若信任对复核有效，模型重发同一条
+    /// 命令就会被静默放行，升级失效。
     #[test]
     fn escalated_request_ignores_session_trust() {
         let gate = CliApprovalGate::new();
         let req = escalated_request(r"echo hi > C:\Windows\temp\x");
 
-        // 先授出一条前缀信任，让它确实在会话里生效。
+        // 先授予一条前缀信任，确认它在会话内生效。
         let ordinary = request_with("run_command", json!({"command": "cargo test"}));
         assert!(decide(&gate, "p\ncargo\n", &ordinary).is_ok());
         assert_eq!(gate.trusted_entries(), 1);
@@ -726,7 +719,7 @@ mod tests {
         let same_prefix = request_with("run_command", json!({"command": "cargo build"}));
         assert!(decide(&gate, "", &same_prefix).is_ok());
 
-        // 复核请求照问，且 `a` 不被接受——它既不记信任也不放行。
+        // 复核请求仍会询问；`a` 不被接受，既不记信任也不放行。
         assert!(decide(&gate, "a\n", &req).is_err(), "复核请求不得被 `a` 放行");
         assert_eq!(gate.trusted_entries(), 1, "复核请求不得写入信任");
 
@@ -756,10 +749,9 @@ mod tests {
         assert!(printed.contains("不适用会话信任"), "应说明原因: {printed}");
     }
 
-    /// 重新询问时，提示必须点破"之前问过、那次没答复"。
+    /// 重新询问时，提示必须说明"之前问过且未答复"。
     ///
-    /// 人被问第二遍时最自然的反应是"怎么又问我"。不点破这一层，人可能
-    /// 以为程序出了故障——或者更糟，顺手按了 y。
+    /// 否则用户会以为程序出错，可能在未看清的情况下误按 y。
     #[test]
     fn a_resumed_request_shows_that_it_was_asked_before() {
         let gate = CliApprovalGate::new();
@@ -773,15 +765,15 @@ mod tests {
         assert!(printed.contains("没答复"), "应说明那次没答复: {printed}");
     }
 
-    /// 重新询问不吃会话信任：上一次没答复，不等于这一次可以免掉。
+    /// 重新询问不适用会话信任：上次未答复不能视为本次已批准。
     ///
-    /// 信任记录记的是"人点过 yes"。恢复后被问的是另一次决定——人根本
-    /// 没看过这个提示（它在上一个进程里被关掉了）。拿旧信任放行新请求，
-    /// 等于把"人没点过"读成"人点过了"。
+    /// 信任记录表示"人点过 yes"。恢复后的询问是另一次决定，用户没有
+    /// 看到提示（它在上一个进程中已关闭）。用旧信任放行新请求，会把
+    /// "未批准"当成"已批准"。
     #[test]
     fn a_resumed_request_ignores_session_trust() {
         let gate = CliApprovalGate::new();
-        // 先授出一条精确信任：同工具同参数在普通请求里会被自动放行。
+        // 先授予一条精确信任：同工具同参数在普通请求中会自动放行。
         assert!(decide(&gate, "a\n", &request("write_file")).is_ok());
         assert_eq!(gate.trusted_entries(), 1);
 
@@ -809,8 +801,8 @@ mod tests {
         }
     }
 
-    /// 命令的候选取前两个词：够窄到不吞掉别的子命令，
-    /// 也够宽到把同一条命令的参数变体一次收编。
+    /// 命令候选取前两个词：窄到不覆盖其他子命令，宽到覆盖同一命令的
+    /// 参数变体。
     #[test]
     fn suggested_prefix_takes_the_first_two_words_of_a_command() {
         assert_eq!(
@@ -818,15 +810,15 @@ mod tests {
             Some("cargo test".to_owned()),
             "参数不该进候选：候选是给后续调用用的，带上这次特有的参数就永远匹配不上"
         );
-        // 恰好两个词时候选就是整条命令：省下打字，范围一点没变。
+        // 恰好两个词时，候选就是整条命令，范围不变。
         assert_eq!(
             suggested_prefix(&call_with("run_command", json!({"command": "cargo test"}))),
             Some("cargo test".to_owned())
         );
     }
 
-    /// 裸程序名不给建议：一个词的命令头等于把整个程序交给会话信任，
-    /// `cargo` 会连 `cargo publish` 一起吞掉——那不如让用户自己敲。
+    /// 裸程序名不给建议：单词命令头会把整个程序交给会话信任，
+    /// `cargo` 会连 `cargo publish` 一起放行。
     #[test]
     fn a_bare_program_name_gets_no_suggestion() {
         assert_eq!(
@@ -835,10 +827,10 @@ mod tests {
         );
     }
 
-    /// 路径的候选是所在目录：目录边界是天然的授权范围。
+    /// 路径候选取所在目录：目录边界是天然的授权范围。
     ///
-    /// 不取"前两段路径"是因为前缀匹配不认词边界，`src/domain*` 会连
-    /// `src/domain.rs` 一起吞掉；带上结尾的 `/` 才精确落在目录内。
+    /// 不取"前两段路径"，因为前缀匹配不认词边界，`src/domain*` 会同时
+    /// 匹配 `src/domain.rs`；结尾带 `/` 才能精确落在目录内。
     #[test]
     fn suggested_prefix_for_a_path_is_its_directory() {
         assert_eq!(
@@ -847,8 +839,8 @@ mod tests {
         );
     }
 
-    /// 就在 workspace 根上的文件没有目录可授：给建议只会变成
-    /// "放行所有写入"，那是用户没说过的范围。
+    /// workspace 根目录下的文件没有目录可授予：建议会变成"放行所有写入"，
+    /// 超出用户表达的范围。
     #[test]
     fn a_path_at_the_workspace_root_gets_no_suggestion() {
         assert_eq!(
@@ -859,9 +851,9 @@ mod tests {
 
     /// 带 shell 链接符的命令不给建议。
     ///
-    /// 信任只覆盖命令头（`prefix_matches` 明确不让 `*` 吞 `&&` 之后的部分），
-    /// 而人眼前这条调用是一条链——建议一个只覆盖前半截的前缀，会让人以为
-    /// 整条链都被记住了，下次它照样要问。
+    /// 信任只覆盖命令头（`prefix_matches` 不让 `*` 匹配 `&&` 之后的部分），
+    /// 而用户面前的调用是一条链。只覆盖前半截的前缀会让人误以为整条链
+    /// 都被记住，实际下次仍会询问。
     #[test]
     fn chained_commands_get_no_suggestion() {
         assert_eq!(
@@ -870,8 +862,8 @@ mod tests {
         );
     }
 
-    /// 没有 command / path 参数的工具（git_status、多数 MCP 工具）
-    /// 没有可授的范围——与既有的"无法按前缀放行"是同一个结论。
+    /// 没有 command / path 参数的工具（git_status、多数 MCP 工具）没有
+    /// 可授予的范围，结论与"无法按前缀放行"一致。
     #[test]
     fn a_tool_without_matchable_arguments_gets_no_suggestion() {
         assert_eq!(suggested_prefix(&call_with("git_status", json!({}))), None);
@@ -879,8 +871,8 @@ mod tests {
 
     /// 建议值必须原样显示在输入框里。
     ///
-    /// 人得看得见自己授的是什么范围，否则"回车"这个动作没有任何信息量——
-    /// 他以为批的是眼前这一条，实际放开的是一整类调用。
+    /// 用户需要看到授予范围。否则回车没有信息量：用户以为批准了眼前一条，
+    /// 实际放开的是一类调用。
     #[test]
     fn prefix_prompt_shows_the_suggested_candidate() {
         let gate = CliApprovalGate::new();
@@ -894,7 +886,7 @@ mod tests {
         assert!(printed.contains("cargo test"), "应显示建议值: {printed}");
     }
 
-    /// 选 `p` 后直接回车 = 接受建议值，不必手敲。
+    /// 选 `p` 后直接回车表示接受建议值，无需手动输入。
     #[test]
     fn accepting_the_suggestion_with_enter_trusts_the_suggested_prefix() {
         let gate = CliApprovalGate::new();
@@ -906,12 +898,12 @@ mod tests {
         // 建议范围生效：同命令头的另一条调用不再询问。
         let same_head = request_with("run_command", json!({"command": "cargo test --doc"}));
         assert!(decide(&gate, "", &same_head).is_ok(), "cargo test 一族应已被信任");
-        // 但换了子命令仍要问：建议值没有宽到把 cargo 整个吞掉。
+        // 换子命令仍会询问：建议范围没有覆盖整个 cargo。
         let other = request_with("run_command", json!({"command": "cargo build"}));
         assert!(decide(&gate, "", &other).is_err(), "cargo build 不在建议范围内");
     }
 
-    /// 用户仍然可以敲自己的前缀：建议只是省一次打字，不是替人决定。
+    /// 用户可以输入自己的前缀：建议只减少输入，不代替用户决定。
     #[test]
     fn typing_a_prefix_still_overrides_the_suggestion() {
         let gate = CliApprovalGate::new();

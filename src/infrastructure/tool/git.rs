@@ -1,13 +1,13 @@
 //! Git 只读工具：状态与差异。
 //!
-//! 通过 shell 执行 `git` 而不是引 `git2`：libgit2 是 C 依赖，构建成本高，
-//! 而这两个工具只是把两条现成的 git 命令的输出搬给模型。
-//! git 不在 PATH 时的失败要给出可读的说明，不 panic。
+//! 通过 shell 执行 `git`，不引入 `git2`。libgit2 是 C 依赖，构建成本高，
+//! 而这两个工具只需要把现成 git 命令的输出交给模型。
+//! git 不在 PATH 时返回可读的失败说明，不 panic。
 //!
-//! 仓库类测试需要 git 在 PATH 中，标了 `#[ignore = "需要 git 在 PATH 中"]`：
-//! `cargo test` 默认不跑它们，`cargo test -- --ignored` 才跑。不用
-//! "git 缺失就 return"的运行时跳过——那会被 cargo 记为 passed，
-//! 在没装 git 的机器上制造"git 工具都有覆盖"的虚假信心。
+//! 仓库类测试需要 git 在 PATH 中，标为 `#[ignore = "需要 git 在 PATH 中"]`：
+//! `cargo test` 默认不执行，`cargo test -- --ignored` 才执行。不使用
+//! "git 缺失就 return"的运行时跳过，因为 cargo 会将其记为 passed，
+//! 在没有 git 的机器上造成测试已覆盖的假象。
 
 use serde::Deserialize;
 use serde_json::json;
@@ -23,9 +23,10 @@ use super::shell::{clamp_output, run_with_policy};
 
 const GIT_STATUS: &str = "git_status";
 const GIT_DIFF: &str = "git_diff";
-/// git 只读命令的超时：比 run_command 默认值短，git 卡住多半是仓库坏了。
+/// git 只读命令的超时，与 run_command 默认值一致：git 卡住通常说明仓库
+/// 有问题，不值得等更久。
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
-/// diff 输出的截断上限：diff 可能非常长，4000 字符够模型判断改了什么。
+/// diff 输出的截断上限。diff 可能很长，4000 字符足以让模型判断改动。
 const DIFF_MAX_CHARS: usize = 4000;
 
 /// 查看工作区状态。
@@ -134,19 +135,19 @@ impl ToolInvoker for GitDiff {
     }
 }
 
-/// workspace 不是 git 仓库根时，返回给模型的说明；是仓库根则返回 `None`。
+/// workspace 不是 git 仓库根时返回给模型的说明；是仓库根时返回 `None`。
 ///
-/// git 在找不到 `.git` 的目录里会**沿父目录一路向上爬**，直到撞见一个仓库
-/// 才肯报告。于是 workspace 里的 `git status` 会输出父仓库的状态，模型
-/// 据此以为自己看到的是 workspace 的改动——本项目的 workspace 常常是
-/// 父目录下的临时副本（基准评测的 fixture 副本、用户实测仓库都中过招），
-/// 这个泄露会直接把 agent 带偏去改不相干的文件。
+/// 在找不到 `.git` 的目录中，git 会沿父目录向上查找，直到找到仓库。
+/// 因此 workspace 里的 `git status` 会输出父仓库状态，模型可能误以为
+/// 那是 workspace 的改动。本项目的 workspace 常是父目录下的临时副本
+/// （基准评测的 fixture 副本与用户实测仓库都出现过），这种泄露会让
+/// agent 修改无关文件。
 ///
-/// 判定用 `.git` 的存在性而非 `git rev-parse --show-toplevel`：前者一次
-/// stat 就够，且不受 workspace 路径写法（相对/绝对/大小写/尾斜杠）影响；
-/// 后者要把两条路径规范化后才能比，而"要不要比"本身还是要先确认 `.git`。
-/// `.git` 是文件（worktree、submodule）也算仓库根——它们各自有独立的
-/// 工作区，git 报的就是本目录的状态，不会向上爬。
+/// 判定依据是 `.git` 是否存在，不用 `git rev-parse --show-toplevel`。
+/// 前者只需一次 stat，且不受 workspace 路径写法（相对/绝对/大小写/
+/// 尾斜杠）影响；后者需要规范化两条路径再比较。`.git` 是文件
+/// （worktree、submodule）时同样视为仓库根，它们有独立工作区，git 报告
+/// 的是本目录的状态，不会向上查找。
 fn not_a_repo_notice(root: &WorkspaceRoot) -> Option<String> {
     if root.as_path().join(".git").exists() {
         return None;
@@ -209,10 +210,10 @@ mod tests {
         }
     }
 
-    /// 建一个真实 git 仓库（需要 git 在 PATH），返回根路径。
+    /// 创建真实 git 仓库（需要 git 在 PATH），返回根路径。
     ///
-    /// 只被 `#[ignore]` 的测试调用：有人显式 `-- --ignored` 要求跑时，
-    /// 环境就该具备 git，缺了直接 panic 暴露问题，而不是静默跳过。
+    /// 只被 `#[ignore]` 测试调用。显式执行 `-- --ignored` 时应具备 git，
+    /// 缺失时直接 panic 暴露问题，不静默跳过。
     fn temp_repo(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("qch-git-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -231,7 +232,7 @@ mod tests {
         dir
     }
 
-    /// 把 repo 里现有文件全部提交，制造一个干净基线。
+    /// 提交 repo 中现有文件，建立干净基线。
     fn commit_all(repo: &PathBuf) {
         for args in [
             vec!["add", "."],
@@ -246,11 +247,10 @@ mod tests {
         }
     }
 
-    /// workspace 里没有 `.git` 时必须明确说"不是仓库根"。
+    /// workspace 中没有 `.git` 时必须明确返回"不是仓库根"。
     ///
-    /// 这条不依赖 git 在 PATH，也不该依赖：判定本身只看文件系统，git
-    /// 根本不会被执行——"不执行"正是修复的一部分（旧行为会执行 git，
-    /// 然后 git 沿父目录爬到一个不相干的仓库里去）。
+    /// 该判定不依赖 git 在 PATH：判定只看文件系统，不会执行 git。
+    /// 旧行为会执行 git，git 随后沿父目录找到无关仓库。
     #[tokio::test]
     async fn workspace_without_git_dir_is_reported_as_not_a_repo() {
         let dir = std::env::temp_dir().join(format!("qch-git-nogitdir-{}", std::process::id()));
@@ -277,16 +277,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 仓库子目录里的 git 工具不得泄露父仓库状态。
+    /// 仓库子目录中的 git 工具不得泄露父仓库状态。
     ///
-    /// 这是实测中把 agent 带偏的那个 bug 的回归测试：workspace 是仓库的
-    /// 子目录时，旧实现让 git 沿父目录爬，模型看到的是父仓库的改动，
-    /// 于是据此修改了跟 workspace 无关的文件。
+    /// 回归测试：workspace 是仓库子目录时，旧实现让 git 沿父目录查找，
+    /// 模型看到父仓库的改动，据此修改了与 workspace 无关的文件。
     #[tokio::test]
     #[ignore = "需要 git 在 PATH 中"]
     async fn subdirectory_of_a_repo_does_not_leak_the_parent_status() {
         let repo = temp_repo("subdir");
-        // 仓库根的未提交改动：泄露发生时它一定会出现在观察里。
+        // 仓库根的未提交改动。发生泄露时它必然出现在观察里。
         std::fs::write(repo.join("parent-only.txt"), "父仓库的改动\n").unwrap();
         let nested = repo.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
@@ -307,7 +306,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    /// diff 同样不得泄露父仓库：父仓库的差异对 workspace 里的模型是噪音。
+    /// diff 同样不得泄露父仓库。父仓库的差异对 workspace 中的模型是噪音。
     #[tokio::test]
     #[ignore = "需要 git 在 PATH 中"]
     async fn subdirectory_of_a_repo_does_not_leak_the_parent_diff() {
@@ -352,7 +351,7 @@ mod tests {
     #[ignore = "需要 git 在 PATH 中"]
     async fn status_reports_clean_worktree() {
         let repo = temp_repo("clean");
-        // 提交一个初始 commit，让工作区干净。
+        // 创建初始提交，使工作区干净。
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
         commit_all(&repo);
 
@@ -402,7 +401,7 @@ mod tests {
         let repo = temp_repo("staged");
         std::fs::write(repo.join("file.txt"), "基线\n").unwrap();
         commit_all(&repo);
-        // 未暂存的改动：staged diff 应该看不到它。
+        // 未暂存的改动，staged diff 不应包含它。
         std::fs::write(repo.join("file.txt"), "未暂存\n").unwrap();
 
         let tool = GitDiff::new(WorkspaceRoot::new(&repo));
@@ -421,13 +420,13 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("建临时目录");
         let tool = GitDiff::new(WorkspaceRoot::new(&dir));
 
-        // 带参数与不带参数都走通（这里仓库不存在，只验证解析与失败路径）。
+        // 带参数与不带参数都走通。目录不是仓库，只验证解析与失败路径。
         let with_args = tool.invoke(&call(GIT_DIFF, json!({"staged": true}))).await;
         let no_args = tool.invoke(&call(GIT_DIFF, json!({}))).await;
         assert_eq!(with_args.status, OutcomeStatus::Failed);
         assert_eq!(no_args.status, OutcomeStatus::Failed);
 
-        // 坏参数类型 → failed。
+        // 参数类型错误时返回 failed。
         let bad = tool.invoke(&call(GIT_DIFF, json!({"staged": "yes"}))).await;
         assert_eq!(bad.status, OutcomeStatus::Failed);
         assert!(bad.content.contains("参数解析失败"));

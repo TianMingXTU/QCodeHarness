@@ -1,13 +1,12 @@
 //! 单文件 JSON 任务快照存储。
 //!
-//! 路径布局：`<workspace>/.qcodeharness/tasks/<task_id>.json`，
-//! 与会话快照（`snapshots/`）平行——一个任务 ID 一个文件，任务级恢复
-//! 与会话级恢复互不干扰。
+//! 路径布局：`<workspace>/.qcodeharness/tasks/<task_id>.json`，与会话快照
+//! 目录 `snapshots/` 平行。一个任务 ID 对应一个文件，任务级恢复与会话级
+//! 恢复互不干扰。
 //!
-//! 原子写沿用会话快照那套"先写临时文件并刷盘，再改名覆盖"的做法：
-//! 半途崩溃最多个残留一个 `.tmp`，绝不会留下一个截断的快照顶替上一次
-//! 的好快照。任务快照尤其怕这个——它装着"这个任务做到哪"，坏了就
-//! 意味着整个任务从头再来。
+//! 原子写沿用会话快照的做法：先写临时文件并刷盘，再改名覆盖。中途崩溃
+//! 最多残留一个 `.tmp`，不会留下截断的快照覆盖上一份有效快照。任务快照
+//! 记录"任务执行到哪一步"，损坏会导致整个任务从头开始。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,8 +40,8 @@ impl TaskStore for JsonTaskStore {
     fn save(&self, snapshot: &TaskSnapshot) -> Result<(), StoreError> {
         fs::create_dir_all(&self.dir)?;
         let path = self.path_for(snapshot.task_id());
-        // 原子写：先写临时文件并刷盘，再改名覆盖。半途崩溃最多个
-        // 残留一个 .tmp，绝不会留下一个截断的快照顶替上一次的好快照。
+        // 原子写：先写临时文件并刷盘，再改名覆盖。中途崩溃最多残留一个
+        // .tmp，不会留下截断的快照覆盖上一份有效快照。
         let temp = path.with_extension("json.tmp");
         {
             let mut file = fs::File::create(&temp)?;
@@ -61,12 +60,11 @@ impl TaskStore for JsonTaskStore {
         }
         let snapshot: TaskSnapshot = serde_json::from_str(&fs::read_to_string(&path)?)?;
         snapshot.check_version()?;
-        // 文件名与内容里的任务 ID 必须对得上。
+        // 文件名与内容中的任务 ID 必须一致。
         //
-        // 复制一个快照文件换个名字就能绕过"这是哪个任务的"这一问——
-        // 而恢复会用文件里的进度去续文件里的会话，两者其实自洽，
-        // 错的是**用户以为自己在恢复哪个任务**。这条拦的是这种
-        // "名字换了内容没换"的情形。
+        // 复制快照文件并改名可以绕过"这是哪个任务"的检查，而恢复会使用
+        // 文件内的进度继续文件内的会话，两者自洽，错的只是用户以为自己在
+        // 恢复另一个任务。这里拦截的就是这种改名不改内容的情况。
         if snapshot.task_id() != task_id {
             return Err(StoreError::Corrupt(format!(
                 "任务快照文件 {path:?} 里的任务 ID 是 {}，与请求的 {} 不一致",
@@ -81,7 +79,7 @@ impl TaskStore for JsonTaskStore {
         let mut ids = Vec::new();
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
-            // 目录还不存在 = 还没有任何任务快照，不是错误。
+            // 目录不存在表示尚无任务快照，不属于错误。
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
             Err(error) => return Err(error.into()),
         };
@@ -113,7 +111,7 @@ mod tests {
     use crate::domain::worktree::WorktreeManifest;
     use std::time::Duration;
 
-    /// 每次测试用独立的临时目录，避免并行测试互相踩。
+    /// 每次测试使用独立的临时目录，避免并行测试相互干扰。
     fn temp_workspace(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("qch-task-store-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -260,18 +258,18 @@ mod tests {
 
         store.save(&task_snapshot_for("../../evil")).unwrap();
 
-        // 净化后的文件名落在任务目录里，而不是目录外。
+        // 净化后的文件名位于任务目录内。
         assert!(store.path_for(&evil).file_name().unwrap() == "______evil.json");
         assert!(store.path_for(&evil).starts_with(&store.dir));
         assert!(store.load(&evil).unwrap().is_some());
         let _ = fs::remove_dir_all(&workspace);
     }
 
-    /// 文件名与内容里的任务 ID 必须一致。
+    /// 文件名与内容中的任务 ID 必须一致。
     ///
-    /// 复制一个快照文件换个名字就能绕过"这是哪个任务的"这一问——
-    /// 而恢复会用文件里的进度去续文件里的会话，两者其实自洽，
-    /// 错的是**用户以为自己在恢复哪个任务**。
+    /// 复制快照文件并改名可以绕过"这是哪个任务"的检查，而恢复会使用文件内
+    /// 的进度继续文件内的会话，两者自洽，错的只是用户以为自己在恢复另一个
+    /// 任务。
     #[test]
     fn a_renamed_snapshot_file_is_rejected() {
         let workspace = temp_workspace("renamed");

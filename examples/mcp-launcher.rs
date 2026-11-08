@@ -1,6 +1,6 @@
-//! 演示 launcher：作为 harness 的直接子进程启动，再由它拉起真正的
-//! MCP echo Server 作为**子进程**。这个"直接子进程 ≠ Server"的形状
-//! 正是 MCP 沙箱收口要处理的场景（uvx / npx / pipx 都是它）。
+//! 演示 launcher：harness 把它作为直接子进程启动，它再拉起真正的
+//! MCP echo Server 作为子进程。直接子进程不是 Server，这是 MCP 沙箱
+//! 需要处理的场景（uvx / npx / pipx 都这样）。
 
 use std::process::{Command, Stdio};
 

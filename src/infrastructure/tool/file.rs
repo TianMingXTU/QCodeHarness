@@ -1,11 +1,11 @@
 //! 文件工具：读取、列目录、整体写入。
 //!
-//! 三个工具各自独立成结构体，配置都只有 workspace 根。共享的路径校验
-//! 与参数解析在 [`super`] 里，这里不复述。
+//! 每个工具独立成结构体，配置都只有 workspace 根。共享的路径校验与
+//! 参数解析在 [`super`] 中，此处不重复。
 //!
-//! `write_file` 与 `edit_file`（见 `super::edit`）的分工要在描述里说清：
-//! 前者创建新文件或整体覆盖，后者只替换已有文件中的一段——让模型
-//! 在该用哪个上不靠猜。
+//! `write_file` 与 `edit_file`（见 `super::edit`）的分工写在工具描述里：
+//! 前者创建新文件或整体覆盖，后者只替换已有文件中的一段，让模型明确
+//! 该用哪个。
 
 use serde::Deserialize;
 use serde_json::json;
@@ -21,11 +21,11 @@ const READ_FILES: &str = "read_files";
 const LIST_DIR: &str = "list_dir";
 const WRITE_FILE: &str = "write_file";
 
-/// `read_file` 默认显示的行数。与 search_text/run_command 的截断口径对齐：
-/// read_file 是只读工具，默认策略下不问人就执行，一旦读进一个超长文件，
-/// 整份内容会直接吃掉大量上下文——所以它不能是唯一"裸奔"的工具。
+/// `read_file` 默认显示的行数。与 search_text/run_command 一样，截断时附说明。
+/// read_file 是只读工具，默认策略下无需审批就执行，读取超长文件会占用
+/// 大量上下文。
 const READ_FILE_DEFAULT_LINES: usize = 400;
-/// `max_lines` 的硬上限。再大的文件也该用 search_text 定位后分块读。
+/// `max_lines` 的硬上限。更大的文件应先用 search_text 定位再分块读取。
 const READ_FILE_HARD_MAX_LINES: usize = 2000;
 
 // ── read_file ────────────────────────────────────────────────────────
@@ -87,11 +87,11 @@ impl ToolInvoker for ReadFile {
     }
 }
 
-/// 读一个文件并按行数上限渲染。
+/// 读取一个文件并按行数上限渲染。
 ///
-/// `read_file` 与 `read_files` 共用这一条路径：两条路对同一个文件必须给出
-/// 逐字节相同的结果（含截断说明的措辞），否则模型对"这个文件有多长"的
-/// 判断会取决于它是一次读的还是批量读的——而它没有任何依据去做这个区分。
+/// `read_file` 与 `read_files` 共用该路径，同一文件必须得到逐字节相同的
+/// 结果（包括截断说明的措辞）。否则模型对文件长度的判断会随单读或批量读
+/// 而变化，而模型没有依据做这种区分。
 async fn read_one_file(
     root: &WorkspaceRoot,
     raw_path: &str,
@@ -104,8 +104,8 @@ async fn read_one_file(
     let content = match tokio::fs::read_to_string(path.as_path()).await {
         Ok(content) => content,
         Err(error) => {
-            // InvalidData 即"内容不是合法 UTF-8"：多半是二进制文件。
-            // 不点破的话模型会以为是权限或路径问题，反复重试同一个文件。
+            // InvalidData 表示内容不是合法 UTF-8，常见于二进制文件。
+            // 不说明原因时，模型可能误以为权限或路径问题而反复重试。
             let hint = if error.kind() == std::io::ErrorKind::InvalidData {
                 "（文件可能不是 UTF-8 文本，例如二进制文件；本工具只能读文本文件）"
             } else {
@@ -121,9 +121,9 @@ async fn read_one_file(
 
 /// 一次读取多个文本文件。
 ///
-/// Harness 一轮只执行一条工具调用（见 `application::agent_run` 的
-/// `step()`），所以"读 5 个文件"如果拆成 5 次 `read_file`，就是 5 轮模型
-/// 往返。已知路径时一次拿回全部内容，轮数直接除以文件数。
+/// 模型也可以在一条回复里发多条 `read_file`（一轮内顺序执行，见
+/// `application::agent_run` 的 `record_and_advance`），但那需要模型逐个
+/// 发起；已知路径时一次调用取回全部内容，意图更直接，工具定义也更省。
 pub struct ReadFiles {
     root: WorkspaceRoot,
 }
@@ -162,9 +162,9 @@ impl ReadFiles {
                 },
                 "required": ["paths"]
             }),
-            // 与 read_file 同权：只读、无破坏、幂等、不碰外部世界。
-            // 标成只读还有一层实际意义——默认策略下它不问人就执行，
-            // 批量读几个文件不该让人逐个点头。
+            // 与 read_file 权限相同：只读、无破坏、幂等、不访问外部世界。
+            // 标为只读还有一个作用：默认策略下无需审批即可执行，批量读
+            // 文件不必逐个确认。
             annotations: ToolAnnotations::new(true, false, true, false),
         }
     }
@@ -191,17 +191,17 @@ impl ToolInvoker for ReadFiles {
             }
             let mut sections = Vec::with_capacity(args.paths.len());
             let mut read_any = false;
-            // 逐个读而不是并发读：路径校验要碰文件系统，而 Harness 对工具
-            // 执行的假设是"一次一个"（审计事件、审批、沙箱都按这个来）。
-            // 这里的收益本就不在读取本身，而在省下的模型往返。
+            // 逐个读取，不并发。路径校验需要访问文件系统，Harness 也假设
+            // 工具一次执行一个（审计、审批、沙箱都基于此）。收益来自减少
+            // 模型往返，不在读取本身。
             for raw in &args.paths {
                 let outcome = read_one_file(&self.root, raw, args.max_lines).await;
                 read_any |= outcome.status == OutcomeStatus::Success;
                 sections.push(format!("{}\n{}", section_header(raw), outcome.content));
             }
             let body = sections.join("\n\n");
-            // 整批的成败看"有没有读到任何一个"：全部失败时报 failed，
-            // 否则模型会以为内容已经拿到手，而实际上手里只有几条错误说明。
+            // 整批成败取决于是否读到至少一个文件。全部失败时报 failed，
+            // 否则模型会以为已拿到内容，实际只有错误说明。
             if read_any {
                 ToolOutcome::success(body)
             } else {
@@ -213,20 +213,20 @@ impl ToolInvoker for ReadFiles {
 
 /// 批量读取的分节标题。
 ///
-/// 用模型当初请求的那个路径原文，不做规范化：模型是靠"我传了什么"把
-/// 内容和文件对上的，换成别的写法它反而认不出这一节是谁。
+/// 使用模型请求时的路径原文，不做规范化。模型依靠自己传入的路径将内容
+/// 与文件对应，改写后反而难以识别。
 fn section_header(path: &str) -> String {
     format!("── {path} ──")
 }
 
-/// 按行数上限渲染读取结果，超限截断并附说明。
+/// 按行数上限渲染读取结果，超限时截断并附说明。
 ///
-/// 说明必须点名 search_text 与 max_lines：模型看到截断后最常犯的错是
-/// 原样重读同一文件，要告诉它出路在哪。
+/// 说明中必须提到 search_text 与 max_lines。模型看到截断后常会原样重读
+/// 同一文件，需要告知可行的处理方式。
 ///
-/// 行切分用 `split_inclusive('\n')` 而不是 `lines()`：后者会把 CRLF 的
-/// `\r` 剥掉，截断路径下 Windows 文件的行尾就被静默改写了——模型据此
-/// 构造的 edit_file old_string 会匹配不上原始文件。
+/// 行切分使用 `split_inclusive('\n')` 而非 `lines()`。后者会去掉 CRLF
+/// 中的 `\r`，截断路径下 Windows 文件的行尾被改写，模型据此构造的
+/// edit_file old_string 将无法匹配原始文件。
 fn render_with_line_cap(content: &str, max_lines: Option<usize>) -> ToolOutcome {
     let max_lines = max_lines
         .unwrap_or(READ_FILE_DEFAULT_LINES)
@@ -288,7 +288,7 @@ impl ToolInvoker for ListDir {
                 Ok(args) => args,
                 Err(message) => return ToolOutcome::failed(message),
             };
-            // 两种来源统一成 PathBuf：校验过的相对路径，或 workspace 根本身。
+            // 两种情况统一为 PathBuf：校验后的相对路径，或 workspace 根目录本身。
             let path: std::path::PathBuf = match args.path {
                 Some(raw) => match resolve_in(&self.root, &raw) {
                     Ok(path) => path.as_path().to_path_buf(),
@@ -362,7 +362,7 @@ impl WriteFile {
                 },
                 "required": ["path", "content"]
             }),
-            // 覆盖写入不可逆，且不幂等；只作用于已知的本地文件，所以不是开放世界。
+            // 覆盖写入不可逆且不幂等。只作用于已知本地文件，不属于开放世界。
             annotations: ToolAnnotations::new(false, true, false, false),
         }
     }
@@ -437,8 +437,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_name_is_refused_by_the_registry() {
-        // 路由收归注册表后，兜底拒绝由注册表给出：模型指名一个没登记的
-        // 工具 → refused，不 panic。
+        // 路由由注册表负责，兜底拒绝也由注册表给出：模型指定未注册的
+        // 工具时返回 refused，不 panic。
         use std::sync::Arc;
         use crate::application::tool_registry::{ToolEntry, ToolRegistry};
         let registry = ToolRegistry::new(vec![ToolEntry {
@@ -464,10 +464,10 @@ mod tests {
 
     // ── read_file 行数截断 ─────────────────────────────────────────
     //
-    // 这些测试用真实临时文件：截断逻辑操作的是读进来的字符串，
-    // 只有走完整的 invoke 路径才能验证"读 → 截 → 附说明"串起来没错。
+    // 测试使用真实临时文件。截断逻辑处理读入的字符串，只有走完整的
+    // invoke 路径才能验证读取、截断、附说明连起来是否正确。
 
-    /// 在共享临时目录里造一个文件，返回目录路径。
+    /// 在共享临时目录中创建一个文件，返回目录路径。
     fn temp_dir_with(name: &str, content: &[u8]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("qch-file-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("建临时目录");
@@ -506,15 +506,15 @@ mod tests {
         assert!(outcome.content.starts_with("第1行\n第2行\n第3行"), "{}", outcome.content);
         assert!(outcome.content.contains("共 10 行"), "{}", outcome.content);
         assert!(outcome.content.contains("仅显示前 3 行"), "{}", outcome.content);
-        // 截断说明要给模型指路：定位工具与调参出口都得提到。
+        // 截断说明需提到定位工具与调参入口。
         assert!(outcome.content.contains("search_text"), "{}", outcome.content);
         assert!(outcome.content.contains("max_lines"), "{}", outcome.content);
     }
 
     #[tokio::test]
     async fn read_file_truncation_preserves_crlf_line_endings() {
-        // CRLF 文件在截断路径下必须逐字节保留 \r\n：模型拿截断输出构造
-        // edit_file 的 old_string 时才不会和磁盘上的原始内容对不上。
+        // 截断路径必须逐字节保留 CRLF 的 \r\n，否则模型用截断输出构造的
+        // edit_file old_string 会与磁盘内容不一致。
         let dir = temp_dir_with("crlf.txt", b"line1\r\nline2\r\nline3\r\n");
         let tools = ReadFile::new(WorkspaceRoot::new(&dir));
         let outcome = tools
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn write_file_description_mentions_edit_file() {
-        // 分工说明是给模型看的：不提 edit_file，模型就会用整体覆盖做小修改。
+        // 描述面向模型：不提到 edit_file 时，模型会用整体覆盖做小修改。
         let description = WriteFile::spec().description;
         assert!(description.contains("edit_file"));
     }
@@ -601,9 +601,9 @@ mod tests {
 
     // ── read_files 批量读取 ──────────────────────────────────────────
 
-    /// 造一个带若干普通文件、一份 `.env` 和一个二进制文件的 workspace。
+    /// 创建包含普通文件、`.env` 与二进制文件的 workspace。
     ///
-    /// 每类失败各来一个（不存在、非 UTF-8、受保护），用来证明它们互不影响。
+    /// 每类失败各准备一个（不存在、非 UTF-8、受保护），验证它们互不影响。
     fn batch_workspace(name: &str) -> PathBuf {
         let dir = protected_dir(name);
         std::fs::write(dir.join("a.txt"), "AAA\nBBB\n").expect("写 a.txt");
@@ -634,10 +634,10 @@ mod tests {
         assert!(outcome.content.contains("BBB only"), "{}", outcome.content);
     }
 
-    /// 单个文件失败不影响其他文件——这是 `read_files` 存在的全部理由。
+    /// 单个文件失败不影响其他文件。
     ///
-    /// 不存在、非 UTF-8、受保护三种失败同时出现，读得到的两个文件
-    /// 必须照常回来，每种失败也都要各自说明原因。
+    /// 不存在、非 UTF-8、受保护三种失败同时出现时，能读到的两个文件必须
+    /// 正常返回，每种失败分别说明原因。
     #[tokio::test]
     async fn read_files_one_file_failing_does_not_affect_the_others() {
         let dir = batch_workspace("batch-partial");
@@ -649,7 +649,7 @@ mod tests {
             ))
             .await;
 
-        // 有读成的，整批就是成功：模型要能拿到读到的那些，而不是整批作废。
+        // 有文件读成功，整批即为成功，模型需要拿到已读到的内容。
         assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
         assert!(
             outcome.content.contains("AAA\nBBB"),
@@ -661,11 +661,11 @@ mod tests {
             "读得到的文件必须回来: {}",
             outcome.content
         );
-        // 失败逐个点名，不合并成一句含糊的"部分失败"。
+        // 每个失败单独列出，不合并为"部分失败"。
         assert!(outcome.content.contains("missing.txt"), "{}", outcome.content);
         assert!(outcome.content.contains("UTF-8"), "{}", outcome.content);
         assert!(outcome.content.contains("受保护"), "{}", outcome.content);
-        // 失败原因不得夹带任何读到的内容。
+        // 失败原因不得包含读到的内容。
         assert!(
             !outcome.content.contains("supersecret"),
             "凭据不得进观察: {}",
@@ -673,7 +673,7 @@ mod tests {
         );
     }
 
-    /// 一个都没读成时不能报 success：那会让模型以为内容已经拿到手。
+    /// 全部未读成时必须报失败，否则模型会以为已拿到内容。
     #[tokio::test]
     async fn read_files_reports_failure_when_nothing_was_read() {
         let dir = batch_workspace("batch-allfail");
@@ -686,7 +686,7 @@ mod tests {
         assert!(outcome.content.contains("受保护"), "{}", outcome.content);
     }
 
-    /// 空 `paths` 是参数错误，不是"读零个文件并且成功了"。
+    /// 空 `paths` 是参数错误，不能视为读零个文件成功。
     #[tokio::test]
     async fn read_files_rejects_an_empty_path_list() {
         let dir = batch_workspace("batch-empty");
@@ -701,10 +701,10 @@ mod tests {
         );
     }
 
-    /// 截断口径与 `read_file` 逐字一致，且每个文件各自判定。
+    /// 截断口径与 `read_file` 逐字一致，且每个文件独立判定。
     ///
-    /// 同一个批量调用里，超限的那个附说明，没超限的那个原样返回——
-    /// 混为一谈会让模型以为短文件也被截了。
+    /// 同一次批量调用中，超限文件附截断说明，未超限文件原样返回。
+    /// 两者混淆会让模型以为短文件也被截断。
     #[tokio::test]
     async fn read_files_applies_the_same_line_cap_as_read_file() {
         let dir = batch_workspace("batch-cap");
@@ -737,10 +737,10 @@ mod tests {
         );
     }
 
-    /// 受保护路径在批量读取里同样逐个拒绝，且内容不进观察。
+    /// 受保护路径在批量读取中同样逐个拒绝，内容不进入观察。
     ///
-    /// 每条路径都独立走 `resolve_in`，所以 junction 变形（词法上合法、
-    /// 物理上落进受保护目录的路径）在这里和单文件读取一样被拦下。
+    /// 每条路径独立经过 `resolve_in`，因此 junction 变形（词法合法但
+    /// 物理上落入受保护目录）与单文件读取一样会被拦截。
     #[tokio::test]
     async fn read_files_refuses_protected_paths_per_file() {
         let dir = batch_workspace("batch-protected");
@@ -793,10 +793,9 @@ mod tests {
         );
     }
 
-    /// `read_file` 的描述要指路 `read_files`。
+    /// `read_file` 的描述要指向 `read_files`。
     ///
-    /// 不指路的后果是模型继续一个个读——那正是这个工具要省掉的往返，
-    /// 而省掉这些往返正是批量读取存在的目的。
+    /// 不指向时模型会继续逐个读取，批量读取因此失去作用。
     #[test]
     fn read_file_description_points_at_the_batch_tool() {
         assert!(
@@ -806,10 +805,10 @@ mod tests {
         );
     }
 
-    /// `list_dir` 的描述要把"看完结构之后怎么办"说完。
+    /// `list_dir` 的描述要说明列出结构之后的下一步。
     ///
-    /// 停在"列出目录"的话，模型下一步仍是一个个 `read_file`；
-    /// 把 `read_files` 接在后面，一次摸结构的代价就换来一次批量读。
+    /// 只写"列出目录"时，模型接下来仍会逐个 `read_file`。接上
+    /// `read_files` 后，查看一次目录即可进行一次批量读取。
     #[test]
     fn list_dir_description_leads_into_the_batch_reader() {
         assert!(
@@ -821,8 +820,8 @@ mod tests {
 
     /// 受保护路径测试专用的临时目录。
     ///
-    /// 不复用 `temp_dir_with` 的共享目录：那些测试并行跑，末尾会
-    /// `remove_dir_all` 整个目录，把这边刚建好的 `.git` 一起删掉。
+    /// 独立命名，不与 `temp_dir_with` 的共享目录混用：这些测试各自先
+    /// 清空再重建目录，共享目录里的既有测试文件会被误删。
     fn protected_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("qch-protected-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -832,16 +831,15 @@ mod tests {
 
     // ── 受保护路径（工具层）──────────────────────────────────────
 
-    /// `write_file(".git/config")` 必须在策略之前就被拒绝。
+    /// `write_file(".git/config")` 必须在策略检查之前被拒绝。
     ///
-    /// 这条测试刻意不碰策略引擎：保护是 workspace 路径解析的固有行为，
-    /// 任何"放行写入"的配置都不该让它失效。工具层的拒绝观察就是契约——
-    /// 模型看到的是 refused，不是"审批一下就能写"。
+    /// 本测试不涉及策略引擎。保护是 workspace 路径解析的固有行为，
+    /// 任何放行写入的配置都不应使其失效。模型看到的观察是 refused，
+    /// 不会进入审批。
     #[tokio::test]
     async fn write_file_refuses_protected_paths_without_consulting_policy() {
         let dir = protected_dir("write");
-        // 造一个真的 .git/config：拒绝必须发生在文件系统之前，
-        // 不能让"文件不存在"成为一种假通过。
+        // 创建真实的 .git/config，确保拒绝发生在文件系统访问之前。
         std::fs::create_dir_all(dir.join(".git")).expect("建 .git");
         std::fs::write(dir.join(".git/config"), "[core]\n").expect("写 .git/config");
         let tools = WriteFile::new(WorkspaceRoot::new(&dir));
@@ -862,7 +860,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 读与写同权：agent 也不能通过 `read_file` 摸 `.git` 和 `.env`。
+    /// 读与写权限相同：`read_file` 也不能访问 `.git` 和 `.env`。
     #[tokio::test]
     async fn read_file_refuses_protected_paths() {
         let dir = protected_dir("read");
@@ -880,7 +878,7 @@ mod tests {
     }
 
     /// `list_dir(".qcodeharness")` 同样拒绝：目录列表会泄露会话文件名，
-    /// 那是审计证据的索引，不该进模型的上下文。
+    /// 而会话文件是审计证据的索引，不应进入模型上下文。
     #[tokio::test]
     async fn list_dir_refuses_protected_directories() {
         let dir = protected_dir("list");
@@ -896,7 +894,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// WorkspacePath 校验通过时 resolve_in 返回路径本身。
+    /// 路径校验通过时 `resolve_in` 返回该路径。
     #[test]
     fn resolve_in_returns_validated_path() {
         let root = workspace();

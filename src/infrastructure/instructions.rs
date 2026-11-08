@@ -1,30 +1,28 @@
-//! 项目指令文件：把 workspace 里的项目约定注入系统提示词。
+//! 项目指令文件：把 workspace 中的项目约定注入系统提示词。
 //!
-//! 对标 Claude Code 的 `CLAUDE.md` 与 Codex 的 `AGENTS.md`：模型每次
-//! 运行都该知道"这个项目自己怎么做事"，否则它只能按通用习惯来，而通用
-//! 习惯和项目约定冲突时它不会怀疑自己。
+//! 对应 Claude Code 的 `CLAUDE.md` 与 Codex 的 `AGENTS.md`。模型每次运行
+//! 都应了解项目自身的约定；否则只能沿用通用习惯，而通用习惯与项目约定
+//! 冲突时模型不会察觉。
 //!
-//! 读文件是 IO，所以在接口层；领域层的 `AgentRoster` 只接收已经读好的
-//! 正文，负责把它拼到每个角色的提示词后面。
+//! 读取文件属于 IO，因此放在基础设施层。应用层的 `AgentRoster` 只接收
+//! 已读入的正文，并拼接到各角色的提示词之后。
 
 use std::path::{Path, PathBuf};
 
 /// 项目指令的字节上限。
 ///
-/// 8 KiB 是"能写完一个项目的关键约定"与"每轮都白花一遍上下文"之间的
-/// 折中。指令进的是系统提示词，每个角色每一轮都要重发一遍——写成一本书
-/// 的成本是按轮数放大的。
+/// 8 KiB 是在"能写完项目关键约定"与"每轮重复消耗上下文"之间的折中。
+/// 指令进入系统提示词，每个角色每轮都会重发，成本随轮数放大。
 const MAX_INSTRUCTION_BYTES: usize = 8 * 1024;
 
 /// workspace 根下的项目指令文件。
 const ROOT_INSTRUCTIONS: &str = "QCODEHARNESS.md";
 
-/// 次级位置：harness 自己的目录里。
+/// 次级位置：harness 自己的目录。
 ///
-/// 存在的意义是"模型改不了"：`.qcodeharness` 是受保护路径，agent 读写
-/// 都会被拒，所以放在这里的指令不会被一次失控的 `write_file` 抹掉。
-/// 两个位置都存在时根上的赢——它离项目的 README 更近，
-/// 是使用者最先会想到的地方。
+/// `.qcodeharness` 是受保护路径，agent 的读写都会被拒绝，因此放在这里的
+/// 指令不会被一次误写的 `write_file` 覆盖。两个位置都存在时使用根目录
+/// 版本：它更接近项目的 README，也是使用者最先查看的位置。
 const SECONDARY_INSTRUCTIONS: &str = ".qcodeharness/instructions.md";
 
 /// 项目指令的加载结果。
@@ -42,8 +40,9 @@ pub struct ProjectInstructions {
 
 /// 从 workspace 根加载项目指令。
 ///
-/// 两个位置都没有可读的文件时返回 `None`——此时提示词就是内置档案
-/// 那一份，不多一行。
+/// 按顺序查找两个位置，读取第一个存在的文件。两个位置都不存在时返回
+/// `None`，此时提示词只包含内置档案。文件存在但读取失败时返回空正文与
+/// 告警，不尝试下一个位置。
 pub fn load_project_instructions(root: &Path) -> Option<ProjectInstructions> {
     for relative in [ROOT_INSTRUCTIONS, SECONDARY_INSTRUCTIONS] {
         let path = root.join(relative);
@@ -61,8 +60,8 @@ fn read_instructions(path: &Path) -> ProjectInstructions {
     let (text, truncated) = match std::fs::read_to_string(path) {
         Ok(text) => truncate_to_limit(text),
         Err(error) => {
-            // 读不了不当场炸：指令文件是便利设施，不是安全边界。
-            // 但必须响一声——静默跳过会让使用者以为约定已经生效。
+            // 读取失败不返回错误：指令文件是便利设施，不是安全边界。
+            // 但必须告警，静默跳过会让使用者误以为约定已生效。
             warnings.push(format!("{} 存在但读不了（{error}），本次不使用项目指令", path.display()));
             (String::new(), false)
         }
@@ -75,10 +74,10 @@ fn read_instructions(path: &Path) -> ProjectInstructions {
     }
 }
 
-/// 把正文截到上限，返回截断后的文本与是否动过手。
+/// 将正文按上限截断并追加截断提示，返回文本与是否发生截断。
 ///
-/// 按字符边界切：多字节字符（中文注释里遍地都是）被切成半个会让整个
-/// 字符串在后面按 UTF-8 处理时直接失效，而提示词是要进 JSON 的。
+/// 按字符边界切分。多字节字符被截成半个会使字符串不是合法 UTF-8，而
+/// 提示词随后要序列化为 JSON。
 fn truncate_to_limit(text: String) -> (String, bool) {
     if text.len() <= MAX_INSTRUCTION_BYTES {
         return (text, false);
@@ -107,8 +106,8 @@ mod tests {
 
     #[test]
     fn no_instruction_file_means_no_instructions() {
-        // 兼容性承诺：文件不存在时加载器什么都不给，
-        // 提示词保持与内置档案逐字相同。
+        // 兼容性承诺：文件不存在时加载器返回 None，提示词与内置档案
+        // 逐字相同。
         assert_eq!(load_project_instructions(&root("absent")), None);
     }
 
@@ -125,8 +124,8 @@ mod tests {
         assert!(loaded.warnings.is_empty());
     }
 
-    /// 根上的赢：使用者最先找的是 workspace 根的 `QCODEHARNESS.md`，
-    /// 次级位置只是"模型改不动的备份"，不该悄悄顶替它。
+    /// 根目录优先：使用者最先查找 workspace 根的 `QCODEHARNESS.md`；
+    /// 次级位置只是模型无法修改的备份，不应替代它。
     #[test]
     fn root_file_wins_over_the_secondary_location() {
         let dir = root("both");
@@ -180,10 +179,10 @@ mod tests {
         assert_eq!(loaded.text.len(), MAX_INSTRUCTION_BYTES);
     }
 
-    /// 截断点落在多字节字符中间时，必须退到字符边界。
+    /// 截断点落在多字节字符内部时必须回退到字符边界。
     ///
-    /// 中文指令正好踩在 8 KiB 边界上时，按字节硬切会产出半个 UTF-8
-    /// 序列——提示词随后进 JSON，序列化直接失败。
+    /// 中文指令正好位于 8 KiB 边界时，按字节硬切会产生半个 UTF-8 序列，
+    /// 导致后续 JSON 序列化失败。
     #[test]
     fn truncation_respects_character_boundaries() {
         let dir = root("utf8");
@@ -199,11 +198,11 @@ mod tests {
         assert!(!loaded.text.contains('\u{FFFD}'), "不应出现替换字符");
     }
 
-    /// 读不成 UTF-8 的文件要给告警，不能静默跳过。
+    /// 无法按 UTF-8 读取的文件必须告警，不能静默跳过。
     ///
-    /// 这不是假想的边界：Windows 上拿记事本"另存为 ANSI"保存的
-    /// `QCODEHARNESS.md` 就是 GBK 字节流，`read_to_string` 直接失败。
-    /// 静默跳过会让使用者以为约定已经生效，而模型一个字都没看到。
+    /// Windows 上用记事本以 ANSI 编码保存的 `QCODEHARNESS.md` 是 GBK
+    /// 字节流，`read_to_string` 会失败。静默跳过会让使用者以为约定已
+    /// 生效，而模型未收到任何内容。
     #[test]
     fn non_utf8_instruction_file_warns_instead_of_failing_silently() {
         let dir = root("gbk");

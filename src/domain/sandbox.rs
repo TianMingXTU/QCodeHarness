@@ -55,15 +55,14 @@ impl ExecutionBoundary {
         }
     }
 
-    /// MCP 调用的边界事实。`process_isolation` 报告 Server 进程是否在握手
-    /// **之前**就被纳入了宿主进程沙箱（Windows 上是 Job Object）：纳入只
-    /// 覆盖该进程之后创建的子孙，所以先后顺序决定这个字段是否为真保护。
-    /// 纳入失败、拿不到 PID 或非 Windows 平台为 false。口径与 shell 工具
-    /// 一致：不谎报保护，也不因为"是外部进程"就一律写 false——治理后能
-    /// 反映真实边界状态。
+    /// MCP 调用的边界事实。`process_isolation` 表示 Server 进程是否在
+    /// 握手**之前**纳入宿主进程沙箱（Windows 上为 Job Object）。纳入只
+    /// 覆盖该进程之后创建的子孙，先后顺序决定该字段是否代表真实保护。
+    /// 纳入失败、拿不到 PID 或非 Windows 平台时为 false。口径与 shell
+    /// 工具一致：不虚报保护，也如实反映治理后的边界状态。
     ///
-    /// `platform` 仍是 `MCP subprocess` 而非平台标签：证据要能分辨"这来自
-    /// 外部 Server"与"这是内置工具"，而 `active` 单独回答"有没有进程隔离"。
+    /// `platform` 固定为 `MCP subprocess`，不使用平台标签：证据需要区分
+    /// "来自外部 Server"与"内置工具"，进程隔离状态由 `active` 单独表示。
     pub fn mcp(process_isolation: bool) -> Self {
         Self {
             platform: MCP_BOUNDARY_LABEL,
@@ -78,9 +77,9 @@ impl ExecutionBoundary {
 pub struct SandboxPolicy {
     /// 超时或结束时终止整个进程树（含孙进程）。
     ///
-    /// 修的是真实缺陷：`child.kill()` 只杀直接子进程，
-    /// `cmd /C "start /b ..."` 拉起的孙进程会活到自然结束——超时只是
-    /// 让模型"以为"停了，孤儿进程继续吃宿主机资源。
+    /// `child.kill()` 只终止直接子进程，`cmd /C "start /b ..."` 拉起的
+    /// 孙进程会运行到自然结束。仅杀子进程会让模型误以为任务已停止，
+    /// 孤儿进程继续占用宿主机资源。
     pub kill_tree: bool,
     /// 树内单个进程的内存提交上限（字节）。None = 不限。
     pub per_process_memory: Option<u64>,
@@ -88,19 +87,18 @@ pub struct SandboxPolicy {
     pub max_processes: Option<u32>,
     /// 树内全部进程的 CPU 时间累计上限。None = 不限。
     ///
-    /// 默认不设：cargo/rustc 并行编译的 CPU 时间不可预估，设小了误杀。
-    /// 进程数与内存两道边界已经兜住"失控 fork 炸弹"的主要形态。
+    /// 默认不设：cargo/rustc 并行编译的 CPU 时间无法预估，限制过小会
+    /// 误杀。进程数与内存两项上限已覆盖失控 fork 的主要情形。
     pub cpu_time: Option<Duration>,
 }
 
 impl Default for SandboxPolicy {
-    /// 默认策略的取向：**宁可宽到不误杀，也不要紧到断任务**。
+    /// 默认策略偏宽，优先避免误杀。
     ///
-    /// 本项目自己的测试和基准都要在沙箱内跑 `cargo test`（编译
-    /// fixture crate），限额设紧了最先被杀的是这个仓库自己的
-    /// 工作流。沙箱的价值在"机械兜底"而不是"精细配额"：
-    /// kill_tree 修的是确凿缺陷（孙进程失控），内存与进程数给的是
-    /// 宽裕的天花板（正常编译远够不到，失控时是刹车不是绊索）。
+    /// 本项目的测试和基准都在沙箱内运行 `cargo test`（编译 fixture
+    /// crate），限额过紧会杀掉自身工作流。沙箱提供机械兜底，不做精细
+    /// 配额：kill_tree 修复孙进程失控这一确凿缺陷，内存与进程数设置
+    /// 宽裕上限，正常编译用不到，失控时起限制作用。
     fn default() -> Self {
         Self {
             kill_tree: true,
@@ -114,12 +112,13 @@ impl Default for SandboxPolicy {
     }
 }
 
-/// 判断命令是否可能把写操作伸到 workspace 外；命中后用于升级审批。
+/// 判断命令是否可能把写操作延伸到 workspace 外，命中后升级审批。
 ///
-/// 这是**词法**边界判定，不是隔离，也不是 shell 求值：变量拼接、命令替换、
-/// 编码绕过与链接物理目标仍可绕过；真正的进程边界由基础设施层建立。
-/// 无根与有根共用同一份解析结果，唯一差别是 `root`：
-/// 无根时所有绝对路径都算嫌疑，有根时只拒真的不在根下的绝对路径。
+/// 这是**词法**判定，既不是隔离也不是 shell 求值。变量拼接、命令替换、
+/// 编码绕过与链接的物理目标仍可绕过，真正的进程边界由基础设施层
+/// 建立。无根与有根共用同一份解析结果，差别只在 `root`：无根时所有
+/// 绝对路径都视为嫌疑，有根时拒绝越出根的路径；含 `..` 成分的词元
+/// 无论有无根一律拒绝（`..` 出现即嫌疑，不做归一化豁免）。
 pub fn write_escape_suspect(command: &str) -> Option<String> {
     command_escape_violation(&parse_command(command), None)
 }
@@ -128,17 +127,18 @@ pub fn write_escape_beyond(command: &str, root: &Path) -> Option<String> {
     command_escape_violation(&parse_command(command), Some(root))
 }
 
-/// 两道防线唯一的裁决器：逐段、逐重定向、逐词元查越界，任一段命中即拒。
+/// 两道防线共用的裁决器：逐段、逐重定向、逐词元检查越界，任一处命中
+/// 即拒绝。
 ///
-/// `root` 表达两道防线有意保留的口径落差：无根调用没有根可参照，
-/// 所有盘符绝对路径都升级审批（根内也多问一次）；有根调用知道根在哪，
-/// 只硬拒绝真的越界。升级审批宁可多问，机械防线必须精准，
-/// 两边语义不同，不能合并成一个判据。
+/// `root` 体现两道防线有意保留的差异：无根调用没有根可参照，所有盘符
+/// 绝对路径都升级审批，根内路径也再问一次；有根调用知道根的位置，拒绝
+/// 越出根的路径，`..` 成分则两种模式都拒绝。审批可以多问，机械防线必须
+/// 准确，两者语义不同，不能合并为一个判据。
 fn command_escape_violation(parsed: &ParsedCommand, root: Option<&Path>) -> Option<String> {
     let multi_segment = parsed.segments.len() > 1;
     for (index, segment) in parsed.segments.iter().enumerate() {
         for redirect in &segment.redirects {
-            // `<` 是输入，不是"把输出写到外面"；其余形态一视同仁。
+            // `<` 是输入重定向，不是写出 workspace；其余形态一并检查。
             if redirect.op == RedirectOp::Input {
                 continue;
             }
@@ -151,13 +151,13 @@ fn command_escape_violation(parsed: &ParsedCommand, root: Option<&Path>) -> Opti
                 ));
             }
         }
-        // 重定向目标也留在词元流里："任何词元提到越界路径即触发"
-        // 是现行口径，不能因为有了 redirect 索引就退回只看重定向。
+        // 重定向目标也留在词元流里。现行口径是任何词元提到越界路径
+        // 即触发，不能因为有了 redirect 索引就只看重定向。
         for word in &segment.words {
             let candidate = word.path_candidate();
             if let Some(reason) = path_escape_reason(candidate, root) {
-                // 理由里点名完整词元（旧格式对 --flag= 也是整个词元），
-                // 判据则只看等号后的值——两者不能混为一谈。
+                // 理由中给出完整词元（旧格式对 --flag= 也取整个词元），
+                // 判据只看等号后的值，两者不同。
                 let text = match write_verb(segment) {
                     Some(verb) => {
                         format!(
@@ -174,9 +174,9 @@ fn command_escape_violation(parsed: &ParsedCommand, root: Option<&Path>) -> Opti
     None
 }
 
-/// 多段命令的理由要点名是哪一段、哪个程序；单段沿用三种既有文案模板，
-/// 不追加段号。重定向目标由结构化模型直接收齐，带空格的目标也按
-/// "输出重定向"归类；`<` 是输入，不套输出重定向的理由。
+/// 多段命令的理由标明段号与程序；单段沿用既有文案模板，不追加段号。
+/// 重定向目标由结构化模型直接收集，带空格的目标同样归为"输出重定向"。
+/// `<` 是输入重定向，不套用输出重定向的理由。
 fn segment_note(
     reason: String,
     segment: &CommandSegment,
@@ -190,9 +190,9 @@ fn segment_note(
     format!("{reason}（第 {} 段，程序 `{program}`）", index + 1)
 }
 
-/// 写入型动词只用于生成可读理由；任何越界路径都会触发，不以动词为门槛。
+/// 写入型动词只用于生成可读理由，不是触发条件：任何越界路径都会触发。
 /// 归属按**段**判定：`cargo test && rm D:/outside/x` 的理由应指向 `rm`，
-/// 而不是从整条命令里挑一个恰好出现过的动词。
+/// 不从整条命令中挑选出现过的动词。
 fn write_verb(segment: &CommandSegment) -> Option<&'static str> {
     const WRITE_VERBS: [&str; 11] = [
         "del",
@@ -273,8 +273,8 @@ fn is_absolute_path(token: &str) -> bool {
     escape_shape(token)
 }
 
-/// 纯词法规范化：统一分隔符、剥设备/UNC 装饰、抵消 `.` 与 `..`，
-/// 并按目标平台决定是否忽略大小写。绝不做文件系统解析。
+/// 纯词法规范化：统一分隔符、剥离设备/UNC 前缀、抵消 `.` 与 `..`，
+/// 按目标平台决定是否忽略大小写。不访问文件系统。
 fn normalize_path(raw: &str) -> Vec<String> {
     let trimmed = trim_device_prefix(raw);
     let mut parts: Vec<String> = Vec::new();
@@ -294,8 +294,8 @@ fn normalize_path(raw: &str) -> Vec<String> {
     parts
 }
 
-/// `\\?\C:\x`、`//?/UNC/server/share/x` 等前缀只影响 Windows 的路径解释，
-/// 不改变它指向的卷或共享；UNC 的 server/share 也一并作为普通组件比较。
+/// `\\?\C:\x`、`//?/UNC/server/share/x` 等前缀只影响 Windows 的路径
+/// 解释，不改变指向的卷或共享。UNC 的 server/share 作为普通组件比较。
 fn trim_device_prefix(raw: &str) -> &str {
     let mut text = raw;
     for prefix in [r"\\?\UNC\", r"\\.\", r"\\?\", "//?/UNC/", "//./", "//?/"] {
@@ -315,13 +315,12 @@ mod tests {
     #[test]
     fn default_policy_kills_tree_and_sets_generous_ceilings() {
         let policy = SandboxPolicy::default();
-        // kill_tree 是核心价值：整树终止必须是默认行为，不能靠
-        // 调用方记得开。
+        // kill_tree 是核心行为：整树终止默认开启，不依赖调用方设置。
         assert!(policy.kill_tree);
-        // 内存/进程数给天花板不设绊索：宽到正常构建永远够不到。
+        // 内存与进程数上限宽裕，正常构建不会触及。
         assert_eq!(policy.per_process_memory, Some(4 * 1024 * 1024 * 1024));
         assert_eq!(policy.max_processes, Some(256));
-        // CPU 时间不设：编译型工作负载的 CPU 时间不可预估。
+        // CPU 时间不设：编译型负载的 CPU 时间无法预估。
         assert_eq!(policy.cpu_time, None);
     }
 
@@ -338,13 +337,13 @@ mod tests {
 
     // ── 越界写入嫌疑 ──────────────────────────────────────────────
 
-    /// 真值表：看得见越界目标的写入要被抓出来，workspace 内的操作不打扰。
+    /// 真值表：越界的写入被识别，workspace 内的操作不被误判。
     ///
-    /// 每一条对应一种模型真实的越界写法，不是为凑覆盖编的字符串。
+    /// 每条对应一种实际出现过的越界写法。
     #[test]
     fn write_escape_suspect_detects_out_of_workspace_writes_only() {
         let suspects = [
-            // 重定向到别的盘：没有写入型动词，光一个 `>` 就够了。
+            // 重定向到其他盘：没有写入型动词，仅 `>` 即可触发。
             r"echo hi > C:\Windows\temp\x",
             r"cargo test > D:/build.log",
             r"type a > D:/x",
@@ -359,12 +358,11 @@ mod tests {
             r"echo hi >> ..\out.txt",
             // UNC 共享路径。
             r"copy src \\server\share\x",
-            // 不带写入型动词、也不带 `>` 的越界：默认基线放行了
-            // `git diff *` 一族，而 `--output` 是 git 自己的写文件选项，
-            // 只按动词和重定向判就整个漏掉——本机实测
-            // `git diff --output=D:\x` 会落盘，内容确实写到了外面。
+            // 无写入型动词、无 `>` 的越界。默认基线放行 `git diff *` 一族，
+            // 而 `--output` 是 git 的写文件选项，仅按动词和重定向判断会
+            // 漏掉。实测 `git diff --output=D:\x` 会写入文件。
             r"git diff --output=C:\Windows\temp\x",
-            // 开关与值之间不写空格是常见写法，值跟在 `=` 后面。
+            // 开关与值不写空格时，值跟在 `=` 后面。
             r"cargo build --target-dir=D:/cache",
             r"git diff --output D:\Windows\temp\x",
         ];
@@ -378,10 +376,10 @@ mod tests {
         let clean = [
             "cargo test",
             r"echo hi > out.txt",
-            // 重定向目标就在 workspace 内，即使命令本身看着像在写。
+            // 重定向目标在 workspace 内，命令形式像写入也不命中。
             r"echo hi>out.txt",
             "git status",
-            // 网络类操作不归这个启发式管（见模块文档的边界说明）。
+            // 网络操作不在本启发式范围内（见模块文档）。
             "git push",
             "curl -o out.txt https://example.com",
             // 词边界：`del` 不能命中 `model`。
@@ -479,19 +477,19 @@ mod tests {
         assert!(reason.contains(r"D:\repo space\out.txt"), "{reason}");
     }
 
-    /// 词法裁决的结构化回归表：旧真值表原样保留（不放松、不误杀），
-    /// 新覆盖只增不减。每条都给出"为什么这一条必须这样判"。
+    /// 词法裁决的结构化回归表：旧真值表保持不变（不放松、不误杀），
+    /// 新增用例只增不减。每条注明判定依据。
     #[test]
     fn structured_adjudication_keeps_the_no_loosening_contract() {
         let root = Path::new(r"D:/repo");
 
         // 收紧后的新增形态：段、多重定向、--flag= 归属、引号内复合命令。
         let tightened = [
-            // 越界出现在第 2 段：整串扫词元也碰得到，但理由必须归到 rm 那一段。
+            // 越界在第 2 段。扫描整串也能命中，理由必须归到 rm 段。
             r"cargo test && rm D:/outside/x",
-            // 越界出现在第 1 段：动词归属不能反过来指向后面的 cargo test。
+            // 越界在第 1 段。动词归属不能指向后面的 cargo test。
             r"rm D:/outside/x && cargo test",
-            // 第二个重定向目标是越界：旧实现只扫到第一个就收工。
+            // 第二个重定向目标越界。旧实现只扫描第一个。
             r"echo x > local.txt 2> /tmp/out",
             // 分号后的 --flag= 逐段生效，等号后只看值。
             r"git diff --output=in_root ; git diff --output=D:/outside/x",
@@ -501,25 +499,25 @@ mod tests {
             r"cargo test | copy src \\server\share\x",
             "cargo test\nrm /tmp/out",
             r"cargo test || del C:\Windows\temp\x",
-            // 用户点名的既有拒绝形态，重构成结构模型后一个都不许丢。
+            // 用户明确要求的既有拒绝形态，重构后不可丢失。
             r"cat /etc/passwd",
             r"echo x > /tmp/out",
             r"type D:\outside\x",
             r"copy src \\server\share\x",
             r"del ..\foo",
             r"git diff --output=D:\x",
-            // Unicode 空白也必须是词元边界：旧 tokenize 用 is_whitespace，
-            // 新词法若只认 ASCII 空格会把整条命令粘成一个不命中的词元。
+            // Unicode 空白同样是词元边界。旧 tokenize 使用 is_whitespace，
+            // 新词法若只认 ASCII 空格，会把整条命令粘成一个不命中的词元。
             "type\u{a0}..\\outside",
             "echo\u{a0}/etc/passwd",
-            // 重定向目标自己带 `=`：目标索引不看等号，但词元流仍按
+            // 重定向目标本身含 `=`。目标索引不看等号，词元流仍按
             // path_candidate() 取第一个等号后的值，不能只靠 redirect 索引。
             r"echo x > X=D:/outside",
             r"echo x > --output=..\outside",
             // `<` 是输入重定向：不套"输出重定向"理由，但目标词元照常扫描。
             r"cat < /tmp/out",
             r"cat < D:\outside\x",
-            // 卷根、盘符相对、设备前缀 UNC：三种形状一个都不许漏。
+            // 卷根、盘符相对路径、设备前缀 UNC：三种形态都不能漏。
             r"type D:\",
             r"type D:secret.txt",
             r"type \\?\UNC\server\share\x",
@@ -530,7 +528,7 @@ mod tests {
             r"echo x &> /tmp/all",
             // 多段命令只由真段构成：开头链接符不留空段、不加凭空的段号。
             r"&& rm D:/outside/x",
-            // `&` 只有在 `>&数字` 形态才是 fd 复制；粘住真实越界目标就是放松。
+            // `&` 只有在 `>&数字` 形态才是 fd 复制；与真实越界目标相连就是放松。
             r"echo x > local.txt&D:\outside\run.cmd",
             r"echo x > &C:\Windows\temp\x",
             r"echo x 2>&C:\Windows\temp\x",
@@ -548,7 +546,7 @@ mod tests {
             );
         }
 
-        // 根内路径与无害命令照旧放行：不能把收紧做成"禁用 run_command"。
+        // 根内路径与无害命令仍然放行：收紧不能变成禁用 run_command。
         let clean = [
             "cargo test",
             r"echo hi > out.txt",
@@ -570,8 +568,8 @@ mod tests {
             // 变量展开/命令替换不覆盖，但也不能凭空变成误拒。
             r"echo x > $OUT",
             r"echo x > %OUT%",
-            // 已知词法缺口：单级 POSIX 绝对路径与 /s /q 开关用同一个形状，
-            // 为避免误杀 Windows 开关而放行；README 明确记录这个边界。
+            // 已知词法缺口：单级 POSIX 绝对路径与 /s /q 开关形状相同，
+            // 为避免误杀 Windows 开关而放行；README 记录了这个边界。
             "cat /etc",
             "type /tmp",
             // `--flag=` 只看第一个等号后的值；第二个等号后的片段不在判据内。
@@ -586,8 +584,8 @@ mod tests {
         }
     }
 
-    /// 多段理由点名段号与程序，写动词归属按段而不是按整串；
-    /// 单段沿用旧文案模板，不带段号（审批界面与拒绝理由都钉住了它）。
+    /// 多段命令的理由包含段号与程序，写动词归属按段判断。
+    /// 单段命令沿用旧文案模板，不带段号（审批界面与拒绝理由依赖它）。
     #[test]
     fn reasons_name_the_offending_segment_but_single_segment_text_stays_verbatim() {
         let root = Path::new(r"D:/repo");
@@ -613,8 +611,8 @@ mod tests {
         );
     }
 
-    /// 两道防线跑在同一份解析结果上：同一条命令的段号与越界目标一致，
-    /// 差别只在"无根一律嫌疑"与有根的"根内放行"。
+    /// 两道防线使用同一份解析结果：段号与越界目标一致，差别只在无根
+    /// 一律视为嫌疑，有根时根内放行。
     #[test]
     fn both_defenses_share_one_parse_and_keep_the_documented_gap() {
         let parsed = parse_command(r"cargo test && type D:\repo\src\main.rs");
@@ -632,7 +630,7 @@ mod tests {
         );
     }
 
-    /// 返回的原因要能直接进审批理由：用户和模型都得看懂它在说什么。
+    /// 返回的原因可直接用作审批理由，用户和模型都能理解。
     #[test]
     fn write_escape_suspect_explains_what_it_found() {
         let reason = write_escape_suspect(r"echo hi > C:\Windows\temp\x").expect("应命中");
