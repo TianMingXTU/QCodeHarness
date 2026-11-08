@@ -1,6 +1,8 @@
 /target
-# 本地密钥，绝不入库
+# 本地密钥，绝不入库。.env.* 一并忽略：受保护路径那层把 .env 的各种变体
+# 都算成凭据文件，这里要跟它保持同一口径，否则 .env.local 会被误提交。
 .env
+.env.*
 # 运行时证据（.qcodeharness/sessions/*.jsonl），每次运行都会产生
 .qcodeharness/
 # Claude Code 的会话内调度锁，由工具自己维护，不进仓库
