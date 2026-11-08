@@ -524,12 +524,13 @@ mod tests {
     #[test]
     fn write_escape_beyond_allows_only_paths_under_the_exact_root() {
         let root = Path::new(r"D:/repo/src/..");
-        // 大小写变体只在不敏感大小写的平台上算"同一个路径"。敏感大小写的
-        // 平台上 `D:/REPO` 与 `D:/repo` 是两个位置，后者落在根外。
+        // 大小写变体只差被测的 `repo` 组件：盘符大小写必须与根的写法一致，
+        // 否则敏感大小写的平台上盘符先失配，测不到要测的组件。
+        // 不敏感平台上故意用 `d:/REPO`，验证折叠真的生效。
         let case_variant = if Platform::current().has_case_insensitive_paths() {
             r"cargo build --manifest-path=d:/REPO/Cargo.toml"
         } else {
-            r"cargo build --manifest-path=d:/repo/Cargo.toml"
+            r"cargo build --manifest-path=D:/repo/Cargo.toml"
         };
         let allowed = [
             r"type D:\repo\src\main.rs",
@@ -546,12 +547,13 @@ mod tests {
                 "`{command}` 应视为 workspace 内路径"
             );
         }
-        // 大小写变体在敏感大小写的平台上落在根外，必须被拒。
+        // 大小写变体在敏感大小写的平台上落在根外，必须被拒。盘符与根
+        // 一致，失配只可能发生在 `repo` 组件上。
         if !Platform::current().has_case_insensitive_paths() {
             assert!(
-                write_escape_beyond(r"cargo build --manifest-path=d:/REPO/Cargo.toml", root)
+                write_escape_beyond(r"cargo build --manifest-path=D:/REPO/Cargo.toml", root)
                     .is_some(),
-                "大小写敏感的平台上 `d:/REPO` 与 `d:/repo` 是两个位置，必须拒绝"
+                "大小写敏感的平台上 `D:/REPO` 与 `D:/repo` 是两个位置，必须拒绝"
             );
         }
         let refused = [
@@ -676,11 +678,12 @@ mod tests {
             r"echo hi > out.txt 2> out.err",
             r"echo x > D:\repo\out.txt",
             r"type D:\repo\src\main.rs",
-            // 大小写变体只在不敏感大小写的平台上算同一个路径。
+            // 大小写变体只差 `repo` 组件：盘符大小写与根一致，
+            // 敏感平台上才轮得到 `repo` 组件参与比较。
             if Platform::current().has_case_insensitive_paths() {
                 r"cargo build --manifest-path=d:/REPO/Cargo.toml"
             } else {
-                r"cargo build --manifest-path=d:/repo/Cargo.toml"
+                r"cargo build --manifest-path=D:/repo/Cargo.toml"
             },
             r#"type "D:\repo\sub dir\main.rs""#,
             r"echo x > D:\repo\out.txt && cargo test",
