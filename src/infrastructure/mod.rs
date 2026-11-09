@@ -19,3 +19,7 @@ pub mod benchmark;
 pub mod benchmark_runner;
 pub mod instructions;
 pub mod sandbox;
+pub mod config;
+pub mod git_worktree;
+pub mod extensions;
+pub mod delegation;

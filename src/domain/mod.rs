@@ -21,3 +21,5 @@ pub mod policy;
 pub mod task;
 pub mod worktree;
 pub mod workflow;
+pub mod config;
+pub mod extension;

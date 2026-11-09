@@ -21,10 +21,15 @@ use qcode_harness::application::agent_run::{
 use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::infrastructure::benchmark_runner::{run_benchmark, run_long_benchmark};
 use qcode_harness::application::context_policy::DefaultContextPolicy;
+use qcode_harness::application::delegation::ChildAgentFactory;
 use qcode_harness::application::error::ApplicationError;
+use qcode_harness::application::extension::{ExtensionRegistry, ExtensionSelection};
+use qcode_harness::application::isolation::{IsolationWorkspace, WorkspaceVerifier};
 use qcode_harness::application::mcp_lifecycle::McpLifecycleRecorder;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
-use qcode_harness::application::port::{ApprovalGate, EvidenceSink, NoopHooks};
+use qcode_harness::application::port::{
+    ApprovalGate, Clock, EvidenceSink, ModelGateway, NoopHooks, TimeLimiter, Timestamp,
+};
 use qcode_harness::application::provider_registry::ProviderRegistry;
 use qcode_harness::application::report::{render_json, render_text, BenchmarkReport};
 use qcode_harness::application::snapshot::{RunSnapshot, SessionStore, TaskStore};
@@ -32,31 +37,52 @@ use qcode_harness::application::task_resume::{self, ResumeCheck, WorktreeChangeP
 use qcode_harness::application::tool_registry::{ToolRegistry, ToolSource};
 use qcode_harness::domain::agent::{AgentRole, Effort, Verbosity};
 use qcode_harness::domain::budget::Budget;
+use qcode_harness::domain::config::AppConfig;
 use qcode_harness::domain::context::ContextBudget;
+use qcode_harness::domain::evidence::AuditEvent;
 use qcode_harness::domain::ids::{SessionId, TaskId};
+use qcode_harness::domain::policy::PolicyEngine;
 use qcode_harness::domain::session::Turn;
 use qcode_harness::domain::task::TaskKind;
 use qcode_harness::domain::workspace::WorkspaceRoot;
+use qcode_harness::domain::workflow::WorkflowCatalog;
 use qcode_harness::infrastructure::approval::ai_review::AiReviewGate;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
-use qcode_harness::infrastructure::clock::SystemClock;
+use qcode_harness::infrastructure::clock::{SystemClock, TokioTimeLimiter};
+use qcode_harness::infrastructure::config;
+use qcode_harness::infrastructure::delegation::{
+    CommandVerifier, StructuralVerifier, SubAgentToolSource,
+};
 use qcode_harness::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
 use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::infrastructure::evidence::reader;
+use qcode_harness::infrastructure::extensions::LocalExtensionStore;
+use qcode_harness::infrastructure::git_worktree::GitWorktreeManager;
 use qcode_harness::infrastructure::mcp;
 use qcode_harness::infrastructure::mcp::config::McpConfig;
 use qcode_harness::infrastructure::model::openai_compat::OpenAiCompatProvider;
 use qcode_harness::infrastructure::policy;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::task_store::JsonTaskStore;
-use qcode_harness::infrastructure::tool::BuiltinToolSource;
+use qcode_harness::infrastructure::tool::{BuiltinToolSource, all_tools};
 use qcode_harness::infrastructure::worktree::RootedWorktreeScanner;
 use qcode_harness::interface::cli::{self, ConsoleReporter};
 use qcode_harness::infrastructure::instructions;
+use std::sync::Mutex;
 
-/// `LLM_MAX_TURNS` 未设置时的默认最大轮数。
-const DEFAULT_MAX_TURNS: u32 = 20;
+/// 扩展动作的审批与执行时限。工具本身还有自己的时限，这里只兜底
+/// 扩展声明与审批路径，避免一次挂起的确认拖死整个任务。
+const EXTENSION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 合并前验证命令的时限。项目测试通常比单条工具命令长，给足时间；
+/// 超过就终止，结果按"未知"处理，不把半截输出当成通过。
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 扩展提示词段的标题。与项目指令分开标注：两段来源不同，冲突时
+/// 模型需要知道哪一段是扩展作者写的。
+const EXTENSION_INSTRUCTIONS_HEADER: &str =
+    "──── 扩展指令（来自已启用的 Skill，与上述规则冲突时以项目指令为准）────";
 
 // 系统提示词按角色分发，集中在 `AgentProfile::builtin()` 中（按角色
 // 说明可用与禁止的操作），这里没有全局提示词。
@@ -92,68 +118,103 @@ struct LlmConfig {
 }
 
 impl LlmConfig {
-    /// 从环境变量读取配置。
+    /// 合并文件配置与环境变量；环境变量在文件之后覆盖。
     ///
-    /// 必需变量：`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`；
-    /// 可选变量：`LLM_MAX_TURNS`（默认 20）、`QCH_POLICY`（策略配置路径）、
-    /// `QCH_AUTO_APPROVE`（设为 `1` 时跳过人工审批）、
-    /// `QCH_MAX_WALL_CLOCK`（墙钟上限，秒；编排模式下为整个任务的上限）。
+    /// 文件（用户级/项目级）可以提供 `llm.base_url`、`llm.model`、运行预算
+    /// 与策略路径；`LLM_API_KEY` 始终只从环境变量读取，不落配置文件。
+    /// 环境变量仍保持最高优先级，现有部署不需要改配置。
     ///
     /// # Errors
     ///
-    /// 缺少必需变量、或数值变量不是合法数字时返回说明性错误。
-    fn from_env() -> Result<Self, String> {
+    /// 文件与环境都没有模型地址/模型名、缺少 API Key、或数值变量不是
+    /// 合法数字时返回说明性错误。
+    fn from_env(file: &AppConfig) -> Result<Self, String> {
+        Self::from_lookup(&|name| std::env::var(name).ok(), file)
+    }
+
+    /// 从任意取值源合并配置，便于测试而不修改进程环境。
+    fn from_lookup(
+        lookup: &dyn Fn(&str) -> Option<String>,
+        file: &AppConfig,
+    ) -> Result<Self, String> {
         let required = |name: &str| -> Result<String, String> {
-            std::env::var(name)
-                .map_err(|_| format!("缺少环境变量 {name}，请参考 .env.example 创建 .env"))
+            lookup(name).ok_or_else(|| missing(name))
         };
-        let max_turns = match std::env::var("LLM_MAX_TURNS") {
-            Ok(text) => text
-                .parse()
-                .map_err(|_| format!("LLM_MAX_TURNS 不是合法整数: {text}"))?,
-            Err(_) => DEFAULT_MAX_TURNS,
+        let text = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+        let max_turns = match text("LLM_MAX_TURNS") {
+            Some(text) => {
+                let turns: u32 = text
+                    .parse()
+                    .map_err(|_| format!("LLM_MAX_TURNS 不是合法整数: {text}"))?;
+                // 与配置文件同一套契约：0 会让任务在首轮前就报预算耗尽，
+                // 静默改成 1 又会掩盖配置错误。
+                if turns == 0 {
+                    return Err("LLM_MAX_TURNS 必须大于 0".to_owned());
+                }
+                turns
+            }
+            None => file.run.max_turns,
         };
-        let max_wall_clock = match std::env::var("QCH_MAX_WALL_CLOCK") {
-            Ok(text) => {
+        let max_wall_clock = match text("QCH_MAX_WALL_CLOCK") {
+            Some(text) => {
                 let seconds: u64 = text
                     .parse()
                     .map_err(|_| format!("QCH_MAX_WALL_CLOCK 不是合法秒数: {text}"))?;
+                if seconds == 0 {
+                    return Err("QCH_MAX_WALL_CLOCK 必须大于 0".to_owned());
+                }
                 Some(Duration::from_secs(seconds))
             }
-            Err(_) => None,
+            None => file.run.max_wall_clock_seconds.map(Duration::from_secs),
         };
-        let summarize_min_dropped = match std::env::var("QCH_SUMMARIZE_MIN_DROPPED") {
-            Ok(text) => {
+        let summarize_min_dropped = match text("QCH_SUMMARIZE_MIN_DROPPED") {
+            Some(text) => {
                 let count: usize = text
                     .parse()
                     .map_err(|_| format!("QCH_SUMMARIZE_MIN_DROPPED 不是合法整数: {text}"))?;
-                Some(count.max(1))
+                if count == 0 {
+                    return Err("QCH_SUMMARIZE_MIN_DROPPED 必须大于 0".to_owned());
+                }
+                Some(count)
             }
-            Err(_) => None,
+            None => file.run.summarize_min_dropped,
         };
         Ok(Self {
-            base_url: required("LLM_BASE_URL")?,
+            // 环境变量优先：已有部署只用环境变量，文件是新加的可选层。
+            base_url: match text("LLM_BASE_URL") {
+                Some(value) => value,
+                None => file
+                    .llm
+                    .base_url
+                    .clone()
+                    .ok_or_else(|| missing("LLM_BASE_URL"))?,
+            },
             api_key: required("LLM_API_KEY")?,
-            model: required("LLM_MODEL")?,
+            model: match text("LLM_MODEL") {
+                Some(value) => value,
+                None => file
+                    .llm
+                    .model
+                    .clone()
+                    .ok_or_else(|| missing("LLM_MODEL"))?,
+            },
             max_turns,
-            policy_path: std::env::var_os("QCH_POLICY").map(PathBuf::from),
-            auto_approve: std::env::var("QCH_AUTO_APPROVE").as_deref() == Ok("1"),
+            policy_path: lookup("QCH_POLICY")
+                .map(PathBuf::from)
+                .or_else(|| file.policy_path.clone()),
+            auto_approve: lookup("QCH_AUTO_APPROVE").as_deref() == Some("1"),
             max_wall_clock,
             summarize_min_dropped,
-            role_models: read_role_models(),
-            role_efforts: read_role_efforts()?,
-            role_verbosities: read_role_verbosities()?,
+            role_models: read_role_models_from(|name| lookup(name)),
+            role_efforts: read_role_efforts_from(|name| lookup(name))?,
+            role_verbosities: read_role_verbosities_from(|name| lookup(name))?,
         })
     }
 }
 
-/// 读各角色专属的模型名。
-///
-/// 变量名按 `LLM_MODEL_<角色>` 规则拼接（见
-/// [`AgentRole::model_env_name`]）。未设置的角色不进入映射，编排器
-/// 据此使用运行时默认模型，请求中不出现 `model` 字段。
-fn read_role_models() -> HashMap<AgentRole, String> {
-    read_role_models_from(|name| std::env::var(name).ok())
+/// 缺一项模型设置时的错误：环境变量与配置文件都看过了。
+fn missing(name: &str) -> String {
+    format!("缺少 {name}：既没有环境变量，也没有配置文件里的对应项")
 }
 
 /// 从任意取值源读各角色专属的模型名。
@@ -176,14 +237,6 @@ fn read_role_models_from(lookup: impl Fn(&str) -> Option<String>) -> HashMap<Age
     models
 }
 
-/// 读各角色专属的推理档位。
-///
-/// 档位值非法时进程必须退出。静默失效的档位配置会让用户以为强推理
-/// 已启用。
-fn read_role_efforts() -> Result<HashMap<AgentRole, Effort>, String> {
-    read_role_efforts_from(|name| std::env::var(name).ok())
-}
-
 /// 从任意取值源读各角色专属的推理档位。
 fn read_role_efforts_from(
     lookup: impl Fn(&str) -> Option<String>,
@@ -198,11 +251,6 @@ fn read_role_efforts_from(
         }
     }
     Ok(efforts)
-}
-
-/// 读各角色专属的输出详略档位。
-fn read_role_verbosities() -> Result<HashMap<AgentRole, Verbosity>, String> {
-    read_role_verbosities_from(|name| std::env::var(name).ok())
 }
 
 /// 从任意取值源读各角色专属的输出详略档位。
@@ -256,6 +304,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let workspace = std::env::current_dir()?;
     let store = Arc::new(JsonSessionStore::new(&workspace));
 
+    // 配置文件先加载：后续的扩展管理、MCP 路径、策略与预算都从这里取。
+    // 文件损坏时直接退出，不能用一份猜出来的配置继续跑。
+    let app_config = config::load(&workspace)
+        .map_err(|error| format!("配置加载失败: {error}"))?;
+
+    // 扩展管理是独立模式：安装、列出、启用、禁用状态，不跑任务也不需要
+    // 模型配置。放在模型配置之前，没配 API Key 也能管理扩展。
+    if args.list_extensions
+        || args.install_extension.is_some()
+        || args.enable_extension.is_some()
+        || args.disable_extension.is_some()
+    {
+        return manage_extensions(&workspace, &args);
+    }
+
     // 列清单不需要模型配置：没配 API key 也应该能看有哪些会话可恢复。
     if args.list_sessions {
         return list_sessions(store.as_ref());
@@ -269,10 +332,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 恢复探测同样不需要模型配置：只确认这个 MCP Server 能否通信，
     // 不执行任务、不涉及审批、不读会话历史。
     if let Some(server) = &args.mcp_reconnect {
-        return mcp_probe(&workspace, server).await;
+        return mcp_probe(&workspace, server, &app_config).await;
     }
 
-    let config = LlmConfig::from_env()?;
+    let config = LlmConfig::from_env(&app_config)?;
 
     // 命令行开关优先于环境变量：显式 --yes 覆盖配置默认值。
     let auto_approve = args.auto_approve || config.auto_approve;
@@ -309,6 +372,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ContextBudget::default().with_summarize(min)
         });
 
+    let mut budget = Budget::new(config.max_turns);
+    if let Some(limit) = config.max_wall_clock {
+        budget = budget.with_wall_clock(limit);
+    }
+
     // ── 基准模式：运行 benchmarks/ 下的任务集并打分。位于全局工具
     // 装配之前：运行器为每个任务重建以 fixture 拷贝为根的注册表，
     // 全局注册表与 MCP 连接在此用不上。──
@@ -332,10 +400,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             context_policy: Arc::new(DefaultContextPolicy),
             additional_guards: Vec::new(),
         };
-        let mut budget = Budget::new(config.max_turns);
-        if let Some(limit) = config.max_wall_clock {
-            budget = budget.with_wall_clock(limit);
-        }
         let benchmarks_root = workspace.join("benchmarks");
         println!("基准任务集: {}", benchmarks_root.display());
         println!("模型: {} @ {}", config.model, config.base_url);
@@ -361,14 +425,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // 工具注册表按来源装配：内置工具与每个 MCP Server 各为一个来源。
-    // 仅当配置了 QCH_MCP_CONFIG 时连接，缺文件则关闭 MCP。
+    // MCP 配置取 QCH_MCP_CONFIG，未设置时用配置文件里的 mcp_config_path。
     let workspace_root = WorkspaceRoot::new(workspace.clone());
     let mut tool_sources: Vec<Arc<dyn ToolSource>> =
         vec![Arc::new(BuiltinToolSource::new(workspace_root))];
     // 所有连接汇总于此，三条正常结束路径都显式关闭（见
     // close_mcp_connections）。未配置 MCP 时为空。
     let mut mcp_sources: Vec<mcp::McpToolSource> = Vec::new();
-    if let Some(config_path) = std::env::var_os("QCH_MCP_CONFIG").map(PathBuf::from) {
+    let mcp_config_path = std::env::var_os("QCH_MCP_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| app_config.mcp_config_path.clone());
+    if let Some(config_path) = mcp_config_path {
         // 配置文件存在但非法时进程退出。用户明确要接入 MCP，静默跳过会让
         // 模型使用残缺的工具清单运行（与策略配置同一原则）。
         let mcp_config = McpConfig::load(&config_path)
@@ -398,32 +465,139 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let registry = ToolRegistry::from_sources(&tool_sources);
 
+    // 扩展清单与授权状态。加载失败直接退出：一份读不懂的授权文件不能
+    // 当作"没有扩展"继续跑，否则用户以为生效的约定会静默消失。
+    let extension_store = LocalExtensionStore::new(&workspace);
+    let extensions = extension_store
+        .load(&registry)
+        .map_err(|error| format!("扩展加载失败: {error}"))?;
+    // 配置文件里的空列表表示"没写"，不额外限制选择范围；启用/禁用状态
+    // 仍以安装项自身的授权为准。
+    let selection = extensions
+        .select_optional(
+            app_config.skills.enabled.as_deref(),
+            app_config.hooks.enabled.as_deref(),
+        )
+        .map_err(|error| format!("扩展选择失败: {error}"))?;
+    let skill_tools = extensions
+        .skill_tool_names(&selection)
+        .map_err(|error| format!("扩展加载失败: {error}"))?;
+
+    // 分层指令：用户级 < workspace 根 < 更接近任务目录的约定。读取失败
+    // 只告警，指令是便利设施，不是安全边界。
+    let base_roster = roster_with_role_models(&config);
+    let mut roster = base_roster.clone();
+    match instructions::load_layered_instructions(
+        config::user_directory().as_deref(),
+        &workspace,
+        &workspace,
+    ) {
+        Ok(loaded) => {
+            for warning in &loaded.warnings {
+                eprintln!("警告：{warning}");
+            }
+            if !loaded.text.is_empty() {
+                for source in &loaded.sources {
+                    println!("项目指令: {}", source.display());
+                }
+                roster = roster.with_project_instructions(&loaded.text);
+            }
+        }
+        Err(error) => eprintln!("警告：项目指令未加载（{error}）"),
+    }
+    let extension_instructions = extensions
+        .enabled_instructions(&selection)
+        .map_err(|error| format!("扩展指令加载失败: {error}"))?;
+    if !extension_instructions.is_empty() {
+        roster = roster.with_instructions_section(EXTENSION_INSTRUCTIONS_HEADER, &extension_instructions);
+    }
+    // 已启用的 Skill 入口对所有角色可见；Skill 背后的实际工具仍按角色
+    // 白名单复核，给只读角色一个 Skill 不会让它获得写权限。
+    if !skill_tools.is_empty() {
+        roster = roster.with_extension_tools(&skill_tools);
+    }
+
     // 审批闸门三选一，优先级从高到低：
     //   --yes                恒放行（基准与脚本化场景）
     //   --ai-review          模型先审，拿不准的退回交互式闸门
     //   默认                 交互式闸门
     // --yes 与 --ai-review 同时给出时采用 --yes：用户已声明无需人工
     // 确认，再插入模型审查只会多一次无效调用。
-    let approvals: Arc<dyn ApprovalGate> = if auto_approve {
-        Arc::new(AutoApproveGate)
+    let approval_mode = if auto_approve {
+        ApprovalMode::Auto
     } else if args.ai_review {
-        // 模型审查不确定时必须退回交互式闸门，由人工决定。审查与主循环
-        // 共用同一个模型实例，审查本身是一次普通模型调用；克隆 Arc，不
-        // 移走主循环持有的实例。
-        Arc::new(AiReviewGate::new(
-            Arc::clone(&model),
-            Box::new(CliApprovalGate::new()),
-        ))
+        ApprovalMode::AiReview
     } else {
-        Arc::new(CliApprovalGate::new())
+        ApprovalMode::Interactive
     };
-    let clock = Arc::new(SystemClock);
+    let approvals = approval_mode.gate(&model);
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let reporter = Arc::new(ConsoleReporter::new(config.max_turns));
 
-    let mut budget = Budget::new(config.max_turns);
-    if let Some(limit) = config.max_wall_clock {
-        budget = budget.with_wall_clock(limit);
-    }
+    // 子任务委派：需要真实 Git 工作区根。不是仓库时跳过并说明，
+    // 任务照常运行，只是模型看不到 delegate_subtasks。
+    let delegate_source: Option<Arc<dyn ToolSource>> = if app_config.parallel.max_subtasks == 0 {
+        println!("子任务委派: 已禁用（parallel.max_subtasks = 0）");
+        None
+    } else {
+        match GitWorktreeManager::new(WorkspaceRoot::new(workspace.clone())).await {
+            Ok(manager) => {
+                // 配置了验证命令就在候选工作区真的跑一遍；没配置时只做
+                // 结构校验，并在启动时说明，避免用户误以为测试已通过。
+                let verifier: Arc<dyn WorkspaceVerifier> =
+                    match &app_config.parallel.verify_command {
+                        Some(command) => {
+                            println!("子任务合并前验证: {command}");
+                            Arc::new(CommandVerifier::new(command.clone(), VERIFY_TIMEOUT))
+                        }
+                        None => {
+                            println!(
+                                "子任务合并前验证: 仅结构校验（未配置 parallel.verify_command）"
+                            );
+                            Arc::new(StructuralVerifier)
+                        }
+                    };
+                let factory = Arc::new(ChildFactory {
+                    model: Arc::clone(&model),
+                    policy: policy.clone(),
+                    roster: base_roster.clone(),
+                    context_budget,
+                    user_dir: config::user_directory(),
+                    approval_mode,
+                    store: store.clone(),
+                    sessions_root: workspace.clone(),
+                });
+                Some(Arc::new(SubAgentToolSource::new(
+                    Arc::new(manager),
+                    factory,
+                    verifier,
+                    budget,
+                    app_config.parallel.max_subtasks,
+                )) as Arc<dyn ToolSource>)
+            }
+            Err(error) => {
+                eprintln!("警告：子任务委派不可用（{error}），任务照常运行");
+                None
+            }
+        }
+    };
+
+    let shared = Shared {
+        model,
+        host_tools: registry,
+        approvals,
+        clock,
+        policy,
+        roster,
+        context_budget,
+        store: store.clone(),
+        extensions,
+        selection,
+        delegate: delegate_source,
+        limiter: Arc::new(
+            TokioTimeLimiter::new(EXTENSION_TIMEOUT).map_err(|error| error.to_string())?,
+        ),
+    };
 
     // ── 恢复模式：任务、系统提示词与历史都来自快照，不重新拼装。──
     if let Some(id_text) = args.resume {
@@ -451,23 +625,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // 恢复的会话属于某个角色，角色可用的工具按同一份档案约束。工具
         // 定义用全量（所有步骤一致，前缀缓存才能命中），白名单由 runner
         // 按花名册在调用层校验：装配期不按角色过滤，越权调用会被拒绝。
-        let runner = match AgentRunner::resume(
-            snapshot,
-            AgentDependencies {
-                model: Arc::clone(&model),
-                tools: registry,
-                approvals,
-                evidence,
-                clock,
-                policy,
-                roster: roster_with_role_models(&config),
-                context_budget,
-                session_store: Some(store.clone()),
-                hooks: Arc::new(NoopHooks),
-                context_policy: Arc::new(DefaultContextPolicy),
-                additional_guards: Vec::new(),
-            },
-        ) {
+        let deps = assemble(&shared, evidence, snapshot.spec.role)?;
+        let runner = match AgentRunner::resume(snapshot, deps) {
             Ok(runner) => runner,
             Err(error) => {
                 eprintln!("{error}");
@@ -520,32 +679,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .join("\n")
             );
         }
-        let evidence_factory = evidence_factory_for(&workspace, config.max_turns);
-        let deps = AgentDependencies {
-            model: Arc::clone(&model),
-            tools: registry,
-            approvals,
-            clock,
-            policy,
-            roster: roster_with_role_models(&config),
-            context_budget,
-            evidence: Arc::new(MemoryEvidenceSink::new()),
-            session_store: Some(store.clone()),
-        hooks: Arc::new(NoopHooks),
-        context_policy: Arc::new(DefaultContextPolicy),
-        additional_guards: Vec::new(),
-    };
+        let (evidence_factory, late_evidence) = task_evidence_factory(&workspace, config.max_turns);
+        let initial_role = snapshot
+            .task
+            .steps()
+            .get(snapshot.task.current_index())
+            .map_or(AgentRole::Coder, |step| step.role);
+        let deps = assemble(&shared, late_evidence, initial_role)?;
         let mut orchestrator =
-            Orchestrator::new(deps, budget, evidence_factory).with_task_store(Arc::new(task_store));
+            Orchestrator::with_roster(deps, budget, evidence_factory, shared.roster.clone())
+                .with_task_store(Arc::new(task_store));
         // 工作区被改动时默认拒绝恢复。用户确认过就加 --force-worktree。
-        let policy = if args.force_worktree {
+        let worktree_policy = if args.force_worktree {
             WorktreeChangePolicy::Confirmed
         } else {
             WorktreeChangePolicy::Refuse
         };
         orchestrator = orchestrator
             .with_worktree_scanner(Arc::new(RootedWorktreeScanner::new(&workspace)))
-            .with_worktree_policy(policy);
+            .with_worktree_policy(worktree_policy);
         let outcome = match orchestrator.resume(snapshot).await {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -573,40 +725,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     };
 
-    // 项目指令：workspace 根上的 QCODEHARNESS.md。次级位置
-    // .qcodeharness/instructions.md 属于受保护路径，模型读写都会被拒，
-    // 放在那里的约定不会被失控的 write_file 清除。两个位置都不存在时，
-    // 花名册使用内置档案，行为与没有该特性时相同。
-    let roster = match instructions::load_project_instructions(&workspace) {
-        Some(loaded) => {
-            for warning in &loaded.warnings {
-                eprintln!("警告：{warning}");
-            }
-            if loaded.truncated {
-                eprintln!("警告：{} 超过 8 KiB，已截断后注入", loaded.source.display());
-            }
-            println!(
-                "项目指令: {}（{} 字节）",
-                loaded.source.display(),
-                loaded.text.len()
-            );
-            roster_with_role_models(&config).with_project_instructions(&loaded.text)
-        }
-        None => roster_with_role_models(&config),
-    };
-
     println!("任务: {task}");
     println!("类型: {} 模板", kind.name());
     println!("模型: {} @ {}", config.model, config.base_url);
-    println!(
-        "工具: {}",
-        registry
-            .specs()
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
     if auto_approve {
         println!("审批: 自动放行（QCH_AUTO_APPROVE 或 --yes）");
     } else if args.ai_review {
@@ -618,31 +739,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 证据汇工厂：一个任务一份 JSONL（与任务会话同名），整个任务所有
     // 步骤共用。控制台播报随任务建，不随步骤建。
-    let evidence_factory = evidence_factory_for(&workspace, config.max_turns);
+    let (evidence_factory, late_evidence) = task_evidence_factory(&workspace, config.max_turns);
+    let initial_role = WorkflowCatalog::builtin()
+        .find(kind)
+        .and_then(|template| template.steps.first().map(|step| step.role))
+        .unwrap_or(AgentRole::Coder);
+    let deps = assemble(&shared, late_evidence, initial_role)?;
+    println!(
+        "工具: {}",
+        deps.tools
+            .specs()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     // 任务 ID 复用会话 ID 的生成策略：唯一、可读，证据/快照同名可互查。
-    let task_id = TaskId::new(new_session_id(&*clock).as_str());
+    let task_id = TaskId::new(new_session_id(&*shared.clock).as_str());
 
-    let deps = AgentDependencies {
-        model: Arc::clone(&model),
-        tools: registry,
-        approvals,
-        clock,
-        policy,
-        roster: roster.clone(),
-        context_budget,
-        // 编排器为任务另建证据汇（一个任务一份 JSONL），这个占位不会
-        // 被步骤使用；deps 的结构要求该字段有值。
-        evidence: Arc::new(MemoryEvidenceSink::new()),
-        // 快照落盘随运行自动开启；--resume 可从任一会话恢复。
-        session_store: Some(store.clone()),
-        hooks: Arc::new(NoopHooks),
-        context_policy: Arc::new(DefaultContextPolicy),
-        additional_guards: Vec::new(),
-    };
-    let mut orchestrator = Orchestrator::with_roster(deps, budget, evidence_factory, roster)
-        .with_task_store(Arc::new(JsonTaskStore::new(&workspace)))
-        .with_worktree_scanner(Arc::new(RootedWorktreeScanner::new(&workspace)));
+    let mut orchestrator =
+        Orchestrator::with_roster(deps, budget, evidence_factory, shared.roster.clone())
+            .with_task_store(Arc::new(JsonTaskStore::new(&workspace)))
+            .with_worktree_scanner(Arc::new(RootedWorktreeScanner::new(&workspace)));
     let mut task = orchestrator.create_task(task_id.clone(), kind, &task);
 
     let outcome = match orchestrator.run(&mut task).await {
@@ -675,6 +794,308 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     close_mcp_connections(&mcp_sources).await;
     Ok(())
+}
+
+/// 三条任务入口共用的宿主装配。
+///
+/// 扩展注册表、宿主工具表与角色花名册在进程内不变，建立一次即可。每次
+/// 任务另建适配器，因为适配器绑定这次任务的证据、审批与运行角色。
+struct Shared {
+    model: Arc<dyn ModelGateway>,
+    /// 宿主工具表，不含 `skill__*` 与 `delegate_subtasks`。
+    host_tools: ToolRegistry,
+    approvals: Arc<dyn ApprovalGate>,
+    clock: Arc<dyn Clock>,
+    policy: PolicyEngine,
+    /// 已注入项目指令、扩展指令与 Skill 工具入口的花名册。
+    roster: AgentRoster,
+    context_budget: ContextBudget,
+    store: Arc<JsonSessionStore>,
+    extensions: Arc<ExtensionRegistry>,
+    selection: ExtensionSelection,
+    delegate: Option<Arc<dyn ToolSource>>,
+    /// 扩展动作的时限；由基础设施层的 tokio 计时器实现。
+    limiter: Arc<dyn TimeLimiter>,
+}
+
+/// 为一次任务装配依赖：宿主工具 + 扩展适配器 + 委派工具。
+///
+/// `evidence` 是这次任务的证据汇。扩展适配器会一直持有它，因此编排器
+/// 路径必须传入 [`LateBoundEvidence`]：真实汇要到会话 ID 生成后才存在。
+fn assemble(
+    shared: &Shared,
+    evidence: Arc<dyn EvidenceSink>,
+    initial_role: AgentRole,
+) -> Result<AgentDependencies, String> {
+    let host = AgentDependencies {
+        model: Arc::clone(&shared.model),
+        tools: shared.host_tools.clone(),
+        approvals: Arc::clone(&shared.approvals),
+        evidence,
+        clock: Arc::clone(&shared.clock),
+        policy: shared.policy.clone(),
+        additional_guards: Vec::new(),
+        roster: shared.roster.clone(),
+        context_budget: shared.context_budget,
+        context_policy: Arc::new(DefaultContextPolicy),
+        session_store: Some(shared.store.clone()),
+        hooks: Arc::new(NoopHooks),
+    };
+    // 适配器要求绑定未含 Skill 工具的宿主注册表；它按实际工具表复核每条
+    // 权限，缺工具的已启用扩展在这里报错，而不是等到模型调用才发现。
+    let adapters = shared
+        .extensions
+        .adapters(
+            &host,
+            initial_role,
+            shared.selection.clone(),
+            Arc::clone(&shared.limiter),
+        )
+        .map_err(|error| format!("扩展装配失败: {error}"))?;
+    let mut tools = shared
+        .host_tools
+        .merged_with(&ToolRegistry::from_sources(std::slice::from_ref(
+            &adapters.source,
+        )));
+    if let Some(delegate) = &shared.delegate {
+        tools = tools.merged_with(&ToolRegistry::from_sources(std::slice::from_ref(delegate)));
+    }
+    Ok(AgentDependencies {
+        tools,
+        hooks: adapters.hooks,
+        ..host
+    })
+}
+
+/// 审批模式：父任务与子任务共用同一套选择，子任务另建闸门实例。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalMode {
+    /// 全部放行。
+    Auto,
+    /// 每次副作用调用都问人。
+    Interactive,
+    /// 模型先审，拿不准的退回交互式闸门。
+    AiReview,
+}
+
+impl ApprovalMode {
+    /// 为一次运行新建闸门。
+    ///
+    /// 每个子运行必须有自己的实例：runner 构造时会绑定取消通道，共用
+    /// 实例会让一个子任务的取消覆盖另一个的。
+    fn gate(self, model: &Arc<dyn ModelGateway>) -> Arc<dyn ApprovalGate> {
+        match self {
+            Self::Auto => Arc::new(AutoApproveGate),
+            Self::Interactive => Arc::new(CliApprovalGate::new()),
+            Self::AiReview => Arc::new(AiReviewGate::new(
+                Arc::clone(model),
+                Box::new(CliApprovalGate::new()),
+            )),
+        }
+    }
+}
+
+/// 为委派的子任务装配依赖。
+///
+/// 子任务只拿到以自己工作区为根的内置工具：扩展适配器绑定的是父任务的
+/// 证据与工具表，注入子运行会让扩展动作绕过隔离写回父工作区。子运行的
+/// 审批、证据、快照与取消通道全部独立，父任务的会话不受影响。
+struct ChildFactory {
+    model: Arc<dyn ModelGateway>,
+    policy: PolicyEngine,
+    /// 未注入扩展指令与 Skill 工具的基础花名册。
+    roster: AgentRoster,
+    context_budget: ContextBudget,
+    user_dir: Option<PathBuf>,
+    approval_mode: ApprovalMode,
+    store: Arc<JsonSessionStore>,
+    /// 父工作区根：子会话的证据与快照都落在这里，复盘时一处可查。
+    sessions_root: PathBuf,
+}
+
+impl ChildAgentFactory for ChildFactory {
+    fn dependencies(
+        &self,
+        workspace: &IsolationWorkspace,
+        // 角色不在这里筛选：花名册含全部档案，runner 按 spec.role 取用并
+        // 在调用层校验白名单。缺档案时子运行显式失败。
+        _role: AgentRole,
+        session_id: &SessionId,
+        scope: &Path,
+    ) -> Result<AgentDependencies, String> {
+        // 子工作区是基线的一份拷贝，项目指令按它自己的根与 scope 重新
+        // 加载：父任务目录下的约定不适用于另一棵目录树。加载失败只告警，
+        // 与父任务同一处理方式。
+        let mut roster = self.roster.clone();
+        match instructions::load_layered_instructions(
+            self.user_dir.as_deref(),
+            &workspace.root,
+            scope,
+        ) {
+            Ok(loaded) => {
+                for warning in &loaded.warnings {
+                    eprintln!("警告（子任务 {session_id}）：{warning}");
+                }
+                if !loaded.text.is_empty() {
+                    roster = roster.with_project_instructions(&loaded.text);
+                }
+            }
+            Err(error) => {
+                eprintln!("警告（子任务 {session_id}）：项目指令未加载（{error}）");
+            }
+        }
+        let evidence_path = session_path(&self.sessions_root, session_id.as_str());
+        let evidence: Arc<dyn EvidenceSink> = Arc::new(
+            JsonlEvidenceSink::open(&evidence_path).map_err(|error| {
+                format!("子任务证据无法写入 {}：{error}", evidence_path.display())
+            })?,
+        );
+        Ok(AgentDependencies {
+            model: Arc::clone(&self.model),
+            tools: ToolRegistry::from_sources(&[Arc::new(BuiltinToolSource::new(
+                WorkspaceRoot::new(&workspace.root),
+            ))]),
+            approvals: self.approval_mode.gate(&self.model),
+            evidence,
+            clock: Arc::new(SystemClock),
+            policy: self.policy.clone(),
+            additional_guards: Vec::new(),
+            roster,
+            context_budget: self.context_budget,
+            context_policy: Arc::new(DefaultContextPolicy),
+            session_store: Some(self.store.clone()),
+            hooks: Arc::new(NoopHooks),
+        })
+    }
+}
+
+/// 延迟绑定的证据汇：扩展适配器先拿到它，真实汇在会话 ID 生成后注入。
+///
+/// 编排器为每个任务另建证据汇（一个任务一份 JSONL），而扩展适配器必须
+/// 在任务开始前装配好。绑定前的事件直接丢弃：那段时间还没有任务在跑。
+#[derive(Default)]
+struct LateBoundEvidence {
+    inner: Mutex<Option<Arc<dyn EvidenceSink>>>,
+}
+
+impl LateBoundEvidence {
+    fn bind(&self, sink: Arc<dyn EvidenceSink>) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+}
+
+impl EvidenceSink for LateBoundEvidence {
+    fn record(&self, at: Timestamp, event: AuditEvent) {
+        let sink = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(sink) = sink {
+            sink.record(at, event);
+        }
+    }
+}
+
+/// 任务路径的证据工厂：每建一个证据汇就同步绑定到延迟汇。
+fn task_evidence_factory(
+    workspace: &Path,
+    max_turns: u32,
+) -> (EvidenceFactory, Arc<LateBoundEvidence>) {
+    let inner = evidence_factory_for(workspace, max_turns);
+    let late = Arc::new(LateBoundEvidence::default());
+    let bind = Arc::clone(&late);
+    let factory: EvidenceFactory = Arc::new(move |session_id: &SessionId| {
+        let sink = inner(session_id)?;
+        bind.bind(Arc::clone(&sink));
+        Ok(sink)
+    });
+    (factory, late)
+}
+
+/// 扩展管理：安装、列出、启用、禁用，独立于任务运行。
+///
+/// backing 表只装内置工具：管理扩展时没有连接 MCP，声明 MCP 工具的权限
+/// 仍可安装，真正的可用性在任务装配时按实际工具表复核。
+fn manage_extensions(workspace: &Path, args: &cli::CliArgs) -> Result<(), Box<dyn Error>> {
+    let store = LocalExtensionStore::new(workspace);
+    let backing = ToolRegistry::new(all_tools(WorkspaceRoot::new(workspace)));
+    let registry = store
+        .load(&backing)
+        .map_err(|error| format!("扩展加载失败: {error}"))?;
+
+    if args.list_extensions {
+        let installed = registry
+            .list()
+            .map_err(|error| format!("扩展列表读取失败: {error}"))?;
+        // 授权不在工作区里，说明位置才能让人找到"为什么换台机器就要重新批准"。
+        match store.state_path() {
+            Some(path) => println!("授权状态: {}", path.display()),
+            None => println!("授权状态: 不可保存（系统没有提供用户配置目录）"),
+        }
+        if installed.is_empty() {
+            println!("还没有安装扩展。用 --install-extension <清单文件> 安装。");
+            return Ok(());
+        }
+        println!("已安装扩展（共 {} 个）：", installed.len());
+        for item in installed {
+            let kinds = match (item.has_skill, item.has_hook) {
+                (true, true) => "Skill + Hook",
+                (true, false) => "Skill",
+                (false, true) => "Hook",
+                (false, false) => "（无实现）",
+            };
+            println!(
+                "  {}  [{}]  {}  —  {}",
+                item.descriptor.id,
+                if item.enabled { "启用" } else { "禁用" },
+                kinds,
+                item.descriptor.description
+            );
+            println!("      声明权限: {}", join_or_none(&item.descriptor.permissions));
+            println!("      已批准:   {}", join_or_none(&item.approved_permissions));
+        }
+        return Ok(());
+    }
+
+    if let Some(source) = &args.install_extension {
+        let descriptor = store.install(&registry, Path::new(source))?;
+        println!(
+            "已安装扩展 `{}`（默认禁用）。启用：--enable-extension {} --permissions {}",
+            descriptor.id,
+            descriptor.id,
+            join_or_none(&descriptor.permissions)
+        );
+        return Ok(());
+    }
+
+    if let Some(id) = &args.enable_extension {
+        store.enable(&registry, id, &args.permissions)?;
+        println!(
+            "已启用扩展 `{id}`，批准权限: {}",
+            join_or_none(&args.permissions)
+        );
+        return Ok(());
+    }
+
+    if let Some(id) = &args.disable_extension {
+        store.disable(&registry, id)?;
+        println!("已禁用扩展 `{id}`，批准权限已清空");
+        return Ok(());
+    }
+
+    unreachable!("parse_args 保证扩展管理模式至少有一项")
+}
+
+fn join_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "（无）".to_owned()
+    } else {
+        items.join(", ")
+    }
 }
 
 /// `--list-sessions`：列出可恢复的会话与各自停在哪里。
@@ -839,9 +1260,16 @@ async fn close_mcp_connections(sources: &[mcp::McpToolSource]) {
 /// 写入连接审计，然后显式关闭退出。执行一次即结束，不接任务、不重放
 /// 历史调用、不进入任何会话。探测到的工具不注入当前进程；要在任务中
 /// 使用工具，照常带任务描述启动，走完整的注册、授权与审批。
-async fn mcp_probe(workspace: &Path, server: &str) -> Result<(), Box<dyn Error>> {
-    let Some(config_path) = std::env::var_os("QCH_MCP_CONFIG").map(PathBuf::from) else {
-        return Err("未设置 QCH_MCP_CONFIG，没有可探测的 MCP 配置".into());
+async fn mcp_probe(
+    workspace: &Path,
+    server: &str,
+    app_config: &AppConfig,
+) -> Result<(), Box<dyn Error>> {
+    let Some(config_path) = std::env::var_os("QCH_MCP_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| app_config.mcp_config_path.clone())
+    else {
+        return Err("未配置 MCP：设置 QCH_MCP_CONFIG 或在配置文件里写 mcp_config_path".into());
     };
     let mcp_config = McpConfig::load(&config_path)
         .map_err(|error| format!("{error}（文件: {}）", config_path.display()))?;
@@ -1045,5 +1473,144 @@ mod tests {
             Some(Effort::High)
         );
         assert_eq!(roster.find(AgentRole::Tester).unwrap().model, None);
+    }
+
+    // ── 文件配置与环境变量的合并 ───────────────────────────────────────
+
+    fn file_config(text: &str) -> AppConfig {
+        // 用公开的加载入口解析一段配置文本，避免在测试里复制解析逻辑。
+        // 挂成显式文件（使用者自己写的），因为项目级配置不允许设置
+        // 模型地址与策略路径。
+        let dir = std::env::temp_dir().join(format!(
+            "qch-main-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).expect("建临时配置目录");
+        std::fs::write(&path, text).expect("写临时配置");
+        let config = config::load_from_paths(&config::ConfigPaths {
+            user: None,
+            project: dir.join("absent-project.toml"),
+            explicit: Some(path),
+        })
+        .expect("配置应能加载");
+        std::fs::remove_dir_all(&dir).expect("清理临时配置目录");
+        config
+    }
+
+    /// 文件提供模型地址与模型名，环境变量只补 API Key。
+    #[test]
+    fn the_file_supplies_model_settings_and_env_only_the_key() {
+        let file = file_config("[llm]\nbase_url = 'https://file.invalid/v1'\nmodel = 'file-model'\n");
+        let config = LlmConfig::from_lookup(&table(&[("LLM_API_KEY", "secret")]), &file).unwrap();
+
+        assert_eq!(config.base_url, "https://file.invalid/v1");
+        assert_eq!(config.model, "file-model");
+        assert_eq!(config.api_key, "secret");
+    }
+
+    /// 环境变量在文件之后覆盖，现有部署不用改配置。
+    #[test]
+    fn environment_values_win_over_the_file() {
+        let file = file_config(
+            "[llm]\nbase_url = 'https://file.invalid/v1'\nmodel = 'file-model'\n\
+             [run]\nmax_turns = 7\nmax_wall_clock_seconds = 30\n",
+        );
+        let config = LlmConfig::from_lookup(
+            &table(&[
+                ("LLM_API_KEY", "secret"),
+                ("LLM_BASE_URL", "https://env.invalid/v1"),
+                ("LLM_MODEL", "env-model"),
+                ("LLM_MAX_TURNS", "3"),
+                ("QCH_MAX_WALL_CLOCK", "90"),
+            ]),
+            &file,
+        )
+        .unwrap();
+
+        assert_eq!(config.base_url, "https://env.invalid/v1");
+        assert_eq!(config.model, "env-model");
+        assert_eq!(config.max_turns, 3);
+        assert_eq!(config.max_wall_clock, Some(Duration::from_secs(90)));
+    }
+
+    /// 文件里的运行预算在环境变量缺席时生效。
+    #[test]
+    fn run_budgets_fall_back_to_the_file() {
+        let file = file_config(
+            "[llm]\nbase_url = 'https://file.invalid/v1'\nmodel = 'file-model'\n\
+             [run]\nmax_turns = 7\nmax_wall_clock_seconds = 30\nsummarize_min_dropped = 5\n",
+        );
+        let config = LlmConfig::from_lookup(&table(&[("LLM_API_KEY", "secret")]), &file).unwrap();
+
+        assert_eq!(config.max_turns, 7);
+        assert_eq!(config.max_wall_clock, Some(Duration::from_secs(30)));
+        assert_eq!(config.summarize_min_dropped, Some(5));
+    }
+
+    /// 环境变量与配置文件对同一个字段用同一套范围校验。
+    ///
+    /// 0 轮、0 秒墙钟都会让任务在开始前就判预算耗尽；静默改成 1 则掩盖
+    /// 配置错误，用户只会看到"任务莫名其妙只跑了一轮"。
+    #[test]
+    fn zero_budgets_are_rejected_from_both_sources() {
+        let file = file_config(
+            "[llm]\nbase_url = 'https://file.invalid/v1'\nmodel = 'file-model'\n",
+        );
+        for (name, value) in [
+            ("LLM_MAX_TURNS", "0"),
+            ("QCH_MAX_WALL_CLOCK", "0"),
+            ("QCH_SUMMARIZE_MIN_DROPPED", "0"),
+        ] {
+            let error = LlmConfig::from_lookup(
+                &table(&[("LLM_API_KEY", "secret"), (name, value)]),
+                &file,
+            )
+            .expect_err("0 必须报错");
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    /// 两边都没有模型地址或模型名时必须报错，不能拿空串去请求。
+    #[test]
+    fn missing_model_settings_fail_with_the_variable_name() {
+        let file = file_config("[llm]\nbase_url = 'https://file.invalid/v1'\n");
+        let error = LlmConfig::from_lookup(&table(&[("LLM_API_KEY", "secret")]), &file)
+            .expect_err("缺模型名必须报错");
+        assert!(error.contains("LLM_MODEL"), "{error}");
+
+        let empty = AppConfig::default();
+        let error = LlmConfig::from_lookup(&table(&[("LLM_API_KEY", "secret")]), &empty)
+            .expect_err("缺地址必须报错");
+        assert!(error.contains("LLM_BASE_URL"), "{error}");
+    }
+
+    /// 策略路径优先取环境变量，其次才是文件里的值。
+    #[test]
+    fn the_policy_path_prefers_the_environment() {
+        let file = file_config(
+            "policy_path = 'file-policy.toml'\n\
+             [llm]\nbase_url = 'https://file.invalid/v1'\nmodel = 'file-model'\n",
+        );
+        // 文件里的相对路径已按定义它的文件目录解析过，这里只比较末端。
+        let from_file = LlmConfig::from_lookup(&table(&[("LLM_API_KEY", "k")]), &file).unwrap();
+        assert_eq!(
+            from_file.policy_path.as_deref().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("file-policy.toml"))
+        );
+
+        let from_env = LlmConfig::from_lookup(
+            &table(&[("LLM_API_KEY", "k"), ("QCH_POLICY", "env-policy.toml")]),
+            &file,
+        )
+        .unwrap();
+        assert_eq!(
+            from_env.policy_path,
+            Some(PathBuf::from("env-policy.toml"))
+        );
     }
 }

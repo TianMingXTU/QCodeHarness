@@ -261,3 +261,23 @@ pub trait Clock: Send + Sync {
         start.elapsed().unwrap_or(Duration::ZERO)
     }
 }
+
+/// 动作超过时限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Elapsed;
+
+/// 给一次工具动作加时限的端口。
+///
+/// 计时器由运行时提供：应用层不直接依赖 tokio，测试可以换成不依赖运行时的
+/// 实现。只用于工具动作，不用于审批：人思考多久由人决定，用超时包住交互
+/// 审批只会给出"有时限"的假象。
+pub trait TimeLimiter: Send + Sync {
+    /// 给一次工具动作套上实现方持有的时限。
+    ///
+    /// 动作自身的结局原样透传；只有超过时限才返回 `Err(Elapsed)`。实现方
+    /// 无法中断已经在同步阻塞的调用，时限对这类工具只是尽力而为。
+    fn limit<'a>(
+        &'a self,
+        action: BoxFuture<'a, ToolOutcome>,
+    ) -> BoxFuture<'a, Result<ToolOutcome, Elapsed>>;
+}

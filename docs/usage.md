@@ -185,9 +185,9 @@ cargo run --example custom-tool-source    # 内置工具与自定义 ToolSource 
 证据汇）、每个扩展点该改哪个文件，以及加新行为的判断顺序，见
 [architecture.md](architecture.md)。
 
-**明确不做**：不做 cdylib 动态插件装载，不定义通用插件协议，也不提供多前端
-事件协议——社区扩展以"依赖本 crate 编译、在装配层接线"的方式接入；需要新
-前端时另立协议设计。
+**明确不做**：不做 cdylib 动态插件装载，不做通用脚本插件协议，也不提供多前端
+事件协议——社区扩展以"依赖本 crate 编译、在装配层接线"的方式接入；本地清单
+只描述提示词与已声明的工具动作，需要任意逻辑仍要写 Rust。
 
 ## 结构化补丁（`apply_patch`）
 
@@ -383,11 +383,78 @@ description = "其余 shell 命令一律审批"
 
 作用域只**收紧**规则，从不为调用开路：写在 `allow` 规则里的 scope 之后，仍然要过越界写入升级检查与受保护路径检查。反过来，`deny` 规则的条件**无法求值**时（参数名不叫 `path`/`command`，MCP 工具与 `git_diff` 都会这样）按拒绝处理，不落回默认策略——否则一条"禁止碰 secrets/"会因为参数名不同而静默失效、翻成放行。`ScopeConfig` 带 `deny_unknown_fields`——拼错字段名当场报错，而不是让作用域悄悄消失、把"只放行 cargo test"扩大成"放行所有 run_command"。
 
+## 配置文件（用户级与项目级）
+
+环境变量之外还有一层配置文件，合并顺序是：内置默认 → 用户级 → 项目级 →
+`QCH_CONFIG` 指定的文件。环境变量仍在文件之后覆盖，现有部署不需要改任何东西。
+
+| 层级 | 位置 |
+| --- | --- |
+| 用户级 | Windows `%APPDATA%\qcodeharness\config.toml`；macOS `~/Library/Application Support/qcodeharness/config.toml`；Linux `$XDG_CONFIG_HOME/qcodeharness/config.toml` |
+| 项目级 | `<workspace>/.qcodeharness/config.toml` |
+| 显式 | `QCH_CONFIG` 指向的文件；指定后必须存在 |
+
+字段与默认值见仓库根的 [`config.example.toml`](../config.example.toml)。几条规则：
+
+- 相对路径（`policy_path`、`mcp_config_path`）按**定义该字段的文件**所在目录解析。
+- 列表整体替换，`enabled = []` 是显式清空；没写该字段才继承低层。
+- 数值字段与同一项的环境变量用同一套范围校验：0 轮、0 秒墙钟、0 摘要阈值一律报错，不静默改写。
+- 配置文件只接受不超过 64 KiB 的普通文件，不跟随符号链接。
+- **项目级配置不能设置 `llm.base_url`、`policy_path`、`mcp_config_path`**。仓库可以自带这三项的话，克隆一个仓库就等于接受它指定的模型服务（API Key 与对话内容外发）、关掉审批的策略、以及启动时拉起的子进程。写在这三层里会直接报错，请改用用户级配置或对应环境变量。
+
+## 扩展（Skill / Hook / 插件）
+
+扩展分两种接入方式：
+
+1. **编译期 Plugin**：实现 `Skill` / `Hook` / `Plugin` trait，在装配层登记。完整示例见 [`examples/custom-extension.rs`](../examples/custom-extension.rs)。
+2. **本地清单**：`.qcodeharness/extensions/manifests/<id>.toml`，只有提示词与已声明的工具动作，不解释脚本、不加载动态库。
+
+清单格式：
+
+```toml
+id = "demo"                       # 小写字母/数字/_/-，以字母或数字开头，最长 56 字节
+description = "本地代码阅读规范"
+instructions = "先读文件，再作判断。"
+permissions = ["read_file", "write_file"]   # 实际 backing 工具名，精确匹配
+
+[hook]                            # 可选：事件触发的工具动作
+event = "after_tool"              # before_tool / after_tool
+tool = "write_file"
+args = { path = "audit.txt", content = "..." }
+```
+
+四个管理模式，互斥且不能与任务描述同时使用：
+
+```bash
+cargo run -- --install-extension ./my-skill.toml          # 安装，默认禁用
+cargo run -- --list-extensions                            # 列出状态、声明权限、已批准权限与授权文件位置
+cargo run -- --enable-extension demo --permissions read_file   # 启用并显式批准
+cargo run -- --disable-extension demo                     # 禁用并清空批准
+```
+
+几条边界：
+
+- 安装只校验清单本身，不要求 backing 工具此刻在场（MCP 可能没连）；真正的可用性在任务装配时按本次实际工具表复核。
+- 启用才授予权限，且只授予 `--permissions` 里逐条列出的工具；Skill 的提示词会进系统提示词，但不增加任何工具权限。
+- **授权状态不在工作区**：清单随仓库分发，授权存在用户配置目录的 `qcodeharness/extension-state/<工作区哈希>.toml`。克隆别人的仓库不会带来"已批准"。
+- 扩展动作走与内置工具同一条策略守卫链、审批闸门与证据汇；角色白名单同样适用，只读角色拿到 Skill 也调不动写工具。
+- 动作超时（默认 120 秒）只覆盖工具执行，不覆盖人工审批等待。
+
+## 子 Agent 委派
+
+配置 `[parallel] max_subtasks` 大于 0 时（默认 4），模型会拿到 `delegate_subtasks` 工具，可把一批子任务并行交给子 Agent：
+
+- 每个子任务一个 Git 工作树，子 Agent 只看到以该工作树为根的内置工具。
+- `max_subtasks` 是**并发上限**，不是批次上限；一批最多 16 个子任务，超出的要拆批。
+- 合并前可跑 `verify_command`（配置项 `[parallel] verify_command`）；没配置时只做结构校验（补丁可应用、路径受保护、父工作区干净），启动时会明说。
+- 任一子任务失败或验证不通过，整批不合并；子工作区清理失败会保留路径并在结果里列出。
+- 子任务不能再委派，合并基于补丁应用，冲突不自动解决。
+
 ## 项目指令（QCODEHARNESS.md）
 
 workspace 根的 `QCODEHARNESS.md` 会被追加到**每个角色**的系统提示词末尾，让模型知道这个项目自己怎么做事（提交信息用中文、别动生成代码、跑测试用哪条命令）。次级位置 `.qcodeharness/instructions.md` 语义相同，两个都在时根上的赢；次级位置的存在意义是 `.qcodeharness` 属于受保护路径——放在这里的指令不会被一次失控的 `write_file` 抹掉。
 
-上限 8 KiB，超出按字符边界截断并在提示词里留下说明；读不成 UTF-8 的文件给一条告警后跳过（不当场炸：指令是便利设施，不是安全边界）。文件不存在时不追加任何内容，提示词一行不多。
+指令按目录分层加载，优先级从低到高：用户级（用户配置目录的 `QCODEHARNESS.md` 或 `instructions.md`）→ workspace 根 → 更接近任务目录的各级祖先目录。每层只取第一个存在的位置，目录规则只适用于该目录及其子目录。单个文件上限 8 KiB，合计 32 KiB，超出按字符边界截断并在提示词里留下说明；读不成 UTF-8 的文件给一条告警后跳过（不当场炸：指令是便利设施，不是安全边界）。目录链接越出 workspace 会被拒绝；同一物理文件经不同词法路径出现时只保留优先级最高的一份。文件都不存在时不追加任何内容，提示词一行不多。
 
 **项目指令只改"想做什么"，不改"能做什么"**：工具白名单、受保护路径、策略规则一道都不松。
 

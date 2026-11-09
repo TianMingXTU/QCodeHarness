@@ -81,12 +81,40 @@ impl AgentRoster {
     ///
     /// 只改提示词，不改工具白名单。项目指令改变模型想做什么，不改变它
     /// 能做什么。
-    pub fn with_project_instructions(mut self, instructions: &str) -> Self {
+    pub fn with_project_instructions(self, instructions: &str) -> Self {
+        self.with_instructions_section(PROJECT_INSTRUCTIONS_HEADER, instructions)
+    }
+
+    /// 追加一段带标题的指令，标题说明该段的来源与优先级。
+    ///
+    /// 扩展指令与项目指令用不同的标题：两段来源不同，冲突时的裁决顺序
+    /// 也不同。共用一个标题会让模型分不清哪条约定优先。
+    pub fn with_instructions_section(mut self, header: &str, instructions: &str) -> Self {
         for profile in &mut self.profiles {
             profile.system_prompt = format!(
-                "{}\n\n{}\n{instructions}",
-                profile.system_prompt, PROJECT_INSTRUCTIONS_HEADER
+                "{}\n\n{header}\n{instructions}",
+                profile.system_prompt
             );
+        }
+        self
+    }
+
+    /// 把已启用的 Skill 工具加入受限角色的白名单。
+    ///
+    /// Skill 只是 backing 工具的一层壳，真正能做什么仍由
+    /// `CheckedDispatcher` 按角色白名单逐条复核。不加入白名单的话，
+    /// 只读角色连读取 Skill 指令都会被自己的角色边界拒绝，而 Skill
+    /// 本身不增加任何权限。`None`（不限）的角色不需要追加。
+    pub fn with_extension_tools(mut self, tools: &[String]) -> Self {
+        for profile in &mut self.profiles {
+            let Some(allowed) = profile.tools.as_mut() else {
+                continue;
+            };
+            for tool in tools {
+                if !allowed.contains(tool) {
+                    allowed.push(tool.clone());
+                }
+            }
         }
         self
     }

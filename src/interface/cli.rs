@@ -27,6 +27,10 @@ pub const USAGE: &str = "\
       QCodeHarness --benchmark
       QCodeHarness --benchmark-long
       QCodeHarness --mcp-reconnect <服务器名>
+      QCodeHarness --list-extensions
+      QCodeHarness --install-extension <清单文件>
+      QCodeHarness --enable-extension <ID> [--permissions <工具名,...>]
+      QCodeHarness --disable-extension <ID>
       QCodeHarness --help
 示例: QCodeHarness \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
       QCodeHarness --yes \"非交互场景下跑同一个任务\"
@@ -40,6 +44,9 @@ pub const USAGE: &str = "\
       QCodeHarness --benchmark
       QCodeHarness --benchmark-long
       QCodeHarness --mcp-reconnect fetch
+      QCodeHarness --install-extension ./my-skill.toml
+      QCodeHarness --enable-extension my-skill --permissions read_file,search_text
+      QCodeHarness --list-extensions
 从源码运行时在命令前加 cargo run --，例：cargo run -- --report";
 
 /// 解析出的命令行参数。
@@ -89,6 +96,16 @@ pub struct CliArgs {
     /// 发现，将结果写入连接审计后关闭连接退出。任务中途不会自动重试；
     /// 恢复通信需要人明确发起，与"调用超时不自动重放"一致。
     pub mcp_reconnect: Option<String>,
+    /// 列出已安装扩展及其启用状态（`--list-extensions`）。
+    pub list_extensions: bool,
+    /// 安装一份扩展清单（`--install-extension <清单文件>`）。
+    pub install_extension: Option<String>,
+    /// 启用扩展（`--enable-extension <ID>`），权限子集由 `--permissions` 给出。
+    pub enable_extension: Option<String>,
+    /// 启用时批准的工具权限，逗号分隔（`--permissions read_file,write_file`）。
+    pub permissions: Vec<String>,
+    /// 禁用扩展并清空批准（`--disable-extension <ID>`）。
+    pub disable_extension: Option<String>,
     /// 打印用法后正常退出（`--help` / `-h`）。
     ///
     /// 与其他开关同时出现时仅处理帮助，不运行任务，也不做模式校验。
@@ -119,6 +136,11 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut benchmark = false;
     let mut benchmark_long = false;
     let mut mcp_reconnect = None;
+    let mut list_extensions = false;
+    let mut install_extension = None;
+    let mut enable_extension = None;
+    let mut permissions = Vec::new();
+    let mut disable_extension = None;
     let mut help = false;
     let mut positional: Vec<String> = Vec::new();
 
@@ -132,6 +154,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--json" => json = true,
             "--benchmark" => benchmark = true,
             "--benchmark-long" => benchmark_long = true,
+            "--list-extensions" => list_extensions = true,
             "--help" | "-h" => help = true,
             "--report-dir" => match iter.next() {
                 Some(dir) => report_dir = Some(dir),
@@ -169,6 +192,41 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
                     return None;
                 }
             },
+            "--install-extension" => match iter.next() {
+                Some(path) => install_extension = Some(path),
+                None => {
+                    eprintln!("--install-extension 需要一个清单文件：--install-extension <清单文件>");
+                    return None;
+                }
+            },
+            "--enable-extension" => match iter.next() {
+                Some(id) => enable_extension = Some(id),
+                None => {
+                    eprintln!("--enable-extension 需要一个扩展 ID：--enable-extension <ID>");
+                    return None;
+                }
+            },
+            "--disable-extension" => match iter.next() {
+                Some(id) => disable_extension = Some(id),
+                None => {
+                    eprintln!("--disable-extension 需要一个扩展 ID：--disable-extension <ID>");
+                    return None;
+                }
+            },
+            "--permissions" => match iter.next() {
+                Some(list) => {
+                    permissions = list
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
+                None => {
+                    eprintln!("--permissions 需要一个逗号分隔的工具名列表：--permissions read_file,write_file");
+                    return None;
+                }
+            },
             other => positional.push(other.to_owned()),
         }
     }
@@ -191,6 +249,11 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             benchmark: false,
             benchmark_long: false,
             mcp_reconnect: None,
+            list_extensions: false,
+            install_extension: None,
+            enable_extension: None,
+            permissions: Vec::new(),
+            disable_extension: None,
             help: true,
         });
     }
@@ -265,6 +328,39 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         eprintln!("--mcp-reconnect 是独立模式，不接任务描述，也不与其他模式同场使用");
         return None;
     }
+    // 扩展管理是独立模式：装、列、启、停各自结束进程，不接任务描述，
+    // 也不与运行/恢复/报表/基准/探测同场。静默丢弃任何一方都会让用户
+    // 以为指令生效了。
+    let extension_modes = [
+        list_extensions,
+        install_extension.is_some(),
+        enable_extension.is_some(),
+        disable_extension.is_some(),
+    ]
+    .into_iter()
+    .filter(|active| *active)
+    .count();
+    if extension_modes > 1 {
+        eprintln!("--list-extensions / --install-extension / --enable-extension / --disable-extension 一次只能用一个");
+        return None;
+    }
+    if extension_modes == 1
+        && (task.is_some()
+            || resume.is_some()
+            || resume_task.is_some()
+            || kind.is_some()
+            || report
+            || benchmark
+            || benchmark_long
+            || mcp_reconnect.is_some())
+    {
+        eprintln!("扩展管理是独立模式，不接任务描述，也不与其他模式同场使用");
+        return None;
+    }
+    if !permissions.is_empty() && enable_extension.is_none() {
+        eprintln!("--permissions 只与 --enable-extension 搭配");
+        return None;
+    }
     if task.is_none()
         && resume.is_none()
         && resume_task.is_none()
@@ -273,8 +369,9 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         && !benchmark
         && !benchmark_long
         && mcp_reconnect.is_none()
+        && extension_modes == 0
     {
-        eprintln!("缺少任务描述；恢复请用 --resume <id> 或 --resume-task <id>，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long，MCP 恢复探测请用 --mcp-reconnect <服务器名>\n\n{USAGE}");
+        eprintln!("缺少任务描述；恢复请用 --resume <id> 或 --resume-task <id>，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long，MCP 恢复探测请用 --mcp-reconnect <服务器名>，扩展管理请用 --list-extensions 或 --install-extension <清单文件>\n\n{USAGE}");
         return None;
     }
 
@@ -293,6 +390,11 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         benchmark,
         benchmark_long,
         mcp_reconnect,
+        list_extensions,
+        install_extension,
+        enable_extension,
+        permissions,
+        disable_extension,
         help,
     })
 }
@@ -697,6 +799,47 @@ mod tests {
         let yes = parse_from(argv(&["--mcp-reconnect", "demo", "--yes"])).unwrap();
         assert!(yes.auto_approve);
         assert_eq!(yes.mcp_reconnect.as_deref(), Some("demo"));
+    }
+
+    /// 扩展管理各子模式单独可解析，且不需要任务描述。
+    #[test]
+    fn extension_modes_parse_standalone() {
+        let listed = parse_from(argv(&["--list-extensions"])).unwrap();
+        assert!(listed.list_extensions);
+        assert!(listed.task.is_none());
+
+        let installed = parse_from(argv(&["--install-extension", "demo.toml"])).unwrap();
+        assert_eq!(installed.install_extension.as_deref(), Some("demo.toml"));
+
+        let enabled = parse_from(argv(&[
+            "--enable-extension",
+            "demo",
+            "--permissions",
+            "read_file, write_file",
+        ]))
+        .unwrap();
+        assert_eq!(enabled.enable_extension.as_deref(), Some("demo"));
+        assert_eq!(enabled.permissions, ["read_file", "write_file"]);
+
+        let disabled = parse_from(argv(&["--disable-extension", "demo"])).unwrap();
+        assert_eq!(disabled.disable_extension.as_deref(), Some("demo"));
+    }
+
+    /// 扩展管理与其他意图同场即拒：只有一项会执行，另一项被静默忽略。
+    #[test]
+    fn extension_modes_reject_company() {
+        assert!(parse_from(argv(&["--list-extensions", "--install-extension", "a.toml"])).is_none());
+        assert!(parse_from(argv(&["--enable-extension", "demo", "--disable-extension", "demo"])).is_none());
+        assert!(parse_from(argv(&["--list-extensions", "跑个任务"])).is_none());
+        assert!(parse_from(argv(&["--enable-extension", "demo", "--report"])).is_none());
+        assert!(parse_from(argv(&["--install-extension", "a.toml", "--resume", "s1"])).is_none());
+        // 缺值不能把下一个参数当成 ID 或路径。
+        assert!(parse_from(argv(&["--install-extension"])).is_none());
+        assert!(parse_from(argv(&["--enable-extension"])).is_none());
+        assert!(parse_from(argv(&["--disable-extension"])).is_none());
+        // 权限列表只服务于启用。
+        assert!(parse_from(argv(&["--permissions", "read_file"])).is_none());
+        assert!(parse_from(argv(&["--list-extensions", "--permissions", "read_file"])).is_none());
     }
 
     fn call(name: &str, arguments: serde_json::Value) -> ToolCall {

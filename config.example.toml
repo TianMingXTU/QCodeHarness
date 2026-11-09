@@ -1,0 +1,56 @@
+# QCodeHarness 应用配置示例
+#
+# 合并顺序：内置默认 → 用户级 → 项目级 → QCH_CONFIG 指定的文件。
+# QCH_CONFIG 是最后一层覆盖；指定后文件必须存在，未填写的字段继续继承。
+# 用户级目录遵循平台原生约定：Windows 为 %APPDATA%\qcodeharness，
+# macOS 为 ~/Library/Application Support/qcodeharness，
+# Linux 为 $XDG_CONFIG_HOME/qcodeharness（默认 ~/.config/qcodeharness）。
+# 用户级文件名为 config.toml；项目级文件为 <workspace>/.qcodeharness/config.toml。
+# 可将本文件复制为项目级配置后修改。
+#
+# LLM_BASE_URL、LLM_MODEL、QCH_POLICY、QCH_MCP_CONFIG 等已有环境变量
+# 由启动入口在文件配置之后处理。API Key 仍通过环境变量提供。
+#
+# 未填写的字段继承低层配置，空表不覆盖任何字段。
+# enabled = [] 会清空继承的列表；显式填写 20、4 同样会覆盖低层值。
+
+# 相对路径以定义该字段的配置文件目录为基准。
+# 放在 .qcodeharness/config.toml 时，以下示例指向工作区根目录的文件。
+# 这两项连同 llm.base_url 只允许写在用户级配置或 QCH_CONFIG 里：项目级
+# 配置随仓库分发，不能让仓库决定数据发往哪里、审批是否生效、启动时拉起
+# 哪个子进程。
+# policy_path = "../policy.toml"
+# mcp_config_path = "../mcp.json"
+
+[llm]
+# 未配置时由启动入口解析，已配置的字符串不能为空或仅含空白。
+# base_url 同样只能在用户级配置里设置。
+# base_url = "https://api.example.com/v1"
+# model = "your-model"
+
+[run]
+# 正整数，默认 20。
+max_turns = 20
+# 未设置时不限制墙钟预算；设置时必须为正整数，单位为秒。
+# max_wall_clock_seconds = 300
+# 未设置时使用运行器的默认阈值；设置时必须为正整数。
+# summarize_min_dropped = 8
+
+[skills]
+# 标识符只能包含小写 ASCII 字母、数字、_、-，以字母或数字开头，不能为空
+# 或重复，并且必须能通过扩展安装时的同一套校验。
+# 列表采用整体替换：写了就是"只选这些"，写 enabled = [] 是"一个都不选"，
+# 整个字段不写才是不额外限制。启用扩展不代表授予工具权限。
+# enabled = ["demo"]
+
+[hooks]
+# 标识符与列表覆盖规则同 skills。
+# enabled = ["before-run"]
+
+[parallel]
+# 允许 0..=16，默认 4；0 禁用并行，1 仍由调度器串行执行。
+max_subtasks = 4
+# 整批子任务合并前，在候选工作区执行的验证命令。
+# 未配置时只做结构校验（补丁可应用、路径受保护、父工作区干净），
+# 不运行项目自己的测试。建议写成能在仓库根直接执行的命令。
+# verify_command = "cargo test --quiet"

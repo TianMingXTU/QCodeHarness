@@ -20,3 +20,6 @@ pub mod task_resume;
 pub mod tool_registry;
 pub mod tool_guard;
 pub mod worktree;
+pub mod isolation;
+pub mod delegation;
+pub mod extension;

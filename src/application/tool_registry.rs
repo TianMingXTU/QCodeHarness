@@ -85,6 +85,16 @@ impl ToolRegistry {
         Self::new(entries)
     }
 
+    /// 在现有登记项之后追加另一张表，同名工具由后者覆盖。
+    ///
+    /// 用于装配阶段先建宿主工具表、再由扩展来源追加 `skill__*`；两表都
+    /// 已解析完成，不需要重新提供 `ToolSource`。
+    pub fn merged_with(&self, other: &ToolRegistry) -> Self {
+        let mut entries = self.entries.clone();
+        entries.extend(other.entries.iter().cloned());
+        Self::new(entries)
+    }
+
     /// 模型可见的全部规格。
     ///
     /// 直接返回克隆：调用方（rig 防腐层）需要把它们序列化进请求，
