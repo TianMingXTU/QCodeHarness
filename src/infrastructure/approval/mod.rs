@@ -7,3 +7,4 @@
 pub mod ai_review;
 pub mod auto;
 pub mod cli;
+pub mod async_gate;

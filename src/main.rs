@@ -11,27 +11,29 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use qcode_harness::application::agent_run::{
-    new_session_id, AgentDependencies, AgentRunner, RunState,
-};
 use qcode_harness::application::agent_roster::AgentRoster;
-use qcode_harness::infrastructure::benchmark_runner::{run_benchmark, run_long_benchmark};
+use qcode_harness::application::agent_run::{
+    AgentDependencies, AgentRunner, RunState, new_session_id,
+};
 use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::delegation::ChildAgentFactory;
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::extension::{ExtensionRegistry, ExtensionSelection};
 use qcode_harness::application::isolation::{IsolationWorkspace, WorkspaceVerifier};
 use qcode_harness::application::mcp_lifecycle::McpLifecycleRecorder;
+use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{
     ApprovalGate, Clock, EvidenceSink, ModelGateway, NoopHooks, TimeLimiter, Timestamp,
 };
 use qcode_harness::application::provider_registry::ProviderRegistry;
-use qcode_harness::application::report::{render_json, render_text, BenchmarkReport};
+use qcode_harness::application::report::{BenchmarkReport, render_json, render_text};
+use qcode_harness::application::service::TaskService;
 use qcode_harness::application::snapshot::{RunSnapshot, SessionStore, TaskStore};
 use qcode_harness::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
 use qcode_harness::application::tool_registry::{ToolRegistry, ToolSource};
@@ -42,33 +44,37 @@ use qcode_harness::domain::context::ContextBudget;
 use qcode_harness::domain::evidence::AuditEvent;
 use qcode_harness::domain::ids::{SessionId, TaskId};
 use qcode_harness::domain::policy::PolicyEngine;
+use qcode_harness::domain::service::{ServiceCommand, ServiceError};
 use qcode_harness::domain::session::Turn;
 use qcode_harness::domain::task::TaskKind;
-use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::domain::workflow::WorkflowCatalog;
+use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::infrastructure::approval::ai_review::AiReviewGate;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
+use qcode_harness::infrastructure::benchmark_runner::{run_benchmark, run_long_benchmark};
 use qcode_harness::infrastructure::clock::{SystemClock, TokioTimeLimiter};
 use qcode_harness::infrastructure::config;
 use qcode_harness::infrastructure::delegation::{
     CommandVerifier, StructuralVerifier, SubAgentToolSource,
 };
-use qcode_harness::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
-use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
+use qcode_harness::infrastructure::evidence::jsonl::{JsonlEvidenceSink, session_path};
 use qcode_harness::infrastructure::evidence::reader;
 use qcode_harness::infrastructure::extensions::LocalExtensionStore;
 use qcode_harness::infrastructure::git_worktree::GitWorktreeManager;
+use qcode_harness::infrastructure::instructions;
 use qcode_harness::infrastructure::mcp;
 use qcode_harness::infrastructure::mcp::config::McpConfig;
 use qcode_harness::infrastructure::model::openai_compat::OpenAiCompatProvider;
 use qcode_harness::infrastructure::policy;
+use qcode_harness::infrastructure::service_factory::{ProductionTaskFactory, ServiceFactoryConfig};
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
+use qcode_harness::infrastructure::task_service::LocalTaskService;
 use qcode_harness::infrastructure::task_store::JsonTaskStore;
 use qcode_harness::infrastructure::tool::{BuiltinToolSource, all_tools};
 use qcode_harness::infrastructure::worktree::RootedWorktreeScanner;
-use qcode_harness::interface::cli::{self, ConsoleReporter};
-use qcode_harness::infrastructure::instructions;
+use qcode_harness::interface::cli::{self, ConsoleReporter, FrontendMode};
+use qcode_harness::interface::{stdio::StdioServer, terminal};
 use std::sync::Mutex;
 
 /// 扩展动作的审批与执行时限。工具本身还有自己的时限，这里只兜底
@@ -137,9 +143,8 @@ impl LlmConfig {
         lookup: &dyn Fn(&str) -> Option<String>,
         file: &AppConfig,
     ) -> Result<Self, String> {
-        let required = |name: &str| -> Result<String, String> {
-            lookup(name).ok_or_else(|| missing(name))
-        };
+        let required =
+            |name: &str| -> Result<String, String> { lookup(name).ok_or_else(|| missing(name)) };
         let text = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
         let max_turns = match text("LLM_MAX_TURNS") {
             Some(text) => {
@@ -192,11 +197,7 @@ impl LlmConfig {
             api_key: required("LLM_API_KEY")?,
             model: match text("LLM_MODEL") {
                 Some(value) => value,
-                None => file
-                    .llm
-                    .model
-                    .clone()
-                    .ok_or_else(|| missing("LLM_MODEL"))?,
+                None => file.llm.model.clone().ok_or_else(|| missing("LLM_MODEL"))?,
             },
             max_turns,
             policy_path: lookup("QCH_POLICY")
@@ -244,9 +245,8 @@ fn read_role_efforts_from(
     let mut efforts = HashMap::new();
     for role in AgentRole::all() {
         if let Some(text) = lookup(role.effort_env_name()) {
-            let effort = Effort::parse(&text).map_err(|error| {
-                format!("{}: {error}", role.effort_env_name())
-            })?;
+            let effort = Effort::parse(&text)
+                .map_err(|error| format!("{}: {error}", role.effort_env_name()))?;
             efforts.insert(role, effort);
         }
     }
@@ -260,9 +260,8 @@ fn read_role_verbosities_from(
     let mut verbosities = HashMap::new();
     for role in AgentRole::all() {
         if let Some(text) = lookup(role.verbosity_env_name()) {
-            let verbosity = Verbosity::parse(&text).map_err(|error| {
-                format!("{}: {error}", role.verbosity_env_name())
-            })?;
+            let verbosity = Verbosity::parse(&text)
+                .map_err(|error| format!("{}: {error}", role.verbosity_env_name()))?;
             verbosities.insert(role, verbosity);
         }
     }
@@ -306,8 +305,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 配置文件先加载：后续的扩展管理、MCP 路径、策略与预算都从这里取。
     // 文件损坏时直接退出，不能用一份猜出来的配置继续跑。
-    let app_config = config::load(&workspace)
-        .map_err(|error| format!("配置加载失败: {error}"))?;
+    let app_config = config::load(&workspace).map_err(|error| format!("配置加载失败: {error}"))?;
 
     // 扩展管理是独立模式：安装、列出、启用、禁用状态，不跑任务也不需要
     // 模型配置。放在模型配置之前，没配 API Key 也能管理扩展。
@@ -377,6 +375,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
         budget = budget.with_wall_clock(limit);
     }
 
+    // 服务入口先于一次性工具装配；stdout 归传输层所有，诊断统一写 stderr。
+    if let Some(frontend) = args.frontend {
+        let frontend = frontend_for_terminal(
+            frontend,
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        )?;
+        let mcp_path = std::env::var_os("QCH_MCP_CONFIG")
+            .map(PathBuf::from)
+            .or_else(|| app_config.mcp_config_path.clone());
+        let mcp = match mcp_path {
+            Some(path) => McpConfig::load(&path)
+                .map_err(|error| format!("{error}（文件: {}）", path.display()))?
+                .unwrap_or_default(),
+            None => McpConfig::default(),
+        };
+        let verifier: Arc<dyn WorkspaceVerifier> = match &app_config.parallel.verify_command {
+            Some(command) => Arc::new(CommandVerifier::new(command.clone(), VERIFY_TIMEOUT)),
+            None => Arc::new(StructuralVerifier),
+        };
+        let factory = ProductionTaskFactory::new(ServiceFactoryConfig {
+            model,
+            policy,
+            roster: roster_with_role_models(&config),
+            context_budget,
+            budget,
+            user_dir: config::user_directory(),
+            extensions: LocalExtensionStore::new(&workspace),
+            settings: app_config,
+            mcp,
+            verifier: verifier.clone(),
+        });
+        let service: Arc<dyn TaskService> =
+            Arc::new(LocalTaskService::open(workspace, Arc::new(factory), budget, verifier).await?);
+        return serve_frontend(service, frontend).await.map_err(Into::into);
+    }
+
     // ── 基准模式：运行 benchmarks/ 下的任务集并打分。位于全局工具
     // 装配之前：运行器为每个任务重建以 fixture 拷贝为根的注册表，
     // 全局注册表与 MCP 连接在此用不上。──
@@ -404,8 +439,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("基准任务集: {}", benchmarks_root.display());
         println!("模型: {} @ {}", config.model, config.base_url);
         if args.benchmark_long {
-            let results =
-                run_long_benchmark(&deps, &budget, &benchmarks_root, &workspace).await?;
+            let results = run_long_benchmark(&deps, &budget, &benchmarks_root, &workspace).await?;
             let passed = results.iter().filter(|result| result.passed).count();
             println!("\n通过 {passed}/{} 个长任务", results.len());
             if passed < results.len() {
@@ -509,7 +543,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .enabled_instructions(&selection)
         .map_err(|error| format!("扩展指令加载失败: {error}"))?;
     if !extension_instructions.is_empty() {
-        roster = roster.with_instructions_section(EXTENSION_INSTRUCTIONS_HEADER, &extension_instructions);
+        roster = roster
+            .with_instructions_section(EXTENSION_INSTRUCTIONS_HEADER, &extension_instructions);
     }
     // 已启用的 Skill 入口对所有角色可见；Skill 背后的实际工具仍按角色
     // 白名单复核，给只读角色一个 Skill 不会让它获得写权限。
@@ -544,19 +579,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok(manager) => {
                 // 配置了验证命令就在候选工作区真的跑一遍；没配置时只做
                 // 结构校验，并在启动时说明，避免用户误以为测试已通过。
-                let verifier: Arc<dyn WorkspaceVerifier> =
-                    match &app_config.parallel.verify_command {
-                        Some(command) => {
-                            println!("子任务合并前验证: {command}");
-                            Arc::new(CommandVerifier::new(command.clone(), VERIFY_TIMEOUT))
-                        }
-                        None => {
-                            println!(
-                                "子任务合并前验证: 仅结构校验（未配置 parallel.verify_command）"
-                            );
-                            Arc::new(StructuralVerifier)
-                        }
-                    };
+                let verifier: Arc<dyn WorkspaceVerifier> = match &app_config.parallel.verify_command
+                {
+                    Some(command) => {
+                        println!("子任务合并前验证: {command}");
+                        Arc::new(CommandVerifier::new(command.clone(), VERIFY_TIMEOUT))
+                    }
+                    None => {
+                        println!("子任务合并前验证: 仅结构校验（未配置 parallel.verify_command）");
+                        Arc::new(StructuralVerifier)
+                    }
+                };
                 let factory = Arc::new(ChildFactory {
                     model: Arc::clone(&model),
                     policy: policy.clone(),
@@ -716,7 +749,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let task = args.task.expect("parse_args 保证：非 list/resume 模式必有任务描述");
+    let task = args
+        .task
+        .expect("parse_args 保证：非 list/resume 模式必有任务描述");
 
     // --kind 选模板；不传默认 bug-fix（最常见）。
     let kind_text = args.kind.as_deref().unwrap_or(TaskKind::BugFix.name());
@@ -796,6 +831,66 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// 自动模式只有在输入、输出均为终端时进入 TUI。
+fn frontend_for_terminal(
+    frontend: FrontendMode,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+) -> Result<FrontendMode, ServiceError> {
+    let terminal = stdin_terminal && stdout_terminal;
+    match frontend {
+        FrontendMode::Interactive => Ok(if terminal {
+            FrontendMode::Tui
+        } else {
+            FrontendMode::Text
+        }),
+        FrontendMode::Tui if !terminal => Err(ServiceError::new(
+            "terminal_required",
+            "--tui 需要标准输入和标准输出均连接终端；管道环境请用 --text 或 --stdio",
+        )),
+        frontend => Ok(frontend),
+    }
+}
+
+/// 传输无论正常结束还是报错，都请求服务收尾，并把两侧失败合并成一个结果。
+async fn finish_frontend(
+    service: &dyn TaskService,
+    transport: Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    let shutdown_id = format!("host-shutdown-{}", new_session_id(&SystemClock));
+    let shutdown = service.call(&shutdown_id, ServiceCommand::Shutdown).await;
+    match (transport, shutdown) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) | (Ok(()), Err(error)) => Err(error),
+        (Err(mut error), Err(cleanup)) => {
+            error
+                .message
+                .push_str(&format!("；服务关闭失败: {cleanup}"));
+            Err(error)
+        }
+    }
+}
+
+/// 三条传输共用一个执行流：先跑所选传输，随后按同一收尾路径离开运行时。
+async fn serve_frontend(
+    service: Arc<dyn TaskService>,
+    frontend: FrontendMode,
+) -> Result<(), ServiceError> {
+    let transport = match frontend {
+        FrontendMode::Stdio => {
+            StdioServer::new(service.clone())
+                .serve(tokio::io::stdin(), tokio::io::stdout())
+                .await
+        }
+        FrontendMode::Text => {
+            terminal::run_text(service.clone(), tokio::io::stdin(), tokio::io::stdout()).await
+        }
+        FrontendMode::Tui => terminal::run_tui(service.clone()).await,
+        FrontendMode::Interactive => unreachable!("前端已按终端能力解析"),
+    };
+    finish_frontend(service.as_ref(), transport).await
+}
+
 /// 三条任务入口共用的宿主装配。
 ///
 /// 扩展注册表、宿主工具表与角色花名册在进程内不变，建立一次即可。每次
@@ -852,11 +947,12 @@ fn assemble(
             Arc::clone(&shared.limiter),
         )
         .map_err(|error| format!("扩展装配失败: {error}"))?;
-    let mut tools = shared
-        .host_tools
-        .merged_with(&ToolRegistry::from_sources(std::slice::from_ref(
-            &adapters.source,
-        )));
+    let mut tools =
+        shared
+            .host_tools
+            .merged_with(&ToolRegistry::from_sources(std::slice::from_ref(
+                &adapters.source,
+            )));
     if let Some(delegate) = &shared.delegate {
         tools = tools.merged_with(&ToolRegistry::from_sources(std::slice::from_ref(delegate)));
     }
@@ -945,11 +1041,10 @@ impl ChildAgentFactory for ChildFactory {
             }
         }
         let evidence_path = session_path(&self.sessions_root, session_id.as_str());
-        let evidence: Arc<dyn EvidenceSink> = Arc::new(
-            JsonlEvidenceSink::open(&evidence_path).map_err(|error| {
+        let evidence: Arc<dyn EvidenceSink> =
+            Arc::new(JsonlEvidenceSink::open(&evidence_path).map_err(|error| {
                 format!("子任务证据无法写入 {}：{error}", evidence_path.display())
-            })?,
-        );
+            })?);
         Ok(AgentDependencies {
             model: Arc::clone(&self.model),
             tools: ToolRegistry::from_sources(&[Arc::new(BuiltinToolSource::new(
@@ -1055,8 +1150,14 @@ fn manage_extensions(workspace: &Path, args: &cli::CliArgs) -> Result<(), Box<dy
                 kinds,
                 item.descriptor.description
             );
-            println!("      声明权限: {}", join_or_none(&item.descriptor.permissions));
-            println!("      已批准:   {}", join_or_none(&item.approved_permissions));
+            println!(
+                "      声明权限: {}",
+                join_or_none(&item.descriptor.permissions)
+            );
+            println!(
+                "      已批准:   {}",
+                join_or_none(&item.approved_permissions)
+            );
         }
         return Ok(());
     }
@@ -1099,7 +1200,10 @@ fn join_or_none(items: &[String]) -> String {
 }
 
 /// `--list-sessions`：列出可恢复的会话与各自停在哪里。
-fn list_sessions(store: &dyn qcode_harness::application::snapshot::SessionStore) -> Result<(), Box<dyn Error>> {    let ids = store.list()?;
+fn list_sessions(
+    store: &dyn qcode_harness::application::snapshot::SessionStore,
+) -> Result<(), Box<dyn Error>> {
+    let ids = store.list()?;
     if ids.is_empty() {
         println!("还没有可恢复的会话。跑完一个任务后，快照会自动存到 .qcodeharness/snapshots/。");
         return Ok(());
@@ -1126,7 +1230,11 @@ fn list_sessions(store: &dyn qcode_harness::application::snapshot::SessionStore)
 
 /// `--report`：从证据目录统计运行报表。`report_dir` 是证据根目录
 /// （找它的 `.qcodeharness/sessions/`），缺省为当前工作区。
-fn render_report(workspace: &Path, report_dir: Option<&str>, json: bool) -> Result<(), Box<dyn Error>> {
+fn render_report(
+    workspace: &Path,
+    report_dir: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
     let root = report_dir.map_or(workspace.to_path_buf(), PathBuf::from);
     let sessions_dir = root.join(".qcodeharness").join("sessions");
     if !sessions_dir.is_dir() {
@@ -1318,7 +1426,11 @@ impl FanoutEvidenceSink {
 }
 
 impl EvidenceSink for FanoutEvidenceSink {
-    fn record(&self, at: qcode_harness::application::port::Timestamp, event: qcode_harness::domain::evidence::AuditEvent) {
+    fn record(
+        &self,
+        at: qcode_harness::application::port::Timestamp,
+        event: qcode_harness::domain::evidence::AuditEvent,
+    ) {
         for sink in &self.sinks {
             // catch_unwind 不能跨 await，record 是同步方法，可以包裹。
             // 单个汇 panic 不应影响任务和其余证据。
@@ -1335,6 +1447,95 @@ impl EvidenceSink for FanoutEvidenceSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_frontend_selection_respects_both_terminal_streams() {
+        for (input, output) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(
+                frontend_for_terminal(FrontendMode::Interactive, input, output).unwrap(),
+                if input && output {
+                    FrontendMode::Tui
+                } else {
+                    FrontendMode::Text
+                },
+            );
+            assert_eq!(
+                frontend_for_terminal(FrontendMode::Text, input, output).unwrap(),
+                FrontendMode::Text
+            );
+            assert_eq!(
+                frontend_for_terminal(FrontendMode::Stdio, input, output).unwrap(),
+                FrontendMode::Stdio
+            );
+            assert_eq!(
+                frontend_for_terminal(FrontendMode::Tui, input, output).is_ok(),
+                input && output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn frontend_shutdown_is_awaited_after_transport_success_or_failure() {
+        use qcode_harness::application::port::BoxFuture;
+        use qcode_harness::application::service::EventSubscription;
+        use qcode_harness::domain::service::ServiceReply;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ClosingService {
+            closed: AtomicBool,
+            fail: bool,
+        }
+
+        impl TaskService for ClosingService {
+            fn call<'a>(
+                &'a self,
+                request_id: &'a str,
+                command: ServiceCommand,
+            ) -> BoxFuture<'a, Result<ServiceReply, ServiceError>> {
+                assert!(request_id.starts_with("host-shutdown-"));
+                assert_eq!(command, ServiceCommand::Shutdown);
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    self.closed.store(true, Ordering::SeqCst);
+                    if self.fail {
+                        Err(ServiceError::new("close_failed", "关闭失败"))
+                    } else {
+                        Ok(ServiceReply::Shutdown)
+                    }
+                })
+            }
+
+            fn subscribe(&self, _: u64) -> Result<Box<dyn EventSubscription>, ServiceError> {
+                unreachable!("关闭不订阅事件")
+            }
+        }
+
+        for transport_fails in [false, true] {
+            for shutdown_fails in [false, true] {
+                let service = ClosingService {
+                    closed: AtomicBool::new(false),
+                    fail: shutdown_fails,
+                };
+                let transport = if transport_fails {
+                    Err(ServiceError::new("transport_io", "写入失败"))
+                } else {
+                    Ok(())
+                };
+                let result = finish_frontend(&service, transport).await;
+                assert!(service.closed.load(Ordering::SeqCst));
+                match (transport_fails, shutdown_fails) {
+                    (false, false) => assert!(result.is_ok()),
+                    (false, true) => assert_eq!(result.unwrap_err().code, "close_failed"),
+                    (true, false) => assert_eq!(result.unwrap_err().code, "transport_io"),
+                    (true, true) => {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.code, "transport_io");
+                        assert!(error.message.contains("关闭失败"));
+                    }
+                }
+            }
+        }
+    }
 
     /// 从一张假变量表里取值：只有表里有的名字才有值。
     fn table(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -1505,7 +1706,8 @@ mod tests {
     /// 文件提供模型地址与模型名，环境变量只补 API Key。
     #[test]
     fn the_file_supplies_model_settings_and_env_only_the_key() {
-        let file = file_config("[llm]\nbase_url = 'https://file.invalid/v1'\nmodel = 'file-model'\n");
+        let file =
+            file_config("[llm]\nbase_url = 'https://file.invalid/v1'\nmodel = 'file-model'\n");
         let config = LlmConfig::from_lookup(&table(&[("LLM_API_KEY", "secret")]), &file).unwrap();
 
         assert_eq!(config.base_url, "https://file.invalid/v1");
@@ -1558,19 +1760,16 @@ mod tests {
     /// 配置错误，用户只会看到"任务莫名其妙只跑了一轮"。
     #[test]
     fn zero_budgets_are_rejected_from_both_sources() {
-        let file = file_config(
-            "[llm]\nbase_url = 'https://file.invalid/v1'\nmodel = 'file-model'\n",
-        );
+        let file =
+            file_config("[llm]\nbase_url = 'https://file.invalid/v1'\nmodel = 'file-model'\n");
         for (name, value) in [
             ("LLM_MAX_TURNS", "0"),
             ("QCH_MAX_WALL_CLOCK", "0"),
             ("QCH_SUMMARIZE_MIN_DROPPED", "0"),
         ] {
-            let error = LlmConfig::from_lookup(
-                &table(&[("LLM_API_KEY", "secret"), (name, value)]),
-                &file,
-            )
-            .expect_err("0 必须报错");
+            let error =
+                LlmConfig::from_lookup(&table(&[("LLM_API_KEY", "secret"), (name, value)]), &file)
+                    .expect_err("0 必须报错");
             assert!(error.contains(name), "{error}");
         }
     }
@@ -1608,9 +1807,6 @@ mod tests {
             &file,
         )
         .unwrap();
-        assert_eq!(
-            from_env.policy_path,
-            Some(PathBuf::from("env-policy.toml"))
-        );
+        assert_eq!(from_env.policy_path, Some(PathBuf::from("env-policy.toml")));
     }
 }

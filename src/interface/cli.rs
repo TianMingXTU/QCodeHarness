@@ -31,6 +31,7 @@ pub const USAGE: &str = "\
       QCodeHarness --install-extension <清单文件>
       QCodeHarness --enable-extension <ID> [--permissions <工具名,...>]
       QCodeHarness --disable-extension <ID>
+      QCodeHarness --stdio | --interactive | --text | --tui
       QCodeHarness --help
 示例: QCodeHarness \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
       QCodeHarness --yes \"非交互场景下跑同一个任务\"
@@ -47,11 +48,26 @@ pub const USAGE: &str = "\
       QCodeHarness --install-extension ./my-skill.toml
       QCodeHarness --enable-extension my-skill --permissions read_file,search_text
       QCodeHarness --list-extensions
+      QCodeHarness --stdio        标准输入输出的 NDJSON 服务
+      QCodeHarness --interactive 自动选择终端界面
+      QCodeHarness --text         逐行文本界面（适合屏幕阅读器）
+      QCodeHarness --tui          终端界面
 从源码运行时在命令前加 cargo run --，例：cargo run -- --report";
+
+/// 持续服务的前端模式；文本模式适用于管道和屏幕阅读器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontendMode {
+    Stdio,
+    Interactive,
+    Text,
+    Tui,
+}
 
 /// 解析出的命令行参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CliArgs {
+    /// 服务前端；与一次性命令互斥。
+    pub frontend: Option<FrontendMode>,
     /// 要完成的任务描述。`--resume` / `--resume-task` 沿用快照中的原任务；
     /// `--list-sessions`、报表、基准与 `--mcp-reconnect` 模式不需要。
     pub task: Option<String>,
@@ -123,6 +139,8 @@ pub fn parse_args() -> Option<CliArgs> {
 /// 开关可出现在任意位置。剩余的唯一个位置参数是任务描述。
 /// 未引入 `clap`：开关数量很少，不值得增加依赖。
 pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
+    let mut frontend = None;
+    let mut frontend_count = 0;
     let mut auto_approve = false;
     let mut ai_review = false;
     let mut resume = None;
@@ -156,6 +174,12 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--benchmark-long" => benchmark_long = true,
             "--list-extensions" => list_extensions = true,
             "--help" | "-h" => help = true,
+            // 服务前端：本进程持续运行，不接受任务描述与其他运行模式。
+            // 重复出现即计数，结尾按数量拒绝。
+            "--stdio" => { frontend = Some(FrontendMode::Stdio); frontend_count += 1; }
+            "--interactive" => { frontend = Some(FrontendMode::Interactive); frontend_count += 1; }
+            "--text" => { frontend = Some(FrontendMode::Text); frontend_count += 1; }
+            "--tui" => { frontend = Some(FrontendMode::Tui); frontend_count += 1; }
             "--report-dir" => match iter.next() {
                 Some(dir) => report_dir = Some(dir),
                 None => {
@@ -235,6 +259,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     // 若与其他开关同场时报错，会让查看用法变得困难。
     if help {
         return Some(CliArgs {
+            frontend: None,
             task: None,
             auto_approve: false,
             ai_review: false,
@@ -361,6 +386,29 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         eprintln!("--permissions 只与 --enable-extension 搭配");
         return None;
     }
+    // 服务前端是持续运行模式：彼此互斥，也不接任务描述，
+    // 更不与运行、恢复、报表、基准、探测、扩展管理同场。
+    if frontend_count > 1 {
+        eprintln!("--stdio / --interactive / --text / --tui 一次只能用一个");
+        return None;
+    }
+    if frontend.is_some()
+        && (task.is_some()
+            || auto_approve
+            || ai_review
+            || resume.is_some()
+            || resume_task.is_some()
+            || kind.is_some()
+            || list_sessions
+            || report
+            || benchmark
+            || benchmark_long
+            || mcp_reconnect.is_some()
+            || extension_modes == 1)
+    {
+        eprintln!("服务前端是独立模式，不接任务描述，也不与其他模式同场使用");
+        return None;
+    }
     if task.is_none()
         && resume.is_none()
         && resume_task.is_none()
@@ -370,12 +418,14 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         && !benchmark_long
         && mcp_reconnect.is_none()
         && extension_modes == 0
+        && frontend.is_none()
     {
         eprintln!("缺少任务描述；恢复请用 --resume <id> 或 --resume-task <id>，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long，MCP 恢复探测请用 --mcp-reconnect <服务器名>，扩展管理请用 --list-extensions 或 --install-extension <清单文件>\n\n{USAGE}");
         return None;
     }
 
     Some(CliArgs {
+        frontend,
         task,
         auto_approve,
         ai_review,
@@ -612,6 +662,33 @@ mod tests {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn service_frontends_accept_no_goal_and_reject_other_modes() {
+        for mode in ["--stdio", "--interactive", "--text", "--tui"] {
+            assert!(parse_from(argv(&[mode])).is_some(), "{mode}");
+            for extra in [
+                vec!["修复问题"], vec!["--yes"], vec!["--ai-review"],
+                vec!["--resume", "s1"], vec!["--resume-task", "t1"],
+                vec!["--list-sessions"], vec!["--kind", "review"],
+                vec!["--report"], vec!["--benchmark"], vec!["--benchmark-long"],
+                vec!["--mcp-reconnect", "demo"], vec!["--list-extensions"],
+                vec!["--install-extension", "demo.toml"],
+                vec!["--enable-extension", "demo"], vec!["--disable-extension", "demo"],
+            ] {
+                let mut flags = vec![mode];
+                flags.extend(extra);
+                assert!(parse_from(argv(&flags)).is_none(), "{flags:?}");
+            }
+        }
+        for left in ["--stdio", "--interactive", "--text", "--tui"] {
+            for right in ["--stdio", "--interactive", "--text", "--tui"] {
+                if left != right {
+                    assert!(parse_from(argv(&[left, right])).is_none());
+                }
+            }
+        }
     }
 
     #[test]

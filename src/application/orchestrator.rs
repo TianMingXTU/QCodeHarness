@@ -16,9 +16,10 @@
 use std::sync::Arc;
 
 use crate::application::agent_roster::AgentRoster;
-use crate::application::agent_run::{new_session_id, AgentDependencies, AgentRunner};
+use crate::application::agent_run::{new_session_id, AgentDependencies, AgentRunner, RunState};
+use crate::application::control::ExecutionControl;
 use crate::application::error::ApplicationError;
-use crate::application::port::EvidenceSink;
+use crate::application::port::{CancelHandle, EvidenceSink};
 use crate::application::snapshot::{TaskSnapshot, TaskStore, TASK_FORMAT};
 use crate::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
 use crate::application::worktree::WorktreeScanner;
@@ -71,6 +72,18 @@ pub struct Orchestrator {
     worktree_scanner: Option<Arc<dyn WorktreeScanner>>,
     /// 工作区被改动时的处置策略。
     worktree_policy: WorktreeChangePolicy,
+    /// 预分配的会话 ID。`None` 时每次运行仍按原逻辑从时钟生成。
+    ///
+    /// 服务需要任务与会话 ID 由服务预先分配（重启后沿用同一会话、事件
+    /// 按会话归属），装配方通过 `with_session_id` 指定；一次性 CLI 路径
+    /// 保持 `None`，行为不变。
+    preassigned_session: Option<SessionId>,
+    /// 宿主执行控制：补充输入与运行状态检查。`None` 时 runner 不参与运行
+    /// 期控制。服务常驻模式由装配方注入，随每次运行传给 runner。
+    execution_control: Option<Arc<dyn ExecutionControl>>,
+    /// 宿主取消开关。与 `execution_control` 成对：runner 用它表达"宿主要求
+    /// 中止"。`None` 时用 runner 默认开关。
+    execution_cancel: Option<CancelHandle>,
 }
 
 impl Orchestrator {
@@ -103,7 +116,24 @@ impl Orchestrator {
             task_store: None,
             worktree_scanner: None,
             worktree_policy: WorktreeChangePolicy::default(),
+            preassigned_session: None,
+            execution_control: None,
+            execution_cancel: None,
         }
+    }
+
+    /// 指定任务与会话 ID：服务需要重启后沿用同一会话、事件按会话归属，
+    /// 由装配方预分配。一次性 CLI 路径不指定，仍按原逻辑从时钟生成。
+    pub fn with_session_id(mut self, session_id: SessionId) -> Self {
+        self.preassigned_session = Some(session_id);
+        self
+    }
+
+    /// 接入宿主执行控制与取消开关，随每次运行传给 runner。
+    pub fn with_execution_control(mut self, control: Arc<dyn ExecutionControl>, cancel: CancelHandle) -> Self {
+        self.execution_control = Some(control);
+        self.execution_cancel = Some(cancel);
+        self
     }
 
     /// 接上任务快照存储。
@@ -184,7 +214,11 @@ impl Orchestrator {
         };
         // 会话与证据在进入步骤循环前定好，每一步都往同一个会话里推。
         // 缓存路由键取会话 ID，跨步命中依赖这一点。
-        let session_id = new_session_id(&*self.deps.clock);
+        // 预分配的会话 ID 优先于时钟生成：服务要重启后沿用同一会话。
+        let session_id = self
+            .preassigned_session
+            .clone()
+            .unwrap_or_else(|| new_session_id(&*self.deps.clock));
         let evidence = (self.evidence_factory)(&session_id)
             .map_err(|error| ApplicationError::EvidenceInit(error.to_string()))?;
         let mut runner: Option<AgentRunner> = None;
@@ -197,7 +231,7 @@ impl Orchestrator {
         for index in start..task.steps().len() {
             let step_role = task.steps()[index].role;
             match self
-                .run_step(task, index, budget, &session_id, &evidence, &mut runner)
+                .run_step(task, index, budget, &session_id, &evidence, &completed_outputs, &mut runner)
                 .await
             {
                 Ok(answer) => {
@@ -224,6 +258,7 @@ impl Orchestrator {
                         // 可以直接翻证据，不必再查 --list-sessions。
                         session_id,
                         steps_completed: completed,
+                        source: Box::new(error),
                     });
                 }
             }
@@ -382,6 +417,10 @@ impl Orchestrator {
         let mut deps = self.deps.clone();
         deps.evidence = evidence.clone();
         let mut runner = AgentRunner::resume(snapshot.run.clone(), deps)?;
+        if let Some(control) = &self.execution_control {
+            let cancel = self.execution_cancel.clone().unwrap_or_default();
+            runner = runner.with_execution_control(control.clone(), cancel);
+        }
         // 把已完成步骤的结论交回模型，否则下一步只能从零重推。
         task_resume::hand_off_completed_outputs(&mut runner, &snapshot.completed_outputs);
 
@@ -394,7 +433,7 @@ impl Orchestrator {
         for index in start..task.steps().len() {
             let step_role = task.steps()[index].role;
             match self
-                .run_step(&task, index, budget, &session_id, &evidence, &mut runner)
+                .run_step(&task, index, budget, &session_id, &evidence, &completed_outputs, &mut runner)
                 .await
             {
                 Ok(answer) => {
@@ -417,6 +456,7 @@ impl Orchestrator {
                         message: reason,
                         session_id,
                         steps_completed: completed,
+                        source: Box::new(error),
                     });
                 }
             }
@@ -429,7 +469,61 @@ impl Orchestrator {
         })
     }
 
-    /// 把会话快照里的半轮状态合并进任务快照。
+    /// 在已完成任务上继续对话：沿用会话与历史，把宿主补充输入交给模型，
+    /// 不重放步骤、不推进任务进度。
+    ///
+    /// 与 [`Self::resume`] 的分工：`resume` 接中途断掉的任务，把剩余步骤跑完；
+    /// 本方法接已完成的任务，在既有会话上再跑一轮模型。会话历史、轮数、墙钟
+    /// 全部延续，终态答案先提交进历史，模型才看得见上一次的结论。
+    ///
+    /// 补充输入由宿主执行控制提供（见 [`Self::with_execution_control`]），在
+    /// 下一轮模型调用前应用。任务保持 [`TaskState::Completed`]，完成后落一份
+    /// 检查点，重启后可再次续接。
+    ///
+    /// # Errors
+    ///
+    /// 任务不在 `Completed` 态时返回 [`ApplicationError::Task`]；模型或运行
+    /// 失败时上抛对应错误。
+    pub async fn continue_conversation(
+        &mut self,
+        snapshot: TaskSnapshot,
+    ) -> Result<TaskOutcome, ApplicationError> {
+        let session_id = snapshot.run.session_id.clone();
+        let evidence = (self.evidence_factory)(&session_id)
+            .map_err(|error| ApplicationError::EvidenceInit(error.to_string()))?;
+        let budget = &self.budget;
+
+        let task = snapshot.task.clone();
+        if task.state() != TaskState::Completed {
+            return Err(ApplicationError::Task(TaskError::NotRunning));
+        }
+
+        // 从快照的运行状态重建 runner，会话历史、轮数、墙钟、缓存路由键全部延续。
+        let mut deps = self.deps.clone();
+        deps.evidence = evidence.clone();
+        let mut runner = AgentRunner::resume(snapshot.run.clone(), deps)?;
+        if let Some(control) = &self.execution_control {
+            let cancel = self.execution_cancel.clone().unwrap_or_default();
+            runner = runner.with_execution_control(control.clone(), cancel);
+        }
+        // 任务快照的 `task.state` 是 Completed，但运行状态机可能停在半轮：
+        // 审批等待、工具执行到一半。这两种状态交给 `run` 按恢复语义处理
+        // （重入审批、重放询问），`start_conversation` 会把半轮清掉。
+        // 只有运行状态也真的停在 `Completed`（答案未入历史）才提交答案。
+        if matches!(snapshot.run.state, RunState::Completed(_)) {
+            runner.start_conversation()?;
+        }
+
+        let outcome = runner.run(budget).await?;
+        // 继续对话后再落一份检查点：任务仍处 Completed，步数不变，
+        // 新结论随会话历史与消耗保留，重启后可再次续接。
+        self.save_task_snapshot(&task, Some(&runner), &snapshot.completed_outputs);
+        Ok(TaskOutcome {
+            answer: outcome.answer,
+            steps_completed: task.steps().len(),
+            session_id,
+        })
+    }
     ///
     /// 读盘在这里完成，合并逻辑在 [`task_resume::merge_session_state`]
     /// （纯函数，可单独测试）。会话快照读不出来或损坏时按"没有现场"处理：
@@ -466,6 +560,7 @@ impl Orchestrator {
         budget: &Budget,
         session_id: &SessionId,
         evidence: &Arc<dyn EvidenceSink>,
+        completed_outputs: &[StepOutput],
         runner: &mut Option<AgentRunner>,
     ) -> Result<String, ApplicationError> {
         // 循环保证 index < total；空步骤任务已被 start() 以 NoSteps 拒绝，
@@ -504,7 +599,13 @@ impl Orchestrator {
             None => {
                 let mut deps = self.deps.clone();
                 deps.evidence = evidence.clone();
-                AgentRunner::new(spec, session_id.clone(), prompt, deps)
+                let mut runner = AgentRunner::new(spec, session_id.clone(), prompt, deps);
+                // 宿主执行控制与取消随每次运行传给 runner；服务常驻模式才有。
+                if let Some(control) = &self.execution_control {
+                    let cancel = self.execution_cancel.clone().unwrap_or_default();
+                    runner = runner.with_execution_control(control.clone(), cancel);
+                }
+                runner
             }
         };
         // 记录步骤开始时的角色与轮次，事后查证据不必再对照快照。
@@ -515,6 +616,9 @@ impl Orchestrator {
                 role: step.role,
             },
         );
+        // 模型调用前先落一份任务快照：进程可能停在本步调用中途，快照停在
+        // "这一步刚开始"最干净。已完成步骤结论随快照保存，恢复时交回模型。
+        self.save_task_snapshot(task, Some(&active), completed_outputs);
         // 这一步失败时仍要把 runner 放回去。它持有本轮的历史、轮数与
         // 墙钟，恢复所需的状态都在这里。丢弃后任务快照里的会话会停在上一步
         // 结束处，这一步的交代与观察都会丢失。

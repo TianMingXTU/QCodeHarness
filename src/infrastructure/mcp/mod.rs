@@ -14,6 +14,7 @@
 
 pub mod config;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -276,9 +277,16 @@ impl RealMcpClient {
     /// 有进程沙箱的平台（Windows）上 `_job` 也随返回路径释放并整树兜底，
     /// "启动后握手未成"的清理无需额外代码；其他平台没有进程沙箱，只 kill
     /// 直接子进程。超时预算由调用方给出。
-    async fn connect(config: &config::McpServerConfig, handshake: Duration) -> Result<Self, McpError> {
+    async fn connect(
+        config: &config::McpServerConfig,
+        handshake: Duration,
+        workspace: Option<&Path>,
+    ) -> Result<Self, McpError> {
         let mut command = tokio::process::Command::new(&config.command);
         command.args(&config.args);
+        if let Some(workspace) = workspace {
+            command.current_dir(workspace);
+        }
 
         // 先建 Job 再启动进程，与 shell 工具一致（见 `run_with_policy`）。
         // Windows 上建不起来就拒绝连接：拉起一个无人看管的外部进程再
@@ -529,6 +537,7 @@ fn tool_specs(server: &str, remote_tools: Vec<RmcpTool>) -> Vec<ToolSpec> {
 /// 代码，故障也能带上当时是否进入 Job 的真实保护状态。
 struct TokioConnector {
     config: config::McpServerConfig,
+    workspace: Option<PathBuf>,
 }
 
 impl Connector for TokioConnector {
@@ -537,7 +546,7 @@ impl Connector for TokioConnector {
         timeout: Duration,
     ) -> BoxFuture<'_, Result<Box<dyn McpClientHandle>, McpError>> {
         Box::pin(async move {
-            RealMcpClient::connect(&self.config, timeout)
+            RealMcpClient::connect(&self.config, timeout, self.workspace.as_deref())
                 .await
                 .map(|client| Box::new(client) as Box<dyn McpClientHandle>)
         })
@@ -578,7 +587,19 @@ impl McpToolSource {
         config: &config::McpServerConfig,
         recorder: Option<Arc<McpLifecycleRecorder>>,
     ) -> Result<Self, McpError> {
-        Self::connect_with(config, Arc::new(TokioConnector { config: config.clone() }), recorder, McpTimeouts::production()).await
+        Self::connect_at(config, recorder, None).await
+    }
+
+    async fn connect_at(
+        config: &config::McpServerConfig,
+        recorder: Option<Arc<McpLifecycleRecorder>>,
+        workspace: Option<&Path>,
+    ) -> Result<Self, McpError> {
+        let connector = TokioConnector {
+            config: config.clone(),
+            workspace: workspace.map(Path::to_path_buf),
+        };
+        Self::connect_with(config, Arc::new(connector), recorder, McpTimeouts::production()).await
     }
 
     /// 连接骨架，连接源与超时预算可注入。
@@ -689,10 +710,30 @@ pub async fn connect_all(
     config: &config::McpConfig,
     recorder: Option<Arc<McpLifecycleRecorder>>,
 ) -> (Vec<McpToolSource>, Vec<String>) {
+    connect_all_at(config, recorder, None).await
+}
+
+/// 在指定工作区中启动全部 Server，重连时沿用同一目录。
+///
+/// 常驻服务同时承载多个任务，继承宿主目录会让 Server 访问错误的仓库。
+/// 单个 Server 失败返回警告，其余连接仍可用。
+pub async fn connect_all_in(
+    config: &config::McpConfig,
+    recorder: Option<Arc<McpLifecycleRecorder>>,
+    workspace: &Path,
+) -> (Vec<McpToolSource>, Vec<String>) {
+    connect_all_at(config, recorder, Some(workspace)).await
+}
+
+async fn connect_all_at(
+    config: &config::McpConfig,
+    recorder: Option<Arc<McpLifecycleRecorder>>,
+    workspace: Option<&Path>,
+) -> (Vec<McpToolSource>, Vec<String>) {
     let mut sources = Vec::new();
     let mut warnings = Vec::new();
     for server in &config.mcp_servers {
-        match McpToolSource::connect(server, recorder.clone()).await {
+        match McpToolSource::connect_at(server, recorder.clone(), workspace).await {
             Ok(source) => sources.push(source),
             Err(error) => warnings.push(format!(
                 "MCP Server `{}` 连接失败，其工具本次不可用: {error}",
@@ -1468,7 +1509,7 @@ mod tests {
         let config = fixture_config(&dir, "handshake-fail");
         let error = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone() }),
+            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
             None,
             subprocess_timeouts(),
         )
@@ -1487,7 +1528,7 @@ mod tests {
         let started = std::time::Instant::now();
         let error = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone() }),
+            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
             None,
             McpTimeouts {
                 connect: Duration::from_millis(400),
@@ -1522,7 +1563,7 @@ mod tests {
         let config = fixture_config(&dir, "silent-after-1");
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone() }),
+            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
             None,
             subprocess_timeouts(),
         )
@@ -1557,7 +1598,7 @@ mod tests {
         let (recorder, sink) = test_recorder();
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone() }),
+            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
             Some(recorder),
             subprocess_timeouts(),
         )
@@ -1594,7 +1635,7 @@ mod tests {
         let (recorder, sink) = test_recorder();
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone() }),
+            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
             Some(recorder.clone()),
             subprocess_timeouts(),
         )
@@ -1650,7 +1691,7 @@ mod tests {
         let (recorder, sink) = test_recorder();
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone() }),
+            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
             Some(recorder),
             subprocess_timeouts(),
         )
@@ -1693,7 +1734,7 @@ mod tests {
         let config = fixture_config(&dir, "with-child");
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone() }),
+            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
             None,
             subprocess_timeouts(),
         )

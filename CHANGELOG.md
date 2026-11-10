@@ -8,7 +8,33 @@
 
 ## [未发布]
 
-尚未开始下一个版本。
+P13 交互与集成已交付、待提交：常驻任务服务、版本化 stdio 协议、Rust SDK 与文本/全屏终端前端。
+
+### 新增
+
+- 常驻任务服务：`TaskService` / `TaskFactory` / `EventJournal` / `ExecutionControl`
+  端口与 `LocalTaskService` 持久化（状态、命令凭据、输入队列在
+  `.qcodeharness/service/state.json`，事件在 `events.jsonl`，先落盘再广播，
+  慢消费者收 `lagged`）。
+- 版本化 stdio 协议（NDJSON，Hello/Reply/Event/Error/Subscribed 五类帧）与
+  Rust SDK（`SdkClient` 按请求 ID 分发、独立事件队列，`examples/stdio-client.rs`
+  走真实子进程）。
+- 文本与全屏终端前端（`--text` / `--tui`），支持任务中补充输入、取消、继续、
+  分叉、合并与清理。
+- MCP 子进程绑定本次执行的工作区（`connect_all_in`），不再继承宿主目录。
+
+### 变更
+
+- 会话快照升至 v4：补充输入用独立的 `Turn::Input`，旧版本不迁移。
+- 依赖新增 `crossterm`、`unicode-width`；tokio 增加 `io-std`/`sync`/`signal`。
+  全仓保持 native-tls，未引入 rustls。
+
+### 未变更（已知边界）
+
+- 单进程本地服务，租约保证同一父仓库一个实例；Git 工作区是任务隔离而非
+  操作系统级沙箱。
+- 委派子任务不继承父 MCP 调用器；多用户/远程/ACP/IDE/Web 前端与旧快照自动
+  迁移留给 P15。
 
 ## [0.1.0] - 2026-11-08
 

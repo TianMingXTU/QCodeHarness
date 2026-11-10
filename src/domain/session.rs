@@ -29,6 +29,8 @@ use super::tool::{ToolCall, ToolOutcome};
 pub enum Turn {
     /// 用户消息。第一条是任务描述。
     User(String),
+    /// 运行期间追加的用户输入，不表示模板步骤边界。
+    Input { id: String, text: String },
     /// 模型一轮回复：文本（思考）+ 工具调用意图。
     Agent(AgentTurn),
     /// 与紧前一个 `Agent` 的调用一一对应的观察结果。
@@ -158,6 +160,19 @@ impl Session {
     /// 放进 commit_round 会造出一个空壳轮次。
     pub fn push_user(&mut self, message: impl Into<String>) {
         self.turns.push(Turn::User(message.into()));
+    }
+
+    /// 追加一条有稳定 ID 的补充输入。
+    pub fn push_input(&mut self, id: String, text: String) {
+        self.turns.push(Turn::Input { id, text });
+    }
+
+    /// 查找已经应用的输入，供重复投递时核对内容。
+    pub fn input_text(&self, id: &str) -> Option<&str> {
+        self.turns.iter().find_map(|turn| match turn {
+            Turn::Input { id: existing, text } if existing == id => Some(text.as_str()),
+            _ => None,
+        })
     }
 
     /// 在第 `index` 条历史之前插入一条用户消息。
@@ -329,7 +344,7 @@ impl Session {
                 // 中部用户消息是步骤边界，构造路径可以产生。过去拒绝
                 // 它们的理由（裁剪会静默丢掉）已不成立：见
                 // `domain::context::compact`，步骤交代现在完整保留。
-                Turn::User(_) => index += 1,
+                Turn::User(_) | Turn::Input { .. } => index += 1,
                 Turn::Agent(agent) => {
                     rounds += 1;
                     let calls = agent.calls.len();
@@ -403,7 +418,9 @@ impl Session {
         let mut round = 0_u32;
         for (index, turn) in self.turns.iter().enumerate() {
             match turn {
-                Turn::User(text) => slices.push(ContextSlice::User(Cow::Borrowed(text))),
+                Turn::User(text) | Turn::Input { text, .. } => {
+                    slices.push(ContextSlice::User(Cow::Borrowed(text)));
+                }
                 Turn::Agent(agent) => {
                     round += 1;
                     // commit_round 保证 Observation 紧跟 Agent，

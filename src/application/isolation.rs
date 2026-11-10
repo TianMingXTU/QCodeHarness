@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::application::port::BoxFuture;
 
 /// 从共同基线建立的独立工作区。由隔离实现签发和校验。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IsolationWorkspace {
     /// 调用方分配的子任务 ID。
     pub id: String,

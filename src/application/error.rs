@@ -52,10 +52,13 @@ pub enum ApplicationError {
         limit: Duration,
     },
 
-    /// 外部请求取消。取消是协作式的：不打断执行中的工具，在下一轮
-    /// 调用模型前生效。历史完整保留，可从断点继续。
+    /// 外部请求取消。等待已开始的工具结束，其余调用以拒绝观察配平。
     #[error("运行被取消")]
     Cancelled,
+
+    /// 宿主无法保证输入、审计或运行状态可靠，停止后续动作。
+    #[error("执行控制失败: {message}")]
+    ExecutionControl { message: String },
 
     /// 模型返回了既无文本也无工具调用的回复。
     #[error("模型返回了空回复（既无文本也无工具调用），任务终止")]
@@ -119,6 +122,9 @@ pub enum ApplicationError {
         session_id: SessionId,
         /// 本次运行中已完成的步骤数（失败的那步不算）。
         steps_completed: usize,
+        /// 原始错误保留类型，调用方可区分取消、预算与执行故障。
+        #[source]
+        source: Box<ApplicationError>,
     },
 
     /// 证据文件初始化失败。与快照错误同理：没有证据的运行无法复盘，
@@ -130,6 +136,16 @@ pub enum ApplicationError {
     /// 不要把这个错误抛给任务。
     #[error("历史摘要生成失败: {0}")]
     SummaryFailed(String),
+}
+
+impl ApplicationError {
+    /// 去掉步骤包装，返回原始运行错误。
+    pub fn root_cause(&self) -> &Self {
+        match self {
+            Self::StepFailed { source, .. } => source.root_cause(),
+            other => other,
+        }
+    }
 }
 
 /// 把工作区差异清单排成多行文本。

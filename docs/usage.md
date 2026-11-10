@@ -73,7 +73,7 @@ export LLM_VERBOSITY_CODER="low"          # 编码者少说废话
 
 运行中的每个保存点（每轮提交后、停在审批闸门前、任务完成、出错前）都会把完整可恢复状态原子写入 `.qcodeharness/snapshots/<会话ID>.json`（先写临时文件刷盘再改名，半途崩溃不会留下截断的快照）。快照带格式版本号，读到不认识的版本直接拒绝而不是猜着兼容；历史在重建时逐条校验配对不变量，损坏的快照变成显式错误。
 
-**快照格式版本当前为 3**。旧版本的快照恢复时会被明确拒绝并报出版本差异，不做静默兼容——旧会话无法用 `--resume` 续跑，涉及旧会话的任务请重新执行。拒绝是刻意的：拿旧快照猜着跑比直接说"不支持"危险。
+**会话快照格式版本当前为 4**。P13 为补充输入增加独立的 `Turn::Input`，使输入与模板步骤说明可以分别计数。旧版快照恢复时明确报出版本差异并拒绝，不做自动迁移；涉及旧快照的任务需使用原版本继续或重新执行。任务快照外层版本仍为 1，内部会话同样校验版本。
 
 ```bash
 cargo run -- --list-sessions              # 列出可恢复的会话（ID、轮数、停在哪）
@@ -185,9 +185,7 @@ cargo run --example custom-tool-source    # 内置工具与自定义 ToolSource 
 证据汇）、每个扩展点该改哪个文件，以及加新行为的判断顺序，见
 [architecture.md](architecture.md)。
 
-**明确不做**：不做 cdylib 动态插件装载，不做通用脚本插件协议，也不提供多前端
-事件协议——社区扩展以"依赖本 crate 编译、在装配层接线"的方式接入；本地清单
-只描述提示词与已声明的工具动作，需要任意逻辑仍要写 Rust。
+社区扩展以依赖本 crate 编译、在装配层接线的方式接入；本地清单描述提示词与已声明的工具动作，需要任意逻辑时编写 Rust。动态库插件装载、通用脚本插件协议暂未提供。前端集成使用[常驻任务服务](#常驻任务服务p13)的版本化 stdio 协议与 Rust SDK。
 
 ## 结构化补丁（`apply_patch`）
 
@@ -264,6 +262,100 @@ cargo run -- "阅读 Cargo.toml，说明本项目用了哪些依赖"
 `QCodeHarness.exe`），用法与 `cargo run --` 一致。
 
 任务按模板编排执行（默认 `bug-fix`，见[任务编排](#任务编排)一节）：控制台先打印任务、模板与审批模式，然后在同一个会话里依次跑完各步骤的 ReAct 循环（轮次号跨步连续，分隔线、`[思考]`、`[行动]`、`[观察]`），结束是 `──── 最终答案 ────` 与一行汇总（任务 ID、完成步数、会话 ID）。
+
+## 常驻任务服务（P13）
+
+在目标 Git 仓库根目录启动。服务模式需要与单次 CLI 相同的模型配置，工作区由 Git 工作树隔离；同一个父仓库同时只允许一个服务实例。四种入口互斥，也不与任务描述、`--yes`、`--ai-review` 或恢复参数组合：
+
+```bash
+QCodeHarness --interactive    # stdin/stdout 均为终端时选 TUI，否则选文本
+QCodeHarness --text           # 逐行文本，支持管道与屏幕阅读器
+QCodeHarness --tui            # 全屏界面，要求真实终端
+QCodeHarness --stdio          # NDJSON 协议，供 SDK 或其他前端接入
+```
+
+从源码运行时在命令前加 `cargo run --`。服务不会使用 `QCH_AUTO_APPROVE` 跳过审批；每次需要审批的调用均有独立的审批 ID、任务 ID 和执行 ID。审批等待不占用前端输入通道，可以同时查询、补充输入和取消。
+
+### 文本与 TUI 命令
+
+未选择任务时，直接输入文字创建任务；创建成功后自动选中该任务，后续文字作为补充输入。使用 `/create` 开另一个任务，或 `/select none` 回到未选择状态。以 `//` 开头可输入字面 `/`。
+
+| 命令 | 行为 |
+| --- | --- |
+| `/create [--kind review] <目标>` | 新建任务；模板可用 `bug-fix`、`feature`、`review`、`refactor` |
+| `/list`、`/get [任务ID]` | 查看任务状态、工作区、用量与错误；省略 `get` 的 ID 时取已选任务 |
+| `/select <任务ID>`、`/select none` | 选择任务或取消选择 |
+| `/input <任务ID> <文字>` | 向指定任务提交补充输入 |
+| `/approvals [任务ID或all]` | 查询当前待审批项，显示调用参数、复核理由、恢复重新询问标记与归属 |
+| `/approve <审批ID> [任务ID 执行ID]` | 批准本次审批；省略归属时从实时待审批列表查出并复核 |
+| `/deny <审批ID> [任务ID 执行ID]` | 拒绝本次审批 |
+| `/cancel [任务ID]`、`/continue [任务ID]` | 取消或继续；省略 ID 时取已选任务 |
+| `/fork [任务ID] [补充目标]` | 从停止后的任务复制工作区、历史和任务进度，创建独立分支 |
+| `/events [游标] [条数]` | 只读回放；默认游标 0、100 条，终端每次最多 1000 条 |
+| `/merge <任务ID>` | 将任务改动合并到父仓库；要求父仓库状态满足 Git 合并校验，并执行配置的验证器 |
+| `/cleanup <任务ID>` | 显式删除该任务工作区；运行中的任务需先取消并等它停止 |
+| `/help`、`/quit` | 查看帮助或关闭服务退出 |
+
+TUI 用 Tab / Shift-Tab 切换任务，PageUp / PageDown 滚动事件，左右键、Home / End、Backspace / Delete 编辑输入，Enter 提交。中文按显示宽度定位光标，粘贴作为一条输入处理。Ctrl-C 先取消已选的运行任务，再按一次退出；未选运行任务时直接退出。文本模式不启用终端原始模式，EOF 与 `/quit` 都会请求关闭服务。
+
+### 输入、取消、继续与分叉
+
+补充输入先进入持久队列，只在完整工具轮次配平后的下一次模型调用前追加到会话。`InputReceived` 表示已受理，`InputApplied` 表示已写入会话快照。客户端对重试沿用相同的 `message_id`；同 ID 同文本不会重复应用，改文本会报冲突。停止或已完成任务也可以先收输入，再显式 `/continue`。
+
+取消会唤醒待审批调用，等待已经开始的工具收尾，并为未开始的工具补拒绝观察。服务状态先进入 `stopping`，最终通过 `Stopped` 报告 `cancelled`；在途模型调用需要等待响应或既有超时，取消不会把迟到的模型回复标成完成。
+
+继续沿用任务 ID、会话 ID、历史和已完成步骤，新建执行 ID 并增加 `attempt`。每次执行获得新额度，累计用量保留。已完成任务继续对话时保留原答案，模板步骤不会重跑。任务工作区被外部修改后，摘要校验会拒绝静默续跑。
+
+分叉要求源执行已经停止且存在可恢复检查点。新任务获得独立工作区、任务/会话/执行 ID，沿用已完成步骤和原会话历史，事件记录源任务及原会话归属。补充目标进入新分支输入，不修改原任务。
+
+工作区在完成、取消、预算耗尽或失败后保留，供人工检查、继续或分叉。合并与清理各有显式命令，完成状态不自动触发这两个动作。`verification` 是工作区摘要；合并前是否实际运行测试由 `parallel.verify_command` 决定，未配置时只做结构验证。
+
+### stdio 协议与 Rust SDK
+
+协议版本为 **1**，UTF-8 NDJSON，每行一个 JSON 对象。连接后服务先输出：
+
+```json
+{"type":"hello","version":1}
+```
+
+命令封套含 `version`、客户端生成的 `id`、`command`。例如：
+
+```json
+{"version":1,"id":"create-1","command":{"op":"create","goal":"检查最近的修改","kind":"Review"}}
+{"version":1,"id":"list-1","command":{"op":"list"}}
+{"version":1,"id":"input-1","command":{"op":"input","task_id":"<任务ID>","message_id":"message-1","text":"请同时检查错误路径"}}
+{"version":1,"id":"decision-1","command":{"op":"decide","approval_id":"<审批ID>","task_id":"<任务ID>","execution_id":"<执行ID>","allow":false}}
+{"version":1,"id":"stop-1","command":{"op":"cancel","task_id":"<任务ID>"}}
+{"version":1,"id":"history-1","command":{"op":"events","after":42,"limit":100}}
+{"version":1,"id":"subscription-1","command":{"op":"subscribe","after":42}}
+{"version":1,"id":"shutdown-1","command":{"op":"shutdown"}}
+```
+
+`TaskKind` 在线路上使用 Rust 枚举名：`BugFix`、`Feature`、`Review`、`Refactor`；终端模板参数使用小写连字符形式。命令完整定义见 `domain::service::ServiceCommand`，`subscribe` 是替换连接订阅的传输命令。
+
+stdout 只包含 `hello`、`reply`、`event`、`error`、`subscribed` 五类帧，诊断输出使用 stderr。`reply` 的 `id` 对应请求，`result` 是 `ServiceReply`；`event` 内含版本、连续序号、时间戳、任务/会话/执行归属与实际事件载荷。收到 `Accepted` 只说明命令已受理，任务终态通过事件或查询确认。未知协议版本返回 `unsupported_version`，非法请求返回 `invalid_request`；单条错误不会断开合法后续请求。
+
+有副作用的请求重试必须沿用原 ID 与完整参数。服务持久化命令凭据，相同请求返回原回复；相同 ID 改命令或参数返回 `request_conflict`。连接断开不能证明命令未执行，重连后先查任务状态或以相同 ID 重试。任意崩溃时刻的跨文件原子提交与工具副作用恰好一次执行仍不作保证。
+
+初始订阅从序号 0 回放，`subscribe.after` 与 `events.after` 均为排他游标。事件回放只展示已提交事实，不调用模型、工具或审批。订阅缓冲 128 条，慢消费者会收到 `lagged`，可用最后成功序号分页补读并重新订阅。SDK 本地事件队列同样为 128 条，溢出会显式失败并终止该连接；读完已缓存事件后重连并补读，按序号去重。单帧上限 2 MiB，待处理请求上限 64；大批量回放收到 `frame_too_large` 时缩小 `limit`。
+
+`interface::sdk::SdkClient` 提供 `from_io`、`from_parts`、`call`、`subscribe`、`next_event`。回复按请求 ID 分发，事件独立缓冲；等待审批或命令回复期间可并发提交其他命令。SDK 只拥有本地传输任务，宿主负责子进程生命周期，发送 Shutdown 后仍应等待子进程退出。
+
+[examples/stdio-client.rs](../examples/stdio-client.rs) 展示真实子进程连接、创建任务、读取事件、逐次审批及关闭：
+
+```bash
+cargo build
+cargo run --example stdio-client -- ./target/debug/QCodeHarness "阅读 Cargo.toml"
+# Windows 下将可执行文件路径改为 .\target\debug\QCodeHarness.exe
+```
+
+### 持久化与边界
+
+服务状态及命令凭据在 `.qcodeharness/service/state.json`，服务事件在同目录 `events.jsonl`。服务事件的序号独立于旧 `AuditEvent` evidence 序号；日志包含真实审计载荷及模型、审批、输入和工作区生命周期事件。单事件上限 1 MiB，单日志上限 64 MiB，达到上限明确报错，需停止服务后由宿主归档，不自动丢弃历史。
+
+重启接管原工作区与最新检查点，把上次 `running` / `stopping` 标为 `interrupted`，等待显式继续。旧审批不会从日志自动批准，恢复到审批边界时重新发布请求。关闭服务会取消任务、等待执行及资源收尾，再释放服务和事件日志租约。
+
+隔离覆盖工具根与 MCP 子进程启动目录，仍受[可执行边界](#可执行边界)中已有的平台限制。Git 工作树不是操作系统级文件或网络沙箱。委派子任务重建自己的内置工具、审批和证据，不继承父任务 MCP 调用器；依赖父 MCP 工具的扩展在子任务装配时明确报错。当前交付为本地单用户服务，ACP、IDE 插件、Web UI、远程多用户调度与旧快照自动迁移仍在后续范围。
 
 ## 缺陷修复演练（隔离仓库）
 

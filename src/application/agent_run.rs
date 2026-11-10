@@ -15,6 +15,7 @@ use crate::application::port::{
     ModelRequest, RunHooks,
 };
 use crate::application::agent_roster::AgentRoster;
+use crate::application::control::ExecutionControl;
 use crate::application::context_policy::ContextPolicy;
 use crate::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
 use crate::application::summarizer::{render_slices, SummarizeInput, Summarizer};
@@ -213,6 +214,11 @@ pub struct AgentRunner {
     reask_approval: bool,
     /// 运行挂点：来自依赖。只观察，不参与状态机。
     hooks: Arc<dyn RunHooks>,
+    /// 宿主提供的执行控制：补充输入队列与运行状态检查。
+    ///
+    /// 输入只在完整轮次配平后应用；`check` 失败在下一个工具前停下。
+    /// `None` 表示宿主不参与运行期控制，行为与旧版一致。
+    execution_control: Option<Arc<dyn ExecutionControl>>,
 }
 
 impl AgentRunner {
@@ -273,6 +279,7 @@ impl AgentRunner {
             replay_pending: None,
             reask_approval: false,
             hooks,
+            execution_control: None,
         };
         runner.refresh_role_boundary();
         runner.bind_cancel_to_gate();
@@ -393,6 +400,7 @@ impl AgentRunner {
             replay_pending: None,
             reask_approval: false,
             hooks,
+            execution_control: None,
         };
         runner.refresh_role_boundary();
         runner.bind_cancel_to_gate();
@@ -408,6 +416,73 @@ impl AgentRunner {
     /// [`CancelHandle`]，闸门拿到的是它的副本：两边看到同一个开关。
     fn bind_cancel_to_gate(&self) {
         self.approvals.bind_cancel(self.cancel.clone());
+    }
+
+    /// 在完整轮次配平后应用宿主补充输入。
+    ///
+    /// 输入只在 [`RunState::AwaitingModel`] 边界取用：历史里"助手轮 + 观察"
+    /// 的配对未被打散，新输入追加在末尾，下一轮模型才看得见。先落盘再通知
+    /// 宿主 `input_applied`：生效以持久化为准，宿主确认的是"这条输入已写进
+    /// 会话"，而不是"请求已收到"。宿主取输入或确认失败都归为
+    /// [`ApplicationError::ExecutionControl`]，停止后续动作，不静默吞掉。
+    fn apply_inputs(&mut self) -> Result<(), ApplicationError> {
+        let Some(control) = self.execution_control.clone() else {
+            return Ok(());
+        };
+        let inputs = control.take_inputs();
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        for input in &inputs {
+            // 宿主可在崩溃前保留尚未确认的输入；会话历史已含该 ID 时不再追加，
+            // 但仍要确认，队列才不会反复投递同一条消息。
+            if self.session.input_text(&input.id).is_none() {
+                self.session.push_input(input.id.clone(), input.text.clone());
+            }
+        }
+        self.try_save_snapshot()?;
+        for input in &inputs {
+            control
+                .input_applied(input)
+                .map_err(|message| ApplicationError::ExecutionControl { message })?;
+        }
+        Ok(())
+    }
+
+    /// 工具执行前询问宿主运行状态是否可靠。
+    ///
+    /// 宿主的审计或运行检查失败时，返回 [`ApplicationError::ExecutionControl`]
+    /// 在下一个工具前停下。放在 Dispatching 分支的调用前，不阻断已开始的调用。
+    fn check_control(&self) -> Result<(), ApplicationError> {
+        let Some(control) = &self.execution_control else {
+            return Ok(());
+        };
+        control
+            .check()
+            .map_err(|message| ApplicationError::ExecutionControl { message })
+    }
+
+    /// 在已完成的会话上继续对话：把终态答案提交进历史，退回等待模型。
+    ///
+    /// 与 [`Self::begin_step`] 的分工：`begin_step` 换角色、交代下一步；本方法
+    /// 不换角色，只把 `Completed` 的答案落进历史并回到 [`RunState::AwaitingModel`]。
+    /// 供任务级"继续对话"使用（见 `orchestrator::continue_conversation`）。
+    /// 已完成的最后一步答案只停在 `Completed` 态里、尚未入历史，不提交会让
+    /// 继续对话时模型看不见它。历史与用量全部保留，不重放已完成步骤。
+    ///
+    /// # Errors
+    ///
+    /// 提交最终答案破坏配对时返回 [`ApplicationError::Session`]；正常路径不会发生。
+    pub fn start_conversation(&mut self) -> Result<(), ApplicationError> {
+        if let RunState::Completed(answer) = &self.state {
+            let answer = answer.clone();
+            self.session
+                .commit_round(AgentTurn { text: answer, calls: Vec::new() }, Vec::new())?;
+        }
+        self.state = RunState::AwaitingModel;
+        self.pending = None;
+        self.save_snapshot();
+        Ok(())
     }
 
     /// 把快照里的半轮状态转换为后续执行路径。
@@ -462,6 +537,22 @@ impl AgentRunner {
     /// 模型调用前停下。
     pub fn cancel_handle(&self) -> CancelHandle {
         self.cancel.clone()
+    }
+
+    /// 接入宿主执行控制：运行期补充输入与运行状态检查。
+    ///
+    /// 补充输入只在完整轮次配平后（回到 [`RunState::AwaitingModel`]）应用，
+    /// 保证历史里"助手轮 + 观察"的配对不被打散；`check` 失败（审计或宿主
+    /// 不可靠）在下一个工具前停下，用 [`ApplicationError::ExecutionControl`]
+    /// 表达，不静默吞掉。取消开关与输入应用共用 `cancel`，宿主取消后在途
+    /// 工具仍会配平，未开始的调用以拒绝观察回填。
+    pub fn with_execution_control(mut self, control: Arc<dyn ExecutionControl>, cancel: CancelHandle) -> Self {
+        self.execution_control = Some(control);
+        self.cancel = cancel;
+        // 构造时闸门绑定的是默认开关；换成宿主的取消通道后必须重新绑定，
+        // 否则异步审批永远看不到宿主发出的取消。
+        self.bind_cancel_to_gate();
+        self
     }
 
     /// 进入下一步：换角色、交代步骤、把上一步结论写入历史。
@@ -733,6 +824,9 @@ impl AgentRunner {
         // 重新赋值，取出的默认值不会外泄。
         match std::mem::replace(&mut self.state, RunState::AwaitingModel) {
             RunState::AwaitingModel => {
+                // 补充输入只在完整轮次配平后应用，历史里"助手轮 + 观察"的配对
+                // 不被打散。应用在询问模型前，下一轮模型才看得见新输入。
+                self.apply_inputs()?;
                 let reply = self.ask_model().await?;
                 if reply.turn.is_final_answer() {
                     self.state = RunState::Completed(reply.turn.text.clone());
@@ -891,6 +985,15 @@ impl AgentRunner {
                 if in_flight {
                     return self.replay_interrupted_call(call).await;
                 }
+                // 取消已请求且本调用尚未开始：不执行，以拒绝观察配平本轮，
+                // 历史保持"助手轮 + 观察"完整，恢复时不会重发这次调用。
+                if self.cancel.is_cancelled() {
+                    let outcome = ToolOutcome::refused("运行已取消，该调用未执行".to_owned());
+                    return self.record_and_advance(call, outcome).await;
+                }
+                // 宿主运行状态检查：审计不可靠时，在下一个工具前停下。已开始的
+                // 调用不受影响（上面取消判断已放最前），只拦尚未发出的调用。
+                self.check_control()?;
                 // **执行前落盘**：调用一旦发起，进程可能在其执行期间退出。
                 // 磁盘上必须留下"本次正要执行"的痕迹，否则恢复时无法判断
                 // 是否应重跑。
@@ -956,6 +1059,12 @@ impl AgentRunner {
             }
             match self.step().await {
                 Ok(RunState::Completed(answer)) => {
+                    // 取消可能发生在模型调用期间：回复抵达时闸门已经放行过，
+                    // 循环顶部没有机会再检查。此时不能把取消后的回复报成成功。
+                    if self.cancel.is_cancelled() {
+                        self.save_snapshot();
+                        return Err(ApplicationError::Cancelled);
+                    }
                     return Ok(AgentOutcome {
                         answer,
                         turns_used: self.consumption.turns,
@@ -1250,22 +1359,19 @@ impl AgentRunner {
         }
     }
 
-    /// 将快照保存到依赖提供的存储，失败时降级为 stderr 警告。
-    ///
-    /// 快照是附加能力，任务本身是主线，不能让一次写盘失败（磁盘满、目录
-    /// 被删）中断已经运行多轮的任务。
+    /// 普通运行沿用快照失败时警告的策略；补充输入确认需要严格保存。
     fn save_snapshot(&mut self) {
-        // 先克隆再刷新耗时：refresh_elapsed 需要 &mut self，不能在对
-        // session_store 的借用期间调用。
-        let Some(store) = self.session_store.clone() else {
-            return;
-        };
-        // 保存前重测墙钟，保存点可能位于 run() 循环计时之外。
-        self.refresh_elapsed();
-        let snapshot = self.snapshot();
-        if let Err(error) = store.save(&snapshot) {
+        if let Err(error) = self.try_save_snapshot() {
             eprintln!("警告：快照保存失败（任务继续）: {error}");
         }
+    }
+
+    fn try_save_snapshot(&mut self) -> Result<(), StoreError> {
+        let Some(store) = self.session_store.clone() else {
+            return Ok(());
+        };
+        self.refresh_elapsed();
+        store.save(&self.snapshot())
     }
 }
 

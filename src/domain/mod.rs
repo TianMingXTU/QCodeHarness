@@ -23,3 +23,4 @@ pub mod worktree;
 pub mod workflow;
 pub mod config;
 pub mod extension;
+pub mod service;

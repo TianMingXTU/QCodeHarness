@@ -250,6 +250,11 @@ impl Task {
         }
     }
 
+    /// 复制任务进度，给分支任务分配独立 ID。
+    pub fn fork_with_id(&self, new_id: TaskId) -> Self {
+        Self { id: new_id, ..self.clone() }
+    }
+
     /// 开始执行：`Pending → Running { step: 0 }`。
     ///
     /// # Errors

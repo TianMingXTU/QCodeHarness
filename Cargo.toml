@@ -29,7 +29,7 @@ thiserror = "2"
 # 策略配置用 TOML：人写的配置文件要能带注释解释"为什么禁这个工具"，
 # JSON 不支持注释，YAML 又多一个缩进地狱。toml 的表格数组正好表达规则列表。
 toml = "0.8"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "time", "process", "io-util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "time", "process", "io-util", "io-std", "sync", "signal"] }
 # MCP（Model Context Protocol）官方 Rust SDK：经它接入外部工具。
 # 只选 client + stdio 子进程传输 + 通用 async-rw 传输，明确关掉默认
 # features——默认集会拉 reqwest/SSE 一族，进而引入 rustls（Windows 上
@@ -40,6 +40,10 @@ ignore = "0.4.34"
 regex = "1.13.1"
 # 用户级配置目录（XDG 标准）。
 dirs = "5"
+# 常驻终端前端；文本模式和 stdio 服务不启用终端原始模式。
+crossterm = "0.29"
+# TUI 输入按显示宽度换算终端列位；CJK 全角与组合字符靠它对齐光标。
+unicode-width = "0.2"
 
 # Windows Job Object：进程树的资源限制与整树终止（沙箱）。
 # 只挑 Win32 的三个子 feature（句柄基础 + Job Objects + 进程/线程），

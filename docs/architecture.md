@@ -47,6 +47,7 @@ IO、`rig`、`toml`、`tokio`、`windows` 与文件操作，这条边界由验�
 | 加一条声明式能力（提示词 + 事件触发的工具动作） | `Skill` / `Hook` / `Plugin` | `application/extension.rs` | `ExtensionRegistry`（`LocalExtensionStore` 从 `.qcodeharness/extensions/manifests/` 加载），`adapters()` 装配进任务 | 本地 TOML 清单；编译期 Plugin 示例见 `examples/custom-extension.rs` |
 | 换一种隔离工作区 | `WorkspaceIsolation` + `WorkspaceVerifier` | `application/isolation.rs` | `SubAgentToolSource::new` 的 `isolation` / `verifier` 参数 | `GitWorktreeManager`（`infrastructure/git_worktree.rs`）+ `StructuralVerifier` / `CommandVerifier` |
 | 换子 Agent 的依赖装配方式 | `ChildAgentFactory` | `application/delegation.rs` | `SubAgentToolSource::new` 的 `factory` 参数 | `ChildFactory`（`main.rs`，按子工作区重建工具、审批、证据与指令） |
+| 让同一进程持续接单、外部前端接入（文本/全屏/stdio/SDK） | `TaskService` + `TaskFactory` + `ExecutionControl` | `application/service.rs`、`application/service_factory.rs`、`application/control.rs` | `LocalTaskService`（`infrastructure/task_service.rs`）；生产装配 `ProductionTaskFactory`（`infrastructure/service_factory.rs`），入口在 `main.rs` 的 `--stdio` / `--interactive` / `--text` / `--tui` | 文本与全屏终端（`interface/terminal.rs`）、stdio 传输与 Rust SDK（`interface/stdio.rs`、`interface/sdk.rs`） |
 
 两条可运行示例：
 
@@ -91,5 +92,6 @@ cargo run --example custom-extension      # 编译期 Plugin：Skill + Hook
 - **不做通用脚本插件协议。** 已有的 manifest 只描述提示词与已声明的工具
   动作，不解释脚本、不加载动态库；权限以实际工具名精确匹配，由用户显式
   批准，新增清单默认禁用。需要任意逻辑的扩展仍按上面的扩展点写 Rust。
-- **不提供多前端协议。** 结构化事件流、SDK/ACP、IDE 接入留给后续阶段；
-  当前唯一前端是 CLI。扩展点先稳定，协议后行。
+- **不提供多用户服务。** 任务服务是单进程本地形态：租约保证同一时刻只有一个
+  进程拥有服务状态，多用户并发、远程接入与 ACP/IDE 前端留给稳定版阶段。
+  P13 已提供的版本化 stdio 协议与 Rust SDK 是这些前端接入的既定入口。

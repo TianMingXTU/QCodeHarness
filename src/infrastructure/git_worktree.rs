@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,9 +22,11 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const STATE_EXCLUSION: &str = ":(top,exclude).qcodeharness";
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OwnedWorkspace {
     workspace: IsolationWorkspace,
     marker: Vec<u8>,
+    #[serde(skip)]
     removed: bool,
 }
 
@@ -105,10 +107,319 @@ impl GitWorktreeManager {
             &manager.root,
             manager.storage.parent().expect("storage 有父目录"),
         )?;
-        fs::create_dir(&manager.storage).map_err(io_error)?;
+        // 存储目录与 hooks 文件必须存在；已存在（重启前的任务目录）时复用，不能破坏它们。
+        fs::create_dir_all(&manager.storage).map_err(io_error)?;
+        let disabled = manager.storage.join(".disabled-hooks");
+        match fs::symlink_metadata(&disabled) {
+            Ok(metadata) if metadata.is_file() => {
+                if metadata.len() != 0 {
+                    return Err("隔离实例的 Git 配置文件被改动".to_owned());
+                }
+            }
+            Ok(_) => return Err("隔离实例的 Git 配置文件不是普通文件".to_owned()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                File::create(&disabled).map_err(io_error)?.sync_all().map_err(io_error)?;
+            }
+            Err(error) => return Err(io_error(error)),
+        }
         // hooksPath 指向普通文件，任何 hook 名拼接后都不存在，不依赖一个可被填入脚本的目录。
-        File::create(manager.storage.join(".disabled-hooks")).map_err(io_error)?;
         Ok(manager)
+    }
+
+    /// 接管此前签发的工作区，不要求父工作区仍停留在原基线。
+    ///
+    /// # Errors
+    ///
+    /// 安全目录、签发记录、Git 入口或仓库归属不匹配，或子树 HEAD 已变化时拒绝接管。
+    pub async fn adopt(&self, workspace: &IsolationWorkspace) -> Result<(), String> {
+        let mut workspaces = self.workspaces.lock().await;
+        self.check_storage()?;
+        if workspaces.contains_key(&workspace.id) {
+            self.check_owned(self.owned(&workspaces, workspace)?)?;
+        }
+        let record = self.record_path(workspace)?;
+        check_path(&self.root, &record, false)?;
+        if !fs::symlink_metadata(&record).map_err(io_error)?.is_file() {
+            return Err("工作区签发记录不是普通文件".to_owned());
+        }
+        let owned: OwnedWorkspace = serde_json::from_slice(&fs::read(record).map_err(io_error)?)
+            .map_err(|error| format!("工作区签发记录无效: {error}"))?;
+        if owned.workspace != *workspace {
+            return Err("工作区与持久化签发记录不符".to_owned());
+        }
+        self.check_owned(&owned)?;
+        self.check_repository(workspace, &owned.marker).await?;
+        self.child_at(workspace).await?;
+        workspaces.insert(workspace.id.clone(), owned);
+        Ok(())
+    }
+
+    /// 从源树的原基线复制未提交补丁，保留源树；父工作区的后续变化不妨碍复制。
+    ///
+    /// # Errors
+    ///
+    /// 源树不属于本实例、已提交、含不安全变更，或新 ID 已占用时返回错误。
+    /// Git 忽略的新增文件无法进入 capture 补丁，因此存在这类文件时拒绝复制。
+    /// 补丁应用失败时清理新树，清理失败会在错误中附带路径。
+    pub async fn fork_workspace(
+        &self,
+        source: &IsolationWorkspace,
+        id: &str,
+    ) -> Result<IsolationWorkspace, String> {
+        let mut workspaces = self.workspaces.lock().await;
+        self.check_owned(self.owned(&workspaces, source)?)?;
+        // Git 把嵌套 .git 目录当成仓库边界，status 与 ls-files 都看不见里面的
+        // 文件。fork 前逐目录查一遍，避免这类内容被补丁静默丢掉。
+        check_nested_repositories(&source.root, &source.root)?;
+        let ignored = self
+            .git(
+                &source.root,
+                &[
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    ".",
+                    STATE_EXCLUSION,
+                ],
+                None,
+            )
+            .await?;
+        if let Some(path) = nul_records(&ignored)?.first() {
+            let path = checked_patch_path(path)?;
+            return Err(format!("源工作区含未捕获的忽略文件，拒绝复制: {path:?}"));
+        }
+        let change = self.capture_inner(source).await?;
+        let owned = self
+            .allocate_workspace(id, &source.base_revision, &workspaces)
+            .await?;
+        let copy = async {
+            for path in self
+                .patch_paths(&owned.workspace.root, &change.patch)
+                .await?
+            {
+                check_relative(&owned.workspace.root, &path)?;
+            }
+            self.apply_checked(&owned.workspace.root, &change.patch, true)
+                .await?;
+            let copied = self.capture_inner(&owned.workspace).await?;
+            if copied.patch != change.patch {
+                return Err("新工作区补丁与源工作区不一致".to_owned());
+            }
+            self.check_owned(self.owned(&workspaces, source)?)?;
+            self.child_at(source).await
+        }
+        .await;
+        if let Err(error) = copy {
+            return combine_cleanup(Err(error), self.discard_workspace(&owned.workspace).await);
+        }
+        self.register_workspace(owned, &mut workspaces).await
+    }
+
+    /// 返回 capture 补丁的 Git blob 摘要，不写入对象库。
+    ///
+    /// 调用方保存并比较返回值，以发现暂停或重启期间的未提交改动；相同补丁的摘要相同。
+    /// 此操作与 `capture` 一样会暂存子树变更。
+    ///
+    /// # Errors
+    ///
+    /// 工作区校验、捕获或 Git 摘要计算失败时返回错误。
+    pub async fn capture_digest(&self, workspace: &IsolationWorkspace) -> Result<String, String> {
+        let change = self.capture(workspace).await?;
+        let digest = self
+            .git(
+                &self.root,
+                &["hash-object", "--stdin", "--no-filters"],
+                Some(&change.patch),
+            )
+            .await?;
+        let digest = output_text(&digest)?;
+        validate_revision(digest)?;
+        Ok(digest.to_owned())
+    }
+
+    fn workspace_directory<'a>(
+        &self,
+        workspace: &'a IsolationWorkspace,
+    ) -> Result<&'a Path, String> {
+        validate_id(&workspace.id)?;
+        validate_revision(&workspace.base_revision)?;
+        let relative = workspace
+            .root
+            .strip_prefix(self.storage.parent().expect("storage 有父目录"))
+            .map_err(|_| "工作区不在本仓库的安全工作树目录内")?;
+        let components: Vec<_> = relative.components().collect();
+        if components.len() != 2
+            || components
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || components[1].as_os_str() != workspace.id.as_str()
+        {
+            return Err("工作区路径与任务 ID 或安全目录层级不符".to_owned());
+        }
+        validate_id(
+            components[0]
+                .as_os_str()
+                .to_str()
+                .ok_or("实例目录不是 UTF-8")?,
+        )?;
+        Ok(workspace.root.parent().expect("已验证工作区路径层级"))
+    }
+
+    fn record_path(&self, workspace: &IsolationWorkspace) -> Result<PathBuf, String> {
+        Ok(self
+            .workspace_directory(workspace)?
+            .join(format!(".{}.workspace.json", workspace.id)))
+    }
+
+    async fn check_repository(&self, workspace: &IsolationWorkspace, marker: &[u8]) -> Result<(), String> {
+        let main_git = self.main_git_dir()?;
+        let gitdir = self.child_git_dir(marker)?;
+        let worktrees = main_git.join("worktrees");
+        let name = gitdir
+            .strip_prefix(&worktrees)
+            .map_err(|_| "子工作区 Git 元数据不在父仓库内")?;
+        if name.components().count() != 1 {
+            return Err("子工作区 Git 元数据层级无效".to_owned());
+        }
+        // commondir 决定子树实际使用哪个对象库；被改写指向别处时必须拒绝，
+        // 否则同一 revision 会在不同对象内容上通过校验。
+        let common_file = gitdir.join("commondir");
+        let target = if fs::symlink_metadata(&common_file).is_ok() {
+            let bytes = fs::read(&common_file).map_err(io_error)?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| "commondir 记录不是文本")?;
+            PathBuf::from(text.trim())
+        } else {
+            gitdir.clone()
+        };
+        let target = if target.is_absolute() {
+            target
+        } else {
+            gitdir.join(target)
+        };
+        if fs::canonicalize(target).map_err(io_error)? != main_git {
+            return Err("子工作区的共享对象库被改写，拒绝接管".to_owned());
+        }
+        let top = self
+            .git(&workspace.root, &["rev-parse", "--show-toplevel"], None)
+            .await?;
+        if fs::canonicalize(output_text(&top)?).map_err(io_error)? != workspace.root {
+            return Err("子工作区路径不是 Git 工作树根".to_owned());
+        }
+        let registered = self
+            .git(&self.root, &["worktree", "list", "--porcelain", "-z"], None)
+            .await?;
+        for record in nul_records(&registered)? {
+            if let Some(path) = record.strip_prefix(b"worktree ") {
+                let path = output_text(path)?;
+                if fs::canonicalize(path).is_ok_and(|root| root == workspace.root) {
+                    return Ok(());
+                }
+            }
+        }
+        Err("子工作区未注册在该 Git 仓库中".to_owned())
+    }
+
+    fn main_git_dir(&self) -> Result<PathBuf, String> {
+        if self.root_marker == b"directory" {
+            return fs::canonicalize(self.root.join(".git")).map_err(io_error);
+        }
+        // 父仓库的 .git 是文件时，marker 保存其 gitdir: 内容。
+        let text = std::str::from_utf8(&self.root_marker).map_err(|_| "父工作区的 .git 入口无效")?;
+        let target = text
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .ok_or("父工作区的 .git 入口无效")?;
+        fs::canonicalize(target).map_err(io_error)
+    }
+
+    fn child_git_dir(&self, marker: &[u8]) -> Result<PathBuf, String> {
+        let text = std::str::from_utf8(marker).map_err(|_| "子工作区的 .git 入口不是文本")?;
+        let target = text
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .ok_or("子工作区不是注册的 Git 工作树")?;
+        fs::canonicalize(target).map_err(io_error)
+    }
+
+    async fn allocate_workspace(
+        &self,
+        id: &str,
+        base: &str,
+        workspaces: &HashMap<String, OwnedWorkspace>,
+    ) -> Result<OwnedWorkspace, String> {
+        validate_id(id)?;
+        validate_revision(base)?;
+        if workspaces.contains_key(id) {
+            return Err(format!("工作区 ID 已使用: {id}"));
+        }
+        self.check_storage()?;
+        let workspace = IsolationWorkspace {
+            id: id.to_owned(),
+            root: self.storage.join(id),
+            base_revision: base.to_owned(),
+        };
+        if workspace.root.try_exists().map_err(io_error)?
+            || self
+                .record_path(&workspace)?
+                .try_exists()
+                .map_err(io_error)?
+        {
+            return Err("工作区目录或签发记录已存在，拒绝覆盖".to_owned());
+        }
+        let marker = self.checkout(&workspace.root, base).await?;
+        Ok(OwnedWorkspace {
+            workspace,
+            marker,
+            removed: false,
+        })
+    }
+
+    async fn register_workspace(
+        &self,
+        owned: OwnedWorkspace,
+        workspaces: &mut HashMap<String, OwnedWorkspace>,
+    ) -> Result<IsolationWorkspace, String> {
+        let persist = (|| {
+            let record = self.record_path(&owned.workspace)?;
+            check_path(&self.root, &record, true)?;
+            let bytes = serde_json::to_vec(&owned).map_err(|error| error.to_string())?;
+            File::options()
+                .write(true)
+                .create_new(true)
+                .open(record)
+                .map_err(io_error)?
+                .write_all(&bytes)
+                .map_err(io_error)
+        })();
+        if let Err(error) = persist {
+            return combine_cleanup(Err(error), self.discard_workspace(&owned.workspace).await);
+        }
+        let workspace = owned.workspace.clone();
+        workspaces.insert(workspace.id.clone(), owned);
+        Ok(workspace)
+    }
+
+    fn remove_record(&self, workspace: &IsolationWorkspace) -> Result<(), String> {
+        let record = self.record_path(workspace)?;
+        check_path(&self.root, &record, true)?;
+        match fs::remove_file(record) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error(error)),
+        }
+    }
+
+    async fn discard_workspace(&self, workspace: &IsolationWorkspace) -> Result<(), String> {
+        self.remove_worktree(&workspace.root)
+            .await
+            .map_err(|error| format!("{}: {error}", workspace.root.display()))?;
+        self.remove_record(workspace)
     }
 
     async fn run_git(
@@ -350,7 +661,8 @@ impl GitWorktreeManager {
             return Err("工作区已被移除".to_owned());
         }
         self.check_storage()?;
-        check_path(&self.storage, &owned.workspace.root, false)?;
+        self.workspace_directory(&owned.workspace)?;
+        check_path(&self.root, &owned.workspace.root, false)?;
         if git_marker(&owned.workspace.root)? != owned.marker {
             return Err("子工作区的 .git 入口被改动".to_owned());
         }
@@ -469,6 +781,12 @@ impl GitWorktreeManager {
             let path = checked_patch_path(&record[3..])?;
             let path = path.trim_end_matches('/');
             check_relative(&workspace.root, path)?;
+            // 已暂存的删除在磁盘上没有文件，git add 的字面 pathspec 会拒绝它。
+            // 这类路径跳过即可：索引里的删除已经由 binary_diff 捕获。
+            // 新增或普通删除仍需 add -A，否则补丁拿不到内容。
+            if record[0] == b'D' && fs::symlink_metadata(workspace.root.join(path)).is_err() {
+                continue;
+            }
             let absolute = workspace.root.join(path);
             if fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_dir()) {
                 return Err(format!("隔离变更含嵌套仓库或目录条目: {path}"));
@@ -612,8 +930,30 @@ impl GitWorktreeManager {
     }
 
     async fn remove_worktree(&self, root: &Path) -> Result<(), String> {
-        check_path(&self.storage, root, true)?;
-        // --force 只作用于本实例创建的子工作区，允许清理未提交的子任务结果。
+        // 接管的工作区可能由重启前的实例签发，目录名带旧实例后缀。校验到
+        // 稳定的 worktrees 根，签发记录与 adopt 仍负责核对路径归属。
+        let worktrees = self.storage.parent().expect("storage 有父目录");
+        check_path(&self.root, root, true)?;
+        let relative = root
+            .strip_prefix(worktrees)
+            .map_err(|_| "拒绝移除安全目录之外的工作区")?;
+        // 任务工作区与临时整合目录都位于 <worktrees>/<实例>/<名称> 这一层。
+        // 不接受更深层级，也不接受仓库根等任意目录。
+        let components: Vec<_> = relative.components().collect();
+        if components.len() != 2
+            || components
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err("拒绝移除安全目录层级之外的工作区".to_owned());
+        }
+        validate_id(
+            components[0]
+                .as_os_str()
+                .to_str()
+                .ok_or("实例目录不是 UTF-8")?,
+        )?;
+        // --force 只作用于本实例创建或校验接管的工作区，允许清理未提交的子任务结果。
         self.git(
             &self.root,
             &[
@@ -697,32 +1037,10 @@ impl WorkspaceIsolation for GitWorktreeManager {
         base: &'a str,
     ) -> BoxFuture<'a, Result<IsolationWorkspace, String>> {
         Box::pin(async move {
-            validate_id(id)?;
-            validate_revision(base)?;
             let mut workspaces = self.workspaces.lock().await;
-            if workspaces.contains_key(id) {
-                return Err(format!("工作区 ID 已使用: {id}"));
-            }
             self.parent_at(base).await?;
-            let root = self.storage.join(id);
-            if root.try_exists().map_err(io_error)? {
-                return Err("工作区目录已存在，拒绝覆盖".to_owned());
-            }
-            let marker = self.checkout(&root, base).await?;
-            let workspace = IsolationWorkspace {
-                id: id.to_owned(),
-                root,
-                base_revision: base.to_owned(),
-            };
-            workspaces.insert(
-                id.to_owned(),
-                OwnedWorkspace {
-                    workspace: workspace.clone(),
-                    marker,
-                    removed: false,
-                },
-            );
-            Ok(workspace)
+            let owned = self.allocate_workspace(id, base, &workspaces).await?;
+            self.register_workspace(owned, &mut workspaces).await
         })
     }
 
@@ -756,16 +1074,15 @@ impl WorkspaceIsolation for GitWorktreeManager {
         Box::pin(async move {
             let mut workspaces = self.workspaces.lock().await;
             let owned = self.owned(&workspaces, workspace)?;
-            if owned.removed {
-                return Ok(());
+            if !owned.removed {
+                self.check_owned(owned)?;
+                self.remove_worktree(&workspace.root).await?;
+                workspaces
+                    .get_mut(&workspace.id)
+                    .expect("已验证工作区存在")
+                    .removed = true;
             }
-            self.check_owned(owned)?;
-            self.remove_worktree(&workspace.root).await?;
-            workspaces
-                .get_mut(&workspace.id)
-                .expect("已验证工作区存在")
-                .removed = true;
-            Ok(())
+            self.remove_record(workspace)
         })
     }
 }
@@ -870,6 +1187,38 @@ fn checked_patch_path(bytes: &[u8]) -> Result<&str, String> {
         return Err(format!("隔离变更含受保护路径: {path:?}"));
     }
     Ok(path)
+}
+
+/// 检查 Git 看不见的嵌套仓库。
+///
+/// Git 遇到普通目录里的 `.git`（目录或 gitdir 文件）会把它当仓库边界，
+/// 连 `--untracked-files=all` 也不展开其中文件。fork 只复制补丁，这些
+/// 内容会静默丢失，因此在复制前明确拒绝。顶层 `.git` 是工作树入口，
+/// `.qcodeharness` 是运行状态目录，都不在此列。
+fn check_nested_repositories(root: &Path, directory: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.trim_end_matches([' ', '.']).eq_ignore_ascii_case(".git") {
+            if directory != root {
+                return Err(format!("隔离变更含嵌套仓库: {}", path.display()));
+            }
+            continue;
+        }
+        if path == root.join(".qcodeharness") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(io_error)?;
+        if is_link(&metadata) {
+            return Err(format!("隔离路径不允许链接: {}", path.display()));
+        }
+        if metadata.is_dir() {
+            check_nested_repositories(root, &path)?;
+        }
+    }
+    Ok(())
 }
 
 fn check_relative(root: &Path, relative: &str) -> Result<(), String> {

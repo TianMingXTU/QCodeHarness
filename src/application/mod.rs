@@ -23,3 +23,6 @@ pub mod worktree;
 pub mod isolation;
 pub mod delegation;
 pub mod extension;
+pub mod control;
+pub mod service;
+pub mod service_factory;

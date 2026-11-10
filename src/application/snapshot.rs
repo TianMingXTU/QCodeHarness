@@ -24,7 +24,8 @@ use super::agent_run::{PendingRound, RunState};
 ///
 /// v3：任务上下文从"只有单个 runner"扩到"整个任务"，快照多出任务进度与
 /// 各步结论。v2 快照没有任务上下文，恢复时无法判断当前进度，因此拒绝加载。
-pub const RUN_FORMAT: u32 = 3;
+// v4：补充输入使用独立的 Turn::Input，旧版本无法区分输入与步骤交代。
+pub const RUN_FORMAT: u32 = 4;
 
 /// 当前任务快照格式版本。
 ///
@@ -103,6 +104,22 @@ impl TaskSnapshot {
     /// 任务 ID。
     pub fn task_id(&self) -> &TaskId {
         self.task.id()
+    }
+
+    /// 复制任务进度和会话历史，为分支分配独立的任务与会话标识。
+    ///
+    /// 工作区清单清空，调用方须从复制后的工作区重新采集；新会话的快照
+    /// 和证据使用新标识，后续执行不会覆盖原任务记录。
+    pub fn fork_with_ids(&self, task_id: TaskId, session_id: SessionId) -> Self {
+        Self {
+            task: self.task.fork_with_id(task_id),
+            run: RunSnapshot {
+                session_id,
+                ..self.run.clone()
+            },
+            worktree: WorktreeManifest::default(),
+            ..self.clone()
+        }
     }
 }
 
@@ -312,7 +329,7 @@ mod tests {
         let StoreError::VersionMismatch { found: 2, expected } = error else {
             panic!("应报版本不匹配，实际 {error}")
         };
-        assert_eq!(expected, 3, "当前格式是 v3");
+        assert_eq!(expected, RUN_FORMAT, "当前格式是 v{RUN_FORMAT}");
         assert!(error.to_string().contains("v2"), "{error}");
     }
 
