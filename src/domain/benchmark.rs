@@ -24,6 +24,12 @@ pub struct BenchmarkTask {
     /// 不共用执行路径。
     #[serde(default)]
     pub suite: String,
+    /// fixture 仓库的主语言（`javascript` / `python` / `go` / 缺省 Rust）。
+    ///
+    /// 判据命令经 shell 直跑，框架不内置语言专属执行器；这个字段只服务
+    /// 报告层按语言分组统计通过率。缺省 `None` 记为 Rust。
+    #[serde(default)]
+    pub language: Option<String>,
     /// 成功判据。
     pub criteria: SuccessCriteria,
     /// 两阶段运行配置。仅长任务套件使用，短任务留空即可。
@@ -178,6 +184,12 @@ impl SuccessCriteria {
 pub struct BenchmarkResult {
     /// 任务标识。
     pub task_id: String,
+    /// 任务所属语言（来自任务定义，`None` 为 Rust）。
+    ///
+    /// 结果按任务组织，把语言一并带上，报告层才能按语言分组统计通过率，
+    /// 不必回头再读一遍任务文件。`serde(default)` 让旧结果文件仍能读。
+    #[serde(default)]
+    pub language: Option<String>,
     /// 该任务第一次完成步骤的会话 ID，也是证据文件的入口。
     ///
     /// 一个任务只有一个会话，会话在第一步之前创建。任务只要开始运行，
@@ -220,6 +232,9 @@ pub struct BenchmarkResult {
 pub struct LongBenchmarkResult {
     /// 任务标识。
     pub task_id: String,
+    /// 任务所属语言（来自任务定义，`None` 为 Rust）。供报告按语言分组。
+    #[serde(default)]
+    pub language: Option<String>,
     /// 会话 ID（两段共用同一个会话：恢复接着上一次的会话跑）。
     pub session_id: Option<SessionId>,
     /// 第一次运行的失败原因。空串表示第一次运行没有失败，通常说明
@@ -336,6 +351,7 @@ mod tests {
     fn result_round_trips_through_json() {
         let result = BenchmarkResult {
             task_id: "greet-npe".to_owned(),
+            language: None,
             session_id: Some(SessionId::new("session-1")),
             passed: false,
             failures: vec!["测试命令 `cargo test` 未通过（非 0 退出）".to_owned()],
@@ -503,6 +519,7 @@ mod tests {
     fn the_long_result_round_trips_through_json() {
         let result = LongBenchmarkResult {
             task_id: "long-task-a".to_owned(),
+            language: None,
             session_id: Some(SessionId::new("session-long")),
             first_run_failure: "第 2 步失败: 预算耗尽".to_owned(),
             first_run_steps: 1,

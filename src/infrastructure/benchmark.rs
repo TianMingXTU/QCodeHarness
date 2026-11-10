@@ -53,6 +53,9 @@ struct TaskFile {
     /// 任务属于哪个套件。默认是 `default`（短任务套件）。
     #[serde(default = "default_suite")]
     suite: String,
+    /// fixture 的主语言。缺省 `None`（Rust）。只供报告分组，不影响运行。
+    #[serde(default)]
+    language: Option<String>,
     criteria: CriteriaFile,
     /// 长任务的两阶段运行配置。短任务不写这一节。
     #[serde(default)]
@@ -190,6 +193,7 @@ fn load_one(dir: &Path, name: &str) -> Result<BenchmarkTask, BenchmarkLoadError>
         kind,
         description: file.description,
         suite: file.suite,
+        language: file.language,
         criteria: SuccessCriteria {
             test_command: file.criteria.test_command,
             requires_changes: file.criteria.requires_changes,
@@ -244,17 +248,50 @@ answer_must_mention = []
 
         assert_eq!(
             tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
-            ["greet-npe", "missing-import", "off-by-one"],
+            [
+                "go-http-client",
+                "greet-npe",
+                "js-string-util",
+                "missing-import",
+                "off-by-one",
+                "py-date-parser",
+            ],
             "按目录名排序"
         );
+
+        // 任务类型不再全是 bug-fix：首个 go-http-client 是 feature。
+        assert_eq!(tasks[0].kind, TaskKind::Feature, "go-http-client 是 feature");
         assert!(
-            tasks.iter().all(|t| t.kind == TaskKind::BugFix),
-            "三个任务都是修 bug 类型"
+            tasks[1..].iter().all(|t| t.kind == TaskKind::BugFix),
+            "其余默认任务都是修 bug 类型"
         );
-        let greet = &tasks[0];
+
+        // 语言随 fixture 装载：非 Rust fixture 带语言，Rust 缺省。
+        // 这个字段只服务报告分组，不改变运行。
+        assert_eq!(
+            tasks.iter().map(|t| t.language.as_deref()).collect::<Vec<_>>(),
+            [
+                Some("go"),
+                None,
+                Some("javascript"),
+                None,
+                None,
+                Some("python"),
+            ]
+        );
+
+        let greet = &tasks[1];
         assert_eq!(greet.criteria.test_command, "cargo test");
         assert!(greet.criteria.requires_changes);
         assert_eq!(greet.criteria.answer_must_mention, ["panic"]);
+
+        // 长任务套件同样随库发布，装载不报错且语言字段到位。
+        let long = load_long_tasks(&root).expect("长任务应能装载");
+        assert_eq!(
+            long.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["long-python-pipeline", "long-report-builder", "long-utils-cleanup"]
+        );
+        assert_eq!(long[0].language.as_deref(), Some("python"));
     }
 
     #[test]

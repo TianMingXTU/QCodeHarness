@@ -1,0 +1,9 @@
+id = "js-string-util"
+kind = "bug-fix"
+description = "修复 js-string-util 库的 src/utils.js：capitalize 对任意输入取 text[0] 再放大写，传入空字符串时 text[0] 是 undefined，调用 toUpperCase 抛 TypeError，测试 empty_input 失败。读 src/utils.js 与 test/utils.test.js 找出根因，做最小修复让空输入返回空串，然后运行 node --test 验证全部测试通过。"
+language = "javascript"
+
+[criteria]
+test_command = "node --test"
+requires_changes = true
+answer_must_mention = ["empty"]

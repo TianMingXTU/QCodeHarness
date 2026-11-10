@@ -1,0 +1,9 @@
+id = "go-http-client"
+kind = "feature"
+description = "为 go-http-client 库实现缺失的 Client.Retry：现有 client.go 只有单次执行的 Get，client_test.go 里的 TestRetry 引用了尚未实现的 Retry 方法，导致 go test 编译失败。读 client.go 与 client_test.go，按测试语义补齐 Retry（在 MaxAttempts 内重试、成功后立即返回、全部失败才返回最后一次错误），然后运行 go test ./... 验证通过。"
+language = "go"
+
+[criteria]
+test_command = "go test ./..."
+requires_changes = true
+answer_must_mention = ["retry"]

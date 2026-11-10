@@ -5,6 +5,7 @@
 //! 每个任务使用全新的 fixture 拷贝与独立的工具注册表（workspace 根指向
 //! 拷贝），任务之间互不影响。单个任务失败（编排中断或判据未通过）
 //! 只记为未通过，后续任务继续：基准需要在一次运行中看到全貌。
+//! 进度写 stderr，stdout 由 CLI 输出最终结果，避免污染 JSON 管道。
 //!
 //! 这里直接使用文件、进程与证据的具体实现，因此位于基础设施层。它组合
 //! application 的编排器完成运行，依赖方向仍为 infrastructure →
@@ -63,11 +64,12 @@ pub async fn run_benchmark(
     let total = tasks.len();
     let mut results = Vec::with_capacity(total);
     for (index, task) in tasks.iter().enumerate() {
-        println!("▶ [{}/{}] {}", index + 1, total, task.description);
+        eprintln!("▶ [{}/{}] {}", index + 1, total, task.description);
         let result = match run_one(deps, budget, benchmarks_root, workspace, task).await {
             Ok(result) => result,
             Err(failure) => BenchmarkResult {
                 task_id: task.id.clone(),
+                language: task.language.clone(),
                 session_id: None,
                 passed: false,
                 failures: vec![failure],
@@ -80,7 +82,7 @@ pub async fn run_benchmark(
             },
         };
         let verdict = if result.passed { "✓ 通过" } else { "✗ 未通过" };
-        println!(
+        eprintln!(
             "{} {}：{} 步 / {} 轮 / 墙钟 {} / 审批 {} 次 / 缓存 {} / 成本 {}",
             verdict,
             result.task_id,
@@ -92,7 +94,7 @@ pub async fn run_benchmark(
             cost_label(result.cost_usd),
         );
         for reason in &result.failures {
-            println!("  - {reason}");
+            eprintln!("  - {reason}");
         }
         results.push(result);
     }
@@ -118,11 +120,12 @@ pub async fn run_long_benchmark(
     let total = tasks.len();
     let mut results = Vec::with_capacity(total);
     for (index, task) in tasks.iter().enumerate() {
-        println!("▶ [{}/{}] 长任务：{}", index + 1, total, task.description);
+        eprintln!("▶ [{}/{}] 长任务：{}", index + 1, total, task.description);
         let result = match run_long_one(deps, budget, benchmarks_root, workspace, task).await {
             Ok(result) => result,
             Err(failure) => LongBenchmarkResult {
                 task_id: task.id.clone(),
+                language: task.language.clone(),
                 session_id: None,
                 first_run_failure: failure.clone(),
                 first_run_steps: 0,
@@ -142,9 +145,9 @@ pub async fn run_long_benchmark(
         };
         let verdict = if result.passed { "✓ 通过" } else { "✗ 未通过" };
         if result.first_run_failure.is_empty() {
-            println!("  第一次运行：没有失败——任务一遍跑完了，这次没有测到中断恢复");
+            eprintln!("  第一次运行：没有失败——任务一遍跑完了，这次没有测到中断恢复");
         } else {
-            println!(
+            eprintln!(
                 "  第一次运行：{}（第 {} 步后停 / {} 轮 / 上限 {} 轮）",
                 result.first_run_failure,
                 result.first_run_steps,
@@ -153,13 +156,13 @@ pub async fn run_long_benchmark(
             );
         }
         match &result.resume_failure {
-            Some(reason) => println!("  恢复运行：失败 —— {reason}"),
-            None => println!(
+            Some(reason) => eprintln!("  恢复运行：失败 —— {reason}"),
+            None => eprintln!(
                 "  恢复运行：从任务快照继续 → {}/{} 步 / 本段 {} 轮 / 总 {} 轮",
                 result.steps_completed, result.steps_total, result.resume_turns, result.total_turns,
             ),
         }
-        println!(
+        eprintln!(
             "{} 重复副作用 {} 次 / 墙钟 {} / 成本 {}",
             verdict,
             // 与判据共用同一份统计：这里数的是 no_repeated_commands 中
@@ -170,15 +173,89 @@ pub async fn run_long_benchmark(
             cost_label(result.cost_usd),
         );
         for reason in &result.failures {
-            println!("  - {reason}");
+            eprintln!("  - {reason}");
         }
         results.push(result);
     }
     Ok(results)
 }
 
-/// 墙钟的显示值：以秒为单位，保留一位小数。
+/// 把基准结果按语言分组，供报告层统计各语言通过率。
 ///
+/// 语言是任务的属性，结果按任务组织；把任务的语言带进结果后，分组只需
+/// 按 `language` 归桶。缺省（Rust）也成一组，报告时显示为 `rust`。
+///
+/// 返回 `Vec` 而非 `HashMap`：语言集合固定，排序稳定即可复现，
+/// 不需要哈希表的无序性。桶内保留结果原序。
+pub fn group_by_language<'a, T>(results: &'a [T]) -> Vec<(&'a str, Vec<&'a T>)>
+where
+    T: HasLanguage,
+{
+    let mut buckets: Vec<(&'a str, Vec<&'a T>)> = Vec::new();
+    for result in results {
+        let key = result.language_key();
+        // 可变借用只存在于 if 条件里；else 分支已释放，才能安全 push。
+        if let Some(group) = buckets.iter_mut().find(|(name, _)| *name == key) {
+            group.1.push(result);
+        } else {
+            buckets.push((key, vec![result]));
+        }
+    }
+    buckets
+}
+
+/// 结果携带语言的统一接口。短任务与长任务结果各实现一份，分组共用逻辑。
+pub trait HasLanguage {
+    /// 分组键：语言名，缺省 `rust`。
+    fn language_key(&self) -> &str;
+    /// 语言原文（`None` 为 Rust），供报告与 JSON 输出。
+    fn language(&self) -> Option<&str>;
+    /// 是否通过全部判据。汇总按语言统计通过率用。
+    fn passed(&self) -> bool;
+}
+
+impl HasLanguage for BenchmarkResult {
+    fn language_key(&self) -> &str {
+        self.language.as_deref().unwrap_or("rust")
+    }
+    fn language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+    fn passed(&self) -> bool {
+        self.passed
+    }
+}
+
+impl HasLanguage for LongBenchmarkResult {
+    fn language_key(&self) -> &str {
+        self.language.as_deref().unwrap_or("rust")
+    }
+    fn language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+    fn passed(&self) -> bool {
+        self.passed
+    }
+}
+
+/// 按语言生成汇总行：每行一个语言的通过数/总数。
+///
+/// 供基准运行后打印，回答"哪种语言的 fixture 通过率更低"。只列有任务
+/// 的语言，无信息不占位。缺省语言显示为 `rust`，与实际语言名保持一致。
+pub fn language_summary_lines<T>(results: &[T]) -> Vec<String>
+where
+    T: HasLanguage,
+{
+    group_by_language(results)
+        .into_iter()
+        .map(|(language, group)| {
+            let passed = group.iter().filter(|result| result.passed()).count();
+            format!("{language}: {passed}/{} 通过", group.len())
+        })
+        .collect()
+}
+
+/// 墙钟的显示值：以秒为单位，保留一位小数。///
 /// 基准任务通常耗时几十秒到几分钟。按秒显示便于比较，同时不会把
 /// 200ms 的差异显示成 0。
 pub(crate) fn wall_clock_label(millis: u64) -> String {
@@ -233,6 +310,7 @@ async fn run_one(
         let _ = fs::remove_dir_all(&repo);
         return Ok(BenchmarkResult {
             task_id: task.id.clone(),
+            language: task.language.clone(),
             session_id: None,
             passed: false,
             failures,
@@ -264,6 +342,7 @@ async fn run_one(
         usage_of(workspace, &session_id).await;
     let result = BenchmarkResult {
         task_id: task.id.clone(),
+        language: task.language.clone(),
         session_id: Some(session_id),
         passed: failures.is_empty(),
         failures,
@@ -398,6 +477,7 @@ async fn run_long_one(
 
     let result = LongBenchmarkResult {
         task_id: task.id.clone(),
+        language: task.language.clone(),
         session_id: Some(session_id),
         first_run_failure: first_failure,
         first_run_steps: first_steps,
@@ -1053,6 +1133,88 @@ mod tests {
             observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Refused),
         ];
         assert!(!seen_twice(&mixed, "cargo test"), "一次执行一次拒绝不算重复");
+    }
+
+    #[test]
+    fn group_by_language_buckets_by_fixture_language_defaulting_to_rust() {
+        let results = vec![
+            result("greet", None),
+            result("py", Some("python".into())),
+            result("greet2", None),
+        ];
+
+        let groups = group_by_language(&results);
+        let names: Vec<_> = groups.iter().map(|(name, _)| *name).collect();
+        let counts: Vec<_> = groups.iter().map(|(_, g)| g.len()).collect();
+        assert_eq!(names, ["rust", "python"], "缺省（None）归 rust");
+        assert_eq!(counts, [2, 1], "缺省组保留两条");
+    }
+
+    #[test]
+    fn group_by_language_works_on_long_results() {
+        let results = vec![
+            long_result("a", Some("python".into())),
+            long_result("b", None),
+        ];
+
+        let groups = group_by_language(&results);
+        let names: Vec<_> = groups.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["python", "rust"], "分组顺序取首次出现");
+    }
+
+    fn result(task_id: &str, language: Option<String>) -> BenchmarkResult {
+        BenchmarkResult {
+            task_id: task_id.into(),
+            language,
+            session_id: None,
+            passed: true,
+            failures: Vec::new(),
+            steps_completed: 0,
+            turns_used: 0,
+            wall_clock_ms: 0,
+            approvals: 0,
+            cache_hit_ratio: None,
+            cost_usd: None,
+        }
+    }
+
+    fn long_result(task_id: &str, language: Option<String>) -> LongBenchmarkResult {
+        LongBenchmarkResult {
+            task_id: task_id.into(),
+            language,
+            session_id: None,
+            first_run_failure: String::new(),
+            first_run_steps: 0,
+            first_run_turns: 0,
+            first_run_turn_limit: 0,
+            resume_failure: None,
+            resume_turns: 0,
+            total_turns: 0,
+            steps_total: 0,
+            steps_completed: 0,
+            passed: true,
+            failures: Vec::new(),
+            repeated_commands: Vec::new(),
+            cost_usd: None,
+            wall_clock_ms: 0,
+        }
+    }
+
+    #[test]
+    fn language_summary_lines_report_pass_rate_per_language() {
+        let mut results = vec![
+            result("greet", None),
+            result("py-ok", Some("python".into())),
+            result("py-bad", Some("python".into())),
+        ];
+        results[2].passed = false;
+
+        let lines = language_summary_lines(&results);
+        assert_eq!(
+            lines,
+            ["rust: 1/1 通过", "python: 1/2 通过"],
+            "通过率按语言统计，未通过也计入分母"
+        );
     }
 
     #[test]

@@ -52,7 +52,9 @@ use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::infrastructure::approval::ai_review::AiReviewGate;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
-use qcode_harness::infrastructure::benchmark_runner::{run_benchmark, run_long_benchmark};
+use qcode_harness::infrastructure::benchmark_runner::{
+    language_summary_lines, run_benchmark, run_long_benchmark,
+};
 use qcode_harness::infrastructure::clock::{SystemClock, TokioTimeLimiter};
 use qcode_harness::infrastructure::config;
 use qcode_harness::infrastructure::delegation::{
@@ -436,12 +438,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             additional_guards: Vec::new(),
         };
         let benchmarks_root = workspace.join("benchmarks");
-        println!("基准任务集: {}", benchmarks_root.display());
-        println!("模型: {} @ {}", config.model, config.base_url);
+        // 进度与诊断写 stderr，stdout 留给结果，JSON 才能直接交给下游解析。
+        eprintln!("基准任务集: {}", benchmarks_root.display());
+        eprintln!("模型: {} @ {}", config.model, config.base_url);
         if args.benchmark_long {
             let results = run_long_benchmark(&deps, &budget, &benchmarks_root, &workspace).await?;
             let passed = results.iter().filter(|result| result.passed).count();
-            println!("\n通过 {passed}/{} 个长任务", results.len());
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                println!("\n通过 {passed}/{} 个长任务", results.len());
+                for line in language_summary_lines(&results) {
+                    println!("  {line}");
+                }
+            }
             if passed < results.len() {
                 std::process::exit(1);
             }
@@ -449,7 +459,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         let results = run_benchmark(&deps, &budget, &benchmarks_root, &workspace).await?;
         let passed = results.iter().filter(|result| result.passed).count();
-        println!("\n通过 {passed}/{} 个任务", results.len());
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        } else {
+            println!("\n通过 {passed}/{} 个任务", results.len());
+            for line in language_summary_lines(&results) {
+                println!("  {line}");
+            }
+        }
         if passed < results.len() {
             // 基准是打分工具：存在未通过的任务时使用非 0 退出码，
             // 自动化流水线可据此感知失败。

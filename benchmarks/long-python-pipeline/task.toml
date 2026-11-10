@@ -1,0 +1,23 @@
+id = "long-python-pipeline"
+kind = "bug-fix"
+description = "修复 long-python-pipeline 库：数据处理管道的四个模块各带一个独立缺陷——load.load_lines 丢掉了输入的最后一条行、clean.clean 只去了左边空白、transform.to_percent 忘了把比例乘成百分数、output.rank 排序方向写反（要降序却给了升序），tests/test_pipeline.py 的四条测试全部失败。任务跨多个模块：读 pipeline/ 下四个模块与 tests/test_pipeline.py，逐个定位根因，做最小修复，然后运行 python -m unittest tests.test_pipeline -v 验证全部测试通过。缺陷相互独立，修一个不会让其他测试变绿。"
+suite = "long"
+language = "python"
+
+[long_run]
+# 第一次运行故意在第 4 轮耗尽预算：四个缺陷、四个工作流步骤，
+# 4 轮必然停在修复中途。
+exhaust_turns = 4
+# 历史预算压小到必然触发裁剪：恢复段历史最长，压缩判据从这里核对。
+context_max_tokens = 2000
+
+[criteria]
+test_command = "python -m unittest tests.test_pipeline -v"
+requires_changes = true
+answer_must_mention = []
+# 长任务判据：至少 6 轮模型调用，防"恢复段偷懒跳步"。
+min_turns = 6
+# 全量测试允许在修复前后重复运行，不用于衡量副作用重放。
+no_repeated_commands = []
+# 压缩之后，模型仍要记得自己动过的模块名。
+must_mention_after_compaction = ["clean"]

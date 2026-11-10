@@ -24,8 +24,8 @@ pub const USAGE: &str = "\
       QCodeHarness [--yes] --resume <会话ID>
       QCodeHarness [--yes] [--force-worktree] --resume-task <任务ID>
       QCodeHarness --report [--report-dir <目录>] [--json]
-      QCodeHarness --benchmark
-      QCodeHarness --benchmark-long
+      QCodeHarness --benchmark [--json]
+      QCodeHarness --benchmark-long [--json]
       QCodeHarness --mcp-reconnect <服务器名>
       QCodeHarness --list-extensions
       QCodeHarness --install-extension <清单文件>
@@ -99,7 +99,8 @@ pub struct CliArgs {
     /// 报表统计的证据根目录（`--report-dir <dir>`）。在该目录的
     /// `.qcodeharness/sessions/` 下查找证据文件，缺省为当前工作区。
     pub report_dir: Option<String>,
-    /// 报表输出 JSON（`--json`），只与 `--report` 搭配有效。
+    /// 输出机器可读 JSON（`--json`），与 `--report` / `--benchmark` /
+    /// `--benchmark-long` 搭配有效：报表输出 JSON 报表，基准输出结果清单。
     pub json: bool,
     /// 跑 `benchmarks/` 下的基准任务集并打分（`--benchmark`）。
     pub benchmark: bool,
@@ -311,8 +312,9 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         return None;
     }
     // 组合无效的开关应立即报错。静默忽略会丢弃用户的意图。
-    if json && !report {
-        eprintln!("--json 需要与 --report 搭配");
+    // --json 输出机器可读结果，可用于报表与基准两种模式。
+    if json && !report && !benchmark && !benchmark_long {
+        eprintln!("--json 需要与 --report、--benchmark 或 --benchmark-long 搭配");
         return None;
     }
     if report_dir.is_some() && !report {
@@ -834,6 +836,18 @@ mod tests {
     fn json_without_report_is_rejected() {
         let parsed = parse_from(argv(&["--json"]));
         assert!(parsed.is_none(), "--json 单独使用只会让用户以为生效了");
+    }
+
+    #[test]
+    fn json_combines_with_benchmark_modes() {
+        // --json 现在也服务基准模式：输出机器可读的结果清单。
+        for args in [
+            vec!["--json", "--benchmark"],
+            vec!["--json", "--benchmark-long"],
+        ] {
+            let parsed = parse_from(argv(&args)).expect("应能解析");
+            assert!(parsed.json, "--json 需置位");
+        }
     }
 
     #[test]

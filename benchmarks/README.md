@@ -10,7 +10,7 @@ P10 起任务分两个**套件**：`default`（短任务，一遍跑完）与 `l
 benchmarks/
 ├── <任务ID>/
 │   ├── task.toml      # 任务声明与成功判据
-│   └── repo/          # agent 要动手的 fixture 仓库（独立的小 crate）
+│   └── repo/          # agent 要动手的 fixture 仓库（独立的小项目）
 └── README.md
 ```
 
@@ -21,26 +21,32 @@ id = "greet-npe"                  # 必须与目录同名，否则装载直接�
 kind = "bug-fix"                  # 决定走哪个工作流模板（bug-fix / feature / review / refactor）
 description = "给模型的任务描述……"
 suite = "default"                 # 所属套件（default / long），缺省 default
+language = "rust"                 # 可选；fixture 主语言（rust / javascript / python / go），缺省 Rust，只供报告分组
 
 [criteria]
-test_command = "cargo test"       # 判据一：在 fixture 拷贝里执行，退出码 0 即通过
+test_command = "cargo test"       # 判据一：在 fixture 拷贝里经系统 shell 执行，退出码 0 即通过
 requires_changes = true           # 判据二：工作区必须出现实际改动
 answer_must_mention = ["panic"]   # 判据三：最终答案必须提及的关键词（大小写不敏感；空清单不检查）
 ```
 
 判据字段全部必填：漏写 `requires_changes` 这类判据等于悄悄放宽验收，装载器按"缺字段即报错"处理，未知的字段同样报错——拼错的判据必须当场炸出来，不能静默忽略。
 
+`language` 是可选的：缺省记为 Rust。它只让报告层按语言分组统计通过率，不改变运行方式——多语言任务靠 `test_command` 经系统 shell 直跑本地工具链（`node --test` / `python -m unittest` / `go test ./...`），框架不内置语言专属执行器，也就不引入任何新依赖。
+
 ## 内置任务
 
 ### 短任务套件（`--benchmark`）
 
-| 任务 | 难度 | 缺陷形态 | 判据要点 |
-|------|------|----------|----------|
-| `missing-import` | 入门 | 编译错误（缺 `use std::collections::HashMap`），编译器直接给出修复建议 | `cargo test` 通过 + 有改动；不查答案关键词（全限定路径修复同样合法） |
-| `greet-npe` | 基础 | 运行时 panic（空名字 `unwrap()`），一条测试过、一条崩 | `cargo test` 通过 + 有改动 + 答案提到 panic |
-| `off-by-one` | 进阶 | 逻辑错误（`scores[..n - 1]` 差一），三条测试全错但都不崩——没有异常栈可抄，必须读懂语义 | `cargo test` 通过 + 有改动 |
+| 任务 | 语言 / 类型 | 任务内容 | 判据要点 |
+|------|-------------|----------|----------|
+| `missing-import` | Rust / bug-fix | 缺 `use std::collections::HashMap`，编译器给出修复建议 | `cargo test` 通过 + 有改动；全限定路径修复同样合法 |
+| `greet-npe` | Rust / bug-fix | 空名字触发 `unwrap()` panic | `cargo test` 通过 + 有改动 + 答案提到 panic |
+| `off-by-one` | Rust / bug-fix | `scores[..n - 1]` 差一，测试结果错误但不崩溃 | `cargo test` 通过 + 有改动 |
+| `js-string-util` | JavaScript / bug-fix | `capitalize` 对空字符串调用 `undefined.toUpperCase()` | `node --test` 通过 + 有改动 + 答案提到 empty |
+| `py-date-parser` | Python / bug-fix | 日期的 day 只读取一位数字 | `python -m unittest tests.test_date_parser -v` 通过 + 有改动 + 答案提到 day |
+| `go-http-client` | Go / feature | 实现缺失的 `Client.Retry`，按次数重试并在成功后返回 | `go test ./...` 通过 + 有改动 + 答案提到 retry |
 
-三个任务覆盖了修 bug 的三类典型起点（编译错误 → 运行时崩溃 → 静默逻辑错误），难度梯度来自"定位缺陷需要的推理量"，而不是 fixture 的代码量。
+原有三个 Rust 任务分别覆盖编译错误、运行时崩溃与静默逻辑错误；新增任务覆盖另外三种语言，以及补齐接口的功能开发。
 
 ### 长任务套件（`--benchmark-long`）
 
@@ -48,6 +54,9 @@ answer_must_mention = ["panic"]   # 判据三：最终答案必须提及的关�
 |------|----------|----------|----------|
 | `long-utils-cleanup` | 五模块五个独立缺陷（窗口差一、排序反向、单位遗漏、分隔符错、校验边界反），必须跨模块逐个定位 | 第 4 轮故意耗尽；上下文预算 2000 token | `cargo test` 通过 + 至少 6 轮 + `cargo test --test utils` 不许重复执行 + 压缩后仍要提到 median |
 | `long-report-builder` | 处理链四环节各自带缺陷（聚合、排序、渲染），链路上游也要读 | 第 5 轮故意耗尽；上下文预算 1800 token | `cargo test` 通过 + 至少 7 轮 + `cargo test --test report` 不许重复执行 + 压缩后仍要提到 average |
+| `long-python-pipeline` | Python 四模块缺陷：丢末行、清洗遗漏右空白、百分比换算遗漏、排序反向 | 第 4 轮故意耗尽；上下文预算 2000 token | `python -m unittest tests.test_pipeline -v` 通过 + 至少 6 轮 + 压缩后仍要提到 clean；允许修复前后重跑测试 |
+
+当前共 9 个任务（6 短 + 3 长）。新增四个 fixture 已在临时拷贝中验证破损时失败、修复后通过，尚未建立真实模型通过率与重复运行基线。恢复、MCP、沙箱和扩展的报表统计由 `tests/failure_scenarios.rs` 的合成事件测试覆盖，子系统实际行为由各自集成测试覆盖。
 
 `min_turns` 的取值原则：设在**实测自然完成轮数之下**，防的是"恢复段偷懒跳步"，不是惩罚效率——按预估拍脑袋定的下限会把高效完成误判成失败。
 
@@ -56,7 +65,10 @@ answer_must_mention = ["panic"]   # 判据三：最终答案必须提及的关�
 ```powershell
 cargo run -- --benchmark          # 短任务套件
 cargo run -- --benchmark-long     # 长任务套件（两段式）
+cargo run -- --benchmark --json   # 机器可读结果，长任务同样支持 --json
 ```
+
+两个入口在文本模式下按语言统计通过数；`--json` 的 stdout 只含结果数组，各项带 `language` 与逐条 `failures`。进度与诊断写 stderr，保存 JSON 时不要把 stderr 合并进去。`language` 为 `null` 的旧 Rust 任务按 `rust` 分组。
 
 短任务每个任务的执行流程：
 

@@ -1,0 +1,9 @@
+id = "py-date-parser"
+kind = "bug-fix"
+description = "修复 py-date-parser 库的 src/date_parser.py：parse_iso_date 解析 YYYY-MM-DD 时取日部分用了 text[8] 单字符索引，遇到 '2026-01-05' 只读到 '0' 而丢掉 '5'，day 算成 0，测试 test_zero_padded_day 失败。读 src/date_parser.py 与 tests/test_date_parser.py 找出根因，做最小修复让多位数日期解析正确，然后运行 python -m unittest tests.test_date_parser -v 验证全部测试通过。"
+language = "python"
+
+[criteria]
+test_command = "python -m unittest tests.test_date_parser -v"
+requires_changes = true
+answer_must_mention = ["day"]
