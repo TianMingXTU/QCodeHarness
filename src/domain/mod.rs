@@ -22,5 +22,6 @@ pub mod task;
 pub mod worktree;
 pub mod workflow;
 pub mod config;
+pub mod doctor;
 pub mod extension;
 pub mod service;

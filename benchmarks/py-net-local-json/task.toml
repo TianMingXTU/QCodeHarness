@@ -1,0 +1,9 @@
+id = "py-net-local-json"
+kind = "bug-fix"
+description = "修复 py-net-local-json 库的 src/json_poller.py：fetch_config 拉取 /config 后把整个 JSON 字典直接返回，没取 items 键，调用方拿到 dict 而非 items 列表，测试 test_returns_items_list 失败。读 src/json_poller.py 与 tests/test_json_poller.py 找出根因，做最小修复让 fetch_config 返回 items 列表（服务仍用标准库 http.server 起在 127.0.0.1，客户端用 urllib 只连环回地址），然后运行 python -m unittest tests.test_json_poller -v 验证全部测试通过。"
+language = "python"
+
+[criteria]
+test_command = "python -m unittest tests.test_json_poller -v"
+requires_changes = true
+answer_must_mention = ["items"]

@@ -240,10 +240,7 @@ pub fn merge_session_state(snapshot: TaskSnapshot, session: Option<RunSnapshot>)
 }
 
 /// 比对快照清单与当前清单，判断工作区是否被改动过。
-pub fn check_worktree(
-    saved: &WorktreeManifest,
-    scanner: &dyn WorktreeScanner,
-) -> ResumeCheck {
+pub fn check_worktree(saved: &WorktreeManifest, scanner: &dyn WorktreeScanner) -> ResumeCheck {
     match scanner.scan() {
         Ok(now) => {
             let changes = saved.diff(&now);
@@ -302,7 +299,10 @@ mod tests {
     /// 把一串步骤交代装进会话。第一条交代是会话开局消息：真实运行里
     /// runner 用第一步的 `prompt` 起步（见 orchestrator 的
     /// `AgentRunner::new`），会话里没有独立于交代的任务原文。
-    fn session_with_prompts(id: SessionId, prompts: usize) -> crate::domain::session::SessionSnapshot {
+    fn session_with_prompts(
+        id: SessionId,
+        prompts: usize,
+    ) -> crate::domain::session::SessionSnapshot {
         let mut session = Session::new(id, "第 1 步的交代".to_owned());
         for n in 2..=prompts {
             session.push_user(format!("第 {n} 步的交代"));
@@ -359,7 +359,11 @@ mod tests {
         half_round_session_with_id(SessionId::new("s1"), started_steps, state)
     }
 
-    fn half_round_session_with_id(session_id: SessionId, started_steps: usize, state: RunState) -> RunSnapshot {
+    fn half_round_session_with_id(
+        session_id: SessionId,
+        started_steps: usize,
+        state: RunState,
+    ) -> RunSnapshot {
         let session = session_with_prompts(session_id.clone(), started_steps);
         RunSnapshot {
             format_version: RUN_FORMAT,
@@ -382,6 +386,65 @@ mod tests {
     }
 
     #[test]
+    fn legacy_step_prompts_still_match_after_projecting_the_model_view() {
+        use crate::application::context_policy::{ContextPolicy, DefaultContextPolicy};
+        use crate::domain::context::ContextBudget;
+        use crate::domain::session::ContextSlice;
+        use crate::domain::workflow::WorkflowCatalog;
+
+        let goal = "恢复已有快照并保留目标。".repeat(300);
+        let steps = WorkflowCatalog::builtin()
+            .find(TaskKind::BugFix)
+            .unwrap()
+            .expand(&goal);
+        let mut snapshot = task_snapshot_at(2);
+        snapshot.task = Task::new(TaskId::new("legacy"), TaskKind::BugFix, &goal, steps);
+        snapshot.task.start().unwrap();
+        snapshot.task.advance().unwrap();
+        snapshot.task.advance().unwrap();
+        let prompts: Vec<String> = snapshot.task.steps().iter().take(3).enumerate().map(|(index, step)| {
+            format!("任务：{goal}\n当前步骤（第 {}/4 步）：{}\n完成判据：{}\n达成判据后停止调用工具，直接输出最终答案。", index + 1, step.description, step.done_when)
+        }).collect();
+        let mut session = Session::new(snapshot.run.session_id.clone(), &prompts[0]);
+        for prompt in &prompts[1..] {
+            session.push_user(prompt);
+        }
+        session.push_input(
+            "constraint".to_owned(),
+            "恢复后仍禁止修改公共接口".to_owned(),
+        );
+        snapshot.run.session = session.snapshot();
+        let saved = snapshot.clone();
+        check_resumable(&snapshot, Some(&snapshot.run.session_id)).unwrap();
+
+        let session = Session::from_snapshot(
+            snapshot.run.session_id.clone(),
+            snapshot.run.session.clone(),
+        )
+        .unwrap();
+        let view = DefaultContextPolicy.view(&session, &ContextBudget::default(), None);
+        let goal_copies: usize = view
+            .iter()
+            .filter_map(|slice| match slice {
+                ContextSlice::User(text) => Some(text.matches(&goal).count()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(goal_copies, 1, "旧快照也应共享一次目标");
+        assert_eq!(session.snapshot(), saved.run.session);
+        assert_eq!(session.started_steps(), 3);
+        check_resumable(&snapshot, Some(&snapshot.run.session_id)).unwrap();
+        assert_eq!(snapshot, saved);
+
+        snapshot.run.session.turns[1] =
+            crate::domain::session::Turn::User(prompts[1].replace(&goal, "另一个任务"));
+        assert!(
+            check_resumable(&snapshot, None).is_err(),
+            "缩短模型视图不能放宽恢复核对"
+        );
+    }
+
+    #[test]
     fn a_matching_half_round_session_is_merged() {
         // 正对照：会话与任务同属一个 run，停在要恢复的那一步（开跑了
         // resumed_step + 1 步），半轮现场应覆盖步骤边界。
@@ -396,7 +459,8 @@ mod tests {
         // 会话 ID 对不上时快照不属于这个任务。拿它续跑会把副作用记到
         // 错误的账上。
         let snapshot = task_snapshot_at(1);
-        let session = half_round_session_with_id(SessionId::new("s2"), 2, RunState::Dispatching(vec![]));
+        let session =
+            half_round_session_with_id(SessionId::new("s2"), 2, RunState::Dispatching(vec![]));
         let merged = merge_session_state(snapshot.clone(), Some(session));
         assert_eq!(merged.run, snapshot.run, "会话 ID 不一致时不合并");
     }

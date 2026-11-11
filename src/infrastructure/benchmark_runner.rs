@@ -24,7 +24,7 @@ use crate::application::port::EvidenceSink;
 use crate::application::report::{cost_label, hit_ratio_label, summarize};
 use crate::application::snapshot::TaskStore;
 use crate::application::tool_registry::ToolRegistry;
-use crate::domain::benchmark::{BenchmarkResult, BenchmarkTask, CriteriaObservation, LongBenchmarkResult};
+use crate::domain::benchmark::{BenchmarkMetrics, BenchmarkResult, BenchmarkTask, CriteriaObservation, LongBenchmarkResult, SecurityCaseResult};
 use crate::domain::budget::Budget;
 use crate::domain::ids::{SessionId, TaskId};
 use crate::domain::workspace::WorkspaceRoot;
@@ -41,6 +41,89 @@ const TEST_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// 失败诊断保留的命令输出行数。失败原因通常在结尾；判据命令的输出
 /// 不进证据文件，完整内容到此即丢，全部写进结果会淹没判据清单。
 const FAILURE_OUTPUT_LINES: usize = 20;
+
+/// 从一份会话证据生成机器可读扩展指标。
+///
+/// 证据读取失败或文件为空时 token 分项记 `None`，不把未知用量当作 0。
+/// 安全用例结果由调用方从独立实测证据传入，单次模型运行不自行声称通过。
+fn benchmark_metrics(
+    workspace: &Path,
+    session: &SessionId,
+    failures: &[String],
+    security_cases: &[SecurityCaseResult],
+) -> BenchmarkMetrics {
+    let path = session_path(workspace, session.as_str());
+    let Some(log) = read_session(&path).ok().flatten() else {
+        return failed_metrics(failures, security_cases);
+    };
+    let summary = summarize(&log);
+    let has_usage = summary.input_tokens > 0
+        || summary.output_tokens > 0
+        || summary.cached_input_tokens > 0
+        || summary.cache_creation_input_tokens > 0;
+    BenchmarkMetrics {
+        input_tokens: has_usage.then_some(summary.input_tokens),
+        output_tokens: has_usage.then_some(summary.output_tokens),
+        cached_input_tokens: has_usage.then_some(summary.cached_input_tokens),
+        cache_creation_input_tokens: has_usage.then_some(summary.cache_creation_input_tokens),
+        turn_latencies_ms: summary.turn_latencies_ms,
+        manual_interventions: None,
+        security_cases: security_cases.to_vec(),
+        unresolved_failures: failures.to_vec(),
+    }
+}
+
+/// 没有可用证据时的扩展指标：只有确定的失败与安全用例状态，用量保持未知。
+fn failed_metrics(failures: &[String], security_cases: &[SecurityCaseResult]) -> BenchmarkMetrics {
+    BenchmarkMetrics {
+        security_cases: security_cases.to_vec(),
+        unresolved_failures: failures.to_vec(),
+        ..BenchmarkMetrics::default()
+    }
+}
+
+/// 任务连会话都没建立时的扩展指标。
+fn error_metrics(failure: &str) -> BenchmarkMetrics {
+    let failures = vec![failure.to_owned()];
+    failed_metrics(&failures, &security_case_results())
+}
+
+/// 读取独立安全实测的机器可读结果。
+///
+/// `QCH_SECURITY_CASES` 指向 JSON 数组，结构为
+/// `domain::benchmark::SecurityCaseResult`。未配置、文件损坏或数组为空都
+/// 返回一条 `passed = None` 的未知用例；诊断只走 stderr，不进入 `--json`。
+fn security_case_results() -> Vec<SecurityCaseResult> {
+    let Some(raw) = std::env::var_os("QCH_SECURITY_CASES") else {
+        return vec![unknown_security_case("未配置 QCH_SECURITY_CASES，安全用例未运行")];
+    };
+    let path = PathBuf::from(&raw);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("警告：安全用例证据 {} 读不出来: {error}", path.display());
+            return vec![unknown_security_case("安全用例证据读取失败")];
+        }
+    };
+    match serde_json::from_str::<Vec<SecurityCaseResult>>(&text) {
+        Ok(cases) if !cases.is_empty() => cases,
+        Ok(_) => vec![unknown_security_case("安全用例证据为空")],
+        Err(error) => {
+            eprintln!("警告：安全用例证据 {} 解析失败: {error}", path.display());
+            vec![unknown_security_case("安全用例证据格式错误")]
+        }
+    }
+}
+
+/// 无法形成安全结论时保留一条机器可读的未知记录。
+fn unknown_security_case(reason: &str) -> SecurityCaseResult {
+    SecurityCaseResult {
+        case_id: "security_cases_unknown".to_owned(),
+        passed: None,
+        evidence_path: None,
+        reason: Some(reason.to_owned()),
+    }
+}
 
 /// 运行整个基准任务集，逐个打分。
 ///
@@ -67,19 +150,23 @@ pub async fn run_benchmark(
         eprintln!("▶ [{}/{}] {}", index + 1, total, task.description);
         let result = match run_one(deps, budget, benchmarks_root, workspace, task).await {
             Ok(result) => result,
-            Err(failure) => BenchmarkResult {
-                task_id: task.id.clone(),
-                language: task.language.clone(),
-                session_id: None,
-                passed: false,
-                failures: vec![failure],
-                steps_completed: 0,
-                turns_used: 0,
-                wall_clock_ms: 0,
-                approvals: 0,
-                cache_hit_ratio: None,
-                cost_usd: None,
-            },
+            Err(failure) => {
+                let metrics = error_metrics(&failure);
+                BenchmarkResult {
+                    task_id: task.id.clone(),
+                    language: task.language.clone(),
+                    session_id: None,
+                    passed: false,
+                    failures: vec![failure],
+                    steps_completed: 0,
+                    turns_used: 0,
+                    wall_clock_ms: 0,
+                    approvals: 0,
+                    cache_hit_ratio: None,
+                    cost_usd: None,
+                    metrics,
+                }
+            }
         };
         let verdict = if result.passed { "✓ 通过" } else { "✗ 未通过" };
         eprintln!(
@@ -123,25 +210,29 @@ pub async fn run_long_benchmark(
         eprintln!("▶ [{}/{}] 长任务：{}", index + 1, total, task.description);
         let result = match run_long_one(deps, budget, benchmarks_root, workspace, task).await {
             Ok(result) => result,
-            Err(failure) => LongBenchmarkResult {
-                task_id: task.id.clone(),
-                language: task.language.clone(),
-                session_id: None,
-                first_run_failure: failure.clone(),
-                first_run_steps: 0,
-                first_run_turns: 0,
-                first_run_turn_limit: task.long_run.exhaust_turns.unwrap_or_default(),
-                resume_failure: Some(failure.clone()),
-                resume_turns: 0,
-                total_turns: 0,
-                steps_total: 0,
-                steps_completed: 0,
-                passed: false,
-                failures: vec![failure],
-                repeated_commands: Vec::new(),
-                cost_usd: None,
-                wall_clock_ms: 0,
-            },
+            Err(failure) => {
+                let metrics = error_metrics(&failure);
+                LongBenchmarkResult {
+                    task_id: task.id.clone(),
+                    language: task.language.clone(),
+                    session_id: None,
+                    first_run_failure: failure.clone(),
+                    first_run_steps: 0,
+                    first_run_turns: 0,
+                    first_run_turn_limit: task.long_run.exhaust_turns.unwrap_or_default(),
+                    resume_failure: Some(failure.clone()),
+                    resume_turns: 0,
+                    total_turns: 0,
+                    steps_total: 0,
+                    steps_completed: 0,
+                    passed: false,
+                    failures: vec![failure],
+                    repeated_commands: Vec::new(),
+                    cost_usd: None,
+                    wall_clock_ms: 0,
+                    metrics,
+                }
+            }
         };
         let verdict = if result.passed { "✓ 通过" } else { "✗ 未通过" };
         if result.first_run_failure.is_empty() {
@@ -313,13 +404,14 @@ async fn run_one(
             language: task.language.clone(),
             session_id: None,
             passed: false,
-            failures,
+            failures: failures.clone(),
             steps_completed,
             turns_used: 0,
             wall_clock_ms: 0,
             approvals: 0,
             cache_hit_ratio: None,
             cost_usd: None,
+            metrics: failed_metrics(&failures, &security_case_results()),
         });
     };
 
@@ -340,6 +432,7 @@ async fn run_one(
 
     let (turns_used, cost_usd, wall_clock_ms, approvals, cache_hit_ratio) =
         usage_of(workspace, &session_id).await;
+    let metrics = benchmark_metrics(workspace, &session_id, &failures, &security_case_results());
     let result = BenchmarkResult {
         task_id: task.id.clone(),
         language: task.language.clone(),
@@ -352,6 +445,7 @@ async fn run_one(
         approvals,
         cache_hit_ratio,
         cost_usd,
+        metrics,
     };
     // 结果已定，尽力清理临时仓库。失败诊断依赖结果中的输出末尾与证据。
     let _ = fs::remove_dir_all(&repo);
@@ -475,6 +569,7 @@ async fn run_long_one(
         failures.push(resume_failure.clone().unwrap_or_default());
     }
 
+    let metrics = benchmark_metrics(workspace, &session_id, &failures, &security_case_results());
     let result = LongBenchmarkResult {
         task_id: task.id.clone(),
         language: task.language.clone(),
@@ -493,6 +588,7 @@ async fn run_long_one(
         repeated_commands: repeated,
         cost_usd,
         wall_clock_ms,
+        metrics,
     };
     let _ = fs::remove_dir_all(&repo);
     Ok(result)
@@ -618,9 +714,9 @@ async fn usage_of_long(
         cost = summary.cost_usd;
         wall_clock = summary.wall_clock_ms;
         for evidence in &log.events {
-            if let crate::domain::evidence::AuditEvent::ToolObserved { call, .. } = &evidence.event {
-                if call.name == "run_command" {
-                    if let Some(command) = call.arguments.get("command").and_then(|v| v.as_str()) {
+            if let crate::domain::evidence::AuditEvent::ToolObserved { call, .. } = &evidence.event
+                && call.name == "run_command"
+                    && let Some(command) = call.arguments.get("command").and_then(|v| v.as_str()) {
                         // 先 trim，首尾空白不影响判定。
                         let command = command.trim().to_owned();
                         if repeated.contains(&command) {
@@ -630,8 +726,6 @@ async fn usage_of_long(
                             repeated.push(command);
                         }
                     }
-                }
-            }
         }
     }
     (cost, wall_clock, repeated)
@@ -1064,6 +1158,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_security_evidence_is_recorded_as_unknown_not_green() {
+        // 用空路径触发读取失败，不改写进程级环境变量，避免与其他测试并行冲突。
+        let cases = unknown_security_case("安全用例证据读取失败");
+
+        assert_eq!(cases.case_id, "security_cases_unknown");
+        assert_eq!(cases.passed, None);
+        assert!(cases.reason.is_some());
+    }
+
+    #[test]
+    fn benchmark_metrics_keep_unreported_usage_unknown() {
+        let workspace = temp_benchmarks("metrics-empty");
+        let session = SessionId::new("empty-session");
+        let failures = vec!["模型调用超时".to_owned()];
+        let cases = vec![SecurityCaseResult {
+            case_id: "sandbox_workspace_write".to_owned(),
+            passed: Some(true),
+            evidence_path: Some("runs/security/001.json".to_owned()),
+            reason: None,
+        }];
+
+        let metrics = benchmark_metrics(&workspace, &session, &failures, &cases);
+
+        assert_eq!(metrics.input_tokens, None);
+        assert_eq!(metrics.output_tokens, None);
+        assert_eq!(metrics.manual_interventions, None);
+        assert_eq!(metrics.unresolved_failures, failures);
+        assert_eq!(metrics.security_cases, cases);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
     fn tail_keeps_the_last_lines_of_both_streams() {
         let stdout = (1..=30).map(|i| format!("out{i}")).collect::<Vec<_>>().join("\n");
         let stderr = "error[E0412]: cannot find type\nhelp: consider importing";
@@ -1175,6 +1301,7 @@ mod tests {
             approvals: 0,
             cache_hit_ratio: None,
             cost_usd: None,
+            metrics: BenchmarkMetrics::default(),
         }
     }
 
@@ -1197,6 +1324,7 @@ mod tests {
             repeated_commands: Vec::new(),
             cost_usd: None,
             wall_clock_ms: 0,
+            metrics: BenchmarkMetrics::default(),
         }
     }
 

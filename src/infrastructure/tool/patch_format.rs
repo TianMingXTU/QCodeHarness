@@ -78,13 +78,13 @@ pub fn parse_patch(text: &str) -> Result<Vec<Operation>, String> {
         .map(|line| line.trim_end())
         .collect();
 
-    if trimmed.first().map(|line| *line) != Some(BEGIN_MARKER) {
+    if trimmed.first().copied() != Some(BEGIN_MARKER) {
         return Err(format!(
             "补丁必须以 `{BEGIN_MARKER}` 开头（实际开头是 `{}`）",
             trimmed.first().copied().unwrap_or("<空>")
         ));
     }
-    if trimmed.last().map(|line| *line) != Some(END_MARKER) {
+    if trimmed.last().copied() != Some(END_MARKER) {
         return Err(format!(
             "补丁必须以 `{END_MARKER}` 结尾（实际结尾是 `{}`）",
             trimmed.last().copied().unwrap_or("<空>")

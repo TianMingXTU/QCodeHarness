@@ -1,0 +1,8 @@
+id = "rust-refactor-units"
+kind = "refactor"
+description = "重构 bench-units 库：length 与 area 各自内联了同一份「数值保留一位小数 + 单位」的格式化逻辑，行为等价但重复。验收契约已写在 tests/units.rs——它引用一个尚不存在的共享模块 bench_units::units_fmt（提供 with_unit 函数），所以基线 cargo test 编译失败。先新建共享模块 src/units_fmt.rs 并暴露 with_unit(value, unit)：数值按一位小数格式、后接一个空格与单位；再在 lib.rs 声明该模块，并把 length.rs 与 area.rs 改走共享实现。约束是行为保持等价——length_format 与 area_format 的现有输出一个字符都不许变，回归以 tests/units.rs 全绿为准。"
+
+[criteria]
+test_command = "cargo test"
+requires_changes = true
+answer_must_mention = ["with_unit"]

@@ -5,6 +5,7 @@
 
 pub mod port;
 pub mod agent_roster;
+pub mod doctor;
 pub mod report;
 pub mod agent_run;
 pub mod context_policy;

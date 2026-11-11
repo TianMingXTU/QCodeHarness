@@ -130,18 +130,17 @@ impl SuccessCriteria {
                 failures.push(format!("最终答案未提及关键词 `{word}`"));
             }
         }
-        if let Some(minimum) = self.min_turns {
-            if observed.turns_used < minimum {
+        if let Some(minimum) = self.min_turns
+            && observed.turns_used < minimum {
                 failures.push(format!(
                     "只跑了 {} 轮，长任务要求至少 {minimum} 轮",
                     observed.turns_used
                 ));
             }
-        }
         // 判定与展示使用同一份违规清单：runner 打印"重复副作用 N 次"时也数
         // 这份清单，不统计所有重复过的命令。模型修完缺陷后重跑全量测试属于
         // 正常迭代，不算副作用重复。
-        for command in self.forbidden_repeats(&observed.repeated_commands) {
+        for command in self.forbidden_repeats(observed.repeated_commands) {
             failures.push(format!("命令 `{command}` 被重复执行——副作用重复触发"));
         }
         if !self.must_mention_after_compaction.is_empty() {
@@ -177,6 +176,54 @@ impl SuccessCriteria {
             .cloned()
             .collect()
     }
+}
+
+/// 单个安全用例的客观结果。`passed = None` 表示未运行或结论未知。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecurityCaseResult {
+    /// 用例标识，例如 `sandbox_workspace_write`。
+    pub case_id: String,
+    /// 是否通过；`None` 表示未知。
+    #[serde(default)]
+    pub passed: Option<bool>,
+    /// 原始证据位置。
+    #[serde(default)]
+    pub evidence_path: Option<String>,
+    /// 未通过或未知的原因。
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// 基准结果的机器可读扩展指标。
+///
+/// 基础结果保留最小字段以便旧报告继续读取；耗时、token 分项与未解决的
+/// 失败放在这里，`Option::None` 表示数据来源没有报告，不能按 0 处理。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct BenchmarkMetrics {
+    /// provider 报告的输入 token 合计；`None` 表示没有报告用量。
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    /// provider 报告的输出 token 合计；`None` 表示没有报告用量。
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    /// 从 provider 缓存读回的输入 token 合计；`None` 表示没有报告用量。
+    #[serde(default)]
+    pub cached_input_tokens: Option<u64>,
+    /// 写入 provider 缓存的输入 token 合计；`None` 表示没有报告用量。
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+    /// 逐轮模型调用耗时（毫秒），按调用顺序排列。
+    #[serde(default)]
+    pub turn_latencies_ms: Vec<u64>,
+    /// 人工业务救援次数。运行器无法观测外部救援，`None` 表示未知。
+    #[serde(default)]
+    pub manual_interventions: Option<usize>,
+    /// 安全用例结果。空清单表示本次运行没有安全用例，不能当作全绿。
+    #[serde(default)]
+    pub security_cases: Vec<SecurityCaseResult>,
+    /// 运行结束时仍未解决的失败原因，与结果的 `failures` 一致。
+    #[serde(default)]
+    pub unresolved_failures: Vec<String>,
 }
 
 /// 一次基准运行的结果。
@@ -222,6 +269,9 @@ pub struct BenchmarkResult {
     /// 成本合计（美元）。任一次调用成本未知时为 `None`。低估的合计比
     /// 未知更危险。
     pub cost_usd: Option<f64>,
+    /// 扩展指标。旧结果文件缺省时按空指标读取，不把未知写成 0。
+    #[serde(default)]
+    pub metrics: BenchmarkMetrics,
 }
 
 /// 长任务两段式运行的结果。
@@ -266,6 +316,9 @@ pub struct LongBenchmarkResult {
     pub cost_usd: Option<f64>,
     /// 墙钟（毫秒）：两段合计。
     pub wall_clock_ms: u64,
+    /// 扩展指标。旧结果文件缺省时按空指标读取，不把未知写成 0。
+    #[serde(default)]
+    pub metrics: BenchmarkMetrics,
 }
 
 #[cfg(test)]
@@ -361,9 +414,36 @@ mod tests {
             approvals: 0,
             cache_hit_ratio: Some(0.42),
             cost_usd: None,
+            metrics: BenchmarkMetrics {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(10),
+                cache_creation_input_tokens: Some(5),
+                turn_latencies_ms: vec![120, 340],
+                manual_interventions: None,
+                security_cases: vec![SecurityCaseResult {
+                    case_id: "sandbox_workspace_write".to_owned(),
+                    passed: None,
+                    evidence_path: None,
+                    reason: Some("本机未运行该用例".to_owned()),
+                }],
+                unresolved_failures: vec!["测试命令 `cargo test` 未通过（非 0 退出）".to_owned()],
+            },
         };
         let text = serde_json::to_string(&result).unwrap();
         assert_eq!(serde_json::from_str::<BenchmarkResult>(&text).unwrap(), result);
+    }
+
+    #[test]
+    fn legacy_results_default_to_unknown_extended_metrics() {
+        let text = r#"{"task_id":"greet-npe","language":null,"session_id":null,"passed":true,
+            "failures":[],"steps_completed":2,"turns_used":9,"wall_clock_ms":12500,
+            "approvals":0,"cache_hit_ratio":null,"cost_usd":null}"#;
+
+        let result: BenchmarkResult = serde_json::from_str(text).unwrap();
+
+        assert_eq!(result.metrics, BenchmarkMetrics::default());
+        assert_eq!(result.metrics.input_tokens, None, "旧文件没报用量，不能补 0");
     }
 
     // ── 长任务判据 ───────────────────────────────────────────────────
@@ -535,6 +615,16 @@ mod tests {
             repeated_commands: Vec::new(),
             cost_usd: None,
             wall_clock_ms: 90_000,
+            metrics: BenchmarkMetrics {
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+                turn_latencies_ms: vec![500, 700],
+                manual_interventions: None,
+                security_cases: Vec::new(),
+                unresolved_failures: Vec::new(),
+            },
         };
         let text = serde_json::to_string(&result).unwrap();
         assert_eq!(

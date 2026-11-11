@@ -11,7 +11,7 @@
 //! **上下文与证据分开。** 历史被裁掉后，模型仍要知道这个任务动过什么：
 //! 读过哪些文件、写过哪些文件、跑过哪些命令、哪些调用没成功。这些事实
 //! 由 [`EvidenceIndex`] 从会话历史**算**出来，另记一份会与历史分叉。
-//! 台账在占位说明之后呈现给模型；用户也能通过 `--report` 取到同一份账。
+//! 模型接收预算内的台账摘录；用户通过 `--report` 仍能取到完整台账。
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -324,6 +324,86 @@ impl EvidenceIndex {
     }
 }
 
+/// 模型台账最多占剩余预算的四分之一，且不超过这个上限。近期轮次和
+/// 用户交代先占预算；完整台账仍由 `EvidenceIndex::render` 提供给报告。
+const MODEL_LEDGER_MAX_TOKENS: usize = 1024;
+
+fn model_ledger(session: &Session, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+    let mut successful = EvidenceIndex::default();
+    let mut failures = Vec::new();
+    for slice in session.slices() {
+        let ContextSlice::Round {
+            number,
+            calls,
+            observations,
+            ..
+        } = slice
+        else {
+            continue;
+        };
+        for (call, outcome) in calls.iter().zip(observations) {
+            if outcome.status == OutcomeStatus::Success {
+                successful.add_call(call, Some(outcome));
+            } else {
+                failures.push(format!(
+                    "- 第 {number} 轮 {} {}({}) → {:?}：{}",
+                    call.id.as_str(),
+                    call.name,
+                    abbreviated(&brief_arguments(call)),
+                    outcome.status,
+                    abbreviated(&outcome.content),
+                ));
+            }
+        }
+    }
+    if successful.is_empty() && failures.is_empty() {
+        return String::new();
+    }
+    let mut text = format!(
+        "【本会话的证据台账】限长视图；未成功调用 {} 条。完整参数与结果见原始会话/审计，按轮次与调用 ID 定位。",
+        failures.len(),
+    );
+    if estimate_tokens(&text) > max_tokens {
+        return String::new();
+    }
+    let facts = successful
+        .files_read
+        .iter()
+        .map(|path| format!("- 读过的文件：{}", abbreviated(path)))
+        .chain(
+            successful
+                .files_written
+                .iter()
+                .map(|path| format!("- 写过的文件：{}", abbreviated(path))),
+        )
+        .chain(
+            successful
+                .commands_run
+                .iter()
+                .map(|command| format!("- 跑过的命令：{}", abbreviated(command))),
+        );
+    // 失败优先，且从最近一次开始列，避免大量成功读操作挤掉当前阻塞。
+    for line in failures.into_iter().rev().chain(facts) {
+        let candidate = format!("{text}\n{line}");
+        if estimate_tokens(&candidate) <= max_tokens {
+            text = candidate;
+        }
+    }
+    text
+}
+
+fn abbreviated(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut brief: String = chars.by_ref().take(80).collect();
+    if chars.next().is_some() {
+        brief.push_str("…（已省略）");
+    }
+    brief
+}
+
 /// 内置工具的分类。
 ///
 /// 分类依据工具名：领域层拿不到工具注解（注解在注册表里，注册表在应用
@@ -348,7 +428,13 @@ enum ToolKind {
 /// 唯一的用途是让应用层与真实注册表对照（见
 /// `application::tool_registry` 的测试）。
 pub fn known_tool_names() -> &'static [&'static str] {
-    &["read_file", "read_files", "write_file", "edit_file", "run_command"]
+    &[
+        "read_file",
+        "read_files",
+        "write_file",
+        "edit_file",
+        "run_command",
+    ]
 }
 
 /// 工具名属于哪一类。
@@ -369,7 +455,11 @@ fn subject(call: &ToolCall) -> Vec<String> {
     if let Some(path) = call.arguments.get("path").and_then(|value| value.as_str()) {
         return vec![path.to_owned()];
     }
-    if let Some(paths) = call.arguments.get("paths").and_then(|value| value.as_array()) {
+    if let Some(paths) = call
+        .arguments
+        .get("paths")
+        .and_then(|value| value.as_array())
+    {
         let listed: Vec<String> = paths
             .iter()
             .filter_map(|path| path.as_str().map(str::to_owned))
@@ -378,7 +468,11 @@ fn subject(call: &ToolCall) -> Vec<String> {
             return listed;
         }
     }
-    if let Some(command) = call.arguments.get("command").and_then(|value| value.as_str()) {
+    if let Some(command) = call
+        .arguments
+        .get("command")
+        .and_then(|value| value.as_str())
+    {
         return vec![command.to_owned()];
     }
     vec![call.name.clone()]
@@ -430,7 +524,7 @@ pub struct CompactionReport {
     pub tokens_before: usize,
     /// 裁剪后**实际发出**的 token 估算。
     ///
-    /// 它不小于"原历史减去被裁轮次"，因为占位说明与证据台账是新增内容。
+    /// 包含说明、摘要与模型台账的开销；必保内容本身过长时仍可超过预算。
     pub tokens_after: usize,
     /// 净减少的 token 数。
     ///
@@ -480,8 +574,8 @@ impl CompactionReport {
 /// 查出了什么"的唯一来源，丢了模型会跑偏。最初的用户任务由
 /// [`ContextBudget::keep_task`] 决定去留。
 ///
-/// 被裁掉的位置先放占位说明，其后紧跟一条**证据台账**：做过什么由代码
-/// 从历史算出，不靠模型记忆。
+/// 占位说明、既有摘要与限长证据台账都在选择保留轮次前计入预算。
+/// 必保内容本身已用尽预算时不再追加合成消息，原始历史仍完整保留。
 pub fn compact<'a>(
     session: &'a Session,
     budget: &ContextBudget,
@@ -498,37 +592,31 @@ pub fn compact_with_summary<'a>(
     budget: &ContextBudget,
     summary: Option<&Summary>,
 ) -> (Vec<ContextSlice<'a>>, CompactionReport) {
-    let slices = session.slices();
-    let costs: Vec<usize> = slices.iter().map(slice_tokens).collect();
-    let tokens_before: usize = costs.iter().sum();
-    let round_numbers: Vec<u32> = slices.iter().filter_map(round_number).collect();
-    let rounds_before = round_numbers.len();
+    let view = compact_slices(session, session.slices(), budget, summary);
+    let report = CompactionReport::measure(session, &view);
+    (view, report)
+}
 
-    let mut report = CompactionReport {
-        rounds_before,
-        rounds_after: rounds_before,
-        dropped: Vec::new(),
-        tokens_before,
-        tokens_after: tokens_before,
-        dropped_tokens: 0,
-    };
-
+/// 对已投影的模型视图分配预算，原始会话只用于构造证据索引。
+pub(crate) fn compact_slices<'a>(
+    session: &Session,
+    slices: Vec<ContextSlice<'a>>,
+    budget: &ContextBudget,
+    summary: Option<&Summary>,
+) -> Vec<ContextSlice<'a>> {
     let Some(max_tokens) = budget.max_tokens else {
-        return (slices, report);
+        return slices;
     };
-    if tokens_before <= max_tokens {
-        return (slices, report);
+    let costs: Vec<usize> = slices.iter().map(slice_tokens).collect();
+    if costs.iter().sum::<usize>() <= max_tokens {
+        return slices;
     }
-
-    // 每轮在切片里的位置与它的 token 代价。
     let rounds: Vec<(u32, usize)> = slices
         .iter()
         .enumerate()
         .filter_map(|(index, slice)| round_number(slice).map(|number| (number, index)))
         .collect();
-
-    // 一定会留在视图里的用户消息，其代价先从预算里扣掉。步骤边界与交接
-    // 消息不会被裁；最初的任务消息由 keep_task 决定，它被裁掉时不占预算。
+    let round_numbers: Vec<u32> = rounds.iter().map(|(number, _)| *number).collect();
     let mandatory_tokens: usize = slices
         .iter()
         .zip(&costs)
@@ -538,72 +626,94 @@ pub fn compact_with_summary<'a>(
         })
         .map(|(_, (_, cost))| cost)
         .sum();
-    // 最近几轮一定留着：模型至少要有近期上下文。
-    let floor = budget.min_recent_rounds.min(rounds.len());
-    let floor_start = rounds.len() - floor;
+    let unpinned_total =
+        mandatory_tokens + rounds.iter().map(|(_, index)| costs[*index]).sum::<usize>();
+    if unpinned_total <= max_tokens {
+        return if budget.keep_task {
+            slices
+        } else {
+            slices
+                .into_iter()
+                .enumerate()
+                .filter_map(|(position, slice)| (position != 0).then_some(slice))
+                .collect()
+        };
+    }
+    let floor_start = rounds.len() - budget.min_recent_rounds.min(rounds.len());
     let floor_tokens: usize = rounds[floor_start..]
         .iter()
         .map(|(_, index)| costs[*index])
         .sum();
     let room = max_tokens.saturating_sub(mandatory_tokens + floor_tokens);
+    let ledger = if floor_start > 0 {
+        model_ledger(session, (room / 4).min(MODEL_LEDGER_MAX_TOKENS))
+    } else {
+        String::new()
+    };
+    let ledger_tokens = estimate_tokens(&ledger);
+    let notice_room = room.saturating_sub(ledger_tokens);
 
-    // 从最新的一轮往前装，装不下的就是最老的那几轮。
-    let mut used = 0usize;
+    let mut used = 0;
     let mut keep_from = floor_start;
     for index in (0..floor_start).rev() {
         let cost = costs[rounds[index].1];
-        if used + cost > room {
+        let overhead = if index == 0 {
+            0
+        } else {
+            ledger_tokens
+                + estimate_tokens(&budgeted_omission(
+                    summary,
+                    &round_numbers[..index],
+                    notice_room,
+                ))
+        };
+        if used + cost + overhead > room {
             break;
         }
         used += cost;
         keep_from = index;
     }
 
-    let dropped: Vec<u32> = rounds[..keep_from].iter().map(|(number, _)| *number).collect();
-    let dropped_set: HashSet<u32> = dropped.iter().copied().collect();
-
-    let mut kept: Vec<ContextSlice<'a>> = Vec::with_capacity(slices.len() + 2);
-    // 顺序：任务消息、占位说明与台账、保留的轮次。与人先交代任务、
-    // 再读摘要、然后看近期工作的顺序一致。
-    if budget.keep_task {
-        if let Some(ContextSlice::User(task)) = slices.first() {
+    let mut kept = Vec::with_capacity(slices.len() + 2);
+    if budget.keep_task
+        && let Some(ContextSlice::User(task)) = slices.first() {
             kept.push(ContextSlice::User(task.clone()));
         }
-    }
-    // 只有真的裁掉轮次才需要占位说明与台账。没裁却写"已省略第 0-0 轮"，
-    // 会让模型以为漏看了不存在的历史。
-    if !dropped.is_empty() {
-        kept.push(ContextSlice::User(Cow::Owned(omitted_text(summary, &dropped))));
-        let index = EvidenceIndex::from_session(session);
-        if !index.is_empty() {
-            kept.push(ContextSlice::User(Cow::Owned(format!(
-                "【本会话的证据台账】前面的对话历史被裁剪了，但下列事实仍然成立：\n{}",
-                index.render()
-            ))));
+    if keep_from > 0 {
+        let notice = budgeted_omission(summary, &round_numbers[..keep_from], notice_room);
+        if !notice.is_empty() {
+            kept.push(ContextSlice::User(Cow::Owned(notice)));
+        }
+        if !ledger.is_empty() {
+            kept.push(ContextSlice::User(Cow::Owned(ledger)));
         }
     }
-    for (position, slice) in slices.iter().enumerate() {
-        match slice {
-            // 任务消息已放在最前面（或按 keep_task 裁掉），原样再放一遍
-            // 会让模型把同一件事看两遍。
+    let dropped: HashSet<u32> = round_numbers[..keep_from].iter().copied().collect();
+    for (position, slice) in slices.into_iter().enumerate() {
+        match &slice {
             ContextSlice::User(_) if position == 0 => {}
-            // 其余用户消息是步骤边界（单会话编排的产物），是"现在在第几步"
-            // 的唯一来源，不是历史轮次。裁掉它模型就不知道进度，而裁剪
-            // 通常发生在步数最多的长任务上。按原位置保留：把第 3 步的
-            // 交代挪到第 1 步的观察之前，会给出错误的时间线。
-            ContextSlice::User(_) => kept.push(slice.clone()),
-            ContextSlice::Round { number, .. } if !dropped_set.contains(number) => {
-                kept.push(slice.clone())
-            }
+            // 保留用户约束、交接与步骤序列的原始位置。
+            ContextSlice::User(_) => kept.push(slice),
+            ContextSlice::Round { number, .. } if !dropped.contains(number) => kept.push(slice),
             ContextSlice::Round { .. } => {}
         }
     }
+    kept
+}
 
-    report.rounds_after = rounds_before - dropped.len();
-    report.dropped = dropped;
-    report.tokens_after = kept.iter().map(slice_tokens).sum();
-    report.dropped_tokens = tokens_before.saturating_sub(report.tokens_after);
-    (kept, report)
+fn budgeted_omission(summary: Option<&Summary>, dropped: &[u32], max_tokens: usize) -> String {
+    let text = omitted_text(summary, dropped);
+    if estimate_tokens(&text) <= max_tokens {
+        return text;
+    }
+    // 摘要不能挤掉必保轮次。没有余量时不追加合成消息，超预算仅由必保
+    // 用户消息和近期轮次产生。
+    let notice = omitted_notice(dropped);
+    if estimate_tokens(&notice) <= max_tokens {
+        notice
+    } else {
+        String::new()
+    }
 }
 
 /// 切片的轮次号。用户消息没有轮次号。
@@ -648,6 +758,10 @@ mod tests {
     /// 建一个带 `n` 轮历史的会话：第 `i` 轮读 `r{i}.txt`，观察文本带轮次号，
     /// 用于断言某轮的观察是否出现在裁剪结果里。
     fn session_with_rounds(n: u32) -> Session {
+        session_with_output(n, "")
+    }
+
+    fn session_with_output(n: u32, padding: &str) -> Session {
         let mut session = Session::new(SessionId::new("s1"), "任务");
         for index in 1..=n {
             session
@@ -660,7 +774,7 @@ mod tests {
                             arguments: json!({"path": format!("r{index}.txt")}),
                         }],
                     },
-                    vec![ToolOutcome::success(format!("观察{index}"))],
+                    vec![ToolOutcome::success(format!("观察{index}{padding}"))],
                 )
                 .unwrap();
         }
@@ -767,19 +881,22 @@ mod tests {
 
     #[test]
     fn keep_task_pins_the_task_message_first() {
-        let session = session_with_rounds(4);
-        let (slices, _) = compact(&session, &budget(1));
+        let session = session_with_output(4, &"x".repeat(2000));
+        let (slices, _) = compact(&session, &budget(200));
 
         assert!(
             matches!(&slices[0], ContextSlice::User(text) if text.as_ref() == "任务"),
             "任务消息必须排在第一位，实际 {:?}",
             slices[0]
         );
-        assert!(matches!(&slices[1], ContextSlice::User(_)), "第二位是占位说明");
+        assert!(
+            matches!(&slices[1], ContextSlice::User(_)),
+            "第二位是占位说明"
+        );
 
         // 关掉 keep_task：任务也被裁掉，占位说明排到第一位。
         let no_task = ContextBudget {
-            max_tokens: Some(1),
+            max_tokens: Some(200),
             min_recent_rounds: 0,
             keep_task: false,
             summarize: None,
@@ -812,13 +929,34 @@ mod tests {
         let (slices, report) = compact(&session, &no_task);
 
         let numbers: Vec<u32> = slices.iter().filter_map(round_number).collect();
-        assert_eq!(
-            numbers,
-            vec![5, 6],
-            "任务消息被裁掉时不占预算，应留下两轮"
-        );
+        assert_eq!(numbers, vec![5, 6], "任务消息被裁掉时不占预算，应留下两轮");
         assert_eq!(report.dropped, vec![1, 2, 3, 4]);
         assert_eq!(report.rounds_after, 2);
+    }
+
+    #[test]
+    fn dropping_only_an_unpinned_task_does_not_require_history_compaction() {
+        let mut saved = session_with_rounds(6).snapshot();
+        saved.turns[0] = Turn::User("可丢弃的任务描述".repeat(1000));
+        let session =
+            Session::from_snapshot(SessionId::new("unpinned-task"), saved.clone()).unwrap();
+        let limit = round_costs(&session).iter().sum();
+        let budget = ContextBudget {
+            max_tokens: Some(limit),
+            min_recent_rounds: 0,
+            keep_task: false,
+            summarize: None,
+        };
+        let (view, report) = compact(&session, &budget);
+
+        assert!(
+            report.dropped.is_empty(),
+            "去掉任务后全部轮次都能装下: {report:?}"
+        );
+        assert_eq!(report.rounds_after, 6);
+        assert!(report.tokens_after <= limit);
+        assert!(user_texts(&view).is_empty());
+        assert_eq!(session.snapshot(), saved);
     }
 
     /// 超预算但没有可裁轮次时，不写占位说明，也不写证据台账。
@@ -846,7 +984,11 @@ mod tests {
 
         assert!(report.dropped.is_empty());
         assert_eq!(report.rounds_after, 2);
-        assert_eq!(user_texts(&slices), ["任务"], "保住的两轮之外不追加用户消息");
+        assert_eq!(
+            user_texts(&slices),
+            ["任务"],
+            "保住的两轮之外不追加用户消息"
+        );
     }
 
     /// 没有裁剪时，摘要也不进入视图。
@@ -868,16 +1010,22 @@ mod tests {
 
     #[test]
     fn placeholder_names_the_omitted_range() {
-        let session = session_with_rounds(6);
-        let (slices, _) = compact(&session, &budget(1));
+        let session = session_with_output(6, &"x".repeat(2000));
+        let (slices, _) = compact(&session, &budget(200));
 
         let Some(ContextSlice::User(placeholder)) = slices.get(1) else {
             panic!("第二位应当是占位说明，实际 {:?}", slices.get(1));
         };
         assert!(placeholder.contains("第 1-6 轮"), "{}", placeholder);
         assert!(placeholder.contains("共 6 轮"), "{}", placeholder);
-        assert!(placeholder.contains("search_text"), "应指路 search_text: {placeholder}");
-        assert!(placeholder.contains("read_file"), "应指路 read_file: {placeholder}");
+        assert!(
+            placeholder.contains("search_text"),
+            "应指路 search_text: {placeholder}"
+        );
+        assert!(
+            placeholder.contains("read_file"),
+            "应指路 read_file: {placeholder}"
+        );
     }
 
     #[test]
@@ -897,11 +1045,12 @@ mod tests {
     }
 
     #[test]
-    fn zero_token_budget_keeps_only_task_and_placeholder() {
+    fn zero_token_budget_keeps_the_task_without_synthetic_messages() {
         let session = session_with_rounds(2);
         let (slices, report) = compact(&session, &budget(0));
 
-        assert!(slices.len() >= 2, "至少是任务 + 占位说明");
+        assert_eq!(user_texts(&slices), ["任务"]);
+        assert_eq!(report.tokens_after, estimate_tokens("任务"));
         assert_eq!(report.dropped, vec![1, 2]);
     }
 
@@ -925,7 +1074,10 @@ mod tests {
                                 arguments: json!({"path": "a.txt"}),
                             }],
                         },
-                        vec![ToolOutcome::success(format!("第 {step} 步的观察"))],
+                        vec![ToolOutcome::success(format!(
+                            "第 {step} 步的观察{}",
+                            "x".repeat(2000)
+                        ))],
                     )
                     .unwrap();
             }
@@ -936,17 +1088,18 @@ mod tests {
     #[test]
     fn step_boundaries_survive_compaction_in_their_original_order() {
         let session = session_with_steps(2);
-        // 只够装两轮：三步各两轮里只有最后两轮保留，但每条步骤交代
-        // 都不能丢。步骤交代是用户消息，永远保留，也占 token，计算上限
-        // 时要算进去。
+        // 留出说明与台账的空间，剩余预算只够最近两轮。
         let costs = round_costs(&session);
-        let limit = costs[4] + costs[5] + mandatory_tokens(&session, true);
+        let limit = costs[4] + costs[5] + mandatory_tokens(&session, true) + 256;
         let (slices, report) = compact(&session, &budget(limit));
 
         assert_eq!(report.dropped, vec![1, 2, 3, 4], "裁掉前四轮");
         let texts = user_texts(&slices);
         assert_eq!(texts[0], "任务", "任务交代钉在最前");
-        assert!(texts[1].contains("已省略第 1-4 轮"), "第二位是占位说明: {texts:?}");
+        assert!(
+            texts[1].contains("已省略第 1-4 轮"),
+            "第二位是占位说明: {texts:?}"
+        );
         // 第 1 步没有独立交代，任务消息就是第 1 步的交代。
         for step in 2..=3 {
             assert!(
@@ -1007,8 +1160,8 @@ mod tests {
 
     #[test]
     fn without_summary_the_placeholder_behaviour_is_unchanged() {
-        let session = session_with_rounds(6);
-        let (slices, _) = compact(&session, &budget(1));
+        let session = session_with_output(6, &"x".repeat(2000));
+        let (slices, _) = compact(&session, &budget(200));
 
         let text = second_slice_text(&slices);
         assert!(text.contains("已省略第 1-6 轮"), "{text}");
@@ -1017,25 +1170,31 @@ mod tests {
 
     #[test]
     fn summary_covering_all_dropped_rounds_replaces_the_placeholder() {
-        let mut session = session_with_rounds(6);
+        let mut session = session_with_output(6, &"x".repeat(2000));
         with_summary(&mut session, 1, 6);
-        let (slices, _) = compact(&session, &budget(1));
+        let (slices, _) = compact(&session, &budget(200));
 
         let text = second_slice_text(&slices);
         assert!(text.contains("摘要：第 1-6 轮做了什么事"), "{text}");
-        assert!(!text.contains("已省略"), "摘要覆盖全部被裁轮次时不应再出现占位说明: {text}");
+        assert!(
+            !text.contains("已省略"),
+            "摘要覆盖全部被裁轮次时不应再出现占位说明: {text}"
+        );
     }
 
     #[test]
     fn partial_summary_falls_back_to_the_placeholder() {
-        let mut session = session_with_rounds(6);
+        let mut session = session_with_output(6, &"x".repeat(2000));
         // 摘要只覆盖第 1-2 轮，被裁的第 3-6 轮在覆盖范围外。
         with_summary(&mut session, 1, 2);
-        let (slices, _) = compact(&session, &budget(1));
+        let (slices, _) = compact(&session, &budget(200));
 
         let text = second_slice_text(&slices);
         assert!(text.contains("已省略第 1-6 轮"), "{text}");
-        assert!(!text.contains("摘要"), "部分覆盖时不得把没摘要的轮次说成已概括: {text}");
+        assert!(
+            !text.contains("摘要"),
+            "部分覆盖时不得把没摘要的轮次说成已概括: {text}"
+        );
     }
 
     /// 显式传入的摘要不必先写回会话，也能替代占位说明。
@@ -1043,13 +1202,13 @@ mod tests {
     /// 上下文策略就是这样用的：刚生成的摘要直接带进裁剪，会话保持只读。
     #[test]
     fn an_explicit_summary_is_used_without_writing_it_into_the_session() {
-        let session = session_with_rounds(6);
+        let session = session_with_output(6, &"x".repeat(2000));
         let summary = Summary {
             covers: (1, 6),
             text: "外部摘要：全部六轮".to_owned(),
             steps: Vec::new(),
         };
-        let (slices, _) = compact_with_summary(&session, &budget(1), Some(&summary));
+        let (slices, _) = compact_with_summary(&session, &budget(200), Some(&summary));
 
         let text = second_slice_text(&slices);
         assert!(text.contains("外部摘要"), "{text}");
@@ -1058,17 +1217,21 @@ mod tests {
 
     #[test]
     fn compact_stays_pure_when_a_summary_is_set() {
-        let mut session = session_with_rounds(5);
-        // 摘要覆盖全部五轮。预算压到 1 时五轮全被裁，摘要会被用上。
+        let mut session = session_with_output(5, &"x".repeat(2000));
+        // 预算能容纳摘要，但装不下一轮原始观察。
         with_summary(&mut session, 1, 5);
         let summary_before = session.summary().cloned();
         let turns_before = session.turns().len();
 
-        let (first, _) = compact(&session, &budget(1));
-        let (second, _) = compact(&session, &budget(1));
+        let (first, _) = compact(&session, &budget(200));
+        let (second, _) = compact(&session, &budget(200));
 
         assert_eq!(first, second, "同一输入两次裁剪结果一致（无隐藏状态变更）");
-        assert_eq!(session.summary(), summary_before.as_ref(), "摘要不被裁剪改动");
+        assert_eq!(
+            session.summary(),
+            summary_before.as_ref(),
+            "摘要不被裁剪改动"
+        );
         assert_eq!(session.turns().len(), turns_before);
         assert!(
             first.iter().any(|slice| match slice {
@@ -1181,6 +1344,264 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_large_failed_payload_is_locatable_without_reinjection() {
+        let mut session = Session::new(SessionId::new("large-failure"), "修复解析器");
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: src/parser.rs\n{}\n*** End Patch",
+            "+replacement\n".repeat(5000)
+        );
+        let error = format!("补丁格式错误：找不到上下文\n{}", "诊断细节".repeat(10000));
+        let calls = vec![
+            ToolCall {
+                id: CallId::new("failed-patch"),
+                name: "apply_patch".to_owned(),
+                arguments: json!({"patch": patch}),
+            },
+            ToolCall {
+                id: CallId::new("failed-command"),
+                name: "run_command".to_owned(),
+                arguments: json!({"command": "cargo test"}),
+            },
+        ];
+        session
+            .commit_round(
+                AgentTurn {
+                    text: "尝试修复".to_owned(),
+                    calls: calls.clone(),
+                },
+                vec![
+                    ToolOutcome::refused("补丁格式错误：拒绝执行"),
+                    ToolOutcome::failed(error.clone()),
+                ],
+            )
+            .unwrap();
+        for _ in 0..6 {
+            session
+                .commit_round(
+                    AgentTurn {
+                        text: "近期工作".repeat(150),
+                        calls: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+        let original = session.snapshot();
+        let limit = ContextBudget {
+            max_tokens: Some(2400),
+            min_recent_rounds: 2,
+            keep_task: true,
+            summarize: None,
+        };
+        let (view, report) = compact(&session, &limit);
+        let users = user_texts(&view).join("\n");
+
+        assert!(report.dropped.contains(&1));
+        assert!(
+            report.tokens_after <= 2400,
+            "失败参数不应重新撑爆预算: {report:?}"
+        );
+        assert!(
+            users.contains("failed-patch")
+                && users.contains("apply_patch")
+                && users.contains("第 1 轮"),
+            "被裁失败应能按轮次和调用 ID 定位"
+        );
+        assert!(users.contains("failed-command") && users.contains("补丁格式错误"));
+        assert!(!users.contains(&patch));
+        assert!(!users.contains(&error));
+        assert_eq!(session.snapshot(), original);
+        let full_report = EvidenceIndex::from_session(&session).render();
+        assert!(full_report.contains(&patch), "人用报告仍保留完整失败参数");
+        assert!(full_report.contains(&error), "人用报告仍保留完整错误");
+        let events = vec![
+            AuditEvent::ToolObserved {
+                turn: 1,
+                call: calls[0].clone(),
+                outcome: ToolOutcome::refused("补丁格式错误：拒绝执行"),
+            },
+            AuditEvent::ToolObserved {
+                turn: 1,
+                call: calls[1].clone(),
+                outcome: ToolOutcome::failed(error),
+            },
+        ];
+        assert_eq!(
+            EvidenceIndex::from_events(&events),
+            EvidenceIndex::from_session(&session)
+        );
+    }
+
+    #[test]
+    fn many_ledger_entries_share_the_context_budget() {
+        let mut session = Session::new(SessionId::new("many-entries"), "核对调用结果");
+        for index in 1..=150 {
+            session.commit_round(
+                AgentTurn { text: "收集证据".to_owned(), calls: vec![
+                    ToolCall { id: CallId::new(format!("read-{index}")), name: "read_file".to_owned(), arguments: json!({"path": format!("src/module_{index}/long_file_name.rs")}) },
+                    ToolCall { id: CallId::new(format!("failure-{index}")), name: "edit_file".to_owned(), arguments: json!({"path": format!("src/module_{index}/target.rs"), "content": "新内容".repeat(200)}) },
+                ] },
+                vec![ToolOutcome::success("文件内容".repeat(80)), ToolOutcome::failed("匹配失败：原文不存在".repeat(50))],
+            ).unwrap();
+        }
+        let original = session.snapshot();
+        let limit = ContextBudget {
+            max_tokens: Some(4000),
+            min_recent_rounds: 2,
+            keep_task: true,
+            summarize: None,
+        };
+        let (view, report) = compact(&session, &limit);
+        let users = user_texts(&view).join("\n");
+
+        assert!(!report.dropped.is_empty());
+        assert!(
+            report.tokens_after <= 4000,
+            "台账条数增长也必须受限: {report:?}"
+        );
+        assert!(users.contains("failure-150"), "优先保留近期失败的定位信息");
+        assert!(users.contains("部分") || users.contains("限长") || users.contains("省略"));
+        assert_eq!(session.snapshot(), original);
+        assert_eq!(
+            EvidenceIndex::from_session(&session).unfinished_calls.len(),
+            150
+        );
+    }
+
+    #[test]
+    fn compaction_reserves_space_for_the_notice_and_ledger_before_rounds() {
+        let mut session = session_with_rounds(6);
+        for _ in 0..4 {
+            session
+                .commit_round(
+                    AgentTurn {
+                        text: "工作记录".repeat(250),
+                        calls: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+        let costs = round_costs(&session);
+        let limit = mandatory_tokens(&session, true) + costs[8] + costs[9];
+        let budget = ContextBudget {
+            max_tokens: Some(limit),
+            min_recent_rounds: 1,
+            keep_task: true,
+            summarize: None,
+        };
+        let (view, report) = compact(&session, &budget);
+
+        assert!(
+            report.tokens_after <= limit,
+            "新增台账和说明必须预先计入预算: {report:?}"
+        );
+        assert!(report.rounds_after >= 1);
+        assert!(
+            user_texts(&view).iter().any(|text| text.contains("r1.txt")),
+            "被裁文件仍有证据索引"
+        );
+        assert_eq!(CompactionReport::measure(&session, &view), report);
+    }
+
+    #[test]
+    fn compaction_accounts_for_overhead_at_each_budget_boundary() {
+        let session = session_with_output(5, &"边界观察".repeat(20));
+        let original = session.snapshot();
+        let all_tokens = CompactionReport::measure(&session, &session.slices()).tokens_before;
+        let costs = round_costs(&session);
+
+        for keep_task in [false, true] {
+            for min_recent_rounds in 0..=2 {
+                let pinned_tokens = mandatory_tokens(&session, keep_task)
+                    + costs[costs.len() - min_recent_rounds..]
+                        .iter()
+                        .sum::<usize>();
+                for max_tokens in pinned_tokens..=all_tokens + 1 {
+                    let budget = ContextBudget {
+                        max_tokens: Some(max_tokens),
+                        min_recent_rounds,
+                        keep_task,
+                        summarize: None,
+                    };
+                    let (view, report) = compact(&session, &budget);
+                    assert!(
+                        report.tokens_after <= max_tokens,
+                        "边界预算应包含合成消息开销: {budget:?}, {report:?}"
+                    );
+                    if report.dropped.is_empty() {
+                        assert!(
+                            user_texts(&view).iter().all(|text| text == "任务"),
+                            "未裁历史时不应追加说明或台账"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(session.snapshot(), original);
+    }
+
+    #[test]
+    fn pinned_recent_rounds_may_exceed_the_budget_without_ledger_growth() {
+        let mut session = session_with_rounds(4);
+        for _ in 0..2 {
+            session
+                .commit_round(
+                    AgentTurn {
+                        text: "必须保留的近期结果".repeat(300),
+                        calls: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+        let original = session.snapshot();
+        let costs = round_costs(&session);
+        let pinned_tokens = mandatory_tokens(&session, true) + costs[4] + costs[5];
+        let budget = ContextBudget {
+            max_tokens: Some(100),
+            min_recent_rounds: 2,
+            keep_task: true,
+            summarize: None,
+        };
+        let (view, report) = compact(&session, &budget);
+
+        assert_eq!(
+            view.iter().filter_map(round_number).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        assert!(
+            report.tokens_after > 100,
+            "近期轮次下限允许不可避免的超预算"
+        );
+        assert_eq!(
+            report.tokens_after, pinned_tokens,
+            "没有余量时不得再追加台账或说明"
+        );
+        assert_eq!(session.snapshot(), original);
+    }
+
+    #[test]
+    fn a_large_existing_summary_cannot_expand_the_compacted_view() {
+        let mut session = session_with_a_fat_round();
+        session.set_summary(Summary {
+            covers: (1, 4),
+            text: "摘要正文".repeat(5000),
+            steps: vec![1],
+        });
+        let original = session.snapshot();
+        let (view, report) = compact(&session, &budget(1200));
+
+        assert!(
+            report.tokens_after <= 1200,
+            "既有摘要也需要预算: {report:?}"
+        );
+        assert!(!report.dropped.is_empty());
+        assert_eq!(session.snapshot(), original);
+        assert_eq!(CompactionReport::measure(&session, &view), report);
+    }
+
     // ── 证据台账 ─────────────────────────────────────────────────────
 
     /// 台账从会话历史算出来：读过什么、写过什么、跑过什么。
@@ -1281,7 +1702,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(EvidenceIndex::from_session(&session).files_read, vec!["a.txt"]);
+        assert_eq!(
+            EvidenceIndex::from_session(&session).files_read,
+            vec!["a.txt"]
+        );
     }
 
     /// 批量读按一文件一项记录：台账里能逐个认出读过哪些文件。
@@ -1322,16 +1746,19 @@ mod tests {
                         arguments: json!({"path": "a.txt"}),
                     }],
                 },
-                vec![ToolOutcome::success("内容".to_owned())],
+                vec![ToolOutcome::success("内容".repeat(1000))],
             )
             .unwrap();
 
-        let (slices, _) = compact(&session, &budget(1));
+        let (slices, _) = compact(&session, &budget(512));
 
         let texts = user_texts(&slices);
         assert!(texts[1].contains("已省略"), "第二位是占位说明: {texts:?}");
         assert!(texts[2].contains("证据台账"), "第三位是台账: {texts:?}");
-        assert!(texts[2].contains("a.txt"), "台账里应列出读过的文件: {texts:?}");
+        assert!(
+            texts[2].contains("a.txt"),
+            "台账里应列出读过的文件: {texts:?}"
+        );
     }
 
     /// 没裁剪时不加台账：模型看到的历史完整，不需要这一段。
@@ -1364,7 +1791,7 @@ mod tests {
                 vec![ToolOutcome::success("内容".to_owned())],
             )
             .unwrap();
-        let events = vec![AuditEvent::ToolObserved {
+        let events = [AuditEvent::ToolObserved {
             turn: 1,
             call,
             outcome: ToolOutcome::success("内容".to_owned()),

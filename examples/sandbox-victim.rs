@@ -33,6 +33,8 @@ fn main() {
             // 故意不 wait：parent 结束后 child 成为孤儿并继续运行，这是旧实现
             // 的缺陷形态，child.kill() 无法终止它。
             println!("child pid: {}", child.id());
+            // 保留 Child 句柄到进程结束，避免把测试夹具误报为资源泄漏。
+            std::mem::forget(child);
             run_victim(&suffixed(log, ".parent"));
         }
         other => panic!("用法: sandbox-victim <日志路径> 或 --child <日志路径>，实际 {other:?}"),

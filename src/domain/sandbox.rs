@@ -4,6 +4,11 @@
 //! 强制执行。目前只有 Windows 的 Job Object 提供进程沙箱，且它不提供
 //! 文件系统或网络隔离；其他平台没有进程沙箱。平台能力见
 //! [`PlatformCapabilities::detect`]。
+//!
+//! 无完整隔离能力时（`unisolation_statement` 为 Some），开放命令由
+//! [`unisolated_decision`] 按基线名单裁决：只放行策略基线覆盖的只读
+//! 与测试命令形状，其余硬拒绝，除非宿主显式设置
+//! `QCH_ALLOW_UNISOLATED_COMMANDS=1`。
 
 use std::path::Path;
 use std::time::Duration;
@@ -90,6 +95,326 @@ impl PlatformCapabilities {
 pub const SANDBOX_DOWNGRADE_NOTICE: &str =
     "⚠️ 进程沙箱未生效：本命令在无资源限制的宿主机环境执行，请格外保守。";
 pub const MCP_BOUNDARY_LABEL: &str = "MCP subprocess";
+
+/// 宿主显式放行开放命令的环境变量。
+///
+/// 只放宽 [`UnisolatedDecision::Refused`] 的裁决：审批闸门、词法硬拒绝、
+/// 越界写入检查与角色白名单都不受它影响。设置时未生效声明仍必须带
+/// 上（`unisolation_statement`），让模型与证据看到「执行但无完整隔离」。
+pub const ALLOW_UNISOLATED_COMMANDS_ENV: &str = "QCH_ALLOW_UNISOLATED_COMMANDS";
+
+/// 稳定拒绝码。执行层用它向模型报告「该命令被策略拒绝」，程序侧按码
+/// 分支，不靠解析消息文本。
+pub const REFUSAL_CODE_UNISOLATED: &str = "sandbox_unisolated_command";
+
+/// 无完整隔离能力（`unisolation_statement` 为 Some）时对一条开放命令的裁决。
+///
+/// 与 [`UnisolatedCommand`] 的区别：这里已经读入环境变量，执行层拿到的是
+/// 可以直接落地的结论，不用再查一遍宿主配置。
+/// 不派生 `Copy`：`Refused` 携带 `String` 理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnisolatedDecision {
+    /// 允许执行。结论必须随 `unisolation_statement` 一起呈现：模型可见
+    /// 文本与边界证据都要声明进程沙箱、文件隔离、网络隔离未生效。
+    Allowed,
+    /// 拒绝执行。`reason` 含未生效声明与可执行建议；`stable_code` 固定为
+    /// [`REFUSAL_CODE_UNISOLATED`]，执行层原样带回给模型与调用方。
+    Refused { reason: String, stable_code: &'static str },
+}
+
+/// 缺少文件与网络隔离时，判断一条开放命令是否允许执行。
+///
+/// 这是纯判定：`host_allows` 由调用方传入环境变量的当前值，函数不读
+/// 环境，因此可以被任意 `PlatformCapabilities` 构造组合做单元测试，
+/// 不需要真实的 Linux 或 macOS 机器。
+///
+/// 口径：只放行策略基线覆盖的只读与测试命令形状（[`UnisolatedCommand`]
+/// 的文档列了完整清单），其余一律拒绝。`host_allows` 为 true 时拒绝
+/// 全部让位给放行，但**不允许**借此省略未生效声明：`unisolation_statement`
+/// 是执行层必须附带的固定文本，与本函数的裁决无关。
+///
+/// 不改变既有防线：词法硬拒绝（越界写入）、审批闸门、角色白名单在调用
+/// 本函数之前各自生效，本函数只在它们全部放行之后做最后一道开放命令收口。
+pub fn unisolated_decision(
+    capabilities: &PlatformCapabilities,
+    command: &ParsedCommand,
+    host_allows: bool,
+) -> UnisolatedDecision {
+    let Some(statement) = capabilities.unisolation_statement() else {
+        return UnisolatedDecision::Allowed;
+    };
+    match UnisolatedCommand::classify(command) {
+        UnisolatedCommand::Baseline => UnisolatedDecision::Allowed,
+        UnisolatedCommand::Open => {
+            if host_allows {
+                UnisolatedDecision::Allowed
+            } else {
+                UnisolatedDecision::Refused {
+                    reason: unisolated_refusal_reason(statement),
+                    stable_code: REFUSAL_CODE_UNISOLATED,
+                }
+            }
+        }
+    }
+}
+
+/// 拒绝理由。把「为什么拒」与「怎么办」写给模型，不依赖它再猜一次。
+/// 开头固定是稳定码，程序侧可按码前缀分支。
+fn unisolated_refusal_reason(statement: &str) -> String {
+    format!(
+        "{REFUSAL_CODE_UNISOLATED}: {statement} 开放命令在缺少文件系统与网络隔离的\
+         宿主机上默认拒绝。基线允许：cargo test/check/build、go test/build/vet、\
+         gofmt -l、python -m unittest、node --test、git status/diff（只读形式），\
+         以及这些命令后面接 `echo` 回显退出码或 `head`/`tail`/`wc` 一类只读输出\
+         过滤器。如需执行开放命令，请宿主设置 `{ALLOW_UNISOLATED_COMMANDS_ENV}=1`；\
+         该开关不关闭审批、词法硬拒绝、越界写入检查或角色白名单，\
+         执行时未生效声明照常附带。"
+    )
+}
+
+impl PlatformCapabilities {
+    /// 文件隔离或网络隔离任一缺失时，返回写进模型可见文本与证据的未生效
+    /// 声明；两项都实现时返回 `None`。
+    ///
+    /// 声明只覆盖文件与网络两项，不虚报已生效的隔离。进程沙箱缺失的声明
+    /// 由 `SANDBOX_DOWNGRADE_NOTICE` 单独承担，两个声明通道互不覆盖：
+    /// 无进程沙箱的平台降级执行时两条都会出现，模型一次看全。
+    pub fn unisolation_statement(&self) -> Option<&'static str> {
+        if self.has_filesystem_isolation && self.has_network_isolation {
+            return None;
+        }
+        Some(
+            "⚠️ 文件系统隔离与网络隔离未生效：命令可以读写 workspace 外的文件，\
+             且可以访问网络。请格外保守。",
+        )
+    }
+}
+
+/// 开放命令形状判定。
+///
+/// `Baseline` 的清单与策略基线对齐：只读 git、各语言的标准测试与构建
+/// 命令、只读的格式化检查，以及这些命令后面接输出观察器的组合。清单外
+/// 的任何程序都归为 `Open`：宁可让宿主多设一次环境变量，也不能在无法
+/// 证明命令无害时放行。
+/// 判定用 [`ParsedCommand`] 的结构化模型，不用原始文本：链接符在词法层
+/// 面就把命令分段了，逐段检查比匹配整串文本可靠，也与策略基线不吞链接
+/// 符的口径一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnisolatedCommand {
+    /// 策略基线覆盖的只读与测试命令形状，允许不经宿主放行直接执行。
+    ///
+    /// 完整清单（重定向目标限 workspace 内）：
+    /// - `cargo test *`、`cargo check *`、`cargo build *`（含 `--offline`）
+    /// - `go test *`、`go build *`、`go vet *`
+    /// - `gofmt -l *`（列出未格式化文件；带 `-w` 的形态不在内）
+    /// - `python -m unittest *`、`python -I -m unittest *`
+    /// - `node --test *`
+    /// - `git status`、`git diff`（只读形式；带 `--output` 的形态不在内）
+    /// - 以上命令用 `;`、`&&`、`||`、管道或换行串起来，且每一段都在清单内
+    /// - 上述命令后面接 `echo` 回显，或接 `head`/`tail`/`more`/`wc`/`uniq`
+    ///   截取输出（过滤器不带文件操作数）
+    Baseline,
+    /// 开放命令：可能写 workspace 外、可能联网、可能拉起任意程序。
+    /// 在文件与网络隔离缺失时必须被拒绝，除非宿主显式放行。
+    Open,
+}
+
+impl UnisolatedCommand {
+    /// 按结构化命令模型分类。
+    ///
+    /// 整条命令逐段裁决：首段必须是基线命令，其余每段要么也是基线命令，
+    /// 要么是只把上游输出转发到 stdout 的输出观察器（见
+    /// `observer_baseline`）。`;`、`&&`、`||`、管道、换行与后台 `&` 都走
+    /// 同一规则，不再一律拒绝：真实运行里 `go test ./... 2>&1; echo
+    /// "EXIT=$?"`、`node --test 2>&1 | tail -30` 是最普通的验证方式，整条
+    /// 拒绝会把正常编码任务挡在门外。任何一段落在两类之外仍然是 `Open`。
+    pub fn classify(command: &ParsedCommand) -> Self {
+        let mut segments = command.segments.iter();
+        let Some(first) = segments.next() else {
+            return UnisolatedCommand::Open;
+        };
+        if segment_baseline(first) != UnisolatedCommand::Baseline {
+            return UnisolatedCommand::Open;
+        }
+        let rest_is_baseline = segments.all(|segment| {
+            segment_baseline(segment) == UnisolatedCommand::Baseline
+                || observer_baseline(segment)
+        });
+        if rest_is_baseline {
+            UnisolatedCommand::Baseline
+        } else {
+            UnisolatedCommand::Open
+        }
+    }
+}
+
+/// 单段基线判定：程序名与子命令都在清单内才算基线。
+fn segment_baseline(segment: &CommandSegment) -> UnisolatedCommand {
+    match segment.program() {
+        Some("cargo") => cargo_baseline(segment),
+        Some("go") => go_baseline(segment),
+        Some("gofmt") => gofmt_list_baseline(segment),
+        Some("python") => python_unittest_baseline(segment),
+        Some("node") => node_test_baseline(segment),
+        Some("git") => git_readonly_baseline(segment),
+        _ => UnisolatedCommand::Open,
+    }
+}
+
+/// 输出观察器：只把上游输出或固定文本写到 stdout 的段。
+///
+/// `echo` 用于回显退出码与阶段标记；`head`/`tail`/`more`/`wc`/`uniq`
+/// 用于截断或统计上游输出。过滤器参数只允许短选项与纯数字（`-30`、
+/// `-n 40`、`-l`），带文件操作数时判为开放命令：那会把观察器变成读文件
+/// 的入口，超出「观察上游输出」的范围。`sort` 有 `-o` 写文件选项，不列
+/// 入清单。
+fn observer_baseline(segment: &CommandSegment) -> bool {
+    let Some(program) = segment.program() else {
+        return false;
+    };
+    match program {
+        "echo" => true,
+        "head" | "tail" | "more" | "wc" | "uniq" => {
+            let redirect_targets: Vec<&str> = segment
+                .redirects
+                .iter()
+                .map(|redirect| redirect.target.as_str())
+                .collect();
+            segment.arguments().all(|word| {
+                // `arguments()` 含重定向目标（如 `2>&1` 的 `&1`），它们不
+                // 是文件操作数，按目标表放行。
+                is_filter_option(&word.text) || redirect_targets.contains(&word.text.as_str())
+            })
+        }
+        _ => false,
+    }
+}
+
+/// 过滤器参数形状：`-n`、`-30`、`40` 这类选项与数字。其余词元按文件
+/// 操作数处理，宁可判开放也不放行读文件。
+fn is_filter_option(text: &str) -> bool {
+    match text.strip_prefix('-') {
+        Some(flag) => {
+            !flag.is_empty()
+                && flag
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '=' | '_'))
+        }
+        None => !text.is_empty() && text.chars().all(|ch| ch.is_ascii_digit()),
+    }
+}
+
+/// `cargo test *`、`cargo check *`、`cargo build *`。
+///
+/// 子命令名必须精确匹配这三个词；`cargo run`、`cargo publish` 等是开放
+/// 命令，不在基线内。带 `--manifest-path=` 指向 workspace 外的路径由
+/// 越界写入检查单独拦截，本函数只判命令形状。
+fn cargo_baseline(segment: &CommandSegment) -> UnisolatedCommand {
+    let second = segment
+        .arguments()
+        .next()
+        .map(|word| word.text.as_str())
+        .unwrap_or("");
+    if matches!(second, "test" | "check" | "build") {
+        UnisolatedCommand::Baseline
+    } else {
+        UnisolatedCommand::Open
+    }
+}
+
+/// `go test *`、`go build *`、`go vet *`。
+///
+/// 与 cargo 的 test/check/build 对称：本地编译、测试与静态分析都不需要
+/// 网络，产物落在 workspace 与工具链缓存内。`go run`、`go get` 等仍按
+/// 开放命令处理。
+fn go_baseline(segment: &CommandSegment) -> UnisolatedCommand {
+    let second = segment
+        .arguments()
+        .next()
+        .map(|word| word.text.as_str())
+        .unwrap_or("");
+    if matches!(second, "test" | "build" | "vet") {
+        UnisolatedCommand::Baseline
+    } else {
+        UnisolatedCommand::Open
+    }
+}
+
+/// `gofmt -l *`：只列出未格式化的文件。
+///
+/// 带 `-w` 会改写文件，是开放命令；不带 `-l` 时 gofmt 从 stdin 读或直接
+/// 改写，形状不可控，同样不在基线内。
+fn gofmt_list_baseline(segment: &CommandSegment) -> UnisolatedCommand {
+    let mut lists = false;
+    for word in segment.arguments() {
+        match word.text.as_str() {
+            "-l" => lists = true,
+            "-w" => return UnisolatedCommand::Open,
+            _ => {}
+        }
+    }
+    if lists {
+        UnisolatedCommand::Baseline
+    } else {
+        UnisolatedCommand::Open
+    }
+}
+
+/// `python -m unittest *` 与 `python -I -m unittest *`。
+///
+/// 参数顺序是固定的：`-I`（隔离解释器模式）在前，`-m` 在后，unittest
+/// 是模块名。其他子命令（`-c`、`-u`、`pip` 等）都是开放命令。
+fn python_unittest_baseline(segment: &CommandSegment) -> UnisolatedCommand {
+    let words: Vec<&str> = segment.arguments().map(|word| word.text.as_str()).collect();
+    // 两种基线形状：`-m unittest …` 与 `-I -m unittest …`。
+    let is_unittest = matches!(
+        (words.first().copied(), words.get(1).copied(), words.get(2).copied()),
+        (Some("-m"), Some("unittest"), _) | (Some("-I"), Some("-m"), Some("unittest"))
+    );
+    if is_unittest {
+        UnisolatedCommand::Baseline
+    } else {
+        UnisolatedCommand::Open
+    }
+}
+
+/// `node --test *`。
+fn node_test_baseline(segment: &CommandSegment) -> UnisolatedCommand {
+    let second = segment
+        .arguments()
+        .next()
+        .map(|word| word.text.as_str())
+        .unwrap_or("");
+    if second == "--test" {
+        UnisolatedCommand::Baseline
+    } else {
+        UnisolatedCommand::Open
+    }
+}
+
+/// `git status` 与 `git diff`（只读形式）。
+///
+/// 带 `--output=` 或 `--output` 的 `git diff` 会写文件，是开放命令，
+/// 不在基线内。其他子命令（`push`、`commit` 等）同样是开放命令。
+fn git_readonly_baseline(segment: &CommandSegment) -> UnisolatedCommand {
+    let second = segment
+        .arguments()
+        .next()
+        .map(|word| word.text.as_str())
+        .unwrap_or("");
+    if !matches!(second, "status" | "diff") {
+        return UnisolatedCommand::Open;
+    }
+    // `git diff --output=...` 是写文件选项，必须按开放命令拒绝。
+    let writes_file = segment
+        .words
+        .iter()
+        .any(|word| word.flag_value.as_deref().is_some_and(|_| word.text.starts_with("--output")));
+    if writes_file {
+        return UnisolatedCommand::Open;
+    }
+    UnisolatedCommand::Baseline
+}
 
 /// 执行方报告的实际边界状态，不能从命令输出文本推断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,5 +1088,212 @@ mod tests {
             reason.contains(r"C:\Windows\temp\x"),
             "原因应点名目标: {reason}"
         );
+    }
+
+    // ── 无完整隔离时的开放命令收口 ──────────────────────────────────
+
+    /// 构造指定平台的能力：文件与网络隔离恒 false（任何平台都没实现），
+    /// 进程沙箱只在 Windows 为 true。不依赖真实 Linux/macOS 机器。
+    fn constructed_capabilities(platform: Platform, has_process_sandbox: bool) -> PlatformCapabilities {
+        PlatformCapabilities {
+            platform,
+            has_process_sandbox,
+            has_tree_kill: has_process_sandbox,
+            has_filesystem_isolation: false,
+            has_network_isolation: false,
+        }
+    }
+
+    /// 模拟 Linux/macOS：无进程沙箱、无文件与网络隔离。
+    fn unix_like_capabilities() -> PlatformCapabilities {
+        constructed_capabilities(Platform::Linux, false)
+    }
+
+    /// 模拟 Windows：有进程沙箱，但同样无文件与网络隔离。
+    fn windows_like_capabilities() -> PlatformCapabilities {
+        constructed_capabilities(Platform::Windows, true)
+    }
+
+    fn parse(command: &str) -> ParsedCommand {
+        parse_command(command)
+    }
+
+    /// 基线形状在默认口径下放行：cargo/go/python/node 测试命令与只读 git
+    /// 照跑。缺文件与网络隔离不是理由把这些正常编码任务挡掉。
+    #[test]
+    fn baseline_shapes_are_allowed_by_default_without_isolation() {
+        let capabilities = unix_like_capabilities();
+        let baseline = [
+            "cargo test",
+            "cargo test --release",
+            "cargo check",
+            "cargo build",
+            "cargo test --offline",
+            "go test ./...",
+            "python -m unittest",
+            "python -m unittest tests.test_x",
+            "python -I -m unittest",
+            "node --test",
+            "git status",
+            "git status --porcelain=v1",
+            "git diff",
+            "git diff --staged",
+        ];
+        for command in baseline {
+            let decision = unisolated_decision(&capabilities, &parse(command), false);
+            assert!(
+                matches!(decision, UnisolatedDecision::Allowed),
+                "`{command}` 是基线形状，默认应放行，实际: {decision:?}"
+            );
+        }
+    }
+
+    /// 基线命令接输出观察器照常放行。这些是真实运行里最常见的验证形状：
+    /// 回显退出码、截取测试输出尾部。整条拒绝会把正常编码任务挡在门外。
+    #[test]
+    fn baseline_with_output_observers_is_allowed() {
+        let capabilities = unix_like_capabilities();
+        let allowed = [
+            r#"go test ./... -v 2>&1; echo "EXIT=$?""#,
+            "go build ./... && echo BUILD_OK",
+            "go vet ./... && echo VET_OK",
+            "gofmt -l . ; echo GOFMT_EXIT=$?",
+            "cargo check && cargo test",
+            "cargo test | head -40",
+            "node --test 2>&1 | tail -30",
+            "python -m unittest 2>&1 | wc -l",
+            "git status && git diff",
+        ];
+        for command in allowed {
+            let decision = unisolated_decision(&capabilities, &parse(command), false);
+            assert!(
+                matches!(decision, UnisolatedDecision::Allowed),
+                "`{command}` 是基线加观察器，默认应放行，实际: {decision:?}"
+            );
+        }
+    }
+
+    /// 观察器不等于放开任意程序：链接符后面的非基线段、带文件操作数的
+    /// 过滤器、写文件的 gofmt 仍然按开放命令拒绝。
+    #[test]
+    fn observers_do_not_open_arbitrary_programs() {
+        let capabilities = unix_like_capabilities();
+        let refused = [
+            "cargo test && rm -rf out",
+            "cargo test | curl http://example.com",
+            "cargo test | sh script.sh",
+            // 首段不是基线，观察器不能单独构成基线。
+            "echo hi; cargo test",
+            // 过滤器带文件操作数会变成读文件入口。
+            "cargo test | head secret.txt",
+            "cargo test | tail -n 30 notes.md",
+            // gofmt 写文件。
+            "gofmt -w .",
+            // 基线后面接任意脚本解释器。
+            "cargo test; python -c 'print(1)'",
+        ];
+        for command in refused {
+            let decision = unisolated_decision(&capabilities, &parse(command), false);
+            assert!(
+                matches!(decision, UnisolatedDecision::Refused { .. }),
+                "`{command}` 不是基线加观察器，默认应拒绝，实际: {decision:?}"
+            );
+        }
+    }
+
+    /// 开放命令在默认口径下拒绝：缺文件与网络隔离时不能无提示裸跑。
+    /// 模拟 Linux/macOS、Windows 都拒（Windows 有进程沙箱但同样缺文件与
+    /// 网络隔离）。
+    #[test]
+    fn open_commands_are_refused_by_default_on_all_isolationless_platforms() {
+        for capabilities in [unix_like_capabilities(), windows_like_capabilities()] {
+            let open = [
+                "echo hello",
+                "curl -o out.txt https://example.com",
+                "cargo run",
+                "cargo publish",
+                "git push",
+                "git commit -m x",
+                "python -c 'print(1)'",
+                "python -m pip install pkg",
+                "node server.js",
+                "git diff --output=x.txt",
+                // 链接链：基线形状后面跟开放命令，整条按开放处理。
+                "cargo test && curl http://x",
+                "cargo test | rm out",
+            ];
+            for command in open {
+                let decision = unisolated_decision(&capabilities, &parse(command), false);
+                match decision {
+                    UnisolatedDecision::Refused {
+                        reason,
+                        stable_code,
+                    } => {
+                        assert_eq!(stable_code, REFUSAL_CODE_UNISOLATED);
+                        assert!(
+                            reason.starts_with(REFUSAL_CODE_UNISOLATED),
+                            "拒绝理由以稳定码开头，供程序分支: {reason}"
+                        );
+                        assert!(
+                            reason.contains(ALLOW_UNISOLATED_COMMANDS_ENV),
+                            "拒绝理由给出可执行建议（开关名）: {reason}"
+                        );
+                        assert!(
+                            reason.contains("未生效"),
+                            "拒绝理由写明隔离未生效: {reason}"
+                        );
+                    }
+                    other => panic!(
+                        "`{command}` 应被默认拒绝，实际: {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// 宿主显式设开关时开放命令放行，但未生效声明照旧存在：执行仍是「无
+    /// 完整隔离」，证据与模型可见文本必须声明 active=false 与原因。
+    #[test]
+    fn explicit_host_opt_in_allows_open_commands_but_isolation_is_still_missing() {
+        let capabilities = unix_like_capabilities();
+        let open = ["echo hello", "curl -o out.txt https://example.com", "git push"];
+        for command in open {
+            let decision = unisolated_decision(&capabilities, &parse(command), true);
+            assert!(
+                matches!(decision, UnisolatedDecision::Allowed),
+                "`{command}` 在宿主放行时应允许执行"
+            );
+        }
+        // 未生效声明与裁决无关：宿主放行后仍然必须附带，让证据如实反映。
+        let statement = capabilities.unisolation_statement().expect("缺隔离能力必有声明");
+        assert!(statement.contains("未生效"), "{statement}");
+    }
+
+    /// Windows 也有进程沙箱，但文件与网络隔离缺失时未生效声明仍要出：
+    /// 收口不能只针对 Linux/macOS。
+    #[test]
+    fn windows_process_sandbox_does_not_silence_the_unisolation_statement() {
+        let capabilities = windows_like_capabilities();
+        let statement = capabilities.unisolation_statement().expect("Windows 缺文件与网络隔离");
+        assert!(statement.contains("未生效"), "{statement}");
+        // 开放命令默认拒，与 Linux/macOS 同口径。
+        let decision = unisolated_decision(&capabilities, &parse("git push"), false);
+        assert!(matches!(decision, UnisolatedDecision::Refused { .. }));
+    }
+
+    /// 两项隔离都实现时不收口：开放命令默认可执行（这是将来平台补上隔离
+    /// 能力后应自动放行的语义，当前 detect() 永远走不到这里）。
+    #[test]
+    fn fully_isolated_platform_never_enters_the_gate() {
+        let capabilities = PlatformCapabilities {
+            platform: Platform::Linux,
+            has_process_sandbox: true,
+            has_tree_kill: true,
+            has_filesystem_isolation: true,
+            has_network_isolation: true,
+        };
+        assert!(capabilities.unisolation_statement().is_none());
+        let decision = unisolated_decision(&capabilities, &parse("git push"), false);
+        assert!(matches!(decision, UnisolatedDecision::Allowed));
     }
 }

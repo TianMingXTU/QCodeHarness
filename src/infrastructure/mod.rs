@@ -23,6 +23,8 @@ pub mod config;
 pub mod git_worktree;
 pub mod extensions;
 pub mod delegation;
+pub mod doctor;
 pub mod service_events;
 pub mod task_service;
 pub mod service_factory;
+pub mod service_report;

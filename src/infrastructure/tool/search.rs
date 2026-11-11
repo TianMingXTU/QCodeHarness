@@ -145,7 +145,7 @@ impl ExtFilter {
         if !self.include.is_empty() {
             return ext.is_some() && self.include.iter().any(|want| ext.as_deref() == Some(want.as_str()));
         }
-        !ext.is_some_and(|actual| self.exclude.iter().any(|skip| *skip == actual))
+        !ext.is_some_and(|actual| self.exclude.contains(&actual))
     }
 }
 

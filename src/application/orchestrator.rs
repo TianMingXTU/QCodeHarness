@@ -86,6 +86,15 @@ pub struct Orchestrator {
     execution_cancel: Option<CancelHandle>,
 }
 
+/// 新步骤的 runner 装配参数。仅用于把 `run_step` 的长参数表收束到一处。
+struct StepContext<'a> {
+    index: usize,
+    budget: &'a Budget,
+    session_id: &'a SessionId,
+    evidence: &'a Arc<dyn EvidenceSink>,
+    completed_outputs: &'a [StepOutput],
+}
+
 impl Orchestrator {
     /// 组装编排器，使用内置花名册。`budget` 是编排级配置，每个步骤的
     /// runner 共用。
@@ -231,7 +240,13 @@ impl Orchestrator {
         for index in start..task.steps().len() {
             let step_role = task.steps()[index].role;
             match self
-                .run_step(task, index, budget, &session_id, &evidence, &completed_outputs, &mut runner)
+                .run_step(task, StepContext {
+                    index,
+                    budget,
+                    session_id: &session_id,
+                    evidence: &evidence,
+                    completed_outputs: &completed_outputs,
+                }, &mut runner)
                 .await
             {
                 Ok(answer) => {
@@ -433,7 +448,13 @@ impl Orchestrator {
         for index in start..task.steps().len() {
             let step_role = task.steps()[index].role;
             match self
-                .run_step(&task, index, budget, &session_id, &evidence, &completed_outputs, &mut runner)
+                .run_step(&task, StepContext {
+                    index,
+                    budget,
+                    session_id: &session_id,
+                    evidence: &evidence,
+                    completed_outputs: &completed_outputs,
+                }, &mut runner)
                 .await
             {
                 Ok(answer) => {
@@ -556,16 +577,17 @@ impl Orchestrator {
     async fn run_step(
         &self,
         task: &Task,
-        index: usize,
-        budget: &Budget,
-        session_id: &SessionId,
-        evidence: &Arc<dyn EvidenceSink>,
-        completed_outputs: &[StepOutput],
+        context: StepContext<'_>,
         runner: &mut Option<AgentRunner>,
     ) -> Result<String, ApplicationError> {
         // 循环保证 index < total；空步骤任务已被 start() 以 NoSteps 拒绝，
         // 越界只可能是程序错误，直接用下标访问。
+        let index = context.index;
         let step = &task.steps()[index];
+        let budget = context.budget;
+        let session_id = context.session_id;
+        let evidence = context.evidence;
+        let completed_outputs = context.completed_outputs;
         let total = task.steps().len();
         let profile = self
             .deps

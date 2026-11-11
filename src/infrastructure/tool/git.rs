@@ -19,7 +19,7 @@ use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 use crate::domain::workspace::WorkspaceRoot;
 
 use super::parse_args;
-use super::shell::{clamp_output, run_with_policy};
+use super::shell::{clamp_output, run_with_policy, unisolated_open_command_refusal};
 
 const GIT_STATUS: &str = "git_status";
 const GIT_DIFF: &str = "git_diff";
@@ -58,6 +58,11 @@ impl GitStatus {
     async fn run(&self) -> ToolOutcome {
         if let Some(notice) = not_a_repo_notice(&self.root) {
             return ToolOutcome::failed(notice);
+        }
+        // 无完整隔离时开放命令收口，与 run_command 共用同一决策。git status
+        // 是基线只读命令，正常放行；若将来收口口径变化，这里跟着收紧。
+        if let Some(refusal) = unisolated_open_command_refusal("git status --porcelain=v1") {
+            return ToolOutcome::refused(refusal);
         }
         let execution = run_with_policy(
             &self.root, "git status --porcelain=v1", GIT_TIMEOUT, &self.policy,
@@ -112,6 +117,11 @@ impl GitDiff {
         } else {
             "git diff"
         };
+        // 无完整隔离时开放命令收口，与 run_command 共用同一决策。git diff
+        // 是基线只读命令，正常放行；口径变化时这里跟着收紧。
+        if let Some(refusal) = unisolated_open_command_refusal(command) {
+            return ToolOutcome::refused(refusal);
+        }
         let execution = run_with_policy(&self.root, command, GIT_TIMEOUT, &self.policy).await;
         git_outcome(execution, false)
     }

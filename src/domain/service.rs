@@ -13,6 +13,20 @@ use super::tool::{ToolAnnotations, ToolCall};
 /// 服务协议版本；不兼容的事件格式必须提升版本并由读取方明确拒绝。
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// 事件日志的字节上限。
+///
+/// 属于服务的持久契约：写入侧用它拒绝超限追加，诊断侧用它判断容量水位。
+/// 定义在 domain 让应用层诊断不必为了一个常量反向依赖基础设施。
+pub const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 服务状态文件（`service/state.json`）的当前格式版本；缺少版本字段的
+/// 旧文件按 v0 处理。
+///
+/// 属于服务的持久契约：写入侧用它区分自动迁移与稳定拒绝，诊断侧用它
+/// 判断状态文件是否可被当前程序读取。定义在 domain 让应用层诊断不必
+/// 为了一个常量反向依赖基础设施。
+pub const SERVICE_STATE_FORMAT: u32 = 1;
+
 /// 可跨传输层返回的错误。`code` 供程序分支，`message` 供用户诊断。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("{code}: {message}")]
@@ -84,7 +98,7 @@ pub enum ServiceCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ServiceReply {
-    Task { task: TaskView },
+    Task { task: Box<TaskView> },
     Tasks { tasks: Vec<TaskView> },
     Accepted { task_id: String, execution_id: Option<String> },
     PendingApprovals { requests: Vec<PendingApproval> },

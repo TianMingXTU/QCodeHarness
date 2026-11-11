@@ -17,7 +17,7 @@ const MAX_PENDING_CALLS: usize = 64;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum Reply {
-    Service(ServiceReply),
+    Service(Box<ServiceReply>),
     Subscribed(u64),
 }
 
@@ -101,7 +101,7 @@ impl SdkClient {
     pub async fn call(&self, id: &str, command: ServiceCommand) -> Result<ServiceReply, ServiceError> {
         let request = StdioRequest { version: PROTOCOL_VERSION, id: id.to_owned(), command };
         match self.exchange(id, &request).await? {
-            Reply::Service(reply) => Ok(reply),
+            Reply::Service(reply) => Ok(*reply),
             Reply::Subscribed(_) => Err(ServiceError::new("unexpected_reply", "业务命令收到了订阅结论")),
         }
     }
@@ -193,13 +193,13 @@ async fn read_loop<R: AsyncRead + Unpin>(
             Err(error) => { shared.fail(error); return; }
         };
         let event = match response {
-            StdioResponse::Reply { id, result, .. } => { shared.deliver(&id, Ok(Reply::Service(result))); continue; }
+            StdioResponse::Reply { id, result, .. } => { shared.deliver(&id, Ok(Reply::Service(Box::new(result)))); continue; }
             StdioResponse::Subscribed { id, after, .. } => { shared.deliver(&id, Ok(Reply::Subscribed(after))); continue; }
             StdioResponse::Error { id, error, .. } if !id.is_empty() => { shared.deliver(&id, Err(error)); continue; }
             StdioResponse::Error { error, .. } => Err(error),
             StdioResponse::Event { event, .. } => {
                 if event.version != PROTOCOL_VERSION { shared.fail(unsupported_version(event.version)); return; }
-                Ok(event)
+                Ok(*event)
             }
             StdioResponse::Hello { .. } => { shared.fail(ServiceError::new("invalid_response", "重复的 hello 帧")); return; }
         };

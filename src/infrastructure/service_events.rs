@@ -14,6 +14,10 @@ use crate::application::port::{
 };
 use crate::application::service::{EventJournal, EventSubscription};
 use crate::domain::evidence::AuditEvent;
+// 事件日志字节上限 `MAX_JOURNAL_BYTES` 定义在 domain/service。这里公开再导出，
+// 让既有按 infrastructure 路径引用它的调用方与测试继续可用，也避免同一份
+// 常量出现两个来源。
+pub use crate::domain::service::MAX_JOURNAL_BYTES;
 use crate::domain::service::{
     EventContext, ServiceError, ServiceEvent, ServiceEventPayload, PROTOCOL_VERSION,
 };
@@ -23,8 +27,84 @@ use crate::domain::tool::ToolCall;
 pub const EVENT_QUEUE_CAPACITY: usize = 128;
 /// 单条 JSONL 记录的字节上限，包含末尾换行。
 pub const MAX_EVENT_BYTES: usize = 1024 * 1024;
-/// 单个服务日志的字节上限，达到上限后明确报错，由部署方归档。
-pub const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+// 事件日志字节上限 `MAX_JOURNAL_BYTES` 定义在 domain/service，这里通过
+// use 引入供本模块与既有外部调用方使用，避免同一份常量出现两个来源。
+
+/// 一次事件日志归档的结果；空跑不会生成归档或创建数据日志。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RotateReport {
+    /// 是否已归档非空日志。
+    pub archived: bool,
+    /// 原日志的保留位置；空跑时为 `None`。
+    pub archive_path: Option<PathBuf>,
+    /// 原日志不存在或没有新事件时为 `true`。
+    pub empty_run: bool,
+    /// 服务重启、游标与原数据恢复的建议。
+    pub recommendation: String,
+}
+
+/// 取得日志写入租约后归档原始字节，再创建空日志；不解析或删除归档。
+///
+/// 日志不存在或长度为零时返回空跑结果。运行中的服务持有同一租约，
+/// 因此必须先停止服务；归档后的新日志从序号 1 开始。
+///
+/// # Errors
+///
+/// 租约被占用、系统时间无效或文件操作失败时返回错误。原日志重命名后
+/// 若无法创建新日志，错误会给出仍然保留原始数据的归档路径。
+pub fn rotate_events(workspace: &Path) -> Result<RotateReport, ServiceError> {
+    let service = workspace.join(".qcodeharness/service");
+    let path = service.join("events.jsonl");
+    let empty = RotateReport {
+        archived: false,
+        archive_path: None,
+        empty_run: true,
+        recommendation: "没有需要归档的新事件；可正常启动服务，已有归档保持保留".to_owned(),
+    };
+    if !service.try_exists().map_err(io_error)? {
+        return Ok(empty);
+    }
+    let _lease = open_lease(&path)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(empty),
+        Err(error) => return Err(io_error(error)),
+    };
+    if !metadata.is_file() {
+        return Err(ServiceError::new("journal_io", "事件日志必须是普通文件"));
+    }
+    if metadata.len() == 0 {
+        return Ok(empty);
+    }
+    let mut millis = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| {
+        ServiceError::new("invalid_clock", error.to_string())
+    })?.as_millis();
+    // 同毫秒内再次归档或时钟回拨时也不能覆盖已有归档。
+    let archive_path = loop {
+        let candidate = service.join(format!("events.jsonl.{millis}.archive"));
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => millis += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break candidate,
+            Err(error) => return Err(io_error(error)),
+        }
+    };
+    std::fs::rename(&path, &archive_path).map_err(io_error)?;
+    OpenOptions::new().write(true).create_new(true).open(&path).map_err(|error| {
+        ServiceError::new(
+            "journal_io",
+            format!(
+                "原日志已保留在 {}，创建新日志失败: {error}；修复文件权限后重新启动服务，或停止服务后将归档复制回原路径",
+                archive_path.display()
+            ),
+        )
+    })?;
+    Ok(RotateReport {
+        archived: true,
+        archive_path: Some(archive_path),
+        empty_run: false,
+        recommendation: "原数据已保留在归档中；重新启动服务后从游标 0 订阅。需要恢复旧日志时，先停止服务并备份新日志，再将归档复制回 events.jsonl".to_owned(),
+    })
+}
 
 struct JournalState {
     file: File,
@@ -259,7 +339,12 @@ fn event_too_large() -> ServiceError {
 }
 
 fn journal_too_large() -> ServiceError {
-    ServiceError::new("journal_too_large", format!("事件日志超过 {MAX_JOURNAL_BYTES} 字节上限"))
+    ServiceError::new(
+        "journal_too_large",
+        format!(
+            "事件日志超过 {MAX_JOURNAL_BYTES} 字节上限；先停止服务，执行 `--rotate-events` 归档日志并保留原数据，再重新启动服务"
+        ),
+    )
 }
 
 struct JournalSubscription {
@@ -307,11 +392,10 @@ pub fn context_for_call(context: &EventContext, call: &ToolCall) -> EventContext
 
 fn context_for_call_id(context: &EventContext, id: &str) -> EventContext {
     let mut context = context.clone();
-    if let Some((extension, _)) = id.strip_prefix("extension__").and_then(|rest| rest.split_once("__")) {
-        if !extension.is_empty() {
+    if let Some((extension, _)) = id.strip_prefix("extension__").and_then(|rest| rest.split_once("__"))
+        && !extension.is_empty() {
             context.origin.extension_id = Some(extension.to_owned());
         }
-    }
     context
 }
 
@@ -387,5 +471,26 @@ impl RunHooks for ServiceEvidence {
                 text: reply.turn.text.clone(), calls: reply.turn.calls.clone(), retried,
             });
         })
+    }
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_journal_still_requires_the_writers_lease() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "qch-rotate-empty-lease-{}-{stamp}", std::process::id()
+        ));
+        let path = workspace.join(".qcodeharness/service/events.jsonl");
+        let journal = JsonEventJournal::open(&path).unwrap();
+
+        assert_eq!(rotate_events(&workspace).unwrap_err().code, "journal_locked");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        drop(journal);
+        assert!(rotate_events(&workspace).unwrap().empty_run);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }

@@ -622,6 +622,7 @@ impl McpToolSource {
     }
 
     /// 共享的状态机句柄：lib 内测试与断言经由它。
+    #[cfg(test)]
     pub(crate) fn managed(&self) -> &Arc<ManagedServer> {
         &self.managed
     }
@@ -998,7 +999,7 @@ mod tests {
     fn infer_annotations_reads_are_read_only() {
         let read_only = infer_annotations("get_page", "Fetches a web page and returns its text");
         assert!(read_only.read_only, "纯读动词应判只读");
-        assert!(read_only.requires_approval() == false);
+        assert!(!read_only.requires_approval());
         assert!(read_only.open_world);
     }
 

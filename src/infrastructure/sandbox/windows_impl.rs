@@ -294,11 +294,10 @@ mod tests {
         async fn wait_for_child_pid(&self) -> u32 {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             loop {
-                if let Ok(text) = std::fs::read_to_string(&self.child_pid) {
-                    if let Ok(pid) = text.trim().parse::<u32>() {
+                if let Ok(text) = std::fs::read_to_string(&self.child_pid)
+                    && let Ok(pid) = text.trim().parse::<u32>() {
                         return pid;
                     }
-                }
                 if tokio::time::Instant::now() >= deadline {
                     let reason = std::fs::read_to_string(&self.launcher_err)
                         .unwrap_or_else(|_| "<空>".to_owned());

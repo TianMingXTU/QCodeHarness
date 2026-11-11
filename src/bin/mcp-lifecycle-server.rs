@@ -20,7 +20,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -91,7 +91,7 @@ fn spawn_grandchild(counter_path: &Option<PathBuf>) {
     std::mem::forget(child);
 }
 
-fn with_suffix(path: &PathBuf, suffix: &str) -> PathBuf {
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut text = path.as_os_str().to_os_string();
     text.push(suffix);
     PathBuf::from(text)
@@ -139,8 +139,8 @@ fn serve(
             })),
             "tools/call" => {
                 calls += 1;
-                if let Some(path) = &counter_path {
-                    if let Err(error) = OpenOptions::new()
+                if let Some(path) = &counter_path
+                    && let Err(error) = OpenOptions::new()
                         .create(true)
                         .append(true)
                         .open(path)
@@ -148,7 +148,6 @@ fn serve(
                     {
                         eprintln!("helper 计数失败: {error}");
                     }
-                }
                 let triggered = if then_exit { calls == threshold } else { calls >= threshold };
                 if triggered {
                     if then_exit {
@@ -165,15 +164,14 @@ fn serve(
             // 与其他未知方法：不回。
             _ => None,
         };
-        if let Some(response) = response {
-            if serde_json::to_writer(&mut stdout, &response).is_err()
+        if let Some(response) = response
+            && (serde_json::to_writer(&mut stdout, &response).is_err()
                 || writeln!(&mut stdout).is_err()
-                || stdout.flush().is_err()
+                || stdout.flush().is_err())
             {
                 eprintln!("helper stdout 写失败：父进程可能已退出");
                 return;
             }
-        }
     }
     // stdin EOF：父进程关闭了写端。写一个标记文件，让"清理到达子进程"
     // 成为可断言的事实，无需等待数秒后再检查进程是否存在。

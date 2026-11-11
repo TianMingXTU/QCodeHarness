@@ -97,6 +97,7 @@ impl TaskSnapshot {
             Err(StoreError::VersionMismatch {
                 found: self.format_version,
                 expected: TASK_FORMAT,
+                backup_hint: ".qcodeharness/tasks/<task-id>.json.bak-v{found}".to_owned(),
             })
         }
     }
@@ -137,6 +138,7 @@ impl RunSnapshot {
             Err(StoreError::VersionMismatch {
                 found: self.format_version,
                 expected: RUN_FORMAT,
+                backup_hint: ".qcodeharness/snapshots/<session-id>.json.bak-v{found}".to_owned(),
             })
         }
     }
@@ -204,12 +206,17 @@ pub enum StoreError {
     Parse(#[from] serde_json::Error),
 
     /// 快照由别的格式版本写入。
-    #[error("快照版本不匹配：文件由 v{found} 写入，当前程序是 v{expected}；拒绝加载以免带入不兼容状态")]
+    ///
+    /// 错误文本带出当前版本、文件版本、可执行动作与备份位置，旧状态不在
+    /// 字段语义不明时自动迁移。
+    #[error("快照版本不匹配：文件由 v{found} 写入，当前程序是 v{expected}；拒绝加载以免带入不兼容状态。可用动作：先备份原文件到 {backup_hint}，再用写入该文件的旧版本继续，或从基线重建任务；当前版本不会修改此文件")]
     VersionMismatch {
         /// 文件里的版本。
         found: u32,
         /// 当前程序认识的版本。
         expected: u32,
+        /// 建议的备份位置；调用方按实际快照目录替换占位符。
+        backup_hint: String,
     },
 
     /// 快照可解析，但状态自相矛盾，例如停在半轮却没有待配平的轮次。
@@ -299,9 +306,11 @@ mod tests {
         let error = snapshot.check_version().unwrap_err();
         assert!(matches!(
             error,
-            StoreError::VersionMismatch { found: 999, expected: RUN_FORMAT }
+            StoreError::VersionMismatch { found: 999, expected: RUN_FORMAT, .. }
         ));
         assert!(error.to_string().contains("v999"), "{error}");
+        assert!(error.to_string().contains("可用动作"), "{error}");
+        assert!(error.to_string().contains("备份"), "{error}");
     }
 
     #[test]
@@ -311,7 +320,7 @@ mod tests {
         let mut snapshot = mid_round_snapshot();
         snapshot.format_version = 1;
         let error = snapshot.check_version().unwrap_err();
-        let StoreError::VersionMismatch { found: 1, expected } = error else {
+        let StoreError::VersionMismatch { found: 1, expected, .. } = error else {
             panic!("应报版本不匹配")
         };
         assert_eq!(expected, RUN_FORMAT);
@@ -326,7 +335,7 @@ mod tests {
         let mut snapshot = mid_round_snapshot();
         snapshot.format_version = 2;
         let error = snapshot.check_version().unwrap_err();
-        let StoreError::VersionMismatch { found: 2, expected } = error else {
+        let StoreError::VersionMismatch { found: 2, expected, .. } = error else {
             panic!("应报版本不匹配，实际 {error}")
         };
         assert_eq!(expected, RUN_FORMAT, "当前格式是 v{RUN_FORMAT}");
@@ -408,7 +417,8 @@ mod tests {
             error,
             StoreError::VersionMismatch {
                 found: 999,
-                expected: TASK_FORMAT
+                expected: TASK_FORMAT,
+                ..
             }
         ), "{error}");
     }

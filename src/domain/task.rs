@@ -172,14 +172,13 @@ struct TaskWire {
 impl<'de> Deserialize<'de> for Task {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = TaskWire::deserialize(deserializer)?;
-        if let TaskState::Running { step } = wire.state {
-            if step >= wire.steps.len() {
+        if let TaskState::Running { step } = wire.state
+            && step >= wire.steps.len() {
                 return Err(serde::de::Error::custom(format!(
                     "任务状态是 Running {{ step: {step} }}，但只有 {} 个步骤——进度下标越界",
                     wire.steps.len()
                 )));
             }
-        }
         if wire.state == TaskState::Completed && wire.steps.is_empty() {
             return Err(serde::de::Error::custom(
                 "任务状态是 Completed，但它没有任何步骤——空任务不可能走到完成",
@@ -190,15 +189,14 @@ impl<'de> Deserialize<'de> for Task {
                 "任务状态是 Failed，却没有失败详情——失败原因会丢",
             ));
         }
-        if let Some(failure) = &wire.failure {
-            if failure.step >= wire.steps.len() {
+        if let Some(failure) = &wire.failure
+            && failure.step >= wire.steps.len() {
                 return Err(serde::de::Error::custom(format!(
                     "失败步号 {} 超出 {} 个步骤——恢复会从不存在的一步开始",
                     failure.step,
                     wire.steps.len()
                 )));
             }
-        }
         Ok(Self {
             id: wire.id,
             kind: wire.kind,

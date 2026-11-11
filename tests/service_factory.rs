@@ -175,8 +175,7 @@ impl Runtime {
             loop {
                 if let ServiceEventPayload::ApprovalWaiting { request } =
                     events.next().await.unwrap().payload
-                {
-                    if self
+                    && self
                         .broker
                         .pending(None)
                         .iter()
@@ -184,7 +183,6 @@ impl Runtime {
                     {
                         return request;
                     }
-                }
             }
         })
         .await

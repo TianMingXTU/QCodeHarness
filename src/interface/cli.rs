@@ -24,6 +24,8 @@ pub const USAGE: &str = "\
       QCodeHarness [--yes] --resume <会话ID>
       QCodeHarness [--yes] [--force-worktree] --resume-task <任务ID>
       QCodeHarness --report [--report-dir <目录>] [--json]
+      QCodeHarness --doctor [--json]
+      QCodeHarness --rotate-events [--json]
       QCodeHarness --benchmark [--json]
       QCodeHarness --benchmark-long [--json]
       QCodeHarness --mcp-reconnect <服务器名>
@@ -33,6 +35,7 @@ pub const USAGE: &str = "\
       QCodeHarness --disable-extension <ID>
       QCodeHarness --stdio | --interactive | --text | --tui
       QCodeHarness --help
+      QCodeHarness --version
 示例: QCodeHarness \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
       QCodeHarness --yes \"非交互场景下跑同一个任务\"
       QCodeHarness --ai-review \"让模型先审一遍，拿不准的再问人\"
@@ -69,7 +72,7 @@ pub struct CliArgs {
     /// 服务前端；与一次性命令互斥。
     pub frontend: Option<FrontendMode>,
     /// 要完成的任务描述。`--resume` / `--resume-task` 沿用快照中的原任务；
-    /// `--list-sessions`、报表、基准与 `--mcp-reconnect` 模式不需要。
+    /// 列表、诊断、事件维护、报表、基准与 MCP 探测模式不需要。
     pub task: Option<String>,
     /// 跳过人工审批，所有工具自动放行。
     pub auto_approve: bool,
@@ -99,8 +102,11 @@ pub struct CliArgs {
     /// 报表统计的证据根目录（`--report-dir <dir>`）。在该目录的
     /// `.qcodeharness/sessions/` 下查找证据文件，缺省为当前工作区。
     pub report_dir: Option<String>,
-    /// 输出机器可读 JSON（`--json`），与 `--report` / `--benchmark` /
-    /// `--benchmark-long` 搭配有效：报表输出 JSON 报表，基准输出结果清单。
+    /// 只读运行诊断（`--doctor`），配置损坏或缺少模型凭据时仍可运行。
+    pub doctor: bool,
+    /// 归档服务事件日志（`--rotate-events`），保留原数据。
+    pub rotate_events: bool,
+    /// 输出机器可读 JSON（`--json`），用于报表、诊断、事件维护与基准模式。
     pub json: bool,
     /// 跑 `benchmarks/` 下的基准任务集并打分（`--benchmark`）。
     pub benchmark: bool,
@@ -127,6 +133,12 @@ pub struct CliArgs {
     ///
     /// 与其他开关同时出现时仅处理帮助，不运行任务，也不做模式校验。
     pub help: bool,
+    /// 打印版本后正常退出（`--version` / `-V`）。
+    ///
+    /// 与帮助一样是纯查询：不读配置、不起模型、不做模式校验，同场的
+    /// 其他开关与位置参数一律忽略。安装、升级、回滚后用它确认
+    /// `current` 指向的版本。
+    pub version: bool,
 }
 
 /// 解析命令行参数。
@@ -151,6 +163,8 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut kind = None;
     let mut report = false;
     let mut report_dir = None;
+    let mut doctor = false;
+    let mut rotate_events = false;
     let mut json = false;
     let mut benchmark = false;
     let mut benchmark_long = false;
@@ -159,8 +173,10 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut install_extension = None;
     let mut enable_extension = None;
     let mut permissions = Vec::new();
+    let mut permissions_supplied = false;
     let mut disable_extension = None;
     let mut help = false;
+    let mut version = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut iter = argv.into_iter();
@@ -170,11 +186,14 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--ai-review" => ai_review = true,
             "--list-sessions" => list_sessions = true,
             "--report" => report = true,
+            "--doctor" => doctor = true,
+            "--rotate-events" => rotate_events = true,
             "--json" => json = true,
             "--benchmark" => benchmark = true,
             "--benchmark-long" => benchmark_long = true,
             "--list-extensions" => list_extensions = true,
             "--help" | "-h" => help = true,
+            "--version" | "-V" => version = true,
             // 服务前端：本进程持续运行，不接受任务描述与其他运行模式。
             // 重复出现即计数，结尾按数量拒绝。
             "--stdio" => { frontend = Some(FrontendMode::Stdio); frontend_count += 1; }
@@ -184,14 +203,14 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--report-dir" => match iter.next() {
                 Some(dir) => report_dir = Some(dir),
                 None => {
-                    eprintln!("--report-dir 需要一个目录：--report-dir <目录>");
+                    eprintln!("cli_invalid_args: --report-dir 需要一个目录：--report-dir <目录>");
                     return None;
                 }
             },
             "--resume" => match iter.next() {
                 Some(id) => resume = Some(id),
                 None => {
-                    eprintln!("--resume 需要一个会话 ID：--resume <id>");
+                    eprintln!("cli_invalid_args: --resume 需要一个会话 ID：--resume <id>");
                     return None;
                 }
             },
@@ -199,47 +218,48 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--resume-task" => match iter.next() {
                 Some(id) => resume_task = Some(id),
                 None => {
-                    eprintln!("--resume-task 需要一个任务 ID：--resume-task <id>");
+                    eprintln!("cli_invalid_args: --resume-task 需要一个任务 ID：--resume-task <id>");
                     return None;
                 }
             },
             "--kind" => match iter.next() {
                 Some(name) => kind = Some(name),
                 None => {
-                    eprintln!("--kind 需要一个模板名：--kind <模板名>");
+                    eprintln!("cli_invalid_args: --kind 需要一个模板名：--kind <模板名>");
                     return None;
                 }
             },
             "--mcp-reconnect" => match iter.next() {
                 Some(name) => mcp_reconnect = Some(name),
                 None => {
-                    eprintln!("--mcp-reconnect 需要一个服务器名：--mcp-reconnect <服务器名>");
+                    eprintln!("cli_invalid_args: --mcp-reconnect 需要一个服务器名：--mcp-reconnect <服务器名>");
                     return None;
                 }
             },
             "--install-extension" => match iter.next() {
                 Some(path) => install_extension = Some(path),
                 None => {
-                    eprintln!("--install-extension 需要一个清单文件：--install-extension <清单文件>");
+                    eprintln!("cli_invalid_args: --install-extension 需要一个清单文件：--install-extension <清单文件>");
                     return None;
                 }
             },
             "--enable-extension" => match iter.next() {
                 Some(id) => enable_extension = Some(id),
                 None => {
-                    eprintln!("--enable-extension 需要一个扩展 ID：--enable-extension <ID>");
+                    eprintln!("cli_invalid_args: --enable-extension 需要一个扩展 ID：--enable-extension <ID>");
                     return None;
                 }
             },
             "--disable-extension" => match iter.next() {
                 Some(id) => disable_extension = Some(id),
                 None => {
-                    eprintln!("--disable-extension 需要一个扩展 ID：--disable-extension <ID>");
+                    eprintln!("cli_invalid_args: --disable-extension 需要一个扩展 ID：--disable-extension <ID>");
                     return None;
                 }
             },
             "--permissions" => match iter.next() {
                 Some(list) => {
+                    permissions_supplied = true;
                     permissions = list
                         .split(',')
                         .map(str::trim)
@@ -248,7 +268,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
                         .collect();
                 }
                 None => {
-                    eprintln!("--permissions 需要一个逗号分隔的工具名列表：--permissions read_file,write_file");
+                    eprintln!("cli_invalid_args: --permissions 需要一个逗号分隔的工具名列表：--permissions read_file,write_file");
                     return None;
                 }
             },
@@ -256,9 +276,9 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         }
     }
 
-    // 帮助是纯查询：忽略其余开关与位置参数，也不进入后续模式校验。
-    // 若与其他开关同场时报错，会让查看用法变得困难。
-    if help {
+    // 帮助与版本都是纯查询：忽略其余开关与位置参数，也不进入后续模式
+    // 校验。若与其他开关同场时报错，会让查看用法或确认版本变得困难。
+    if help || version {
         return Some(CliArgs {
             frontend: None,
             task: None,
@@ -271,6 +291,8 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             kind: None,
             report: false,
             report_dir: None,
+            doctor: false,
+            rotate_events: false,
             json: false,
             benchmark: false,
             benchmark_long: false,
@@ -280,63 +302,92 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             enable_extension: None,
             permissions: Vec::new(),
             disable_extension: None,
-            help: true,
+            help,
+            version,
         });
     }
 
     if positional.len() > 1 {
-        eprintln!("任务描述只能是其中一个位置参数，请用引号包住完整描述");
+        eprintln!("cli_invalid_args: 任务描述只能是其中一个位置参数，请用引号包住完整描述");
         return None;
     }
     let task = positional.into_iter().next();
+    if doctor && rotate_events {
+        eprintln!("cli_invalid_args: --doctor 与 --rotate-events 不能同时使用");
+        return None;
+    }
+    if (doctor || rotate_events)
+        && (task.is_some()
+            || auto_approve
+            || ai_review
+            || resume.is_some()
+            || resume_task.is_some()
+            || force_worktree
+            || list_sessions
+            || kind.is_some()
+            || report
+            || report_dir.is_some()
+            || benchmark
+            || benchmark_long
+            || frontend.is_some()
+            || mcp_reconnect.is_some()
+            || list_extensions
+            || install_extension.is_some()
+            || enable_extension.is_some()
+            || disable_extension.is_some()
+            || permissions_supplied)
+    {
+        eprintln!("cli_invalid_args: --doctor / --rotate-events 是独立模式，只能与 --json 搭配");
+        return None;
+    }
     // 报表与基准是不接受任务描述的独立模式。带描述运行会让人误以为描述
     // 生效，因此直接拒绝。
     if task.is_some() && (report || benchmark || benchmark_long) {
-        eprintln!("--report / --benchmark / --benchmark-long 不接受任务描述");
+        eprintln!("cli_invalid_args: --report / --benchmark / --benchmark-long 不接受任务描述");
         return None;
     }
     // 恢复模式沿用快照中的原任务。追加用户消息会破坏"助手轮次后紧跟
     // 观察"的配对，也无法确定真正的任务。
     if task.is_some() && resume.is_some() {
-        eprintln!("--resume 会沿用快照里的原任务，不能再另外指定任务描述");
+        eprintln!("cli_invalid_args: --resume 会沿用快照里的原任务，不能再另外指定任务描述");
         return None;
     }
     if task.is_some() && resume_task.is_some() {
-        eprintln!("--resume-task 会沿用快照里的原任务，不能再另外指定任务描述");
+        eprintln!("cli_invalid_args: --resume-task 会沿用快照里的原任务，不能再另外指定任务描述");
         return None;
     }
     // 会话级与任务级恢复不能同时使用。二者恢复的对象不同，同时指定时
     // 只有一方生效，用户不会察觉另一项被忽略。
     if resume.is_some() && resume_task.is_some() {
-        eprintln!("--resume 与 --resume-task 不能同时使用：一个恢复会话，一个恢复任务");
+        eprintln!("cli_invalid_args: --resume 与 --resume-task 不能同时使用：一个恢复会话，一个恢复任务");
         return None;
     }
     // 组合无效的开关应立即报错。静默忽略会丢弃用户的意图。
-    // --json 输出机器可读结果，可用于报表与基准两种模式。
-    if json && !report && !benchmark && !benchmark_long {
-        eprintln!("--json 需要与 --report、--benchmark 或 --benchmark-long 搭配");
+    // JSON 输出只用于会生成结构化报告的模式。
+    if json && !report && !doctor && !rotate_events && !benchmark && !benchmark_long {
+        eprintln!("cli_invalid_args: --json 需要与 --report、--doctor、--rotate-events、--benchmark 或 --benchmark-long 搭配");
         return None;
     }
     if report_dir.is_some() && !report {
-        eprintln!("--report-dir 需要与 --report 搭配");
+        eprintln!("cli_invalid_args: --report-dir 需要与 --report 搭配");
         return None;
     }
     if benchmark && resume.is_some() {
-        eprintln!("--benchmark 不能与 --resume 搭配");
+        eprintln!("cli_invalid_args: --benchmark 不能与 --resume 搭配");
         return None;
     }
     if benchmark && resume_task.is_some() {
-        eprintln!("--benchmark 不能与 --resume-task 搭配");
+        eprintln!("cli_invalid_args: --benchmark 不能与 --resume-task 搭配");
         return None;
     }
     // 两种基准互斥，执行方式不同（长任务基准先耗尽预算再恢复）。同时
     // 指定时只有较快的一项会被注意到。
     if benchmark && benchmark_long {
-        eprintln!("--benchmark 与 --benchmark-long 不能同时使用");
+        eprintln!("cli_invalid_args: --benchmark 与 --benchmark-long 不能同时使用");
         return None;
     }
     if force_worktree && resume_task.is_none() {
-        eprintln!("--force-worktree 只对 --resume-task 有意义");
+        eprintln!("cli_invalid_args: --force-worktree 只对 --resume-task 有意义");
         return None;
     }
     // `--mcp-reconnect` 是独立模式，探测完成后退出。与其他意图（运行
@@ -352,7 +403,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             || benchmark
             || benchmark_long)
     {
-        eprintln!("--mcp-reconnect 是独立模式，不接任务描述，也不与其他模式同场使用");
+        eprintln!("cli_invalid_args: --mcp-reconnect 是独立模式，不接任务描述，也不与其他模式同场使用");
         return None;
     }
     // 扩展管理是独立模式：装、列、启、停各自结束进程，不接任务描述，
@@ -368,7 +419,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     .filter(|active| *active)
     .count();
     if extension_modes > 1 {
-        eprintln!("--list-extensions / --install-extension / --enable-extension / --disable-extension 一次只能用一个");
+        eprintln!("cli_invalid_args: --list-extensions / --install-extension / --enable-extension / --disable-extension 一次只能用一个");
         return None;
     }
     if extension_modes == 1
@@ -381,17 +432,17 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             || benchmark_long
             || mcp_reconnect.is_some())
     {
-        eprintln!("扩展管理是独立模式，不接任务描述，也不与其他模式同场使用");
+        eprintln!("cli_invalid_args: 扩展管理是独立模式，不接任务描述，也不与其他模式同场使用");
         return None;
     }
     if !permissions.is_empty() && enable_extension.is_none() {
-        eprintln!("--permissions 只与 --enable-extension 搭配");
+        eprintln!("cli_invalid_args: --permissions 只与 --enable-extension 搭配");
         return None;
     }
     // 服务前端是持续运行模式：彼此互斥，也不接任务描述，
     // 更不与运行、恢复、报表、基准、探测、扩展管理同场。
     if frontend_count > 1 {
-        eprintln!("--stdio / --interactive / --text / --tui 一次只能用一个");
+        eprintln!("cli_invalid_args: --stdio / --interactive / --text / --tui 一次只能用一个");
         return None;
     }
     if frontend.is_some()
@@ -408,7 +459,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             || mcp_reconnect.is_some()
             || extension_modes == 1)
     {
-        eprintln!("服务前端是独立模式，不接任务描述，也不与其他模式同场使用");
+        eprintln!("cli_invalid_args: 服务前端是独立模式，不接任务描述，也不与其他模式同场使用");
         return None;
     }
     if task.is_none()
@@ -416,13 +467,15 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         && resume_task.is_none()
         && !list_sessions
         && !report
+        && !doctor
+        && !rotate_events
         && !benchmark
         && !benchmark_long
         && mcp_reconnect.is_none()
         && extension_modes == 0
         && frontend.is_none()
     {
-        eprintln!("缺少任务描述；恢复请用 --resume <id> 或 --resume-task <id>，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long，MCP 恢复探测请用 --mcp-reconnect <服务器名>，扩展管理请用 --list-extensions 或 --install-extension <清单文件>\n\n{USAGE}");
+        eprintln!("cli_invalid_args: 缺少任务描述；恢复请用 --resume <id> 或 --resume-task <id>，诊断请用 --doctor，事件归档请用 --rotate-events，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long，MCP 恢复探测请用 --mcp-reconnect <服务器名>，扩展管理请用 --list-extensions 或 --install-extension <清单文件>\n\n{USAGE}");
         return None;
     }
 
@@ -438,6 +491,8 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         kind,
         report,
         report_dir,
+        doctor,
+        rotate_events,
         json,
         benchmark,
         benchmark_long,
@@ -448,6 +503,7 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         permissions,
         disable_extension,
         help,
+        version,
     })
 }
 
@@ -719,6 +775,26 @@ mod tests {
         assert!(args.help);
         assert!(args.task.is_none(), "帮助模式不带任务");
         assert!(!args.json, "帮助之外的模式开关不应生效");
+    }
+
+    /// `--version` / `-V` 是纯查询：不带任务，不同场开关也不生效。
+    #[test]
+    fn version_flag_is_a_query_not_a_task() {
+        for flag in ["--version", "-V"] {
+            let args = parse_from(argv(&[flag])).expect("版本查询应解析成功");
+            assert!(args.version, "{flag} 应置 version");
+            assert!(!args.help, "{flag} 不应置 help");
+            assert!(args.task.is_none(), "{flag} 不能变成任务描述");
+        }
+
+        // 同场的任务描述与其他开关被忽略，不能让人以为任务会跑。
+        let with_task = parse_from(argv(&["--version", "顺便跑个任务"])).unwrap();
+        assert!(with_task.version);
+        assert!(with_task.task.is_none(), "版本查询优先，任务描述被忽略");
+
+        let with_json = parse_from(argv(&["--version", "--json"])).unwrap();
+        assert!(with_json.version);
+        assert!(!with_json.json, "版本查询忽略其余开关");
     }
 
     /// `--ai-review` 与 `--yes` 各自独立，也能同时给出。

@@ -1,7 +1,8 @@
 name: Release
 
-# 推送 v 开头的 tag 时构建各平台二进制并挂到 GitHub Release 上。
-# 生成的 Release 说明在 release 任务里内联，改版本时同步改这一份。
+# 推送 v 开头的 tag 时触发。先跑 gate 全量门禁，只有 gate 全绿才编译各平台
+# 二进制并创建 GitHub Release。是否标记为 prerelease 由 tag 名决定：
+# tag 名里带 -rc 或 -beta 才加 --prerelease，稳定 tag（如 v1.0.0）不加。
 
 on:
   push:
@@ -13,9 +14,83 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# gate：发布前置门禁。在 ubuntu 上跑全量测试、静态检查、文档构建、
+# rustls 依赖树空判定与基准 smoke。build 与 release 都 depends on 它，
+# gate 任一环节变红就阻断后续编译与发布。
 jobs:
+  gate:
+    name: 门禁
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 stable 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: 安装 OpenSSL 开发包
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: 缓存构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: 编译全部目标
+        run: cargo build --locked --all-targets
+
+      # 全量测试与依赖 git 的 ignored 测试都必须在发布前全绿。
+      - name: 运行测试
+        run: cargo test --locked
+
+      - name: 运行依赖 git 的测试
+        run: cargo test --locked -- --ignored
+
+      # clippy 硬门禁：任何警告都阻断发布。
+      - name: clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: 构建文档
+        run: cargo doc --locked --no-deps
+
+      # rustls 不得进入依赖树：项目 TLS 走 native-tls。
+      # `cargo tree -i rustls` 找不到时以 0 退出，按输出文本判定。
+      # cargo tree 自身失败必须让 gate 变红：否则错误输出为空，
+      # grep 判定"未进入"，等于把工具故障当成安全通过。
+      - name: rustls 不得进入依赖树
+        run: |
+          tree="$(cargo tree --locked --target all -i rustls 2>&1)"
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo "::error::cargo tree 执行失败（退出码 $status），无法判定 rustls 是否进入依赖树"
+            printf '%s\n' "$tree"
+            exit 1
+          fi
+          if printf '%s' "$tree" | grep -qE '(^|[^a-z-])rustls v[0-9]'; then
+            echo "::error::rustls 出现在依赖树里"
+            printf '%s\n' "$tree"
+            exit 1
+          fi
+          echo "rustls 未进入依赖树"
+
+      # 基准 smoke：生产 CLI 在空任务集上发空 JSON 结果清单，不起模型。
+      # 验证的是基准装配与输出链路，不是真实模型基准通过率。
+      - name: 基准 smoke（空套件 JSON）
+        run: cargo test --locked --test benchmark_output
+
   build:
     name: 构建 ${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -59,6 +134,9 @@ jobs:
       - name: 编译发布版
         run: cargo build --locked --release --target ${{ matrix.target }}
 
+      # 打包补齐：两个二进制、许可证、README、CHANGELOG、QCODEHARNESS.md、
+      # .env.example、三个示例配置，以及 docs 全目录。SHA256SUMS 覆盖包内
+      # 所有常规文件（除自身与 .sig），供离线校验。
       - name: 打包 (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -69,8 +147,13 @@ jobs:
           mkdir -p "$stage" dist
           cp "target/${{ matrix.target }}/release/QCodeHarness" "$stage/"
           cp "target/${{ matrix.target }}/release/mcp-lifecycle-server" "$stage/"
-          cp LICENSE README.md .env.example "$stage/"
-          cp -r docs "$stage/"
+          cp LICENSE README.md CHANGELOG.md QCODEHARNESS.md .env.example "$stage/"
+          cp config.example.toml policy.example.toml mcp.example.toml "$stage/"
+          cp -r docs scripts "$stage/"
+          # 生成 SHA256SUMS：对包内所有常规文件求和，相对路径记录。
+          # 此刻 SHA256SUMS 尚未写出，find 排除它自身是保险。
+          ( cd "$stage" && find . -type f ! -name 'SHA256SUMS' ! -name '*.sig' -print0 \
+              | xargs -0 sha256sum > SHA256SUMS )
           tar -czf "dist/${stage}.tar.gz" "$stage"
           rm -rf "$stage"
           ls -l dist/
@@ -87,11 +170,55 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\QCodeHarness.exe" $stage
           Copy-Item "target\${{ matrix.target }}\release\mcp-lifecycle-server.exe" $stage
-          Copy-Item LICENSE, README.md, .env.example $stage
-          Copy-Item -Recurse docs $stage
+          Copy-Item LICENSE, README.md, CHANGELOG.md, QCODEHARNESS.md, .env.example $stage
+          Copy-Item config.example.toml, policy.example.toml, mcp.example.toml $stage
+          Copy-Item -Recurse docs, scripts $stage
+          # 生成 SHA256SUMS：对包内所有常规文件求和，SHA256 小写 + 双空格 + 正斜杠相对路径。
+          # 相对路径必须按 staging 目录的绝对路径截断：$stage 是相对名，
+          # 直接拿它的长度去切 $f.FullName 会得出无意义后缀，校验必然失败。
+          $stageFull = (Get-Item -LiteralPath $stage).FullName
+          $files = Get-ChildItem -Recurse -File $stage |
+            Where-Object { $_.Name -ne 'SHA256SUMS' -and $_.Extension -ne '.sig' }
+          $lines = foreach ($f in $files) {
+            $rel = $f.FullName.Substring($stageFull.Length + 1) -replace '\\', '/'
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $rel"
+          }
+          $lines | Set-Content -Encoding utf8 "$stage\SHA256SUMS"
           Compress-Archive -Path $stage -DestinationPath "dist\${stage}.zip"
           Remove-Item -Recurse -Force $stage
           Get-ChildItem dist | Format-Table Name, Length
+
+      # 签名：密钥只从 GitHub Secret 注入，绝不入库。QCH_SIGNING_KEY 放
+      # armored GPG 私钥（base64），QCH_SIGNING_PASS 放 passphrase。未配置
+      # 时跳过签名，SHA256SUMS 仍提供离线校验。
+      - name: GPG 签名（若配置了签名密钥）
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${QCH_SIGNING_KEY:-}" ]; then
+            export GNUPGHOME="$(mktemp -d)"
+            trap 'rm -rf "$GNUPGHOME"' EXIT
+            # 私钥支持 base64 或明文两种存法，base64 失败退回明文。
+            if ! printf '%s' "$QCH_SIGNING_KEY" | base64 -d 2>/dev/null | gpg --batch --import; then
+              printf '%s' "$QCH_SIGNING_KEY" | gpg --batch --import
+            fi
+            fpr="$(gpg --list-keys --with-colons 2>/dev/null | awk -F: '/^fpr/{print $10; exit}')"
+            if [ -z "$fpr" ]; then
+              echo "::error::配置了 QCH_SIGNING_KEY 但导入后找不到可用密钥"
+              exit 1
+            fi
+            for f in dist/*; do
+              case "$f" in *.sig) continue ;; esac
+              gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "${QCH_SIGNING_PASS:-}" \
+                --local-user "$fpr" --armor --detach-sign -o "${f}.sig" "$f"
+              echo "签名 $(basename "$f") -> $(basename "$f").sig"
+            done
+          else
+            echo "未配置 QCH_SIGNING_KEY，跳过签名（SHA256SUMS 仍提供校验）"
+          fi
+          ls -l dist/
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
@@ -102,11 +229,14 @@ jobs:
 
   release:
     name: 发布 Release
-    needs: build
+    needs: [gate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
       - name: 下载全部构建产物
         uses: actions/download-artifact@v4
         with:
@@ -114,6 +244,8 @@ jobs:
           merge-multiple: true
           path: dist
 
+      # 是否 prerelease 由 tag 名决定：带 -rc 或 -beta 才加 --prerelease。
+      # 同时从 CHANGELOG 抓取对应版本小节生成 Release notes，不内联写死版本史。
       - name: 创建 Release 并上传产物
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -122,51 +254,77 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > notes.md <<'EOF'
-          QCodeHarness 是 Rust 实现的 AI 编程执行框架（Coding Agent Harness）。
-          这个发行包是可运行的单任务 Coding Agent：读任务 → 调模型 → 执行工具
-          （文件读写、搜索、补丁、Shell、Git）→ 收集证据 → 给出可审查的结论。
+          version="${TAG#v}"
+          # 查 CHANGELOG 用：预发布 tag 的小节通常挂在稳定版本名下
+          # （v1.1.0-rc1 取 [1.1.0] 的内容），剥掉 -rc* / -beta* 再定位。
+          notes_version="$version"
+          case "$version" in
+            *-rc*) notes_version="${version%%-rc*}" ;;
+            *-beta*) notes_version="${version%%-beta*}" ;;
+          esac
+          # tag 名含 -rc 或 -beta 才标记为预发布，稳定 tag 不加。
+          case "$TAG" in
+            *-rc*|*-beta*) PRERELEASE_ARGS="--prerelease" ;;
+            *) PRERELEASE_ARGS="" ;;
+          esac
+          {
+            echo "# QCodeHarness ${TAG}"
+            echo
+            echo "Rust 实现的 AI 编程执行框架。常驻任务服务、版本化 stdio 协议与 Rust SDK、"
+            echo "文本/TUI 终端前端与多语言基准均已就绪。本版本的外部接入点只有 stdio 协议"
+            echo "与 Rust SDK；ACP 完整实现、IDE 插件、Web UI 与远程多用户调度不在本次范围。"
+            echo
+            echo "## 相对上一版的变更"
+            echo
+            # 从 CHANGELOG 抽 notes_version 下所有 ### 小节（新增/变更/未变更），
+            # 跳过版本 header 与首段仓库侧叙述；到下一个 ## [ 版本段为止。
+            # 用 index() 字符串前缀匹配而非正则，避免 gawk 把 \[ 当字符类。
+            awk -v v="$notes_version" '
+              BEGIN { target="## [" v "]"; inblk=0; started=0 }
+              {
+                if (!inblk) { if (index($0, target)==1) inblk=1; next }
+                if (index($0, "## [")==1) { inblk=0; next }
+                if (index($0, "###")==1) { started=1; print; next }
+                if (started) print
+              }
+            ' CHANGELOG.md
+            echo
+            echo "## 压缩包内容"
+            echo
+            echo "- \`QCodeHarness\`（Windows 下是 \`QCodeHarness.exe\`）：主程序"
+            echo "- \`mcp-lifecycle-server\`：MCP 生命周期演示用的参考 Server"
+            echo "- \`LICENSE\` / \`README.md\` / \`CHANGELOG.md\` / \`QCODEHARNESS.md\`"
+            echo "- \`.env.example\` 与 \`config.example.toml\` / \`policy.example.toml\` / \`mcp.example.toml\`：样例配置"
+            echo "- \`docs/\`：完整用法与安装、升级、回滚文档"
+            echo "- \`scripts/\`：安装、回滚与校验脚本（install / rollback / verify-checksums）"
+            echo "- \`SHA256SUMS\`：包内文件校验和；\`*.sig\`：GPG 签名（若发布时配置了签名密钥）"
+            echo
+            echo "## 安装、签名与校验"
+            echo
+            echo "离线安装、升级与回滚步骤见包内 docs/install.md。"
+            echo "SHA256SUMS 用于离线校验，校验脚本为 scripts/verify-checksums.sh（POSIX）"
+            echo "与 scripts/verify-checksums.ps1（Windows）。若包内带 .sig，"
+            echo "用发行方公布的公钥做 GPG 验签。"
+            echo
+            echo "## 当前安全边界（如实陈述）"
+            echo
+            echo "Windows 上进程沙箱用 Job Object 生效；Linux 与 macOS 降级执行，无进程沙箱。"
+            echo "文件系统与网络隔离尚未实现，本版本不宣称三平台 OS 级隔离已实测。"
+            echo "完整边界见 .github/SECURITY.md 与 README 第 8 节。"
+          } > notes.md
 
-          ## 压缩包内容
-
-          - `QCodeHarness`（Windows 下是 `QCodeHarness.exe`）：主程序
-          - `mcp-lifecycle-server`：MCP 生命周期演示用的参考 Server
-          - `LICENSE`：MIT 许可证
-          - `README.md` 与 `docs/`：项目说明与完整用法手册
-          - `.env.example`：环境变量样例，复制成 `.env` 后填值
-
-          ## 运行
-
-          1. 准备 `.env`：复制压缩包里的 `.env.example`，填入 `LLM_BASE_URL`、
-             `LLM_API_KEY`、`LLM_MODEL` 三项。主程序读当前目录的 `.env`，
-             读不到就退回进程环境变量。
-          2. 在目标代码仓库目录里运行，主程序把当前目录当作 workspace：
-
-             ```bash
-             QCodeHarness "修复失败的测试"
-             ```
-
-          3. 默认每个非只读工具执行前都要人工审批。无人值守的场景设
-             `QCH_AUTO_APPROVE=1` 跳过审批，此时权限边界仍由内置策略与
-             越界写入检查兜住。
-
-          ## 关于这个版本
-
-          0.1.0 是首个公开发行版本，覆盖单任务执行链路：ReAct 循环、内置工具、
-          结构化补丁、权限审批、MCP 接入、上下文压缩与会话/任务级恢复、
-          证据与运行报表。进程沙箱目前只在 Windows 上生效（Job Object 限制
-          进程树并整树终止），Linux 与 macOS 降级执行；文件系统级隔离尚未
-          实现。已知边界见仓库 README 第 8 节。
-          EOF
-          # 这个 job 没有 checkout，工作目录不是 git 仓库，gh 推断不出仓库名，
-          # 每条命令都要显式给 --repo。
+          # 这个 job 已 checkout，但仍显式给 --repo 以稳健。
           # --draft=false：tag 被删过再重建时，GitHub 会把原 Release 转成草稿，
           # 改标题不会把它转回来，得显式取消草稿状态。
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，改为补传产物"
-            gh release edit "$TAG" --repo "$REPO" --title "QCodeHarness $TAG" --notes-file notes.md --prerelease --draft=false
+            # shellcheck disable=SC2086
+            gh release edit "$TAG" --repo "$REPO" --title "QCodeHarness $TAG" \
+              --notes-file notes.md $PRERELEASE_ARGS --draft=false
           else
-            gh release create "$TAG" --repo "$REPO" --title "QCodeHarness $TAG" --notes-file notes.md --generate-notes --prerelease
+            # shellcheck disable=SC2086
+            gh release create "$TAG" --repo "$REPO" --title "QCodeHarness $TAG" \
+              --notes-file notes.md --generate-notes $PRERELEASE_ARGS
           fi
           gh release upload "$TAG" --repo "$REPO" dist/* --clobber
           gh release view "$TAG" --repo "$REPO"

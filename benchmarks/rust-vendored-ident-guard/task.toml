@@ -1,0 +1,8 @@
+id = "rust-vendored-ident-guard"
+kind = "bug-fix"
+description = "修复 bench-ident-guard 库：src/guard.rs 的 is_safe_dir_name 是仓内自写的标识符校验，但漏掉了 Windows 保留设备名的拦截，对 nul、con、com4、lpt1 这类输入会放行；src/reference.rs 是从固定 revision 逐字复制进来的参考口径（见 SOURCE.md），它的 validate_safe_identifier 会拒绝这些设备名。tests/guard.rs 把同一组输入喂给 guard 与 reference 两处，要求判定完全一致，因此基线上设备名相关的测试失败。读 guard.rs、reference.rs 与 tests/guard.rs，把缺失的设备名拦截补进 guard.rs（保持与 reference 相同口径：con/prn/aux/nul 整体，以及 com1..9、lpt1..9 前缀），不要改动 reference.rs 与测试，然后运行 cargo test 验证全部测试通过。"
+
+[criteria]
+test_command = "cargo test"
+requires_changes = true
+answer_must_mention = ["device"]

@@ -1,0 +1,9 @@
+id = "js-dedupe-keep-first"
+kind = "bug-fix"
+description = "修复 js-dedupe-keep-first 的 src/dedupe.js：dedupeByKey 本应保留每个 key 的首次出现，当前实现却保留了最后一次，先出现的元素被后写的值挤掉。读 src/dedupe.js 与 test/dedupe.test.js，做最小修复让重复 key 保留首次出现的元素，然后运行 node --test 验证全部测试通过。"
+language = "javascript"
+
+[criteria]
+test_command = "node --test"
+requires_changes = true
+answer_must_mention = ["first"]

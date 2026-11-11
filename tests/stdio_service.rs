@@ -87,11 +87,11 @@ impl TaskService for StubService {
         Box::pin(async move {
             self.seen.lock().unwrap().push(command.clone());
             match command {
-                ServiceCommand::Create { .. } => Ok(ServiceReply::Task { task: self.view() }),
+                ServiceCommand::Create { .. } => Ok(ServiceReply::Task { task: Box::new(self.view()) }),
                 ServiceCommand::List => Ok(ServiceReply::Tasks { tasks: vec![self.view()] }),
                 ServiceCommand::Events { after, .. } => Ok(ServiceReply::Events { events: vec![], next: after }),
                 ServiceCommand::Shutdown => Ok(ServiceReply::Shutdown),
-                ServiceCommand::Get { .. } => Ok(ServiceReply::Task { task: self.view() }),
+                ServiceCommand::Get { .. } => Ok(ServiceReply::Task { task: Box::new(self.view()) }),
                 ServiceCommand::Approvals { .. } => Ok(ServiceReply::PendingApprovals { requests: vec![] }),
                 _ => Ok(ServiceReply::Accepted { task_id: "task-1".into(), execution_id: None }),
             }
@@ -362,7 +362,7 @@ async fn sdk_reports_event_overflow_after_preserving_buffered_events() {
         for sequence in 1..=qcode_harness::interface::sdk::SDK_EVENT_CAPACITY + 1 {
             let response = StdioResponse::Event {
                 version: PROTOCOL_VERSION,
-                event: event(sequence as u64, ServiceEventPayload::ExecutionStarted),
+                event: Box::new(event(sequence as u64, ServiceEventPayload::ExecutionStarted)),
             };
             write.write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes()).await.unwrap();
         }

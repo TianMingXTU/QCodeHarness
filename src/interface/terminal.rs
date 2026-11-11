@@ -453,7 +453,7 @@ impl Session {
             Ok(outcome) => {
                 match &outcome.reply {
                     ServiceReply::Task { task } => {
-                        self.tasks.insert(task.task_id.clone(), task.clone());
+                        self.tasks.insert(task.task_id.clone(), (**task).clone());
                         if outcome.select {
                             self.selected = Some(task.task_id.clone());
                             self.interrupted = false;

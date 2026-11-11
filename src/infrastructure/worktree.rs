@@ -144,7 +144,7 @@ impl WorktreeScanner for NoopWorktreeScanner {
 }
 
 /// 把扫描器包成 `Arc`，供依赖注入。
-pub fn shared(scanner: impl WorktreeScanner + Send + Sync + 'static) -> Arc<dyn WorktreeScanner> {
+pub fn shared(scanner: impl WorktreeScanner + 'static) -> Arc<dyn WorktreeScanner> {
     Arc::new(scanner)
 }
 

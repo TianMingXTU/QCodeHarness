@@ -15,6 +15,7 @@
 //! - **工具清单变化不能静默改变契约。** 首次注册的规格不会热更新，
 //!   重连后的再次发现只用于比对。定义变化或工具消失时按旧定义拒绝调用。
 
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -49,6 +50,7 @@ struct State {
     connection: Connection,
     generation: u64,
     current_tools: Vec<ToolSpec>,
+    #[cfg(test)]
     last_recovery: Result<bool, McpError>,
 }
 
@@ -56,11 +58,13 @@ pub(crate) struct ManagedServer {
     pub server: String,
     /// 首次注册的规格永不热更新，审批与调用共用同一份定义。
     pub tools: Vec<ToolSpec>,
+    #[cfg(test)]
     connector: Option<Arc<dyn Connector>>,
     recorder: Option<Arc<McpLifecycleRecorder>>,
     timeouts: McpTimeouts,
     state: Mutex<State>,
     /// 恢复轮次编号。同一次恢复的结果由后来排队的请求共享。
+    #[cfg(test)]
     recovery_revision: AtomicU64,
     watcher: StdMutex<Option<JoinHandle<()>>>,
 }
@@ -99,7 +103,8 @@ impl ManagedServer {
     pub(crate) async fn discover(
         server: &str,
         mut client: Box<dyn McpClientHandle>,
-        connector: Option<Arc<dyn Connector>>,
+        #[cfg(test)] connector: Option<Arc<dyn Connector>>,
+        #[cfg(not(test))] _connector: Option<Arc<dyn Connector>>,
         recorder: Option<Arc<McpLifecycleRecorder>>,
         timeouts: McpTimeouts,
     ) -> Result<Arc<Self>, McpError> {
@@ -122,6 +127,7 @@ impl ManagedServer {
                 return Err(error);
             }
         };
+        #[cfg(test)]
         let managed = Arc::new(Self {
             server: server.to_owned(),
             tools: tools.clone(),
@@ -135,6 +141,19 @@ impl ManagedServer {
                 last_recovery: Ok(false),
             }),
             recovery_revision: AtomicU64::new(0),
+            watcher: StdMutex::new(None),
+        });
+        #[cfg(not(test))]
+        let managed = Arc::new(Self {
+            server: server.to_owned(),
+            tools: tools.clone(),
+            recorder,
+            timeouts,
+            state: Mutex::new(State {
+                connection: Connection::Ready(client),
+                generation: 1,
+                current_tools: tools,
+            }),
             watcher: StdMutex::new(None),
         });
         managed.record(1, McpLifecycleKind::Connected, None, None, active, false);
@@ -225,11 +244,10 @@ impl ManagedServer {
         call: &ToolCall,
     ) -> ToolOutcome {
         let mut state = self.state.lock().await;
-        if let Connection::Ready(client) = &state.connection {
-            if client.is_closed() {
+        if let Connection::Ready(client) = &state.connection
+            && client.is_closed() {
                 self.disconnect(&mut state, Some(call.id.clone())).await;
             }
-        }
         let client = match &state.connection {
             Connection::Ready(client) => client,
             // 短路失败没有发出请求：没有执行边界，也没有结果未知，
@@ -327,10 +345,8 @@ impl ManagedServer {
     ///
     /// 恢复成功后只重建通信；后续调用仍需通过注册比对、角色授权与审批。
     ///
-    /// 运行中的会话不会自动调用它。生产路径上的 `--mcp-reconnect` 是
-    /// 会话外的显式 CLI 动作，走的是新建连接的流程（见
-    /// `McpToolSource::connect`），不走这里。这个方法目前只有测试在用，
-    /// 是留给"会话内显式恢复"的接缝。
+    /// 该方法只由 lib 内测试显式触发；生产恢复走会话外的新连接流程。
+    #[cfg(test)]
     pub(crate) async fn reconnect(
         self: &Arc<Self>,
         call_id: Option<CallId>,
@@ -406,14 +422,18 @@ impl ManagedServer {
                 Err(error)
             }
         };
-        state.last_recovery = result.clone();
-        self.recovery_revision.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            state.last_recovery = result.clone();
+            self.recovery_revision.fetch_add(1, Ordering::SeqCst);
+        }
         self.watch(&state);
         result
     }
 
     /// 当前连接的实际进程保护状态。断连或关闭后没有存活进程，返回 false。
-    /// 该值用于断言与展示，不参与分类。
+    /// 该值由 lib 内测试用于核对状态机，不参与分类。
+    #[cfg(test)]
     pub(crate) async fn process_isolation(&self) -> bool {
         let state = self.state.lock().await;
         match &state.connection {

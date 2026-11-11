@@ -9,20 +9,20 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::application::agent_roster::AgentRoster;
+use crate::application::context_policy::ContextPolicy;
+use crate::application::control::ExecutionControl;
 use crate::application::error::ApplicationError;
 use crate::application::port::{
     ApprovalGate, ApprovalRequest, CancelHandle, Clock, EvidenceSink, ModelGateway, ModelReply,
     ModelRequest, RunHooks,
 };
-use crate::application::agent_roster::AgentRoster;
-use crate::application::control::ExecutionControl;
-use crate::application::context_policy::ContextPolicy;
-use crate::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
-use crate::application::summarizer::{render_slices, SummarizeInput, Summarizer};
-use crate::application::tool_registry::ToolRegistry;
+use crate::application::snapshot::{RUN_FORMAT, RunSnapshot, SessionStore, StoreError};
+use crate::application::summarizer::{SummarizeInput, Summarizer, render_slices};
 use crate::application::tool_guard::{
-    run_guard_chain, BoundaryEscalationGuard, GuardContext, GuardVerdict, PolicyGuard, ToolGuard,
+    BoundaryEscalationGuard, GuardContext, GuardVerdict, PolicyGuard, ToolGuard, run_guard_chain,
 };
+use crate::application::tool_registry::ToolRegistry;
 use crate::domain::agent::{AgentSpec, AgentTurn};
 use crate::domain::budget::{Budget, Consumption};
 use crate::domain::context::{CompactionReport, ContextBudget};
@@ -299,7 +299,10 @@ impl AgentRunner {
     /// 版本不匹配，或状态机位置与待配平轮次不一致（半轮缺 pending、
     /// 正常点带 pending、调用清单错位）时返回 [`ApplicationError::Snapshot`]；
     /// 历史损坏或配对错误经 [`ApplicationError::Session`] 上抛。
-    pub fn resume(snapshot: RunSnapshot, deps: AgentDependencies) -> Result<Self, ApplicationError> {
+    pub fn resume(
+        snapshot: RunSnapshot,
+        deps: AgentDependencies,
+    ) -> Result<Self, ApplicationError> {
         snapshot.check_version()?;
         // 半轮状态依赖 pending 续跑（step() 从 outcomes.len() 推下一条调用）。
         // 缺了它 step() 只能报 NoPendingRound，因此在入口拦下这种矛盾。
@@ -323,27 +326,20 @@ impl AgentRunner {
         }
         // 状态机记录的调用清单必须与待配平轮次一致：step() 按 state 取下一个
         // 调用，按 pending 收观察，不一致会导致调用与观察错位配对。
-        if let (
-            Some(pending),
-            RunState::Evaluating(calls) | RunState::Dispatching(calls),
-        ) = (&snapshot.pending, &snapshot.state)
-        {
-            if calls != &pending.turn.calls {
+        if let (Some(pending), RunState::Evaluating(calls) | RunState::Dispatching(calls)) =
+            (&snapshot.pending, &snapshot.state)
+            && calls != &pending.turn.calls {
                 return Err(StoreError::Corrupt(
                     "状态机记录的调用清单与待配平轮次不一致".to_owned(),
                 )
                 .into());
             }
-        }
         // 观察数即本轮已完成的调用数。它不能超过调用数；在 Dispatching 状态下
         // 必须小于调用数，全部配平表示本轮已结束，应停在等待模型而非执行中。
         // 这两种情况正常构造路径产生不出来，在入口拦下。
         if let Some(pending) = &snapshot.pending {
             if pending.outcomes.len() > pending.turn.calls.len() {
-                return Err(StoreError::Corrupt(
-                    "快照的观察数超过了调用数".to_owned(),
-                )
-                .into());
+                return Err(StoreError::Corrupt("快照的观察数超过了调用数".to_owned()).into());
             }
             if matches!(snapshot.state, RunState::Dispatching(_))
                 && pending.outcomes.len() == pending.turn.calls.len()
@@ -437,7 +433,8 @@ impl AgentRunner {
             // 宿主可在崩溃前保留尚未确认的输入；会话历史已含该 ID 时不再追加，
             // 但仍要确认，队列才不会反复投递同一条消息。
             if self.session.input_text(&input.id).is_none() {
-                self.session.push_input(input.id.clone(), input.text.clone());
+                self.session
+                    .push_input(input.id.clone(), input.text.clone());
             }
         }
         self.try_save_snapshot()?;
@@ -476,8 +473,13 @@ impl AgentRunner {
     pub fn start_conversation(&mut self) -> Result<(), ApplicationError> {
         if let RunState::Completed(answer) = &self.state {
             let answer = answer.clone();
-            self.session
-                .commit_round(AgentTurn { text: answer, calls: Vec::new() }, Vec::new())?;
+            self.session.commit_round(
+                AgentTurn {
+                    text: answer,
+                    calls: Vec::new(),
+                },
+                Vec::new(),
+            )?;
         }
         self.state = RunState::AwaitingModel;
         self.pending = None;
@@ -513,11 +515,7 @@ impl AgentRunner {
             RunState::Dispatching(_) => {
                 self.state = RunState::Evaluating(pending.turn.calls.clone());
                 // 在途调用 = 已配平条数，观察数即已跑完的条数。
-                self.replay_pending = pending
-                    .turn
-                    .calls
-                    .get(pending.outcomes.len())
-                    .cloned();
+                self.replay_pending = pending.turn.calls.get(pending.outcomes.len()).cloned();
             }
             _ => {}
         }
@@ -546,7 +544,11 @@ impl AgentRunner {
     /// 不可靠）在下一个工具前停下，用 [`ApplicationError::ExecutionControl`]
     /// 表达，不静默吞掉。取消开关与输入应用共用 `cancel`，宿主取消后在途
     /// 工具仍会配平，未开始的调用以拒绝观察回填。
-    pub fn with_execution_control(mut self, control: Arc<dyn ExecutionControl>, cancel: CancelHandle) -> Self {
+    pub fn with_execution_control(
+        mut self,
+        control: Arc<dyn ExecutionControl>,
+        cancel: CancelHandle,
+    ) -> Self {
         self.execution_control = Some(control);
         self.cancel = cancel;
         // 构造时闸门绑定的是默认开关；换成宿主的取消通道后必须重新绑定，
@@ -570,11 +572,7 @@ impl AgentRunner {
     /// 提交上一步最终答案时若破坏配平，返回 [`ApplicationError::Session`]。
     /// 正常流程不会发生：无调用轮次的观察必然为空。若真出现，说明会话状态
     /// 已损坏，带着错误历史继续询问模型只会放大错误。
-    pub fn begin_step(
-        &mut self,
-        spec: AgentSpec,
-        prompt: String,
-    ) -> Result<(), ApplicationError> {
+    pub fn begin_step(&mut self, spec: AgentSpec, prompt: String) -> Result<(), ApplicationError> {
         // 恢复路径：runner 停在本步的半轮状态，且本步的交代已在历史末尾。
         // 此时"进入下一步"实际是"继续这一步"。若把状态机重置为等待模型，
         // pending 轮次会整体丢失，副作用与未答复的审批等执行现场也随之消失。
@@ -594,8 +592,13 @@ impl AgentRunner {
         // 上一步的结论；不提交则跨步骤复用上下文无法实现。
         if let RunState::Completed(answer) = &self.state {
             let answer = answer.clone();
-            self.session
-                .commit_round(AgentTurn { text: answer, calls: Vec::new() }, Vec::new())?;
+            self.session.commit_round(
+                AgentTurn {
+                    text: answer,
+                    calls: Vec::new(),
+                },
+                Vec::new(),
+            )?;
         }
         // 恢复路径上本步的交代已在历史里：中断发生在步骤执行期间，交接
         // 内容属于快照。再推一次会让同一句指令出现两次，并导致步骤计数错误。
@@ -774,7 +777,8 @@ impl AgentRunner {
         // 只对本次调用生效，提示完成后清除。
         self.replay_pending = None;
         let content = replay_notice(&call, previous.as_ref());
-        self.record_and_advance(call, ToolOutcome::refused(content)).await
+        self.record_and_advance(call, ToolOutcome::refused(content))
+            .await
     }
 
     /// 查找调用在本次会话中此前的执行结果。
@@ -911,9 +915,7 @@ impl AgentRunner {
                     // 规则，模型才能选择其他路径。
                     GuardVerdict::Deny(reason) => {
                         let outcome = ToolOutcome::refused(denied_by_chain_message(
-                            &call.name,
-                            &decision,
-                            &reason,
+                            &call.name, &decision, &reason,
                         ));
                         self.record_and_advance(call, outcome).await
                     }
@@ -938,9 +940,7 @@ impl AgentRunner {
                         // 即使策略后来放宽，也不能替用户取消这一判断；用户
                         // 必须再确认一次，否则"未答复"会被误读为"已同意"。
                         if reask {
-                            return Ok(
-                                self.park_at_approval(call, spec.annotations, None, true)
-                            );
+                            return Ok(self.park_at_approval(call, spec.annotations, None, true));
                         }
                         self.state = RunState::Dispatching(calls.clone());
                         Ok(RunState::Dispatching(calls))
@@ -1042,15 +1042,14 @@ impl AgentRunner {
                 if budget.exhausted(&self.consumption) {
                     // exhausted 命中后先区分维度：两种超限的处理方式不同，
                     // 错误需要能指导调用方采取动作。
-                    if let Some(limit) = budget.max_wall_clock {
-                        if self.consumption.elapsed >= limit {
+                    if let Some(limit) = budget.max_wall_clock
+                        && self.consumption.elapsed >= limit {
                             self.save_snapshot();
                             return Err(ApplicationError::WallClockExhausted {
                                 elapsed: self.consumption.elapsed,
                                 limit,
                             });
                         }
-                    }
                     self.save_snapshot();
                     return Err(ApplicationError::BudgetExhausted {
                         max_turns: budget.max_turns,
@@ -1263,7 +1262,9 @@ impl AgentRunner {
 
     /// 待配平的轮次。Evaluating/Dispatching/AwaitingApproval 三个状态下必然存在。
     fn pending_round(&self) -> Result<&PendingRound, ApplicationError> {
-        self.pending.as_ref().ok_or(ApplicationError::NoPendingRound)
+        self.pending
+            .as_ref()
+            .ok_or(ApplicationError::NoPendingRound)
     }
 
     /// 记录一条观察并推进：仍有调用未处理则回到 `Evaluating`；全部处理完
@@ -1402,11 +1403,7 @@ fn unregistered_tool_message(name: &str, specs: &[ToolSpec]) -> String {
 /// 拒绝票来自策略守卫时沿用原模板，区分"规则 #N 拒绝"与"默认策略拒绝"；
 /// 来自其他守卫时给出守卫自己的理由。只说"被禁止"会让模型无法判断该换
 /// 参数、换工具还是放弃，只会盲目重试同一调用。
-fn denied_by_chain_message(
-    name: &str,
-    decision: &PolicyDecision,
-    guard_reason: &str,
-) -> String {
+fn denied_by_chain_message(name: &str, decision: &PolicyDecision, guard_reason: &str) -> String {
     // 理由与策略原判一致，说明这一票来自策略守卫，按原模板处理。
     if guard_reason == decision.reason {
         return match decision.rule_index {
@@ -1453,15 +1450,15 @@ fn default_guard_chain(policy: PolicyEngine) -> Vec<Arc<dyn ToolGuard>> {
 mod tests {
     use super::*;
     use crate::application::context_policy::DefaultContextPolicy;
+    use crate::application::memory_evidence::MemoryEvidenceSink;
     use crate::application::port::{BoxFuture, Decision, NoopHooks, ToolInvoker};
-    use crate::domain::policy::PolicyVerdict;
-    use rig::completion::Message;
     use crate::domain::agent::AgentRole;
     use crate::domain::evidence::{AuditEvent, TokenUsage};
     use crate::domain::ids::CallId;
+    use crate::domain::policy::PolicyVerdict;
     use crate::domain::tool::{OutcomeStatus, ToolAnnotations};
-    use crate::application::memory_evidence::MemoryEvidenceSink;
     use crate::infrastructure::model::rig_chat::RigChatGateway;
+    use rig::completion::Message;
     use rig::message::{AssistantContent, ToolName, UserContent};
     use rig::test_utils::{MockCompletionModel, MockTurn};
     use serde_json::json;
@@ -1483,7 +1480,10 @@ mod tests {
         ToolRegistry::new(
             specs
                 .into_iter()
-                .map(|spec| crate::application::tool_registry::ToolEntry { spec, invoker: invoker.clone() })
+                .map(|spec| crate::application::tool_registry::ToolEntry {
+                    spec,
+                    invoker: invoker.clone(),
+                })
                 .collect(),
         )
     }
@@ -1907,8 +1907,7 @@ mod tests {
                 _budget: &ContextBudget,
                 _summary: Option<&crate::domain::context::Summary>,
             ) -> Vec<ContextSlice<'a>> {
-                self.calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 session.slices()
             }
         }
@@ -2245,10 +2244,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            observed, requested,
-            "每条调用都要配到自己的观察，不能错位"
-        );
+        assert_eq!(observed, requested, "每条调用都要配到自己的观察，不能错位");
 
         // 审批只问写工具：两个只读调用照常跳过闸门。
         assert_eq!(harness.approvals.requested_tools(), vec!["write_file"]);
@@ -2687,7 +2683,10 @@ mod tests {
         let text = refusal_text(&harness.mock, 1);
         assert!(text.contains("write_file"), "应点名工具: {text}");
         assert!(text.contains("策略规则 #0"), "应指明规则序号: {text}");
-        assert!(text.contains("测试规则：禁止写文件"), "应带上规则理由: {text}");
+        assert!(
+            text.contains("测试规则：禁止写文件"),
+            "应带上规则理由: {text}"
+        );
     }
 
     #[tokio::test]
@@ -2946,14 +2945,20 @@ mod tests {
         harness.runner.run(&Budget::new(20)).await.unwrap();
 
         assert_eq!(harness.approvals.requested_tools(), vec!["run_command"]);
-        let decisions: Vec<_> = harness.evidence.events().into_iter()
+        let decisions: Vec<_> = harness
+            .evidence
+            .events()
+            .into_iter()
             .filter_map(|entry| match entry.event {
                 AuditEvent::ApprovalDecided { allowed, .. } => Some(allowed),
                 _ => None,
             })
             .collect();
         assert_eq!(decisions, vec![true], "升级后闸门应被问过并获批准");
-        assert!(boundaries(&harness).is_empty(), "未执行的拒绝调用不能记边界证据");
+        assert!(
+            boundaries(&harness).is_empty(),
+            "未执行的拒绝调用不能记边界证据"
+        );
     }
 
     // ── 执行边界证据 ──────────────────────────────────────────────────
@@ -3050,13 +3055,11 @@ mod tests {
 
             assert_eq!(
                 boundaries(&harness),
-                vec![
-                    (
-                        crate::domain::sandbox::MCP_BOUNDARY_LABEL.to_owned(),
-                        process_isolation,
-                        false
-                    )
-                ],
+                vec![(
+                    crate::domain::sandbox::MCP_BOUNDARY_LABEL.to_owned(),
+                    process_isolation,
+                    false
+                )],
                 "MCP 调用要单独标注它跑在外部进程里，active 反映进程是否真进了 \
                  Job（本次 process_isolation={process_isolation}）"
             );
@@ -3363,7 +3366,7 @@ mod tests {
                     .get("path")
                     .and_then(|value| value.as_str())
                     .unwrap_or("?");
-                ToolOutcome::success(format!("OBSERVATION_FOR_{path}"))
+                ToolOutcome::success(format!("OBSERVATION_FOR_{path}{}", "x".repeat(4000)))
             })
         }
     }
@@ -3394,7 +3397,7 @@ mod tests {
                 policy: PolicyEngine::new(),
                 roster: AgentRoster::builtin(),
                 context_budget: ContextBudget {
-                    max_tokens: Some(1),
+                    max_tokens: Some(2200),
                     min_recent_rounds: 2,
                     keep_task: true,
                     summarize: None,
@@ -3410,7 +3413,10 @@ mod tests {
 
         // 最后一次请求：任务在、占位说明在，只看得到第 5、6 轮的观察。
         let rendered = serde_json::to_string(&history(&mock, mock.request_count() - 1)).unwrap();
-        assert!(rendered.contains("读六个文件"), "任务消息应保留: {rendered}");
+        assert!(
+            rendered.contains("读六个文件"),
+            "任务消息应保留: {rendered}"
+        );
         assert!(rendered.contains("已省略"), "应有占位说明: {rendered}");
         assert!(rendered.contains("OBSERVATION_FOR_r5.txt"), "{rendered}");
         assert!(rendered.contains("OBSERVATION_FOR_r6.txt"), "{rendered}");
@@ -3495,7 +3501,7 @@ mod tests {
         let (mut runner, evidence) = summary_test_runner(
             &mock,
             ContextBudget {
-                max_tokens: Some(1),
+                max_tokens: Some(2200),
                 min_recent_rounds: 2,
                 keep_task: true,
                 summarize: None,
@@ -3506,7 +3512,11 @@ mod tests {
         runner.run(&Budget::new(20)).await.unwrap();
 
         // 5 次真实请求 + 2 次摘要调用。
-        assert_eq!(mock.request_count(), 7, "每次超出覆盖范围的裁剪各补一次摘要");
+        assert_eq!(
+            mock.request_count(),
+            7,
+            "每次超出覆盖范围的裁剪各补一次摘要"
+        );
 
         // 摘要调用①：独立的单消息请求，只带被裁片段，不带任务与保留轮次。
         let first_summary = serde_json::to_string(&history(&mock, 3)).unwrap();
@@ -3525,7 +3535,10 @@ mod tests {
 
         // 摘要调用②是增量的：旧摘要在提示里，新片段拼在后面。
         let second_summary = serde_json::to_string(&history(&mock, 5)).unwrap();
-        assert!(second_summary.contains("此前已有摘要"), "应带上旧摘要做增量合并");
+        assert!(
+            second_summary.contains("此前已有摘要"),
+            "应带上旧摘要做增量合并"
+        );
         assert!(
             second_summary.contains("OBSERVATION_FOR_r2.txt"),
             "第二次摘要应包含新被裁的第 2 轮"
@@ -3572,9 +3585,8 @@ mod tests {
         ]);
         let (mut runner, _evidence) =
             summary_test_runner(&mock, ContextBudget::default().with_summarize(1));
-        // token 上限压到 1 才会触发裁剪，默认值是 16000。直接修改字段是为了
-        // 测试装配方便。
-        runner.context_budget.max_tokens = Some(1);
+        // 预算能放下两轮原始观察与说明，第三轮会触发裁剪。
+        runner.context_budget.max_tokens = Some(2200);
 
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
 
@@ -3607,7 +3619,7 @@ mod tests {
         ]);
         let (mut runner, evidence) =
             summary_test_runner(&mock, ContextBudget::default().with_summarize(1));
-        runner.context_budget.max_tokens = Some(1);
+        runner.context_budget.max_tokens = Some(2200);
 
         let outcome = runner.run(&Budget::new(20)).await.unwrap();
 
@@ -3637,7 +3649,7 @@ mod tests {
         let (mut runner, _evidence) = summary_test_runner(
             &mock,
             ContextBudget {
-                max_tokens: Some(1),
+                max_tokens: Some(2200),
                 min_recent_rounds: 2,
                 keep_task: true,
                 summarize: None,
@@ -3656,7 +3668,10 @@ mod tests {
             );
         }
         let final_request = serde_json::to_string(&history(&mock, 4)).unwrap();
-        assert!(final_request.contains("已省略"), "占位说明照旧: {final_request}");
+        assert!(
+            final_request.contains("已省略"),
+            "占位说明照旧: {final_request}"
+        );
     }
 
     // ── 整体超时与取消 ──────────────────────────────────────────────────
@@ -3716,7 +3731,9 @@ mod tests {
             AgentDependencies {
                 model: Arc::new(RigChatGateway::new(mock.clone().erase())),
                 tools: registry_with(
-                    Arc::new(SlowInvoker { clock: clock.clone() }),
+                    Arc::new(SlowInvoker {
+                        clock: clock.clone(),
+                    }),
                     vec![read_file_spec()],
                 ),
                 approvals: Arc::new(CountingGate::default()),
@@ -3740,7 +3757,10 @@ mod tests {
         let ApplicationError::WallClockExhausted { elapsed, limit } = &error else {
             panic!("应当是墙钟超时错误，实际 {error:?}");
         };
-        assert!(*elapsed >= std::time::Duration::from_secs(30), "{elapsed:?}");
+        assert!(
+            *elapsed >= std::time::Duration::from_secs(30),
+            "{elapsed:?}"
+        );
         assert_eq!(*limit, std::time::Duration::from_secs(30));
         assert!(error.to_string().contains("上限"));
         // 正在执行的轮次允许跑完：第一轮已提交，历史完整；第二次模型调用未发生。
@@ -3776,7 +3796,9 @@ mod tests {
             AgentDependencies {
                 model: Arc::new(RigChatGateway::new(mock.clone().erase())),
                 tools: registry_with(
-                    Arc::new(CancellingInvoker { handle_slot: handle_slot.clone() }),
+                    Arc::new(CancellingInvoker {
+                        handle_slot: handle_slot.clone(),
+                    }),
                     vec![read_file_spec()],
                 ),
                 approvals: Arc::new(CountingGate::default()),
@@ -3821,7 +3843,10 @@ mod tests {
             "任务",
             AgentDependencies {
                 model: Arc::new(RigChatGateway::new(mock.clone().erase())),
-                tools: registry_with(Arc::new(RecordingInvoker::default()), vec![read_file_spec()]),
+                tools: registry_with(
+                    Arc::new(RecordingInvoker::default()),
+                    vec![read_file_spec()],
+                ),
                 approvals: Arc::new(CountingGate::default()),
                 evidence: Arc::new(MemoryEvidenceSink::new()),
                 clock,
@@ -4080,14 +4105,8 @@ mod tests {
             text.contains("没有自动再跑"),
             "提示应说明没有自动重跑: {text}"
         );
-        assert!(
-            text.contains("结果未知"),
-            "提示应说明结果未知: {text}"
-        );
-        assert!(
-            text.contains("由你判断"),
-            "提示应把决定权交回模型: {text}"
-        );
+        assert!(text.contains("结果未知"), "提示应说明结果未知: {text}");
+        assert!(text.contains("由你判断"), "提示应把决定权交回模型: {text}");
     }
 
     /// 恢复时，审批必须**再问一次**，不能凭快照放行。
@@ -4162,7 +4181,11 @@ mod tests {
                 invoker.clone(),
                 evidence,
                 approvals.clone(),
-                policy_with("write_file", PolicyVerdict::Deny, "恢复时的策略：禁止写文件"),
+                policy_with(
+                    "write_file",
+                    PolicyVerdict::Deny,
+                    "恢复时的策略：禁止写文件",
+                ),
             ),
         )
         .unwrap();
@@ -4180,7 +4203,10 @@ mod tests {
         );
         // 模型看到的是一条拒绝观察，理由来自**当前**策略。
         let text = last_tool_result_text(&mock, 0);
-        assert!(text.contains("恢复时的策略"), "拒绝理由应来自当前策略: {text}");
+        assert!(
+            text.contains("恢复时的策略"),
+            "拒绝理由应来自当前策略: {text}"
+        );
     }
 
     /// 停在审批前时，当前策略改为拒绝，调用直接拒绝，不询问闸门。
@@ -4200,7 +4226,11 @@ mod tests {
                 invoker.clone(),
                 evidence,
                 approvals.clone(),
-                policy_with("write_file", PolicyVerdict::Deny, "恢复时的策略：禁止写文件"),
+                policy_with(
+                    "write_file",
+                    PolicyVerdict::Deny,
+                    "恢复时的策略：禁止写文件",
+                ),
             ),
         )
         .unwrap();
@@ -4235,7 +4265,11 @@ mod tests {
                 invoker.clone(),
                 evidence,
                 approvals.clone(),
-                policy_with("write_file", PolicyVerdict::Allow, "恢复时的策略：写文件免审"),
+                policy_with(
+                    "write_file",
+                    PolicyVerdict::Allow,
+                    "恢复时的策略：写文件免审",
+                ),
             ),
         )
         .unwrap();

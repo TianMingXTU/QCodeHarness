@@ -379,7 +379,7 @@ async fn version_three_snapshots_are_explicitly_rejected() {
     let mut snapshot = runner(deps(Arc::new(Model::new(vec![])), Arc::new(Tools::default()), None)).snapshot();
     snapshot.format_version = 3;
     let error = AgentRunner::resume(snapshot, deps(Arc::new(Model::new(vec![])), Arc::new(Tools::default()), None)).err().expect("v3 应拒绝");
-    assert!(matches!(error, ApplicationError::Snapshot(StoreError::VersionMismatch { found: 3, expected: RUN_FORMAT })));
+    assert!(matches!(error, ApplicationError::Snapshot(StoreError::VersionMismatch { found: 3, expected: RUN_FORMAT, .. })));
 }
 
 #[test]

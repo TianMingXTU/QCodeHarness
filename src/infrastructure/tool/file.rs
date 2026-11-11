@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn only_write_file_is_destructive() {
-        let specs = vec![ReadFile::spec(), ListDir::spec(), WriteFile::spec()];
+        let specs = [ReadFile::spec(), ListDir::spec(), WriteFile::spec()];
         let destructive: Vec<&str> = specs
             .iter()
             .filter(|spec| spec.annotations.destructive)

@@ -1,0 +1,9 @@
+id = "go-review-ignored-error"
+kind = "review"
+description = "评审 go-review-ignored-error 库：service.go 里 Service.FetchLines 循环中有一处被忽略的错误返回，缺失的订单会被静默当成空行项而不是上报。读 service.go 与 service_test.go，按 review 模板完成评审，在最终答案里指出这处被吞掉的错误及其风险，并给出修复建议。注意：这是评审任务，不要修改任何源码，go test ./... 只是用来确认被评审对象本身能编译并通过既有测试。"
+language = "go"
+
+[criteria]
+test_command = "go test ./..."
+requires_changes = false
+answer_must_mention = ["error"]

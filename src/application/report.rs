@@ -1,13 +1,16 @@
 //! 运行报表：从证据日志统计成功率、工具结局、审批分布与成本。
 //!
-//! [`summarize`] 与 [`BenchmarkReport::from_sessions`] 是纯函数，无 IO、
-//! 无时钟，相同输入始终得到相同摘要。证据读取
-//! （[`crate::infrastructure::evidence::reader`]）与报表渲染都在函数之外，
-//! 统计逻辑可直接用合成数据测试。
+//! [`summarize`]、[`BenchmarkReport::from_sessions`] 与
+//! [`summarize_service_events`] 是纯函数，无 IO、无时钟，相同输入始终得到
+//! 相同摘要。会话证据读取位于 [`crate::infrastructure::evidence::reader`]；
+//! 服务元数据的目录收集（含 `summarize_service`）位于
+//! [`crate::infrastructure::service_report`]，读取问题同样保留在摘要中。
 //!
 //! [`SessionLog`] 放在本模块而非 reader：统计是它的消费方，且
 //! infrastructure 依赖 application 是本仓库既定的依赖方向。
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::context::EvidenceIndex;
 use crate::domain::evidence::{AuditEvent, Evidence};
 use crate::domain::ids::SessionId;
+use crate::domain::service::PROTOCOL_VERSION;
 
 /// 一次运行（一个会话）的证据汇总。
 #[derive(Debug, Clone)]
@@ -186,6 +190,154 @@ pub struct SessionSummary {
     pub mcp_unknown_results: usize,
 }
 
+/// 服务元数据的读取状态；`read` 只表示读取完成，不表示后台进程仍在运行。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceSummaryStatus {
+    #[default]
+    NotRead,
+    NotPresent,
+    Read,
+    Incomplete,
+}
+
+/// 服务文件的读取或格式问题。事件行号从 1 开始，文件级问题没有行号。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorruptServiceFile {
+    pub path: PathBuf,
+    pub line: Option<usize>,
+    pub reason: String,
+}
+
+/// 服务持久化元数据的摘要。未读取的来源保留为 `None`。
+///
+/// 存在损坏记录时，计数仅覆盖可读部分，具体问题见 `corrupt_files`。
+/// 快照只盘点 JSON 与版本字段，不验证恢复所需的完整业务结构。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceSummary {
+    pub status: ServiceSummaryStatus,
+    /// 已完整换行、能解析且协议版本受支持的事件数，包括序号异常的事件。
+    pub events_total: Option<usize>,
+    /// 可读事件在文件中的首末序号；空日志没有端点。
+    pub first_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+    /// 从 1 到最大可读序号之间缺失的序号数，重号与乱序另记读取问题。
+    pub sequence_gaps: Option<u64>,
+    /// 按事件 `payload.type` 统计，与任务当前状态的分布无关。
+    pub status_counts: Option<BTreeMap<String, usize>>,
+    /// tasks 目录中发现的 JSON 路径数，包含损坏文件；目录枚举不完整时未知。
+    pub task_count: Option<usize>,
+    /// state.json 的 schema_version；旧对象缺少该字段时视为 0。
+    pub state_schema_version: Option<u64>,
+    /// tasks/*.json 的 format_version 分布。
+    pub task_version_counts: Option<BTreeMap<u64, usize>>,
+    /// snapshots/*.json 的 format_version 分布，与任务快照版本分别统计。
+    pub snapshot_version_counts: Option<BTreeMap<u64, usize>>,
+    pub corrupt_files: Vec<CorruptServiceFile>,
+    pub state_path: Option<PathBuf>,
+    pub events_path: Option<PathBuf>,
+}
+
+impl ServiceSummary {
+    /// 记录一处读取或格式问题，并把状态标记为不完整。
+    ///
+    /// 纯辅助方法，供本层纯函数与 [`crate::infrastructure::service_report`]
+    /// 的目录收集共同复用，保证"发现问题即降级状态"的口径一致。
+    pub(crate) fn record_corrupt(&mut self, path: &Path, line: Option<usize>, reason: String) {
+        self.status = ServiceSummaryStatus::Incomplete;
+        self.corrupt_files.push(CorruptServiceFile {
+            path: path.to_owned(),
+            line,
+            reason,
+        });
+    }
+}
+
+#[derive(Deserialize)]
+struct ServiceEventMetadata {
+    version: u32,
+    sequence: u64,
+    payload: ServicePayloadMetadata,
+}
+
+#[derive(Deserialize)]
+struct ServicePayloadMetadata {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// 从完整的 JSONL 字节统计服务事件，不读取路径、不取时钟。
+///
+/// `events_path` 只用于标记诊断来源。仅解析报表所需的协议元数据，坏行不阻止
+/// 后续行的统计；末行缺少换行时视为未提交记录，保留诊断但不计入事件。
+/// 本函数不验证各类 payload 的业务字段。
+pub fn summarize_service_events(contents: &[u8], events_path: &Path) -> ServiceSummary {
+    let mut summary = ServiceSummary {
+        status: ServiceSummaryStatus::Read,
+        events_path: Some(events_path.to_owned()),
+        ..ServiceSummary::default()
+    };
+    let mut events_total = 0;
+    let mut counts = BTreeMap::new();
+    let mut sequences = BTreeSet::new();
+    for (index, line) in contents.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let number = Some(index + 1);
+        if line.last() != Some(&b'\n') {
+            summary.record_corrupt(events_path, number, "事件末行缺少换行，记录尚未完整提交".to_owned());
+            continue;
+        }
+        let event: ServiceEventMetadata = match serde_json::from_slice(line) {
+            Ok(event) => event,
+            Err(error) => {
+                summary.record_corrupt(events_path, number, format!("事件元数据解析失败: {error}"));
+                continue;
+            }
+        };
+        if event.version != PROTOCOL_VERSION {
+            summary.record_corrupt(
+                events_path,
+                number,
+                format!("不支持的事件 version {}，当前版本为 {PROTOCOL_VERSION}", event.version),
+            );
+            continue;
+        }
+        if event.sequence == 0 || event.payload.kind.trim().is_empty() {
+            summary.record_corrupt(
+                events_path,
+                number,
+                "sequence 必须从 1 开始，payload.type 不能为空".to_owned(),
+            );
+            continue;
+        }
+        match summary.last_sequence.unwrap_or(0).checked_add(1) {
+            Some(expected) if event.sequence != expected => {
+                summary.record_corrupt(
+                    events_path,
+                    number,
+                    format!("事件序号不连续：期望 {expected}，实际 {}", event.sequence),
+                );
+            }
+            None => summary.record_corrupt(
+                events_path,
+                number,
+                "序号已达 u64 上限，后面仍有事件".to_owned(),
+            ),
+            Some(_) => {}
+        }
+        events_total += 1;
+        *counts.entry(event.payload.kind).or_insert(0) += 1;
+        sequences.insert(event.sequence);
+        summary.first_sequence.get_or_insert(event.sequence);
+        summary.last_sequence = Some(event.sequence);
+    }
+    summary.events_total = Some(events_total);
+    summary.status_counts = Some(counts);
+    // 先去重再按最大序号求缺号数，乱序补回的序号不会被重复计为缺失。
+    summary.sequence_gaps = Some(sequences.last().map_or(0, |last| *last - sequences.len() as u64));
+    summary
+}
+
 /// 多个会话的汇总。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkReport {
@@ -229,12 +381,15 @@ pub struct BenchmarkReport {
     /// "MCP Server 未启动"会被读成任务失败，启动次数会被读成调用次数。
     #[serde(default)]
     pub mcp_lifecycle_logs: usize,
+    /// 独立于会话统计的服务元数据；旧报表缺少本字段时为尚未读取。
+    #[serde(default)]
+    pub service: ServiceSummary,
 }
 
 impl BenchmarkReport {
     /// 从多个会话汇总。空清单返回全零报表，不 panic。
     pub fn from_sessions(logs: &[SessionLog]) -> Self {
-        let sessions: Vec<SessionSummary> = logs.iter().map(|log| summarize(log)).collect();
+        let sessions: Vec<SessionSummary> = logs.iter().map(summarize).collect();
         let mut total_input = 0u64;
         let mut total_output = 0u64;
         let mut total_cached = 0u64;
@@ -288,7 +443,14 @@ impl BenchmarkReport {
             total_approval_wait_ms: total_approval_wait,
             total_cost_usd: total_cost,
             mcp_lifecycle_logs: lifecycle_logs,
+            service: ServiceSummary::default(),
         }
+    }
+
+    /// 装配已读取的服务摘要，不重新计算会话统计。
+    pub fn with_service(mut self, service: ServiceSummary) -> Self {
+        self.service = service;
+        self
     }
 }
 
@@ -622,6 +784,47 @@ fn pad(text: &str, width: usize) -> String {
     padded
 }
 
+/// 服务摘要的简短文本行。未知来源显示为“未知”，读取问题附带路径及行号。
+pub fn service_summary_lines(service: &ServiceSummary) -> Vec<String> {
+    let label = match service.status {
+        ServiceSummaryStatus::NotRead => "尚未读取（not_read）",
+        ServiceSummaryStatus::NotPresent => "服务目录不存在（not_present）",
+        ServiceSummaryStatus::Read => "元数据已读取（read）",
+        ServiceSummaryStatus::Incomplete => "读取不完整（incomplete）",
+    };
+    let number = |value: Option<u64>| value.map_or_else(|| "未知".to_owned(), |value| value.to_string());
+    let counts = |values: Option<Vec<String>>| match values {
+        Some(values) if values.is_empty() => "无".to_owned(),
+        Some(values) => values.join(", "),
+        None => "未知".to_owned(),
+    };
+    let versions = |values: &Option<BTreeMap<u64, usize>>| counts(values.as_ref().map(|values| {
+        values.iter().map(|(version, count)| format!("{version}={count}")).collect()
+    }));
+    let mut lines = vec![
+        format!("常驻服务：{label}"),
+        format!(
+            "  事件 {}；序号 {}..{}；缺号 {}；任务快照 {}",
+            number(service.events_total.map(|value| value as u64)),
+            number(service.first_sequence), number(service.last_sequence),
+            number(service.sequence_gaps), number(service.task_count.map(|value| value as u64)),
+        ),
+        format!(
+            "  状态版本 {}；任务快照版本 {}；运行快照版本 {}",
+            number(service.state_schema_version), versions(&service.task_version_counts),
+            versions(&service.snapshot_version_counts),
+        ),
+        format!("  事件类型：{}", counts(service.status_counts.as_ref().map(|values| {
+            values.iter().map(|(kind, count)| format!("{kind}={count}")).collect()
+        }))),
+    ];
+    for issue in &service.corrupt_files {
+        let line = issue.line.map_or_else(String::new, |line| format!(":{line}"));
+        lines.push(format!("  {}{line}：{}", issue.path.display(), issue.reason));
+    }
+    lines
+}
+
 /// 渲染为供人阅读的对齐表格，按字符显示宽度对齐。
 ///
 /// 轮延迟不进表：一行会话有 N 个延迟值，表格装不下向量，该字段随
@@ -717,6 +920,14 @@ pub fn render_text(report: &BenchmarkReport) -> String {
         out.push_str("\nMCP 生命周期\n");
         out.push_str(&line);
         out.push('\n');
+    }
+
+    if report.service.status != ServiceSummaryStatus::NotRead {
+        out.push('\n');
+        for line in service_summary_lines(&report.service) {
+            out.push_str(&line);
+            out.push('\n');
+        }
     }
 
     // 台账不进表格：每项都是列表，表格无法容纳。按会话列在表后，方便

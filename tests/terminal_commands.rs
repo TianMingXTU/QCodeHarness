@@ -148,7 +148,7 @@ impl TaskService for Service {
                 ServiceCommand::Create { .. }
                 | ServiceCommand::Get { .. }
                 | ServiceCommand::Continue { .. }
-                | ServiceCommand::Fork { .. } => Ok(ServiceReply::Task { task: task() }),
+                | ServiceCommand::Fork { .. } => Ok(ServiceReply::Task { task: Box::new(task()) }),
                 ServiceCommand::List => Ok(ServiceReply::Tasks {
                     tasks: vec![task()],
                 }),

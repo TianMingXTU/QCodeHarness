@@ -248,8 +248,8 @@ impl ToolInvoker for ApplyPatch {
                 // 父目录可能不存在（新建 `src/a/b.rs` 时 `src/a` 是新的）。
                 // 目录创建失败在这里报错：临时文件尚未写入，工作区仍未
                 // 发生变化。
-                if let Some(parent) = temp.parent() {
-                    if let Err(error) = tokio::fs::create_dir_all(parent).await {
+                if let Some(parent) = temp.parent()
+                    && let Err(error) = tokio::fs::create_dir_all(parent).await {
                         for (written, _) in &temps {
                             let _ = tokio::fs::remove_file(written).await;
                         }
@@ -258,7 +258,6 @@ impl ToolInvoker for ApplyPatch {
                             file.display
                         ));
                     }
-                }
                 if let Err(error) = write_temp(&temp, content).await {
                     // 清掉已写好的临时文件，避免污染工作区。
                     for (temp, _) in &temps {

@@ -50,7 +50,7 @@ impl Clock for FixedClock {
 
 /// 按文件名打开追加写的 JSONL 证据汇。
 fn open(dir: &Path, name: &str) -> Arc<dyn EvidenceSink> {
-    Arc::new(JsonlEvidenceSink::open(&dir.join(name)).expect("打开证据文件"))
+    Arc::new(JsonlEvidenceSink::open(dir.join(name)).expect("打开证据文件"))
 }
 
 fn fact(kind: McpLifecycleKind) -> McpLifecycleFact {

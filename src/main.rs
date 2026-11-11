@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +22,7 @@ use qcode_harness::application::agent_run::{
 };
 use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::delegation::ChildAgentFactory;
+use qcode_harness::application::doctor;
 use qcode_harness::application::error::ApplicationError;
 use qcode_harness::application::extension::{ExtensionRegistry, ExtensionSelection};
 use qcode_harness::application::isolation::{IsolationWorkspace, WorkspaceVerifier};
@@ -69,6 +70,7 @@ use qcode_harness::infrastructure::mcp;
 use qcode_harness::infrastructure::mcp::config::McpConfig;
 use qcode_harness::infrastructure::model::openai_compat::OpenAiCompatProvider;
 use qcode_harness::infrastructure::policy;
+use qcode_harness::infrastructure::service_events;
 use qcode_harness::infrastructure::service_factory::{ProductionTaskFactory, ServiceFactoryConfig};
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::task_service::LocalTaskService;
@@ -287,7 +289,14 @@ fn roster_with_role_models(config: &LlmConfig) -> AgentRoster {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     // .env 不存在时静默跳过，回退到进程环境变量。
     dotenvy::dotenv().ok();
 
@@ -302,12 +311,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let workspace = std::env::current_dir()?;
+    // 版本与帮助同列：安装、升级、回滚后用它确认 `current` 指向的版本，
+    // 不读配置、不起模型。
+    if args.version {
+        println!("QCodeHarness {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    let workspace = std::env::current_dir()
+        .map_err(|error| format!("cli_workspace: 无法读取当前工作区: {error}"))?;
+    // 诊断与日志维护不依赖配置成功加载，也不需要模型凭据。
+    if args.doctor {
+        return render_doctor(&workspace, args.json);
+    }
+    if args.rotate_events {
+        return rotate_service_events(&workspace, args.json);
+    }
     let store = Arc::new(JsonSessionStore::new(&workspace));
 
     // 配置文件先加载：后续的扩展管理、MCP 路径、策略与预算都从这里取。
     // 文件损坏时直接退出，不能用一份猜出来的配置继续跑。
-    let app_config = config::load(&workspace).map_err(|error| format!("配置加载失败: {error}"))?;
+    let app_config = config::load(&workspace)
+        .map_err(|error| format!("cli_config_load: 配置加载失败: {error}"))?;
 
     // 扩展管理是独立模式：安装、列出、启用、禁用状态，不跑任务也不需要
     // 模型配置。放在模型配置之前，没配 API Key 也能管理扩展。
@@ -316,12 +341,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         || args.enable_extension.is_some()
         || args.disable_extension.is_some()
     {
-        return manage_extensions(&workspace, &args);
+        return manage_extensions(&workspace, &args)
+            .map_err(|error| format!("cli_extension_management: {error}").into());
     }
 
     // 列清单不需要模型配置：没配 API key 也应该能看有哪些会话可恢复。
     if args.list_sessions {
-        return list_sessions(store.as_ref());
+        return list_sessions(store.as_ref())
+            .map_err(|error| format!("cli_list_sessions: {error}").into());
     }
 
     // 报表同样不需要模型配置：只读证据统计，没配 API key 也能出报表。
@@ -332,17 +359,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 恢复探测同样不需要模型配置：只确认这个 MCP Server 能否通信，
     // 不执行任务、不涉及审批、不读会话历史。
     if let Some(server) = &args.mcp_reconnect {
-        return mcp_probe(&workspace, server, &app_config).await;
+        return mcp_probe(&workspace, server, &app_config).await
+            .map_err(|error| format!("cli_mcp_probe: {error}").into());
     }
 
-    let config = LlmConfig::from_env(&app_config)?;
+    let config = LlmConfig::from_env(&app_config)
+        .map_err(|error| format!("cli_llm_config: {error}"))?;
 
     // 命令行开关优先于环境变量：显式 --yes 覆盖配置默认值。
     let auto_approve = args.auto_approve || config.auto_approve;
 
     // 策略配置读取失败时进程退出。无法理解的策略文件比没有策略更危险。
     let policy = policy::load(config.policy_path.as_deref())
-        .map_err(|error| format!("策略配置加载失败: {error}"))?;
+        .map_err(|error| format!("cli_policy_load: 策略配置加载失败: {error}"))?;
 
     // 模型接入使用提供方注册表：默认（也是唯一）提供方是 OpenAI 兼容
     // chat 端点。更换服务商时实现 LlmProvider 并在此登记，循环、审批
@@ -389,7 +418,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .or_else(|| app_config.mcp_config_path.clone());
         let mcp = match mcp_path {
             Some(path) => McpConfig::load(&path)
-                .map_err(|error| format!("{error}（文件: {}）", path.display()))?
+                .map_err(|error| format!("cli_mcp_config: {error}（文件: {}）", path.display()))?
                 .unwrap_or_default(),
             None => McpConfig::default(),
         };
@@ -442,7 +471,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("基准任务集: {}", benchmarks_root.display());
         eprintln!("模型: {} @ {}", config.model, config.base_url);
         if args.benchmark_long {
-            let results = run_long_benchmark(&deps, &budget, &benchmarks_root, &workspace).await?;
+            let results = run_long_benchmark(&deps, &budget, &benchmarks_root, &workspace).await
+                .map_err(|error| format!("cli_benchmark_long: {error}"))?;
             let passed = results.iter().filter(|result| result.passed).count();
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
@@ -457,7 +487,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             return Ok(());
         }
-        let results = run_benchmark(&deps, &budget, &benchmarks_root, &workspace).await?;
+        let results = run_benchmark(&deps, &budget, &benchmarks_root, &workspace).await
+            .map_err(|error| format!("cli_benchmark: {error}"))?;
         let passed = results.iter().filter(|result| result.passed).count();
         if args.json {
             println!("{}", serde_json::to_string_pretty(&results)?);
@@ -490,7 +521,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // 配置文件存在但非法时进程退出。用户明确要接入 MCP，静默跳过会让
         // 模型使用残缺的工具清单运行（与策略配置同一原则）。
         let mcp_config = McpConfig::load(&config_path)
-            .map_err(|error| format!("{error}（文件: {}）", config_path.display()))?;
+            .map_err(|error| format!("cli_mcp_config: {error}（文件: {}）", config_path.display()))?;
         if let Some(mcp_config) = mcp_config {
             let recorder = mcp_lifecycle_recorder(&workspace);
             let (sources, warnings) = mcp::connect_all(&mcp_config, recorder).await;
@@ -521,7 +552,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let extension_store = LocalExtensionStore::new(&workspace);
     let extensions = extension_store
         .load(&registry)
-        .map_err(|error| format!("扩展加载失败: {error}"))?;
+        .map_err(|error| format!("cli_extension_load: 扩展加载失败: {error}"))?;
     // 配置文件里的空列表表示"没写"，不额外限制选择范围；启用/禁用状态
     // 仍以安装项自身的授权为准。
     let selection = extensions
@@ -529,10 +560,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             app_config.skills.enabled.as_deref(),
             app_config.hooks.enabled.as_deref(),
         )
-        .map_err(|error| format!("扩展选择失败: {error}"))?;
+        .map_err(|error| format!("cli_extension_selection: 扩展选择失败: {error}"))?;
     let skill_tools = extensions
         .skill_tool_names(&selection)
-        .map_err(|error| format!("扩展加载失败: {error}"))?;
+        .map_err(|error| format!("cli_extension_load: 扩展加载失败: {error}"))?;
 
     // 分层指令：用户级 < workspace 根 < 更接近任务目录的约定。读取失败
     // 只告警，指令是便利设施，不是安全边界。
@@ -558,7 +589,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let extension_instructions = extensions
         .enabled_instructions(&selection)
-        .map_err(|error| format!("扩展指令加载失败: {error}"))?;
+        .map_err(|error| format!("cli_extension_instructions: 扩展指令加载失败: {error}"))?;
     if !extension_instructions.is_empty() {
         roster = roster
             .with_instructions_section(EXTENSION_INSTRUCTIONS_HEADER, &extension_instructions);
@@ -645,7 +676,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         selection,
         delegate: delegate_source,
         limiter: Arc::new(
-            TokioTimeLimiter::new(EXTENSION_TIMEOUT).map_err(|error| error.to_string())?,
+            TokioTimeLimiter::new(EXTENSION_TIMEOUT)
+                .map_err(|error| format!("cli_extension_timeout: {error}"))?,
         ),
     };
 
@@ -654,10 +686,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let session_id = SessionId::new(id_text);
         let Some(snapshot) = store
             .load(&session_id)
-            .map_err(|error| format!("读取快照失败: {error}"))?
+            .map_err(|error| format!("cli_session_snapshot: 读取快照失败: {error}"))?
         else {
             eprintln!(
-                "没有找到会话 {} 的快照；用 --list-sessions 查看可恢复的会话",
+                "cli_session_not_found: 没有找到会话 {} 的快照；用 --list-sessions 查看可恢复的会话",
                 session_id.as_str()
             );
             std::process::exit(1);
@@ -694,10 +726,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let task_store = JsonTaskStore::new(&workspace);
         let Some(snapshot) = task_store
             .load(&task_id)
-            .map_err(|error| format!("读取任务快照失败: {error}"))?
+            .map_err(|error| format!("cli_task_snapshot: 读取任务快照失败: {error}"))?
         else {
             eprintln!(
-                "没有找到任务 {} 的快照；任务 ID 在运行失败时打印过",
+                "cli_task_not_found: 没有找到任务 {} 的快照；任务 ID 在运行失败时打印过",
                 task_id.as_str()
             );
             std::process::exit(1);
@@ -773,7 +805,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // --kind 选模板；不传默认 bug-fix（最常见）。
     let kind_text = args.kind.as_deref().unwrap_or(TaskKind::BugFix.name());
     let Some(kind) = TaskKind::parse_name(kind_text) else {
-        eprintln!("未知的任务类型 {kind_text}；可用: bug-fix / feature / review / refactor");
+        eprintln!("cli_invalid_args: 未知的任务类型 {kind_text}；可用: bug-fix / feature / review / refactor");
         std::process::exit(2);
     };
 
@@ -963,7 +995,7 @@ fn assemble(
             shared.selection.clone(),
             Arc::clone(&shared.limiter),
         )
-        .map_err(|error| format!("扩展装配失败: {error}"))?;
+        .map_err(|error| format!("cli_extension_assembly: 扩展装配失败: {error}"))?;
     let mut tools =
         shared
             .host_tools
@@ -1137,7 +1169,7 @@ fn manage_extensions(workspace: &Path, args: &cli::CliArgs) -> Result<(), Box<dy
     let backing = ToolRegistry::new(all_tools(WorkspaceRoot::new(workspace)));
     let registry = store
         .load(&backing)
-        .map_err(|error| format!("扩展加载失败: {error}"))?;
+        .map_err(|error| format!("cli_extension_load: 扩展加载失败: {error}"))?;
 
     if args.list_extensions {
         let installed = registry
@@ -1245,6 +1277,44 @@ fn list_sessions(
     Ok(())
 }
 
+/// 配置加载失败作为诊断项保留，不影响其余检查与报告输出。
+fn render_doctor(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
+    let report = qcode_harness::infrastructure::doctor::diagnose(workspace);
+    let text = if json {
+        serde_json::to_string_pretty(&report)?
+    } else {
+        doctor::render_text(&report)
+    };
+    write_cli_output(&text)?;
+    Ok(())
+}
+
+fn rotate_service_events(workspace: &Path, json: bool) -> Result<(), Box<dyn Error>> {
+    let report = service_events::rotate_events(workspace)?;
+    let text = if json {
+        serde_json::to_string_pretty(&report)?
+    } else {
+        format!(
+            "是否归档: {}\n归档路径: {}\n是否空跑: {}\n恢复建议: {}",
+            report.archived,
+            report.archive_path.as_deref().map_or_else(
+                || "无".to_owned(), |path| path.display().to_string()
+            ),
+            report.empty_run,
+            report.recommendation
+        )
+    };
+    write_cli_output(&text)?;
+    Ok(())
+}
+
+/// 显式提交输出，让报告写出失败成为普通错误而非打印宏触发的 panic。
+fn write_cli_output(text: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{text}")?;
+    stdout.flush()
+}
+
 /// `--report`：从证据目录统计运行报表。`report_dir` 是证据根目录
 /// （找它的 `.qcodeharness/sessions/`），缺省为当前工作区。
 fn render_report(
@@ -1259,7 +1329,8 @@ fn render_report(
         return Ok(());
     }
     let logs = reader::read_all(&sessions_dir).map_err(|error| format!("{error}"))?;
-    let report = BenchmarkReport::from_sessions(&logs);
+    let report = BenchmarkReport::from_sessions(&logs)
+        .with_service(qcode_harness::infrastructure::service_report::summarize_service(&root));
     if json {
         let text = render_json(&report).map_err(|error| format!("{error}"))?;
         println!("{text}");
@@ -1568,7 +1639,7 @@ mod tests {
     /// 每个角色读取各自的环境变量，互不干扰。
     #[test]
     fn role_models_come_from_their_own_variables() {
-        let models = read_role_models_from(&table(&[
+        let models = read_role_models_from(table(&[
             ("LLM_MODEL_PLANNER", "planner-model"),
             ("LLM_MODEL_CODER", "coder-model"),
             ("LLM_MODEL_TESTER", "tester-model"),
@@ -1585,7 +1656,7 @@ mod tests {
     /// 未配置的角色不进入映射，编排器据此使用运行时默认模型。
     #[test]
     fn an_unconfigured_role_is_absent_from_the_table() {
-        let models = read_role_models_from(&table(&[("LLM_MODEL_CODER", "coder-model")]));
+        let models = read_role_models_from(table(&[("LLM_MODEL_CODER", "coder-model")]));
 
         assert_eq!(models.len(), 1);
         assert!(!models.contains_key(&AgentRole::Planner));
@@ -1596,9 +1667,9 @@ mod tests {
     /// 下所有角色共用运行时默认模型。
     #[test]
     fn without_any_configuration_the_tables_are_empty() {
-        assert!(read_role_models_from(&table(&[])).is_empty());
-        assert!(read_role_efforts_from(&table(&[])).unwrap().is_empty());
-        assert!(read_role_verbosities_from(&table(&[])).unwrap().is_empty());
+        assert!(read_role_models_from(table(&[])).is_empty());
+        assert!(read_role_efforts_from(table(&[])).unwrap().is_empty());
+        assert!(read_role_verbosities_from(table(&[])).unwrap().is_empty());
     }
 
     /// 留空的值视为未配置。
@@ -1607,7 +1678,7 @@ mod tests {
     /// 会使请求发往不存在的模型，报错信息也难以理解。
     #[test]
     fn a_blank_value_counts_as_unset() {
-        let models = read_role_models_from(&table(&[("LLM_MODEL_CODER", "   ")]));
+        let models = read_role_models_from(table(&[("LLM_MODEL_CODER", "   ")]));
 
         assert!(models.is_empty(), "空值不应被当成一个模型名");
     }
@@ -1615,7 +1686,7 @@ mod tests {
     /// 推理档位按角色读，拼错时报出是哪个变量名。
     #[test]
     fn role_efforts_are_read_per_role() {
-        let efforts = read_role_efforts_from(&table(&[
+        let efforts = read_role_efforts_from(table(&[
             ("LLM_EFFORT_PLANNER", "high"),
             ("LLM_EFFORT_TESTER", "low"),
         ]))
@@ -1629,7 +1700,7 @@ mod tests {
     /// 档位写错要让进程停下来，并说清是哪个变量名。
     #[test]
     fn a_bad_effort_names_the_variable_that_went_wrong() {
-        let error = read_role_efforts_from(&table(&[("LLM_EFFORT_CODER", "最大")]))
+        let error = read_role_efforts_from(table(&[("LLM_EFFORT_CODER", "最大")]))
             .expect_err("认不出的档位应当报错");
 
         assert!(
@@ -1641,7 +1712,7 @@ mod tests {
     /// 输出档位同样按角色读，同样在写错时报出变量名。
     #[test]
     fn role_verbosities_are_read_per_role() {
-        let verbosities = read_role_verbosities_from(&table(&[
+        let verbosities = read_role_verbosities_from(table(&[
             ("LLM_VERBOSITY_REVIEWER", "high"),
             ("LLM_VERBOSITY_CODER", "low"),
         ]))
@@ -1654,7 +1725,7 @@ mod tests {
 
     #[test]
     fn a_bad_verbosity_names_the_variable_that_went_wrong() {
-        let error = read_role_verbosities_from(&table(&[("LLM_VERBOSITY_TESTER", "啰嗦")]))
+        let error = read_role_verbosities_from(table(&[("LLM_VERBOSITY_TESTER", "啰嗦")]))
             .expect_err("认不出的档位应当报错");
 
         assert!(
@@ -1675,9 +1746,9 @@ mod tests {
             auto_approve: false,
             max_wall_clock: None,
             summarize_min_dropped: None,
-            role_models: read_role_models_from(&table(&[("LLM_MODEL_CODER", "coder-model")])),
-            role_efforts: read_role_efforts_from(&table(&[("LLM_EFFORT_CODER", "high")])).unwrap(),
-            role_verbosities: read_role_verbosities_from(&table(&[])).unwrap(),
+            role_models: read_role_models_from(table(&[("LLM_MODEL_CODER", "coder-model")])),
+            role_efforts: read_role_efforts_from(table(&[("LLM_EFFORT_CODER", "high")])).unwrap(),
+            role_verbosities: read_role_verbosities_from(table(&[])).unwrap(),
         };
 
         let roster = roster_with_role_models(&config);

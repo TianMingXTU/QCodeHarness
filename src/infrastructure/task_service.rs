@@ -69,8 +69,13 @@ struct Receipt {
     result: Result<ServiceReply, ServiceError>,
 }
 
+// 状态文件格式版本定义在 domain，任务服务与诊断层共用同一份契约。
+pub use crate::domain::service::SERVICE_STATE_FORMAT;
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ServiceStateFile {
+    #[serde(default)]
+    schema_version: u32,
     #[serde(default = "one")]
     next_task: u64,
     #[serde(default = "one")]
@@ -88,12 +93,137 @@ fn one() -> u64 {
 impl Default for ServiceStateFile {
     fn default() -> Self {
         Self {
+            schema_version: SERVICE_STATE_FORMAT,
             next_task: 1,
             next_execution: 1,
             tasks: BTreeMap::new(),
             receipts: BTreeMap::new(),
         }
     }
+}
+
+fn load_state(state_path: &Path) -> Result<ServiceStateFile, ServiceError> {
+    let bytes = match std::fs::read(state_path) {
+        Ok(bytes) => bytes,
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ServiceStateFile::default());
+        }
+        Err(cause) => {
+            return Err(corrupt_state(state_path, None, &format!("读取失败: {cause}")));
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|cause| {
+        corrupt_state(state_path, Some(&bytes), &format!("JSON 解析失败: {cause}"))
+    })?;
+    // 先检查版本，未来格式的业务字段可能已不再兼容当前结构。
+    if let Some(version) = value.get("schema_version").and_then(serde_json::Value::as_u64)
+        && version > u64::from(SERVICE_STATE_FORMAT)
+    {
+        return Err(error(
+            "service_state_version_mismatch",
+            format!(
+                "服务状态版本不兼容: 当前版本 {SERVICE_STATE_FORMAT}，文件版本 {version}；\
+                 可用动作: 升级到支持文件版本的程序，或先备份原文件 {} 后恢复兼容状态；\
+                 建议备份位置: {}",
+                state_path.display(),
+                state_path.with_extension("json.backup").display(),
+            ),
+        ));
+    }
+    let mut state: ServiceStateFile = serde_json::from_value(value).map_err(|cause| {
+        corrupt_state(state_path, Some(&bytes), &format!("状态结构无效: {cause}"))
+    })?;
+    if state.schema_version == 0 {
+        migrate_state(state_path, &bytes, &mut state)?;
+    }
+    Ok(state)
+}
+
+fn state_backup_path(state_path: &Path, kind: &str, extension: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    state_path.with_extension(format!("json.{kind}-{timestamp}{extension}"))
+}
+
+fn write_state_backup(backup_path: &Path, mut source: impl std::io::Read) -> std::io::Result<()> {
+    let mut backup = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(backup_path)?;
+    std::io::copy(&mut source, &mut backup)?;
+    backup.sync_all()
+}
+
+fn corrupt_state(state_path: &Path, bytes: Option<&[u8]>, cause: &str) -> ServiceError {
+    let backup_path = state_backup_path(state_path, "corrupt", "");
+    let backup = match bytes {
+        Some(bytes) => write_state_backup(&backup_path, bytes),
+        None => File::open(state_path).and_then(|file| write_state_backup(&backup_path, file)),
+    };
+    let backup_message = match backup {
+        Ok(()) => format!("原数据备份: {}", backup_path.display()),
+        Err(cause) => format!("备份失败，目标 {}: {cause}", backup_path.display()),
+    };
+    error(
+        "service_state_corrupt",
+        format!(
+            "服务状态 {} {cause}；{backup_message}；\
+             修复入口: 停止服务，修复文件读取权限或从有效备份恢复 {} 后重试",
+            state_path.display(),
+            state_path.display(),
+        ),
+    )
+}
+
+fn migrate_state(
+    state_path: &Path,
+    original: &[u8],
+    state: &mut ServiceStateFile,
+) -> Result<(), ServiceError> {
+    let backup_path = state_backup_path(state_path, "migration", ".json");
+    let log_path = state_path.with_file_name("migrations.log");
+    let migration = (|| {
+        write_state_backup(&backup_path, original).map_err(io_error)?;
+        // 先记录已保留备份的迁移准备事件，日志不可写时不改动原状态。
+        let mut entry = serde_json::to_vec(&serde_json::json!({
+            "event": "service_state_migration_prepared",
+            "from_version": state.schema_version,
+            "to_version": SERVICE_STATE_FORMAT,
+            "state_path": state_path,
+            "backup_path": backup_path,
+        }))
+        .map_err(|cause| error("service_state_migration_failed", cause.to_string()))?;
+        entry.push(b'\n');
+        {
+            let mut log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(io_error)?;
+            log.write_all(&entry).map_err(io_error)?;
+            log.sync_all().map_err(io_error)?;
+        }
+        state.schema_version = SERVICE_STATE_FORMAT;
+        write_state(state_path, state)
+    })();
+    migration.map_err(|cause| {
+        error(
+            "service_state_migration_failed",
+            format!(
+                "服务状态 v0 -> v{SERVICE_STATE_FORMAT} 迁移失败: {cause}；\
+                 原数据备份目标: {}；迁移日志: {}；修复后重新打开服务",
+                backup_path.display(),
+                log_path.display(),
+            ),
+        )
+    })?;
+    eprintln!(
+        "服务状态已迁移: v0 -> v{SERVICE_STATE_FORMAT}，备份 {}",
+        backup_path.display(),
+    );
+    Ok(())
 }
 
 /// 输入留在持久队列中，只有会话快照确认后才标记应用。
@@ -283,12 +413,25 @@ enum ExecutionStart {
     Conversation(TaskSnapshot),
 }
 
+/// 新任务视图的一组标识与来源信息。用于避免构造函数出现过长的
+/// 同类型参数表，字段含义在调用处仍一目了然。
+struct NewTaskIdentifiers {
+    task_id: String,
+    session_id: String,
+    execution_id: String,
+    source: Option<String>,
+    parent: Option<String>,
+}
+
 impl LocalTaskService {
     /// 在真实 Git 工作区根上打开服务，恢复既有任务与命令凭据。
     ///
+    /// 旧版状态保留原字节备份和迁移准备记录后升级；未来版本保留原文件并拒绝打开。
+    ///
     /// # Errors
     ///
-    /// 父仓库、事件日志或持久化状态不可用，或已有实例持有租约时返回错误。
+    /// 父仓库、事件日志或持久化状态不可用，状态版本不兼容、迁移失败，
+    /// 或已有实例持有租约时返回错误；损坏状态在返回前尝试保留原字节备份。
     pub async fn open(
         root: PathBuf,
         factory: Arc<dyn TaskFactory>,
@@ -299,13 +442,7 @@ impl LocalTaskService {
         std::fs::create_dir_all(&state_dir).map_err(io_error)?;
         let lease = lease(&state_dir.join("service"))?;
         let state_path = state_dir.join("state.json");
-        let mut state: ServiceStateFile = match std::fs::read(&state_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| {
-                error("service_state_corrupt", format!("服务状态解析失败: {err}"))
-            })?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => ServiceStateFile::default(),
-            Err(err) => return Err(io_error(err)),
-        };
+        let mut state = load_state(&state_path)?;
         let journal_impl = Arc::new(JsonEventJournal::open(state_dir.join("events.jsonl"))?);
         let journal: Arc<dyn EventJournal> = journal_impl.clone();
         let broker = Arc::new(ApprovalBroker::new(journal.clone()));
@@ -418,24 +555,20 @@ impl LocalTaskService {
 
     fn new_view(
         &self,
-        task_id: String,
-        session_id: String,
-        execution_id: String,
+        ids: NewTaskIdentifiers,
         workspace: &IsolationWorkspace,
-        source: Option<String>,
-        parent: Option<String>,
         verification: String,
     ) -> TaskView {
         TaskView {
-            task_id,
-            session_id,
-            execution_id,
+            task_id: ids.task_id,
+            session_id: ids.session_id,
+            execution_id: ids.execution_id,
             attempt: 1,
             status: TaskStatus::Running,
             workspace: workspace.root.clone(),
             base_revision: workspace.base_revision.clone(),
-            source_task: source,
-            parent_task: parent,
+            source_task: ids.source,
+            parent_task: ids.parent,
             answer: None,
             error: None,
             verification,
@@ -464,7 +597,7 @@ impl LocalTaskService {
                         .collect(),
                 }),
                 ServiceCommand::Get { task_id } => Ok(ServiceReply::Task {
-                    task: self.view(&task_id)?,
+                    task: Box::new(self.view(&task_id)?),
                 }),
                 ServiceCommand::Approvals { task_id } => Ok(ServiceReply::PendingApprovals {
                     requests: self.inner.broker.pending(task_id.as_deref()),
@@ -640,12 +773,14 @@ impl LocalTaskService {
             }
         };
         let view = self.new_view(
-            task_id.clone(),
-            session_id,
-            execution_id,
+            NewTaskIdentifiers {
+                task_id: task_id.clone(),
+                session_id,
+                execution_id,
+                source: None,
+                parent: None,
+            },
             &workspace,
-            None,
-            None,
             verification.clone(),
         );
         let record = TaskRecord {
@@ -669,7 +804,7 @@ impl LocalTaskService {
                 request_id.to_owned(),
                 Receipt {
                     command: ServiceCommand::Create { goal, kind },
-                    result: Ok(ServiceReply::Task { task: view.clone() }),
+                    result: Ok(ServiceReply::Task { task: Box::new(view.clone()) }),
                 },
             );
             self.persist(&next)?;
@@ -687,7 +822,7 @@ impl LocalTaskService {
             ExecutionStart::Create(task),
             [ServiceEventPayload::TaskCreated { task: view.clone() }],
         )?;
-        Ok(ServiceReply::Task { task: view })
+        Ok(ServiceReply::Task { task: Box::new(view) })
     }
 
     fn make_task(&self, task_id: &str, kind: TaskKind, goal: &str) -> Result<Task, ServiceError> {
@@ -816,7 +951,7 @@ impl LocalTaskService {
                         task_id: task_id.to_owned(),
                     },
                     result: Ok(ServiceReply::Task {
-                        task: record.view.clone(),
+                        task: Box::new(record.view.clone()),
                     }),
                 },
             );
@@ -830,7 +965,7 @@ impl LocalTaskService {
             start,
             [ServiceEventPayload::ExecutionStarted],
         )?;
-        Ok(ServiceReply::Task { task: record.view })
+        Ok(ServiceReply::Task { task: Box::new(record.view) })
     }
 
     fn idle_record(&self, task_id: &str) -> Result<TaskRecord, ServiceError> {
@@ -920,12 +1055,14 @@ impl LocalTaskService {
             return Err(self.discard_unadmitted_workspace(&workspace, cause).await);
         }
         let mut view = self.new_view(
-            new_task_id.clone(),
-            session_id,
-            execution_id,
+            NewTaskIdentifiers {
+                task_id: new_task_id.clone(),
+                session_id,
+                execution_id,
+                source: Some(task_id.to_owned()),
+                parent: Some(task_id.to_owned()),
+            },
             &workspace,
-            Some(task_id.to_owned()),
-            Some(task_id.to_owned()),
             source.verification.clone(),
         );
         view.consumption = snapshot.run.consumption;
@@ -963,7 +1100,7 @@ impl LocalTaskService {
                         task_id: task_id.to_owned(),
                         goal,
                     },
-                    result: Ok(ServiceReply::Task { task: view.clone() }),
+                    result: Ok(ServiceReply::Task { task: Box::new(view.clone()) }),
                 },
             );
             self.persist(&next)?;
@@ -986,7 +1123,7 @@ impl LocalTaskService {
                 },
             ],
         )?;
-        Ok(ServiceReply::Task { task: view })
+        Ok(ServiceReply::Task { task: Box::new(view) })
     }
 
     async fn merge(&self, task_id: &str) -> Result<(), ServiceError> {
@@ -1267,8 +1404,8 @@ fn load_checkpoint(
         crate::application::task_resume::merge_session_state(snapshot, session.clone());
     // Runner 把已应用的补充输入留在会话快照里，任务快照停在步骤边界。
     // 会话历史是任务快照的前缀扩展时，将这份较新的运行状态带进任务快照。
-    if let Some(session) = session {
-        if session.session_id == snapshot.run.session_id
+    if let Some(session) = session
+        && session.session_id == snapshot.run.session_id
             && session.session.turns.len() >= snapshot.run.session.turns.len()
             && session
                 .session
@@ -1278,7 +1415,6 @@ fn load_checkpoint(
         {
             snapshot.run = session;
         }
-    }
     crate::application::task_resume::check_resumable(
         &snapshot,
         Some(&SessionId::new(record.view.session_id.clone())),
@@ -1494,15 +1630,19 @@ fn combine_result<T>(
 }
 
 fn persist_state(inner: &ServiceInner, state: &ServiceStateFile) -> Result<(), ServiceError> {
+    write_state(&inner.state_path, state)
+}
+
+fn write_state(state_path: &Path, state: &ServiceStateFile) -> Result<(), ServiceError> {
     let bytes =
         serde_json::to_vec(state).map_err(|err| error("service_state_corrupt", err.to_string()))?;
-    let temp = inner.state_path.with_extension("json.tmp");
+    let temp = state_path.with_extension("json.tmp");
     {
         let mut file = File::create(&temp).map_err(io_error)?;
         file.write_all(&bytes).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
     }
-    std::fs::rename(&temp, &inner.state_path).map_err(io_error)
+    std::fs::rename(&temp, state_path).map_err(io_error)
 }
 
 /// 每次执行重新装配依赖，再沿既有编排器链路跑到终态。

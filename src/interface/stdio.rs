@@ -29,7 +29,7 @@ pub struct StdioRequest {
 pub enum StdioResponse {
     Hello { version: u32 },
     Reply { version: u32, id: String, result: ServiceReply },
-    Event { version: u32, event: ServiceEvent },
+    Event { version: u32, event: Box<ServiceEvent> },
     Error { version: u32, id: String, error: ServiceError },
     Subscribed { version: u32, id: String, after: u64 },
 }
@@ -192,7 +192,7 @@ impl StdioServer {
                     }
                 } => {
                     match event {
-                        Ok(event) => write_response(&mut writer, &StdioResponse::Event { version: PROTOCOL_VERSION, event }).await?,
+                        Ok(event) => write_response(&mut writer, &StdioResponse::Event { version: PROTOCOL_VERSION, event: Box::new(event) }).await?,
                         Err(error) => {
                             subscription = None;
                             write_error(&mut writer, "", error).await?;

@@ -91,13 +91,12 @@ impl CliApprovalGate {
         // 上一个进程里且未获答复，不能当作"人已批准"。
         let trustable = request.reason.is_none() && !request.resumed;
 
-        if trustable {
-            if let Some(note) = self.trust_note(&request.call) {
+        if trustable
+            && let Some(note) = self.trust_note(&request.call) {
                 let _ = writeln!(writer, "[审批] {} 已在会话内放行，自动通过", request.call.name);
                 let _ = writeln!(writer, "        （{note}）");
                 return Ok(());
             }
-        }
 
         // `p` 之后用户可能留空取消，此时回到主问题，因此用循环处理。
         loop {

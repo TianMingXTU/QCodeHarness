@@ -434,14 +434,13 @@ fn flush_word(
         // 空引号目标没有路径可判，但仍要保留这次重定向，否则 pending 会被
         // 下一个操作覆盖，重定向目标列表将不完整。只处理显式空引号词；
         // 重定向后的普通空格仍需等待真正的目标词元。
-        if was_quoted {
-            if let Some(op) = pending.take() {
+        if was_quoted
+            && let Some(op) = pending.take() {
                 redirects.push(Redirect {
                     op,
                     target: String::new(),
                 });
             }
-        }
         return;
     }
     let text = std::mem::take(current);

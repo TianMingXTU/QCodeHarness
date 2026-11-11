@@ -250,20 +250,40 @@ answer_must_mention = []
             tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
             [
                 "go-http-client",
+                "go-review-ignored-error",
                 "greet-npe",
+                "js-dedupe-keep-first",
                 "js-string-util",
                 "missing-import",
                 "off-by-one",
                 "py-date-parser",
+                "py-feature-duration",
+                "py-net-local-json",
+                "rust-refactor-units",
+                "rust-vendored-ident-guard",
             ],
             "按目录名排序"
         );
 
-        // 任务类型不再全是 bug-fix：首个 go-http-client 是 feature。
-        assert_eq!(tasks[0].kind, TaskKind::Feature, "go-http-client 是 feature");
-        assert!(
-            tasks[1..].iter().all(|t| t.kind == TaskKind::BugFix),
-            "其余默认任务都是修 bug 类型"
+        // P14 扩容后默认套件不再全是 bug-fix：feature / review / refactor
+        // 各进了一个。逐个 id 钉死类型，任一 fixture 改错 kind 都会炸出来。
+        assert_eq!(
+            tasks.iter().map(|t| t.kind).collect::<Vec<_>>(),
+            [
+                TaskKind::Feature,
+                TaskKind::Review,
+                TaskKind::BugFix,
+                TaskKind::BugFix,
+                TaskKind::BugFix,
+                TaskKind::BugFix,
+                TaskKind::BugFix,
+                TaskKind::BugFix,
+                TaskKind::Feature,
+                TaskKind::BugFix,
+                TaskKind::Refactor,
+                TaskKind::BugFix,
+            ],
+            "各 fixture 的类型随 kind 装载"
         );
 
         // 语言随 fixture 装载：非 Rust fixture 带语言，Rust 缺省。
@@ -272,15 +292,21 @@ answer_must_mention = []
             tasks.iter().map(|t| t.language.as_deref()).collect::<Vec<_>>(),
             [
                 Some("go"),
+                Some("go"),
                 None,
+                Some("javascript"),
                 Some("javascript"),
                 None,
                 None,
                 Some("python"),
+                Some("python"),
+                Some("python"),
+                None,
+                None,
             ]
         );
 
-        let greet = &tasks[1];
+        let greet = &tasks[2];
         assert_eq!(greet.criteria.test_command, "cargo test");
         assert!(greet.criteria.requires_changes);
         assert_eq!(greet.criteria.answer_must_mention, ["panic"]);
@@ -289,9 +315,14 @@ answer_must_mention = []
         let long = load_long_tasks(&root).expect("长任务应能装载");
         assert_eq!(
             long.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
-            ["long-python-pipeline", "long-report-builder", "long-utils-cleanup"]
+            [
+                "long-js-report-chain",
+                "long-python-pipeline",
+                "long-report-builder",
+                "long-utils-cleanup",
+            ]
         );
-        assert_eq!(long[0].language.as_deref(), Some("python"));
+        assert_eq!(long[0].language.as_deref(), Some("javascript"));
     }
 
     #[test]
@@ -373,7 +404,7 @@ answer_must_mention = []
     fn suites_partition_the_task_set() {
         let root = temp_root("suites");
         write_task(&root, "demo", VALID_TASK);
-        write_task(&root, "demo-long", &LONG_TASK);
+        write_task(&root, "demo-long", LONG_TASK);
 
         let default_tasks = load_tasks(&root).expect("装载");
         let long_tasks = load_long_tasks(&root).expect("装载");

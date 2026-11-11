@@ -11,9 +11,15 @@
 
 ## 支持的版本
 
-尚无稳定发布渠道：只维护默认分支 `main`。当前 Cargo 版本 `0.1.0`，
-首个发行版见 [Releases 页面](https://github.com/TianMingXTU/QCodeHarness/releases)，
-性质是试用版，不是稳定版。
+当前稳定候选版本为 `1.0.0`（Cargo 版本），发行渠道是
+[Releases 页面](https://github.com/TianMingXTU/QCodeHarness/releases)。
+安全修复只回灌到**最新稳定小版本**：已发布的旧小版本不再单独跟进，
+请升级到最新稳定小版本获取安全修复。升级路径与回滚方法见
+[docs/install.md](../docs/install.md)。
+
+默认分支 `main` 领先于稳定小版本，其上的安全修复要等下一次
+小版本发布才回灌到发行渠道。拿到安全修复的基准始终是最新稳定小版本，
+不是 `main` 的瞬时状态。
 
 ## 安全模型摘要
 

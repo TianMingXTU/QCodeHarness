@@ -1,6 +1,6 @@
 [package]
 name = "QCodeHarness"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Rust 实现的 AI 编程执行框架：工具调用、权限审批、MCP 接入、Windows 进程沙箱与可审计证据"

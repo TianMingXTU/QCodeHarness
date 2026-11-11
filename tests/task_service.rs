@@ -298,7 +298,7 @@ async fn create(service: &LocalTaskService, id: &str) -> TaskView {
     else {
         panic!("应返回任务")
     };
-    task
+    *task
 }
 
 async fn get(service: &LocalTaskService, id: &str) -> TaskView {
@@ -314,7 +314,7 @@ async fn get(service: &LocalTaskService, id: &str) -> TaskView {
     else {
         panic!("应返回任务")
     };
-    task
+    *task
 }
 
 async fn stopped(service: &LocalTaskService, id: &str) -> TaskView {
@@ -961,7 +961,12 @@ impl Drop for CrashProcess {
 #[tokio::test]
 #[ignore = "由崩溃恢复测试在独立进程中启动"]
 async fn crash_service_child() {
-    let root = PathBuf::from(std::env::var_os("QCH_SERVICE_CRASH_ROOT").unwrap());
+    // 本用例只由上面的崩溃恢复测试以独立进程并设置环境变量启动。
+    // 全量 `--ignored` 也可能直接选中它；此时不构造假服务状态，直接跳过。
+    let Some(root) = std::env::var_os("QCH_SERVICE_CRASH_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
     let model = Arc::new(Model::new());
     let factory = Arc::new(Factory::new(model.clone()));
     let service = LocalTaskService::open(root.clone(), factory, Budget::new(10), Arc::new(Accept))
@@ -1157,8 +1162,7 @@ async fn continuing_a_continued_workspace_is_rejected_until_the_digest_matches()
                     qcode_harness::domain::service::ServiceEventPayload::TaskCreated { .. }
                 )
         })
-        .map(|event| event.origin.parent_session_id.clone())
-        .flatten();
+        .and_then(|event| event.origin.parent_session_id.clone());
     assert_eq!(
         origin.as_deref(),
         Some(task.session_id.as_str()),

@@ -1,0 +1,9 @@
+id = "py-feature-duration"
+kind = "feature"
+description = "为 py-duration 库实现缺失的 format_clock：tests/test_duration.py 已按契约写好测试（整数总秒数格式化成 hh:mm:ss，小时段超过 24 继续进位，例如 90061 秒是 25:01:01），src/duration.py 里只有 NotImplementedError 占位，相关测试全部失败。读 src/duration.py 与 tests/test_duration.py，按测试语义补齐 format_clock，不要改动已实现的 humanize，然后运行 python -m unittest tests.test_duration -v 验证全部测试通过。"
+language = "python"
+
+[criteria]
+test_command = "python -m unittest tests.test_duration -v"
+requires_changes = true
+answer_must_mention = ["clock"]

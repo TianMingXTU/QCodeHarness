@@ -31,11 +31,11 @@ pub fn load(path: Option<&Path>) -> Result<PolicyEngine, PolicyConfigError> {
     };
     let text = std::fs::read_to_string(path).map_err(|source| PolicyConfigError::Read {
         path: path.to_path_buf(),
-        source,
+        source: Box::new(source),
     })?;
     parse(&text).map_err(|source| PolicyConfigError::Parse {
         path: path.to_path_buf(),
-        source,
+        source: Box::new(source),
     })
 }
 
@@ -137,7 +137,7 @@ pub enum PolicyConfigError {
         /// 配置文件路径。
         path: std::path::PathBuf,
         /// 底层 IO 错误。
-        source: std::io::Error,
+        source: Box<std::io::Error>,
     },
     /// 配置文件内容不合法。
     #[error("解析策略配置 {path} 失败: {source}")]
@@ -145,7 +145,7 @@ pub enum PolicyConfigError {
         /// 配置文件路径。
         path: std::path::PathBuf,
         /// TOML 解析错误，自带行列号。
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 }
 

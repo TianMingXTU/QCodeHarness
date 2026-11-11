@@ -29,10 +29,12 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 use crate::application::port::{BoxFuture, ToolInvoker};
+use crate::domain::command::parse_command;
 use crate::domain::platform::Platform;
 use crate::domain::sandbox::{
-    write_escape_beyond, ExecutionBoundary, PlatformCapabilities, SandboxPolicy,
-    SANDBOX_DOWNGRADE_NOTICE,
+    write_escape_beyond, ALLOW_UNISOLATED_COMMANDS_ENV, ExecutionBoundary,
+    PlatformCapabilities, SandboxPolicy, SANDBOX_DOWNGRADE_NOTICE,
+    unisolated_decision, UnisolatedDecision,
 };
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 use crate::domain::workspace::WorkspaceRoot;
@@ -54,12 +56,25 @@ pub struct RunCommand {
     root: WorkspaceRoot,
     // 生产入口使用默认策略；测试可在实例内注入失败策略，不修改全局状态。
     policy: SandboxPolicy,
+    // 宿主是否显式放行开放命令（QCH_ALLOW_UNISOLATED_COMMANDS=1）。
+    // 构造时读一次环境并缓存：同一次执行内所有命令用同一口径，测试
+    // 直接改字段而不动全局环境。
+    host_allows_unisolated: bool,
 }
 
 impl RunCommand {
     /// 以 `root` 作为命令的工作目录构造。
+    ///
+    /// 宿主放行开关在构造时读入并缓存：同一次执行内所有命令用同一口径，
+    /// 测试直接改 `host_allows_unisolated` 字段而不改全局环境。`QCH_ALLOW_
+    /// UNISOLATED_COMMANDS=1` 时开放命令可无完整隔离执行（未生效声明照常
+    /// 附带）；未设置时，缺文件系统与网络隔离的平台只放行基线形状命令。
     pub fn new(root: WorkspaceRoot) -> Self {
-        Self { root, policy: SandboxPolicy::default() }
+        Self {
+            root,
+            policy: SandboxPolicy::default(),
+            host_allows_unisolated: host_allows_unisolated_commands(),
+        }
     }
 
     /// 工具规格。
@@ -91,6 +106,30 @@ impl RunCommand {
             annotations: ToolAnnotations::new(false, true, false, true),
         }
     }
+}
+
+/// 宿主是否显式放行无完整隔离的开放命令。只认 `1`，其余值（含未设置）
+/// 视为未放行。shell 与 git 工具共用这一口径。
+pub(crate) fn host_allows_unisolated_commands() -> bool {
+    std::env::var(ALLOW_UNISOLATED_COMMANDS_ENV).is_ok_and(|value| value == "1")
+}
+
+/// 无完整隔离时对一条命令的开放命令收口裁决。返回 `Some(理由)` 即拒绝
+/// 执行，`None` 放行。
+///
+/// 供 shell 工具与 git 工具共用，避免两套口径。基于实时检测的平台能力
+/// 与实时读入的宿主开关（`host_allows_unisolated_commands`），不依赖
+/// `RunCommand` 实例。`run_command` 走缓存的实例字段版本以便测试注入；
+/// `git_status`/`git_diff` 走这里。
+pub(crate) fn unisolated_open_command_refusal(command: &str) -> Option<String> {
+    if let UnisolatedDecision::Refused { reason, .. } = unisolated_decision(
+        &PlatformCapabilities::detect(),
+        &parse_command(command),
+        host_allows_unisolated_commands(),
+    ) {
+        return Some(reason);
+    }
+    None
 }
 
 /// `run_command` 的参数。
@@ -144,6 +183,20 @@ fn shell_program(command: &str) -> (String, Vec<String>) {
     full.push(command.to_owned());
     (program.to_owned(), full)
 }
+
+/// Windows 下命令进程的创建标志。
+///
+/// 命令必须运行在独立的隐藏控制台里。模型脚本常以
+/// `subprocess.send_signal(CTRL_BREAK_EVENT)` 收尾，实测（实验脚本 repro/
+/// 归档）该事件会广播到整个**共享控制台**，跨进程组、pid 参数无效：共享
+/// 框架控制台时框架进程会被一并终止（真实故障，任务无终态）。只有独立
+/// 控制台能隔离；新进程组让 CTRL_C 定向到组内。取消路径依赖 Job Object
+/// 整树终止，不依赖控制台信号，两者都不影响取消语义。
+#[cfg(windows)]
+pub(crate) fn command_creation_flags() -> u32 {
+    windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP.0
+        | windows::Win32::System::Threading::CREATE_NO_WINDOW.0
+}
 /// 区分启动前拒绝、启动失败和启动后失败，供进程工具共用。
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RunError {
@@ -187,8 +240,20 @@ fn with_process_boundary(
     sandbox_active: bool,
     boundary_checked: bool,
 ) -> ToolOutcome {
+    // 两条独立声明：进程沙箱未生效（平台没有或创建失败）与文件/网络隔离
+    // 未生效（任何平台都没有实现，Windows 有 Job 也缺这两项）。按能力分别
+    // 生成，不虚报。降级说明在前，隔离说明在后，保持既有"降级开头"口径。
+    let mut prefix = String::new();
     if !sandbox_active {
-        outcome.content = format!("{SANDBOX_DOWNGRADE_NOTICE}\n{}", outcome.content);
+        prefix.push_str(SANDBOX_DOWNGRADE_NOTICE);
+        prefix.push('\n');
+    }
+    if let Some(statement) = PlatformCapabilities::detect().unisolation_statement() {
+        prefix.push_str(statement);
+        prefix.push('\n');
+    }
+    if !prefix.is_empty() {
+        outcome.content = format!("{prefix}{}", outcome.content);
     }
     outcome.with_execution(ExecutionBoundary::process(sandbox_active, boundary_checked))
 }
@@ -235,6 +300,16 @@ pub(crate) async fn run_with_policy(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Windows 上命令进程用独立的隐藏控制台和新进程组。模型脚本常以
+    // `subprocess.send_signal(CTRL_BREAK_EVENT)` 收尾，而该事件会广播到
+    // **整个共享控制台**（跨进程组，pid 参数被忽略）：不隔离时框架进程
+    // 会被一并终止（真实故障：任务无终态，调用方只看到 0xC000013A）。
+    // CREATE_NO_WINDOW 给命令一个独立控制台，广播只波及命令自身；同时
+    // 新进程组让 CTRL_C 定向到组内。取消路径依赖 Job Object 整树终止，
+    // 不依赖控制台信号，该组合不影响取消语义。
+    #[cfg(windows)]
+    cmd.creation_flags(command_creation_flags());
 
     // 从继承的环境中移除疑似密钥的变量。
     // env_remove 使用原始名字（注册名大小写敏感），匹配时使用小写名字
@@ -371,6 +446,18 @@ impl ToolInvoker for RunCommand {
                     self.root.as_path().display()
                 ));
             }
+            // 缺少文件系统与网络隔离时收口开放命令：基线形状（各语言测试
+            // 命令与只读 git）放行，开放命令默认拒绝，宿主显式设置
+            // QCH_ALLOW_UNISOLATED_COMMANDS=1 才放行。拒绝发生在启动进程
+            // 之前，不产生 SandboxApplied 证据；放行的开放命令仍走
+            // 降级执行，边界证据 active=false，模型可见文本带未生效声明。
+            if let UnisolatedDecision::Refused { reason, .. } = unisolated_decision(
+                &PlatformCapabilities::detect(),
+                &parse_command(&args.command),
+                self.host_allows_unisolated,
+            ) {
+                return ToolOutcome::refused(reason);
+            }
             let timeout = Duration::from_secs(
                 args.timeout_seconds
                     .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -419,7 +506,11 @@ mod tests {
     }
 
     fn tool(root: &PathBuf) -> RunCommand {
-        RunCommand::new(WorkspaceRoot::new(root))
+        // 测试命令大多是 `echo` 这类开放命令形状；沙箱收口只放行基线形状，
+        // 因此宿主放行开关按测试环境固定开启，未生效声明照常附带。
+        let mut command = RunCommand::new(WorkspaceRoot::new(root));
+        command.host_allows_unisolated = true;
+        command
     }
 
     fn call(arguments: serde_json::Value) -> ToolCall {
@@ -494,6 +585,25 @@ mod tests {
     ///
     /// 探针为 examples/sandbox-victim.rs。整树终止依赖平台能力，由
     /// [`PlatformCapabilities::detect`] 判定。
+    #[cfg(windows)]
+    #[test]
+    fn windows_commands_run_in_an_isolated_console() {
+        // 回归锚点：真实故障（L3 实验任务）里模型脚本发出的
+        // CTRL_BREAK 广播杀死了与命令共享控制台的框架进程。CTRL_BREAK 的
+        // 广播跨进程组，只有 CREATE_NO_WINDOW 的独立控制台能隔离。
+        // cargo test 的测试进程没有控制台（AllocConsole 失败、独立控制台
+        // 替身也不触发广播），无法在本环境复现广播行为；修复对真实故障
+        // 形态的有效性由实验脚本（无修复调用链死亡、带修复存活，同一
+        // smoke_test 脚本对照）独立验证。这里锚定 flags 组合本身，防止
+        // 无意的回退。
+        assert_eq!(
+            command_creation_flags(),
+            windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP.0
+                | windows::Win32::System::Threading::CREATE_NO_WINDOW.0,
+            "命令进程必须在独立隐藏控制台和新进程组中运行"
+        );
+    }
+
     #[tokio::test]
     async fn timeout_kills_the_whole_process_tree() {
         let root = temp_workspace("killtree");
@@ -1072,5 +1182,126 @@ mod tests {
                 .chain(std::iter::once("cargo test".to_owned()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ── 开放命令收口在 run_command 执行路径上的接线 ────────────────
+
+    /// 生产默认口径下，开放命令在启动进程之前被拒绝，不产生执行边界证据，
+    /// 也不启动任何子进程。拒绝理由带稳定码与开关建议。
+    #[tokio::test]
+    async fn invoke_refuses_open_commands_by_default_without_spawn() {
+        let root = temp_workspace("gate-open");
+        let mut cmd = RunCommand::new(WorkspaceRoot::new(root.clone()));
+        cmd.host_allows_unisolated = false;
+
+        let outcome = cmd.invoke(&call(run_args("echo x > open_default.txt"))).await;
+
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Refused,
+            "开放命令默认应被收口拒绝: {}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains(crate::domain::sandbox::REFUSAL_CODE_UNISOLATED),
+            "拒绝理由带稳定码: {}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains(ALLOW_UNISOLATED_COMMANDS_ENV),
+            "拒绝理由给出口令建议: {}",
+            outcome.content
+        );
+        assert!(
+            outcome.execution.is_none(),
+            "拒绝发生在启动进程之前，不能伪造执行边界"
+        );
+        assert!(
+            !root.join("open_default.txt").exists(),
+            "被拒的开放命令不得执行重定向，落盘文件不应出现"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 基线形状在生产默认口径下照常放行：正常编码任务不被误阻断。这里
+    /// 真跑一条基线命令（`cargo check` 太重，用 git 只读形态），验证
+    /// 收口不会把基线命令挡掉。git 不在 PATH 时以非 0 退出码返回，不
+    /// 影响"未拒绝"的判定。
+    #[tokio::test]
+    async fn invoke_allows_baseline_shapes_by_default() {
+        let root = temp_workspace("gate-baseline");
+        let mut cmd = RunCommand::new(WorkspaceRoot::new(root.clone()));
+        cmd.host_allows_unisolated = false;
+
+        let outcome = cmd.invoke(&call(run_args("git status"))).await;
+        assert!(
+            outcome.status != OutcomeStatus::Refused,
+            "基线形状 git status 不应被收口拒绝: {}",
+            outcome.content
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 基线命令接输出观察器在生产默认口径下照常放行：真实运行里
+    /// `node --test 2>&1 | tail -30` 这类形状是最普通的验证方式，收口不能
+    /// 把它整条拒掉。这里用 git 只读形态接 `more` 验证接线：git 在临时
+    /// 目录里必然报「不是仓库」，但进程确实起来了，判定只看「没被收口
+    /// 拒绝、真的执行了」。
+    #[tokio::test]
+    async fn invoke_allows_baseline_with_output_observers_by_default() {
+        let root = temp_workspace("gate-observer");
+        let mut cmd = RunCommand::new(WorkspaceRoot::new(root.clone()));
+        cmd.host_allows_unisolated = false;
+
+        let outcome = cmd
+            .invoke(&call(run_args("git status 2>&1 | more")))
+            .await;
+
+        assert!(
+            outcome.status != OutcomeStatus::Refused,
+            "基线加输出观察器不应被收口拒绝: {}",
+            outcome.content
+        );
+        assert!(
+            outcome.execution.is_some(),
+            "放行后应真的启动进程并留下执行边界"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 宿主显式放行后开放命令执行，模型可见文本仍带未生效声明：证据如实
+    /// 反映「执行但无完整隔离」，未生效声明不因放行而省略。
+    #[tokio::test]
+    async fn host_opt_in_runs_open_commands_with_unisolation_statement() {
+        let root = temp_workspace("gate-optin");
+        let mut cmd = RunCommand::new(WorkspaceRoot::new(root.clone()));
+        cmd.host_allows_unisolated = true;
+
+        let outcome = cmd.invoke(&call(run_args("echo optin_ran"))).await;
+
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "宿主放行后开放命令应执行: {}",
+            outcome.content
+        );
+        // 未生效声明按平台能力生成：缺文件与网络隔离时必然附带。
+        if PlatformCapabilities::detect().unisolation_statement().is_some() {
+            assert!(
+                outcome.content.contains("未生效"),
+                "放行执行仍要声明隔离未生效: {}",
+                outcome.content
+            );
+        }
+        let boundary = outcome.execution.expect("真启动的命令要带执行边界");
+        // 执行边界如实反映进程沙箱状态，不虚报：有进程沙箱的平台 active
+        // 为 true，没有的平台为 false。文件与网络隔离由模型可见文本的
+        // 未生效声明承担，不塞进执行边界字段。
+        assert_eq!(
+            boundary.active,
+            PlatformCapabilities::detect().has_process_sandbox,
+            "进程沙箱状态必须与平台能力一致"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
