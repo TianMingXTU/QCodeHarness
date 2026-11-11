@@ -1803,11 +1803,16 @@ async fn shutdown_executions(inner: &Arc<ServiceInner>) -> Result<(), ServiceErr
 
 fn release_lease(inner: &ServiceInner) -> Result<(), ServiceError> {
     let closed = inner.journal_impl.close();
-    inner
+    // 取出并丢弃锁文件句柄：POSIX 上 flock 随打开文件描述符关闭才释放；先显式
+    // unlock 再 drop，避免关闭行为依赖具体平台实现。即便租约锁被污染也要取出
+    // 句柄，否则同进程重开 `LocalTaskService::open` 会拿到 service_locked。
+    let mut guard = inner
         .lease
         .lock()
-        .map_err(|_| broken("服务租约锁已损坏"))?
-        .take();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(file) = guard.take() {
+        let _ = file.unlock();
+    }
     closed
 }
 
@@ -1820,14 +1825,14 @@ impl Drop for LocalTaskService {
         // 按打开文件描述加锁，fd 未关闭前锁不释放，于是重开拿到 service_locked。
         let live_is_empty = lock_live(&self.inner)
             .map(|live| live.is_empty())
-            .unwrap_or(false);
+            .unwrap_or(true);
         if live_is_empty {
             let lease_held = self
                 .inner
                 .lease
                 .lock()
                 .map(|lease| lease.is_some())
-                .unwrap_or(false);
+                .unwrap_or(true);
             if lease_held {
                 let _ = request_close(&self.inner);
                 let _ = release_lease(&self.inner);
