@@ -58,13 +58,13 @@ jobs:
           set -o pipefail
           cargo test --locked 2>&1 | tee cargo-test.log
 
-      # 失败时把用例名和 panic 首行写成注解，公开仓库无需日志权限也能
-      # 在检查结果里看到哪条用例红了。
+      # 失败时把用例名与 panic 后三行（含 Err 值和断言消息）写成注解，公开
+      # 仓库无需日志权限也能在检查结果里看到哪条用例红了、红在哪。
       - name: 标注失败用例
         if: failure()
         shell: bash
         run: |
-          grep -E '^test .* \.\.\. FAILED$|^---- .* stdout ----|^thread .* panicked' cargo-test.log \
+          grep -E -A3 '^thread .* panicked at|^---- .* stdout ----' cargo-test.log \
             | head -10 | sed 's/^/::error::/' || true
 
       # 需要真实 git 仓库的用例在默认测试里被标为 ignored：
@@ -114,12 +114,13 @@ jobs:
           set -o pipefail
           cargo clippy --locked --all-targets --all-features -- -D warnings 2>&1 | tee clippy.log
 
-      # 同测试任务：把 lint 的首行错误写成注解，便于无日志权限时定位。
+      # 同测试任务：clippy 日志带颜色转义，先剥 ANSI 再把末段（通常是
+      # error 与「could not compile」原因）写成注解。
       - name: 标注 clippy 问题
         if: failure()
         shell: bash
         run: |
-          grep -E '^(error|warning)(\[|:)' clippy.log | head -10 | sed 's/^/::error::/' || true
+          tail -12 clippy.log | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/::error::/' || true
 
       # 文档构建是 docs.rs 的预演：文档链断了会体现在这一步。
       - name: 构建文档
