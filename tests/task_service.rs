@@ -718,6 +718,23 @@ async fn dropping_a_service_keeps_its_lease_until_execution_resources_close() {
 }
 
 #[tokio::test]
+async fn dropped_service_without_live_executions_releases_lease_for_same_process_reopen() {
+    let repo = Repo::new("drop-no-live");
+    let factory = Arc::new(Factory::new(Arc::new(Model::new())));
+    let service = open(&repo, factory.clone(), 10).await;
+    // 不调用 Shutdown，直接 drop；此时没有存活执行。
+    drop(service);
+    // 同进程立即重开：修复前 Drop 把整段收尾（含 release_lease）交给未 await 的
+    // detached 定时任务，而 open() 的 try_lock 在首个 await 前同步执行，POSIX 上旧 fd
+    // 仍持有 flock，导致重开返回 service_locked。修复后无存活执行时租约同步释放，应通过。
+    let reopened = open(&repo, factory, 10).await;
+    reopened
+        .call("shutdown", ServiceCommand::Shutdown)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn forking_a_completed_task_preserves_history_progress_and_origin() {
     let repo = Repo::new("fork");
     let model = Arc::new(Model::new());

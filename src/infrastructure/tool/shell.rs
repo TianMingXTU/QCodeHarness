@@ -374,7 +374,7 @@ pub(crate) async fn run_with_policy(
             let stderr = stderr.map_err(execution_error)?;
             let code = status.map_err(execution_error)?.code().unwrap_or(-1);
             // 关闭 Job 清理残留后代。RawOutput 只保留执行时的边界事实。
-            drop(sandbox);
+            let _ = sandbox;
             Ok(RawOutput {
                 code,
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -391,7 +391,7 @@ pub(crate) async fn run_with_policy(
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
-            drop(sandbox);
+            let _ = sandbox;
             // 收口范围按平台能力措辞。没有整树终止能力时说"已终止进程"
             // 会让模型以为后台进程也被收掉了。
             let killed = if PlatformCapabilities::detect().has_tree_kill {

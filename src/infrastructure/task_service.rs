@@ -1813,6 +1813,29 @@ fn release_lease(inner: &ServiceInner) -> Result<(), ServiceError> {
 
 impl Drop for LocalTaskService {
     fn drop(&mut self) {
+        // 存活执行为空时同步释放租约：保证同进程内随后重开
+        // `LocalTaskService::open` 的 try_lock 不会被尚未调度的 detached 任务挡住。
+        // 该路径对应测试里的 `drop(service)` 后紧接 `open()`：open 在最前面同步 try_lock，
+        // 而原实现把整段收尾（含 release_lease）交给未 await 的定时任务，POSIX 上 flock
+        // 按打开文件描述加锁，fd 未关闭前锁不释放，于是重开拿到 service_locked。
+        let live_is_empty = lock_live(&self.inner)
+            .map(|live| live.is_empty())
+            .unwrap_or(false);
+        if live_is_empty {
+            let lease_held = self
+                .inner
+                .lease
+                .lock()
+                .map(|lease| lease.is_some())
+                .unwrap_or(false);
+            if lease_held {
+                let _ = request_close(&self.inner);
+                let _ = release_lease(&self.inner);
+            }
+            return;
+        }
+        // 仍有存活执行：保持原行为，租约交给定时任务，待执行收束后再释放。
+        // dropping_a_service_keeps_its_lease_until_execution_resources_close 依赖此语义。
         if self
             .inner
             .lease
