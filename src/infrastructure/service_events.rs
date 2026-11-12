@@ -187,50 +187,80 @@ impl EventJournal for JsonEventJournal {
         context: Option<&EventContext>,
         payload: ServiceEventPayload,
     ) -> Result<ServiceEvent, ServiceError> {
+        let mut events = self.append_batch(context, vec![payload])?;
+        Ok(events.pop().expect("单条批次必返回一条事件"))
+    }
+
+    fn append_batch(
+        &self,
+        context: Option<&EventContext>,
+        payloads: Vec<ServiceEventPayload>,
+    ) -> Result<Vec<ServiceEvent>, ServiceError> {
         let mut state = self.lock()?;
         if let Some(error) = &state.failure {
             return Err(error.clone());
         }
-        let sequence = latest_sequence(&state.events).checked_add(1).ok_or_else(|| {
-            ServiceError::new("sequence_exhausted", "服务事件序号已耗尽")
-        })?;
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 启动事件属于一次原子提交：先在内存里取号、编码并检查全部上限，
+        // 再把整批字节一次写入磁盘。任何前置检查失败都不能留下半组事件。
         let millis = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| {
             ServiceError::new("invalid_clock", error.to_string())
         })?.as_millis();
         let time_unix_ms = u64::try_from(millis).map_err(|_| ServiceError::new("invalid_clock", "毫秒时间戳越界"))?;
-        let event = ServiceEvent {
-            version: PROTOCOL_VERSION,
-            sequence,
-            time_unix_ms,
-            task_id: context.map(|context| context.task_id.clone()),
-            session_id: context.map(|context| context.session_id.clone()),
-            execution_id: context.map(|context| context.execution_id.clone()),
-            origin: context.map(|context| context.origin.clone()).unwrap_or_default(),
-            payload,
-        };
-        let mut line = serde_json::to_vec(&event).map_err(|error| {
-            ServiceError::new("event_encoding", error.to_string())
-        })?;
-        line.push(b'\n');
-        if line.len() > MAX_EVENT_BYTES {
-            return Err(event_too_large());
-        }
-        if state.bytes + line.len() as u64 > MAX_JOURNAL_BYTES {
-            return Err(journal_too_large());
+        let task_id = context.map(|context| context.task_id.clone());
+        let session_id = context.map(|context| context.session_id.clone());
+        let execution_id = context.map(|context| context.execution_id.clone());
+        let origin = context.map(|context| context.origin.clone()).unwrap_or_default();
+        let mut sequence = latest_sequence(&state.events);
+        let mut events = Vec::with_capacity(payloads.len());
+        let mut chunk = Vec::new();
+        for payload in payloads {
+            sequence = sequence.checked_add(1).ok_or_else(|| {
+                ServiceError::new("sequence_exhausted", "服务事件序号已耗尽")
+            })?;
+            let event = ServiceEvent {
+                version: PROTOCOL_VERSION,
+                sequence,
+                time_unix_ms,
+                task_id: task_id.clone(),
+                session_id: session_id.clone(),
+                execution_id: execution_id.clone(),
+                origin: origin.clone(),
+                payload,
+            };
+            let mut line = serde_json::to_vec(&event).map_err(|error| {
+                ServiceError::new("event_encoding", error.to_string())
+            })?;
+            line.push(b'\n');
+            if line.len() > MAX_EVENT_BYTES {
+                return Err(event_too_large());
+            }
+            if state.bytes + chunk.len() as u64 + line.len() as u64 > MAX_JOURNAL_BYTES {
+                return Err(journal_too_large());
+            }
+            chunk.extend_from_slice(&line);
+            events.push(event);
         }
         // 取号、写盘和发布持同一把锁，订阅者不会看到尚未确认落盘的事件。
-        if let Err(error) = write_committed(&mut state, &line) {
+        // 写盘失败时先尽力把文件截断回原长度；截断是否成功都返回原始错误，
+        // 不让截断失败掩盖真正的写入原因（如实例外的文件修改）。
+        if let Err(error) = write_committed(&mut state, &chunk) {
+            let _ = state.file.set_len(state.bytes).map_err(io_error);
             state.failure = Some(error.clone());
             state.publisher.take();
             return Err(error);
         }
-        state.bytes += line.len() as u64;
-        state.events.push(event.clone());
-        if let Some(publisher) = &state.publisher {
-            // 没有订阅者是正常状态，持久日志仍是事实来源。
-            let _ = publisher.send(event.clone());
+        state.bytes += chunk.len() as u64;
+        for event in &events {
+            state.events.push(event.clone());
+            if let Some(publisher) = &state.publisher {
+                // 没有订阅者是正常状态，持久日志仍是事实来源。
+                let _ = publisher.send(event.clone());
+            }
         }
-        Ok(event)
+        Ok(events)
     }
 
     fn read(&self, after: u64, limit: usize) -> Result<Vec<ServiceEvent>, ServiceError> {

@@ -88,6 +88,22 @@ pub fn validate_safe_identifier(kind: &str, id: &str, max_bytes: usize) -> Resul
     Ok(())
 }
 
+/// 把任意标识符文本净化成单个文件名片段。
+///
+/// 证据、会话快照与任务快照共用此规则。ID 可能来自旧版本或命令行，
+/// 路径分隔符与 Unicode 字符都会替换成下划线，避免文件名逃出数据目录。
+pub fn sanitize_file_id(id: &str) -> String {
+    id.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// 工程任务标识。一次编排（可能横跨多个会话）对应一个任务。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(String);

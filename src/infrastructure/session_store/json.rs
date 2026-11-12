@@ -8,8 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::application::snapshot::{RunSnapshot, SessionStore, StoreError};
-use crate::domain::ids::SessionId;
-use crate::infrastructure::evidence::jsonl::sanitize_session_id;
+use crate::domain::ids::{sanitize_file_id, SessionId};
 
 /// 把快照存成 workspace 下的单文件 JSON。
 #[derive(Debug, Clone)]
@@ -28,7 +27,7 @@ impl JsonSessionStore {
     /// 某个会话的快照文件路径。
     fn path_for(&self, session_id: &SessionId) -> PathBuf {
         self.dir
-            .join(format!("{}.json", sanitize_session_id(session_id.as_str())))
+            .join(format!("{}.json", sanitize_file_id(session_id.as_str())))
     }
 }
 

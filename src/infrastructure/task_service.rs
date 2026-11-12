@@ -1236,23 +1236,25 @@ impl LocalTaskService {
         start: ExecutionStart,
         events: impl IntoIterator<Item = ServiceEventPayload>,
     ) -> Result<(), ServiceError> {
-        for event in events {
-            if let Err(cause) = self.append(&context, event) {
-                self.inner
-                    .failures
-                    .lock()
-                    .map_err(|_| broken("服务错误表锁已损坏"))?
-                    .push(cause.clone());
-                let stopped = commit_completion(
-                    &self.inner,
-                    &record,
-                    &context,
-                    Err((TaskStatus::Failed, cause.to_string())),
-                    record.snapshot.clone(),
-                    Some(record.verification.clone()),
-                );
-                return combine_result(Err(cause), stopped);
-            }
+        if let Err(cause) = self
+            .inner
+            .journal
+            .append_batch(Some(&context), events.into_iter().collect())
+        {
+            self.inner
+                .failures
+                .lock()
+                .map_err(|_| broken("服务错误表锁已损坏"))?
+                .push(cause.clone());
+            let stopped = commit_completion(
+                &self.inner,
+                &record,
+                &context,
+                Err((TaskStatus::Failed, cause.to_string())),
+                record.snapshot.clone(),
+                Some(record.verification.clone()),
+            );
+            return combine_result(Err(cause), stopped);
         }
         let inner = self.inner.clone();
         let cancel = CancelHandle::default();

@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::application::port::{EvidenceSink, Timestamp};
 use crate::domain::evidence::{AuditEvent, EVIDENCE_FORMAT_MILLIS};
+use crate::domain::ids::sanitize_file_id;
 
 /// 写入磁盘的证据汇。
 ///
@@ -191,21 +192,11 @@ fn last_sequence(path: &Path) -> Option<u64> {
         })
 }
 
-/// 净化会话 ID 中的路径分隔符，防止 `../../etc/passwd` 之类的 ID 把文件
-/// 写到 workspace 外。证据文件与快照文件共用此规则，同一个 ID 只会得到
-/// 一个文件名。
-pub(crate) fn sanitize_session_id(session_id: &str) -> String {
-    session_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
-        .collect()
-}
-
 /// 计算某个会话的证据文件路径：`<root>/.qcodeharness/sessions/<session_id>.jsonl`。
 pub fn session_path(root: &Path, session_id: &str) -> PathBuf {
     root.join(".qcodeharness")
         .join("sessions")
-        .join(format!("{}.jsonl", sanitize_session_id(session_id)))
+        .join(format!("{}.jsonl", sanitize_file_id(session_id)))
 }
 
 #[cfg(test)]

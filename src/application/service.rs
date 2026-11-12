@@ -33,6 +33,21 @@ pub trait EventJournal: Send + Sync {
         payload: ServiceEventPayload,
     ) -> Result<ServiceEvent, ServiceError>;
 
+    /// 一次提交一组启动事件：要么全部落盘，要么一条都不落盘。
+    ///
+    /// 默认实现逐条转发，供只需单条语义的实现复用；有界 JSONL 实现覆盖为
+    /// 单次写盘。调用方据此保证一次执行启动时不会留下半组事件。
+    fn append_batch(
+        &self,
+        context: Option<&EventContext>,
+        payloads: Vec<ServiceEventPayload>,
+    ) -> Result<Vec<ServiceEvent>, ServiceError> {
+        payloads
+            .into_iter()
+            .map(|payload| self.append(context, payload))
+            .collect()
+    }
+
     /// 读取 `after` 之后最多 `limit` 条记录，`after = 0` 表示从头开始。
     ///
     /// 游标大于当前末尾时返回错误；`limit = 0` 返回空集合。

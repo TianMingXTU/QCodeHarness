@@ -355,7 +355,7 @@ cargo run --example stdio-client -- ./target/debug/QCodeHarness "阅读 Cargo.to
 
 ### 持久化与边界
 
-服务状态及命令凭据在 `.qcodeharness/service/state.json`，服务事件在同目录 `events.jsonl`。服务事件的序号独立于旧 `AuditEvent` evidence 序号；日志包含真实审计载荷及模型、审批、输入和工作区生命周期事件。新建、显式继续、分叉各启动一次执行，各记录一条带任务、会话与执行标识的 `execution_started`；多次执行要按执行标识分别计算区间，重放只回放日志、不会再次启动执行。单事件上限 1 MiB，单日志上限 64 MiB，达到上限明确报错，需停止服务后由宿主归档，不自动丢弃历史。
+服务状态及命令凭据在 `.qcodeharness/service/state.json`，服务事件在同目录 `events.jsonl`。服务事件的序号独立于旧 `AuditEvent` evidence 序号；日志包含真实审计载荷及模型、审批、输入和工作区生命周期事件。新建、显式继续、分叉各自启动一次执行，成功启动时各记录一条带任务、会话与执行标识的 `execution_started`；多次执行要按执行标识分别计算区间。若启动批次在落盘前失败，任务会进入终态且不再发出后续执行事件，因此区间判定应基于实际存在的 `execution_started`，而不是假设每次执行都必有起点。重放只回放日志、不会再次启动执行。单事件上限 1 MiB，单日志上限 64 MiB，达到上限明确报错，需停止服务后由宿主归档，不自动丢弃历史。
 
 重启接管原工作区与最新检查点，把上次 `running` / `stopping` 标为 `interrupted`，等待显式继续。旧审批不会从日志自动批准，恢复到审批边界时重新发布请求。关闭服务会取消任务、等待执行及资源收尾，再释放服务和事件日志租约。
 

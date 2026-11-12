@@ -12,8 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::application::snapshot::{StoreError, TaskSnapshot, TaskStore};
-use crate::domain::ids::TaskId;
-use crate::infrastructure::evidence::jsonl::sanitize_session_id;
+use crate::domain::ids::{sanitize_file_id, TaskId};
 
 /// 把任务快照存成 workspace 下的单文件 JSON。
 #[derive(Debug, Clone)]
@@ -32,7 +31,7 @@ impl JsonTaskStore {
     /// 某个任务的快照文件路径。
     fn path_for(&self, task_id: &TaskId) -> PathBuf {
         self.dir
-            .join(format!("{}.json", sanitize_session_id(task_id.as_str())))
+            .join(format!("{}.json", sanitize_file_id(task_id.as_str())))
     }
 }
 

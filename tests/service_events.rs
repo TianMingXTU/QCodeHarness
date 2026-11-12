@@ -12,10 +12,11 @@ use qcode_harness::application::port::{
 use qcode_harness::application::service::{EventJournal, EventSubscription};
 use qcode_harness::domain::agent::{AgentRole, AgentSpec, AgentTurn};
 use qcode_harness::domain::evidence::{AuditEvent, TokenUsage};
+use qcode_harness::domain::budget::Consumption;
 use qcode_harness::domain::ids::CallId;
 use qcode_harness::domain::service::{
     EventContext, EventOrigin, ServiceCommand, ServiceError, ServiceEvent, ServiceEventPayload,
-    PROTOCOL_VERSION,
+    TaskStatus, TaskView, PROTOCOL_VERSION,
 };
 use qcode_harness::domain::tool::{ToolAnnotations, ToolCall};
 use qcode_harness::infrastructure::approval::async_gate::ApprovalBroker;
@@ -251,6 +252,68 @@ fn a_failed_evidence_sink_reports_unhealthy_and_requests_cancellation() {
     assert!(cancel.is_cancelled());
     assert_eq!(evidence.health().unwrap_err().code, "journal_io");
     assert_eq!(journal.latest().unwrap(), 0);
+}
+
+/// 一次提交一组启动事件必须原子：任一条超限，整组都不落盘。
+///
+/// 旧实现逐条 `append`，第二条失败时第一条已写入，订阅者会看到半组事件。
+/// 这里直接走 `append_batch` 的契约：超限批返回错误且日志为空。
+#[test]
+fn a_failed_start_batch_leaves_no_partial_events() {
+    let dir = TestDirectory::new();
+    let journal = JsonEventJournal::open(dir.log()).unwrap();
+    let error = journal
+        .append_batch(
+            Some(&context("t1", "e1")),
+            vec![
+                ServiceEventPayload::ExecutionStarted,
+                ServiceEventPayload::Completed { answer: "x".repeat(MAX_EVENT_BYTES) },
+            ],
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "event_too_large");
+    assert_eq!(journal.latest().unwrap(), 0);
+    assert!(fs::read_to_string(dir.log()).unwrap().is_empty(), "超限批不得留下任何字节");
+}
+
+/// 成功批次整组落盘，序号连续且字节数与状态一致，重开后可正常加载。
+#[test]
+fn a_successful_start_batch_is_durable_and_contiguous() {
+    let dir = TestDirectory::new();
+    let path = dir.log();
+    let journal = JsonEventJournal::open(&path).unwrap();
+    let events = journal
+        .append_batch(
+            Some(&context("t1", "e1")),
+            vec![
+                ServiceEventPayload::TaskCreated {
+                    task: TaskView {
+                        task_id: "t1".into(),
+                        session_id: "s1".into(),
+                        execution_id: "e1".into(),
+                        attempt: 1,
+                        status: TaskStatus::Running,
+                        workspace: PathBuf::new(),
+                        base_revision: String::new(),
+                        source_task: None,
+                        parent_task: None,
+                        answer: None,
+                        error: None,
+                        verification: String::new(),
+                        consumption: Consumption::default(),
+                    },
+                },
+                ServiceEventPayload::ExecutionStarted,
+            ],
+        )
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].sequence + 1, events[1].sequence);
+    let stored = fs::read_to_string(&path).unwrap();
+    assert_eq!(stored.lines().count(), 2);
+    drop(journal);
+    let reopened = JsonEventJournal::open(&path).unwrap();
+    assert_eq!(reopened.latest().unwrap(), 2);
 }
 
 #[tokio::test]

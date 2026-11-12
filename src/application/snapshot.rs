@@ -11,11 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::agent::AgentSpec;
 use crate::domain::budget::Consumption;
-use crate::domain::ids::{SessionId, TaskId};
+use crate::domain::ids::{sanitize_file_id, SessionId, TaskId};
 use crate::domain::session::SessionSnapshot;
 use crate::domain::task::{StepOutput, Task};
 use crate::domain::worktree::WorktreeManifest;
-
 use super::agent_run::{PendingRound, RunState};
 
 /// 当前快照格式版本。快照结构发生不兼容变化时加 1。
@@ -83,6 +82,17 @@ pub struct TaskSnapshot {
     pub worktree: WorktreeManifest,
 }
 
+/// 生成版本不匹配时的备份目标。
+///
+/// 文件名与 JSON 快照存储共用一套净化规则：旧快照或命令行构造的 ID 可能
+/// 带路径分隔符，直接拼接会把备份目标指到快照目录之外。
+fn snapshot_backup_path(directory: &str, id: &str, version: u32) -> String {
+    format!(
+        ".qcodeharness/{directory}/{}.json.bak-v{version}",
+        sanitize_file_id(id)
+    )
+}
+
 impl TaskSnapshot {
     /// 校验快照版本，不匹配时返回错误。
     ///
@@ -97,10 +107,10 @@ impl TaskSnapshot {
             Err(StoreError::VersionMismatch {
                 found: self.format_version,
                 expected: TASK_FORMAT,
-                backup_hint: format!(
-                    ".qcodeharness/tasks/{}.json.bak-v{}",
-                    self.task.id(),
-                    self.format_version
+                backup_hint: snapshot_backup_path(
+                    "tasks",
+                    self.task.id().as_str(),
+                    self.format_version,
                 ),
             })
         }
@@ -142,10 +152,10 @@ impl RunSnapshot {
             Err(StoreError::VersionMismatch {
                 found: self.format_version,
                 expected: RUN_FORMAT,
-                backup_hint: format!(
-                    ".qcodeharness/snapshots/{}.json.bak-v{}",
-                    self.session_id,
-                    self.format_version
+                backup_hint: snapshot_backup_path(
+                    "snapshots",
+                    self.session_id.as_str(),
+                    self.format_version,
                 ),
             })
         }
@@ -454,6 +464,44 @@ mod tests {
         assert_eq!(
             backup_hint, ".qcodeharness/tasks/t1.json.bak-v999",
             "提示应展开成该任务的实际备份路径"
+        );
+    }
+
+    /// 快照 ID 可能来自旧版本或命令行。提示必须与落盘时的净化规则一致，
+    /// 否则用户会备份错文件；路径分隔符更不能把备份目标带出快照目录。
+    #[test]
+    fn backup_hints_use_the_same_sanitized_names_as_the_json_stores() {
+        let mut task = task_snapshot();
+        task.task = Task::new(
+            TaskId::new("../../evil"),
+            TaskKind::BugFix,
+            "修好它",
+            task.task.steps().to_vec(),
+        );
+        task.format_version = 999;
+        let StoreError::VersionMismatch { backup_hint, .. } = task.check_version().unwrap_err()
+        else {
+            panic!("应报版本不匹配")
+        };
+        assert_eq!(backup_hint, ".qcodeharness/tasks/______evil.json.bak-v999");
+
+        let mut run = mid_round_snapshot();
+        run.session_id = SessionId::new("会话/一");
+        run.format_version = 999;
+        let StoreError::VersionMismatch { backup_hint, .. } = run.check_version().unwrap_err()
+        else {
+            panic!("应报版本不匹配")
+        };
+        assert_eq!(
+            backup_hint,
+            ".qcodeharness/snapshots/____.json.bak-v999"
+        );
+        assert!(backup_hint.starts_with(".qcodeharness/snapshots/"));
+        assert!(
+            !std::path::Path::new(&backup_hint)
+                .components()
+                .any(|part| part == std::path::Component::ParentDir),
+            "{backup_hint}"
         );
     }
 
