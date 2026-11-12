@@ -109,7 +109,7 @@ pub fn rotate_events(workspace: &Path) -> Result<RotateReport, ServiceError> {
 struct JournalState {
     file: File,
     /// 独占写入租约。数据文件保持可读，外部回放与归档不会被锁挡住。
-    /// `close()` 取走后丢弃句柄，另一个实例才能接管同一日志。
+    /// `close()` 必须显式解锁并交出句柄，另一个实例才能接管同一日志。
     lease: Option<File>,
     events: Vec<ServiceEvent>,
     bytes: u64,
@@ -155,17 +155,29 @@ impl JsonEventJournal {
     ///
     /// 已提交事件仍在数据文件中；关闭后本实例不再追加。重复关闭无副作用。
     pub fn close(&self) -> Result<(), ServiceError> {
-        let mut state = self.lock()?;
+        // 状态锁可能因执行线程 panic 而毒化。仍要取出租约并显式解锁：POSIX 的
+        // flock 随打开文件描述符释放，服务持有的 Arc 在本方法返回后仍存活。
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.publisher.take();
-        state.lease.take();
+        if let Some(lease) = state.lease.take() {
+            let _ = lease.unlock();
+        }
         if state.failure.is_none() {
             state.failure = Some(ServiceError::new("journal_closed", "事件日志已关闭"));
         }
         Ok(())
     }
 
+    /// 返回状态锁；锁毒化时让调用方报出明确错误，不带着可疑状态继续追加。
+    ///
+    /// 关闭路径不经过这里：即使状态已损坏，也必须释放独占租约。
     fn lock(&self) -> Result<MutexGuard<'_, JournalState>, ServiceError> {
-        self.state.lock().map_err(|_| ServiceError::new("journal_unhealthy", "事件日志状态锁已损坏"))
+        self.state
+            .lock()
+            .map_err(|_| ServiceError::new("journal_unhealthy", "事件日志状态锁已损坏"))
     }
 }
 
@@ -491,6 +503,43 @@ mod rotate_tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         drop(journal);
         assert!(rotate_events(&workspace).unwrap().empty_run);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    /// 状态锁被污染时，关闭仍必须交出写入租约。
+    ///
+    /// POSIX 的 flock 随打开文件描述符释放。若 `close()` 因状态锁毒化提前
+    /// 返回，旧句柄会持续占锁，同进程重开只能拿到 `journal_locked`。这里直接
+    /// 断言关闭成功且租约可移交，不依赖不同平台的锁实现差异。
+    #[test]
+    fn a_poisoned_state_lock_still_releases_the_writer_lease_on_close() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "qch-close-poisoned-lease-{}-{stamp}",
+            std::process::id()
+        ));
+        let path = workspace.join("events.jsonl");
+        let journal = Arc::new(JsonEventJournal::open(&path).unwrap());
+        let poisoner = journal.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.state.lock().unwrap();
+            panic!("模拟持锁线程崩溃");
+        })
+        .join();
+
+        assert!(
+            journal.close().is_ok(),
+            "关闭不应因状态锁毒化而跳过租约释放"
+        );
+        let reopened = JsonEventJournal::open(&path).unwrap();
+        assert!(reopened.close().is_ok());
+        drop(journal);
+        drop(reopened);
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }

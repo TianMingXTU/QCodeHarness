@@ -187,6 +187,19 @@ fn the_same_journal_cannot_have_two_writers() {
     assert!(JsonEventJournal::open(dir.log()).is_ok());
 }
 
+/// `close()` 必须在不丢弃实例的情况下交出写入租约。
+///
+/// 服务关闭时 `Arc<JsonEventJournal>` 仍被 `ServiceInner` 持有，因此不能靠
+/// `Drop` 释放锁文件句柄；现有用例只用 drop 验证过这一点。
+#[test]
+fn closing_a_journal_releases_the_writer_lease_without_dropping_the_instance() {
+    let dir = TestDirectory::new();
+    let journal = JsonEventJournal::open(dir.log()).unwrap();
+    assert!(journal.close().is_ok());
+    let reopened = JsonEventJournal::open(dir.log()).unwrap();
+    assert!(reopened.close().is_ok());
+}
+
 struct SwitchJournal {
     journal: JsonEventJournal,
     fail: AtomicBool,

@@ -852,6 +852,28 @@ async fn dropped_service_without_live_executions_releases_lease_for_same_process
         .unwrap();
 }
 
+/// 显式 Shutdown 后旧实例仍在作用域内，写入租约不能等实例析构才释放。
+#[tokio::test]
+async fn shutdown_releases_the_journal_writer_lease_without_dropping_the_instance() {
+    let repo = Repo::new("shutdown-journal-lease");
+    let factory = Arc::new(Factory::new(Arc::new(Model::new())));
+    let service = open(&repo, factory.clone(), 10).await;
+    assert!(
+        service
+            .call("shutdown", ServiceCommand::Shutdown)
+            .await
+            .is_ok(),
+        "首次关闭应成功"
+    );
+    let reopened = open(&repo, factory, 10).await;
+    assert!(
+        reopened
+            .call("shutdown", ServiceCommand::Shutdown)
+            .await
+            .is_ok()
+    );
+}
+
 #[tokio::test]
 async fn forking_a_completed_task_preserves_history_progress_and_origin() {
     let repo = Repo::new("fork");
