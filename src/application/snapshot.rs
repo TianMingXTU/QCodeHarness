@@ -97,7 +97,11 @@ impl TaskSnapshot {
             Err(StoreError::VersionMismatch {
                 found: self.format_version,
                 expected: TASK_FORMAT,
-                backup_hint: ".qcodeharness/tasks/<task-id>.json.bak-v{found}".to_owned(),
+                backup_hint: format!(
+                    ".qcodeharness/tasks/{}.json.bak-v{}",
+                    self.task.id(),
+                    self.format_version
+                ),
             })
         }
     }
@@ -138,7 +142,11 @@ impl RunSnapshot {
             Err(StoreError::VersionMismatch {
                 found: self.format_version,
                 expected: RUN_FORMAT,
-                backup_hint: ".qcodeharness/snapshots/<session-id>.json.bak-v{found}".to_owned(),
+                backup_hint: format!(
+                    ".qcodeharness/snapshots/{}.json.bak-v{}",
+                    self.session_id,
+                    self.format_version
+                ),
             })
         }
     }
@@ -215,7 +223,7 @@ pub enum StoreError {
         found: u32,
         /// 当前程序认识的版本。
         expected: u32,
-        /// 建议的备份位置；调用方按实际快照目录替换占位符。
+        /// 建议的备份位置，已带实际会话或任务 ID 与文件版本。
         backup_hint: String,
     },
 
@@ -311,6 +319,25 @@ mod tests {
         assert!(error.to_string().contains("v999"), "{error}");
         assert!(error.to_string().contains("可用动作"), "{error}");
         assert!(error.to_string().contains("备份"), "{error}");
+    }
+
+    /// 版本不匹配的备份提示必须是可执行路径，带实际会话 ID 与版本号。
+    ///
+    /// 旧实现只给 `<session-id>.bak-v{found}` 模板，用户拿到提示仍要自己
+    /// 推断该改哪条命令，不满足"旧快照拒绝带可执行指引"的判据。
+    #[test]
+    fn version_mismatch_backup_hint_is_a_concrete_path_for_this_snapshot() {
+        let mut snapshot = mid_round_snapshot();
+        snapshot.format_version = 999;
+        let error = snapshot.check_version().unwrap_err();
+        let StoreError::VersionMismatch { backup_hint, .. } = &error else {
+            panic!("应报版本不匹配，实际 {error}")
+        };
+        assert_eq!(
+            backup_hint, ".qcodeharness/snapshots/s1.json.bak-v999",
+            "提示应展开成该快照的实际备份路径"
+        );
+        assert!(!backup_hint.contains('<') && !backup_hint.contains('{'), "{backup_hint}");
     }
 
     #[test]
@@ -421,6 +448,13 @@ mod tests {
                 ..
             }
         ), "{error}");
+        let StoreError::VersionMismatch { backup_hint, .. } = &error else {
+            panic!("应报版本不匹配，实际 {error}")
+        };
+        assert_eq!(
+            backup_hint, ".qcodeharness/tasks/t1.json.bak-v999",
+            "提示应展开成该任务的实际备份路径"
+        );
     }
 
     /// 任务快照里的任务也要通过 `Task` 的重建校验。

@@ -21,7 +21,8 @@ use qcode_harness::domain::budget::Budget;
 use qcode_harness::domain::evidence::TokenUsage;
 use qcode_harness::domain::policy::PolicyEngine;
 use qcode_harness::domain::service::{
-    ServiceCommand, ServiceError, ServiceReply, TaskStatus, TaskView,
+    ServiceCommand, ServiceError, ServiceEvent, ServiceEventPayload, ServiceReply, TaskStatus,
+    TaskView,
 };
 use qcode_harness::domain::task::TaskKind;
 use qcode_harness::infrastructure::clock::SystemClock;
@@ -329,6 +330,123 @@ async fn stopped(service: &LocalTaskService, id: &str) -> TaskView {
     })
     .await
     .expect("任务应收束")
+}
+
+/// 返回全部服务事件，供跨执行核对事件归属。
+async fn all_events(service: &LocalTaskService) -> Vec<ServiceEvent> {
+    let ServiceReply::Events { events, .. } = service
+        .call(
+            "events",
+            ServiceCommand::Events {
+                after: 0,
+                limit: 1000,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("应返回事件")
+    };
+    events
+}
+
+/// 找出属于这次执行的启动事件；调用方据此断言次数与事件上下文。
+fn start_events<'a>(events: &'a [ServiceEvent], task: &TaskView) -> Vec<&'a ServiceEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(&event.payload, ServiceEventPayload::ExecutionStarted)
+                && event.task_id.as_deref() == Some(task.task_id.as_str())
+                && event.session_id.as_deref() == Some(task.session_id.as_str())
+                && event.execution_id.as_deref() == Some(task.execution_id.as_str())
+        })
+        .collect()
+}
+
+/// 新建、取消后继续、分叉都会启动一次执行；三次执行都应在日志里留下
+/// 一条带本执行标识的 `ExecutionStarted`，订阅方才能计算完整执行区间。
+#[tokio::test]
+async fn every_execution_publishes_one_start_event_with_its_own_context() {
+    let repo = Repo::new("execution-started");
+    let model = Arc::new(Model::new());
+    let factory = Arc::new(Factory::new(model.clone()));
+    let service = open(&repo, factory, 10).await;
+
+    let first = create(&service, "create").await;
+    model.wait_calls(1).await;
+    service
+        .call(
+            "cancel",
+            ServiceCommand::Cancel {
+                task_id: first.task_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    model.permits.add_permits(1);
+    assert_eq!(
+        stopped(&service, &first.task_id).await.status,
+        TaskStatus::Cancelled
+    );
+
+    let ServiceReply::Task { task: continued } = service
+        .call(
+            "continue",
+            ServiceCommand::Continue {
+                task_id: first.task_id.clone(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("应返回新执行")
+    };
+    model.permits.add_permits(4);
+    assert_eq!(
+        stopped(&service, &first.task_id).await.status,
+        TaskStatus::Completed
+    );
+
+    let ServiceReply::Task { task: forked } = service
+        .call(
+            "fork",
+            ServiceCommand::Fork {
+                task_id: first.task_id.clone(),
+                goal: Some("继续处理".to_owned()),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("应返回分支任务")
+    };
+    model.wait_calls(6).await;
+    model.permits.add_permits(1);
+    assert_eq!(
+        stopped(&service, &forked.task_id).await.status,
+        TaskStatus::Completed
+    );
+
+    let events = all_events(&service).await;
+    for task in [&first, continued.as_ref(), forked.as_ref()] {
+        assert_eq!(
+            start_events(&events, task).len(),
+            1,
+            "每次执行应恰有一条带本执行标识的启动事件: {:?}",
+            task.execution_id
+        );
+    }
+    let forked_start = start_events(&events, forked.as_ref());
+    assert_eq!(
+        forked_start[0].origin.parent_session_id.as_deref(),
+        Some(first.session_id.as_str()),
+        "分叉启动事件应保留来源会话"
+    );
+
+    service
+        .call("shutdown", ServiceCommand::Shutdown)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

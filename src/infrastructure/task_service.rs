@@ -816,11 +816,18 @@ impl LocalTaskService {
                 .discard_unadmitted_workspace(&record.workspace, cause)
                 .await);
         }
+        // 新建任务也要发 ExecutionStarted：任务创建与执行启动是两件事，
+        // 但执行区间（供并发/重叠/回放判定）必须从这里算起。只发
+        // TaskCreated 会让"任务刚创建、还没跑"的状态在事件流里没有起点，
+        // 订阅方按 execution_started 取区间时只能拿到 None。
         self.spawn(
             record,
             context,
             ExecutionStart::Create(task),
-            [ServiceEventPayload::TaskCreated { task: view.clone() }],
+            [
+                ServiceEventPayload::TaskCreated { task: view.clone() },
+                ServiceEventPayload::ExecutionStarted,
+            ],
         )?;
         Ok(ServiceReply::Task { task: Box::new(view) })
     }
@@ -1112,12 +1119,15 @@ impl LocalTaskService {
                 .discard_unadmitted_workspace(&record.workspace, cause)
                 .await);
         }
+        // 分叉同样由 spawn 启动一次执行，补充启动事件后订阅方才能从
+        // execution_started 算出这次执行的区间；TaskCreated 仍是首条事件。
         self.spawn(
             record,
             context,
             execution_start(snapshot),
             [
                 ServiceEventPayload::TaskCreated { task: view.clone() },
+                ServiceEventPayload::ExecutionStarted,
                 ServiceEventPayload::Forked {
                     source_task: task_id.to_owned(),
                 },
