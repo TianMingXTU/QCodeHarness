@@ -22,7 +22,9 @@ R1-R5 竞品对齐（OpenAI Codex / Claude Code / DeepSeek Harness 对齐，保�
 审批闸门与 fail-closed 语义）已交付到工作树，边界如下：
 
 - R1 无头契约与工具对齐：`exec` 无头模式（退出码 0/1/2/3/4 分开编码，
-  `--json` 复用基准输出结构，无 profile 默认拒绝非只读动作）；
+  `--json` 复用基准输出结构，无 profile 默认拒绝非只读动作；已装配
+  真实 AgentRunner 循环并实测：无 profile 写任务 exit 3 进模型前拒绝，
+  `--permissions workspace-write` 真实写文件并读回验证 exit 0）；
   `--permissions read-only|workspace-write|full` 档位叠加在策略之上；
   WebFetch/WebSearch 域名白/黑名单（`QCH_WEB_POLICY`/`QCH_WEB_SEARCH_ENDPOINT`）；
   Todo 工具与完成率；后台作业（`run_command` 的 `background` 参数 +
