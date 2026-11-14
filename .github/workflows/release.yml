@@ -193,6 +193,11 @@ jobs:
       # armored GPG 私钥（base64），QCH_SIGNING_PASS 放 passphrase。未配置
       # 时跳过签名，SHA256SUMS 仍提供离线校验。
       - name: GPG 签名（若配置了签名密钥）
+        env:
+          # GitHub Actions 的 secrets 不会自动成为环境变量；缺此映射会让
+          # 签名步骤读到空串并静默跳过，产物看起来像"有签名能力但没签名"。
+          QCH_SIGNING_KEY: ${{ secrets.QCH_SIGNING_KEY }}
+          QCH_SIGNING_PASS: ${{ secrets.QCH_SIGNING_PASS }}
         shell: bash
         run: |
           set -euo pipefail
