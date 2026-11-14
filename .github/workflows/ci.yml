@@ -79,6 +79,18 @@ jobs:
       - name: 基准 smoke（空套件 JSON）
         run: cargo test --locked --test benchmark_output
 
+      # 发行包冒烟契约：三平台各跑一次。Rust 测试按 cfg 选 POSIX/Windows
+      # 脚本，在独立临时目录里造发行包并演练校验→安装→版本/诊断→
+      # 只读基准→回滚→快照拒绝；CI 不重复对源码树执行脚本。
+      - name: 发布冒烟契约（smoke.sh / POSIX）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cargo test --locked --test release_smoke_contract
+
+      - name: 发布冒烟契约（smoke.ps1 / Windows）
+        if: runner.os == 'Windows'
+        run: cargo test --locked --test release_smoke_contract
+
   lint:
     name: 静态检查
     runs-on: ubuntu-latest
