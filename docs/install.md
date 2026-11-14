@@ -128,6 +128,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke.ps1 -SourceDir
 错误。CI 三平台通过 `cargo test --locked --test release_smoke_contract`
 在独立临时目录里造发行包并执行同一套脚本。
 
+安装后建议再跑一次 `--doctor --json`：第 13 项 `provider_connectivity`
+报告凭据是否存在（不主动联网探测），第 14 项 `sandbox_r2_slices` 报告
+当前平台的沙箱切片事实（Windows 上进程树终止为"生效"，文件系统/网络/
+MCP 子进程隔离如实标注"未生效"；未实测的平台标注"未实测"）。缺失或
+未生效的能力不会静默放行开放命令。
+
 ## 升级
 
 升版本 = 装新版本 + 切 `current` 指针，旧版本目录保留可回退。

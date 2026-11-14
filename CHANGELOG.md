@@ -18,6 +18,37 @@ P13 交互与集成已交付：常驻任务服务、版本化 stdio 协议、Rus
 [docs/roadmap.md](docs/roadmap.md) 的 P15 行为准，不宣称三平台 OS 级文件/网络隔离
 已实测。
 
+R1-R5 竞品对齐（OpenAI Codex / Claude Code / DeepSeek Harness 对齐，保留证据账本、
+审批闸门与 fail-closed 语义）已交付到工作树，边界如下：
+
+- R1 无头契约与工具对齐：`exec` 无头模式（退出码 0/1/2/3/4 分开编码，
+  `--json` 复用基准输出结构，无 profile 默认拒绝非只读动作）；
+  `--permissions read-only|workspace-write|full` 档位叠加在策略之上；
+  WebFetch/WebSearch 域名白/黑名单（`QCH_WEB_POLICY`/`QCH_WEB_SEARCH_ENDPOINT`）；
+  Todo 工具与完成率；后台作业（`run_command` 的 `background` 参数 +
+  `job_list`）；Anthropic Messages 协议与订阅式登录凭据（环境变量优先，
+  项目目录永不参与）；`--doctor` 第 13 项 provider 连通性（只查凭据不
+  主动探测）。OS 通知模块（外部命令/OSC 9、超时与进程树终止）与测试
+  已交付，TUI/文本前端集成挂点为后继切片。
+- R2 跨平台沙箱：Windows Job Object 整树终止已实测生效（5 用例含真实
+  后代进程终止）；文件系统/网络/MCP 子进程切片在 Windows 上明确标注
+  未生效，Linux（Landlock/seccomp）/macOS（sandbox-exec）实现标注
+  未实测；`SandboxDegraded` 证据事件、`--sandbox-debug` 判定入口、
+  `--doctor` 第 14 项切片事实如实上报，缺能力绝不静默放行。
+- R3 生态与互操作：PreToolUse 外部命令 exit 2 阻断并入唯一 RunHooks 链；
+  Claude Code（.json）/Codex（.toml）hooks 配置兼容，未映射项显式拒绝；
+  SKILL.md 转换安装（无法映射的 allowed-tools 拒绝安装）；本地技能市场
+  （`--install-extension <skill-id>`，索引 `QCH_SKILL_INDEX`，不做远程
+  托管）；ACP stdio 适配层；官方 GitHub Action 与 TypeScript SDK。
+- R4 长任务与上下文：计划项绑定任务快照步骤、恢复停在计划边界；手动
+  压缩端口与摘要证据；跨会话自动记忆（写入走审批与证据）；后台作业
+  进程注册表；MCP HTTP/SSE 传输握手与故障分类；符号级只读代码导航与
+  图片证据；公开基准清单（固定 seed 20261114，竞品对照与 SWE-bench
+  Verified 实测未执行，指标全部标"未知"）。
+- R5 平台形态：本机 Web UI（`--web-ui`，127.0.0.1 单用户，与 CLI 共享
+  TaskService 与证据语义）；显式审批协议帧与有限嵌套框架（生产多层
+  委派接线为后继切片）；商业化评估文档（纯文档）。
+
 R0 发布收尾 Gate（仓库内交付，不打 tag、不发 Release）：
 
 1. `cargo check`、`cargo test`、`cargo build --release`、

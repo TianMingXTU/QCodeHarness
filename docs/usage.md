@@ -24,6 +24,11 @@ AI 审批审查员、策略配置、项目指令、MCP 接入、证据文件、�
 | `QCH_MAX_WALL_CLOCK` | 否 | 墙钟上限（秒）：编排模式下是整个任务的上限，`--resume` 时是本次恢复运行的上限；超时返回可区分的错误，不设置则不限时 |
 | `QCH_SUMMARIZE_MIN_DROPPED` | 否 | 被裁历史累积到多少轮才花一次 LLM 调用生成摘要；不设置则只用占位说明 |
 | `QCH_MCP_CONFIG` | 否 | MCP 配置文件路径（TOML），配置了才连接外部 MCP Server；缺省时 MCP 关闭 |
+| `QCH_HOOKS_CONFIG` | 否 | 外部 hooks 配置文件：`.json` 按 Claude Code 格式、`.toml` 按 Codex 格式解析；存在未映射项时启动失败，不静默跳过 |
+| `QCH_WEB_POLICY` | 否 | Web 域名策略 TOML（`[[rules]]` 的 `action = "allow"` 进白名单，其余域名拒绝）；不设置时所有 Web 工具请求被拒绝 |
+| `QCH_WEB_SEARCH_ENDPOINT` | 否 | WebSearch 搜索端点 URL；不设置时 WebSearch 显式报"搜索端点未配置" |
+| `QCH_SKILL_INDEX` | 否 | 本地技能市场索引 TOML 路径，`--install-extension <技能ID>` 用它检索；缺省用 `<workspace>/.qcodeharness/skills/marketplace.toml` |
+| `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_SUBSCRIPTION_TOKEN` / `QCH_ANTHROPIC_SUBSCRIPTION_TOKEN` | 否 | Anthropic 订阅登录凭据：任一存在时默认网关切换为 Anthropic Messages 协议；项目目录永不参与凭据读取 |
 
 单次模型调用有 300 秒的硬时限（内置默认，暂不可配置）：连接挂死时中止该次调用并报可区分的错误，任务停在可恢复的断点，用 `--resume` 续跑即可。
 
@@ -163,7 +168,13 @@ cargo run -- --kind review "评审最近的改动"
 | `write_file` | 破坏性 | 创建新文件或整体覆盖 |
 | `edit_file` | 破坏性 | 查找替换式修改；`old_string` 必须在文件中恰好出现一次，否则拒绝执行 |
 | `apply_patch` | 破坏性 | 结构化补丁一次改一处或多处；全部操作要么成功要么一个文件都不改（原子性），中途失败不留半个改动 |
-| `run_command` | 破坏性·开放世界 | 在 workspace 根下执行 shell 命令，运行在进程沙箱内（整树内存/进程数受限，超时终止全部后代进程，仅限有进程沙箱的平台）；沙箱创建失败时**拒绝执行**（Windows，fail-closed），平台没有进程沙箱或沙箱未生效时降级执行并在结果开头显式声明。命令文本里出现指向 workspace 外的路径（绝对/UNC/`..`/重定向/`--flag=`）直接拒绝，审批也不能覆盖。超时默认 30s 上限 300s；疑似密钥的环境变量（名字含 key/token/secret/password/credential）不会传入子进程；输出超过 8000 字符截断 |
+| `run_command` | 破坏性·开放世界 | 在 workspace 根下执行 shell 命令，运行在进程沙箱内（整树内存/进程数受限，超时终止全部后代进程，仅限有进程沙箱的平台）；沙箱创建失败时**拒绝执行**（Windows，fail-closed），平台没有进程沙箱或沙箱未生效时降级执行并在结果开头显式声明。命令文本里出现指向 workspace 外的路径（绝对/UNC/`..`/重定向/`--flag=`）直接拒绝，审批也不能覆盖。超时默认 30s 上限 300s；疑似密钥的环境变量（名字含 key/token/secret/password/credential）不会传入子进程；输出超过 8000 字符截断。`background: true` 时命令转入后台（无进程沙箱的平台同样走越界与开放命令收口），立即返回作业 ID，配合 `job_list` 查询状态 |
+| `job_list` | 只读 | 查询后台作业列表（ID、命令、状态、说明）；只看到本次进程启动后的作业 |
+| `todo` | 破坏性 | 任务清单增删改查与状态流转（pending → in_progress → completed，不回退），落 `<workspace>/.qcodeharness/todos.json`；`--report` 汇总完成率 |
+| `web_fetch` | 破坏性·开放世界 | 抓取白名单域名的 URL；域名白/黑名单来自 `QCH_WEB_POLICY`，未配置时全部拒绝；证据记录 URL、字节数与耗时 |
+| `web_search` | 破坏性·开放世界 | 调用 `QCH_WEB_SEARCH_ENDPOINT` 检索；端点未配置时显式报错 |
+| `code_navigation` | 只读 | 符号定义/引用定位（`ignore` + 正则索引，非完整 LSP/Tree-sitter），证据与同一账本 |
+| `image_evidence` | 只读 | 把图片按 SHA-256 摘要记入证据账本（多模态输入的审计入口） |
 
 工具规格与执行入口绑定在同一个注册表里，`read_file` 与 `edit_file` 的分工写在各自描述中：新建或整体重写用 `write_file`，小段修改用 `edit_file`，一次改多处用 `apply_patch`。
 
@@ -186,6 +197,20 @@ cargo run --example custom-tool-source    # 内置工具与自定义 ToolSource 
 [architecture.md](architecture.md)。
 
 社区扩展以依赖本 crate 编译、在装配层接线的方式接入；本地清单描述提示词与已声明的工具动作，需要任意逻辑时编写 Rust。动态库插件装载、通用脚本插件协议暂未提供。前端集成使用[常驻任务服务](#常驻任务服务p13)的版本化 stdio 协议与 Rust SDK。
+
+### 技能扩展与本地市场
+
+扩展支持两种清单来源，安装后一律默认禁用：
+
+```bash
+QCodeHarness --install-extension ./skills/review.toml      # 本仓 TOML 清单
+QCodeHarness --install-extension ./SKILL.md                # Claude Code SKILL.md（自动转换）
+QCodeHarness --install-extension code-review               # 按技能 ID 查本地市场索引
+```
+
+SKILL.md 转换规则：frontmatter 的 `name`/`description` 与正文直接映射；`allowed-tools` 中符合本仓权限格式的条目进入清单权限，无法映射的条目（如 `Bash(git status:*)`）**拒绝安装**——装出来的权限少于作者声明等于放宽边界。frontmatter 未识别的键以警告形式报告，不静默丢弃。
+
+本地市场索引默认在 `<workspace>/.qcodeharness/skills/marketplace.toml`，可用 `QCH_SKILL_INDEX` 覆盖；格式为 `[[skills]]` 的 `id` + `path` 条目，`path` 指向 TOML 清单或 SKILL.md。不做远程托管。
 
 ## 结构化补丁（`apply_patch`）
 
@@ -276,9 +301,33 @@ QCodeHarness --interactive    # stdin/stdout 均为终端时选 TUI，否则选�
 QCodeHarness --text           # 逐行文本，支持管道与屏幕阅读器
 QCodeHarness --tui            # 全屏界面，要求真实终端
 QCodeHarness --stdio          # NDJSON 协议，供 SDK 或其他前端接入
+QCodeHarness --web-ui         # 本机 Web 页面（127.0.0.1 单用户，Ctrl+C 退出）
 ```
 
 从源码运行时在命令前加 `cargo run --`。服务不会使用 `QCH_AUTO_APPROVE` 跳过审批；每次需要审批的调用均有独立的审批 ID、任务 ID 和执行 ID。审批等待不占用前端输入通道，可以同时查询、补充输入和取消。
+
+### 无头模式（exec）
+
+对标 `codex exec` / `claude -p` 的单次非交互执行：
+
+```bash
+QCodeHarness exec --permissions workspace-write "修复 tests 里失败的用例"
+QCodeHarness exec --permissions read-only --json --timeout 600 "总结当前构建状态"
+```
+
+退出码分开编码：`0` 成功、`1` 运行失败、`2` 参数错误、`3` 审批拒绝（含无 profile 时默认拒绝非只读动作）、`4` 超时。`--json` 复用基准评测输出结构。省略 `--permissions` 时默认 `read-only`，写文件与开放命令在进入模型循环前即被拒绝。
+
+### 审批分级档位
+
+`--permissions read-only|workspace-write|full` 是叠加在既有策略规则之上的基线档位，只收紧或放宽既有结论，不替代策略与审批闸门：
+
+| 档位 | 只读命令 | 工作区写命令 | 开放命令（如 `curl`） |
+| --- | --- | --- | --- |
+| `read-only` | 放行 | 拒绝 | 拒绝 |
+| `workspace-write` | 放行 | 走审批 | 拒绝 |
+| `full` | 走审批 | 放行 | 走审批 |
+
+三态判定有行为测试（`tests/permission_profiles.rs`），档位守卫对普通任务、恢复与子任务装配同时生效。
 
 ### 文本与 TUI 命令
 
