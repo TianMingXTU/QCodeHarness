@@ -1,0 +1,20 @@
+{
+  "name": "@qcodeharness/sdk",
+  "version": "0.1.0",
+  "description": "消费 QCodeHarness versioned stdio 协议的 TypeScript 客户端（仅 ACP 会话范围）",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.test.json && node dist-test/test/e2e.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

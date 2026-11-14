@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "seed": 20261114,
+  "status": "占位清单，不附带真实 SWE-bench Verified 数据",
+  "dataset": "SWE-bench Verified",
+  "license_and_download": "需人工下载并确认使用条款；本仓库不分发数据集",
+  "instance_ids": [],
+  "adapter": {
+    "command": "scripts/public-benchmark.sh --swe-adapter",
+    "input": "人工下载的 JSONL 路径由 PUBLIC_SWE_DATASET 指定",
+    "output": "benchmarks/public/results/swebench-adapter.json",
+    "same_model_same_task_control": "竞品 control arm 必须使用同一模型、同一实例子集",
+    "status": "竞品对照组与 SWE-bench Verified 实测未执行"
+  },
+  "metrics": {
+    "pass_rate": "未知",
+    "cost_usd": "未知",
+    "latency_ms": "未知",
+    "security_cases": "未知"
+  }
+}

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QCodeHarness local Web UI</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; color: #222; background: #fafafa; }
+    h1 { font-size: 1.4rem; }
+    section { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+    button { padding: .4rem .8rem; margin-right: .4rem; }
+    pre { overflow: auto; max-height: 24rem; white-space: pre-wrap; background: #f4f4f4; padding: .8rem; }
+    label { display: inline-block; min-width: 7rem; }
+    input, textarea { width: min(32rem, 90%); margin: .2rem 0 .6rem; }
+    .event { border-bottom: 1px solid #eee; padding: .4rem 0; }
+    .meta { color: #666; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <h1>QCodeHarness local Web UI</h1>
+  <p>单机单用户本地界面。任务、审批和证据全部来自常驻服务的事件流，字段与 CLI 一致；页面不自行推断审批结论。</p>
+  <section>
+    <h2>创建与补充输入</h2>
+    <label for="goal">任务目标</label><input id="goal" value="修复登录页"><br>
+    <label for="kind">任务类型</label><input id="kind" value="BugFix"><br>
+    <button id="create">创建任务</button>
+    <label for="message">补充输入</label><input id="message" value="保留日志"><br>
+    <label for="task-id">任务 ID</label><input id="task-id" value="task-web-1"><br>
+    <button id="input">提交输入</button>
+    <pre id="reply">等待命令回执</pre>
+  </section>
+  <section>
+    <h2>待审批</h2>
+    <button id="refresh-approvals">查询待审批</button>
+    <div id="approvals">尚未查询</div>
+  </section>
+  <section>
+    <h2>事件与证据</h2>
+    <button id="refresh-events">刷新事件</button>
+    <div id="events"></div>
+  </section>
+  <script src="/app.js"></script>
+</body>
+</html>

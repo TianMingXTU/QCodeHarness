@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "seed": 20261114,
+  "status": "清单就绪，竞品对照组与 SWE-bench Verified 实测未执行",
+  "scope": {
+    "self_benchmark": "允许用自建 fixture 产生公开数字；只报通过率、成本、时延与安全用例，不作模型智力结论",
+    "competitor_control": "至少含一个竞品 harness，与 QCodeHarness 使用同模型、同任务；本机未执行",
+    "swe_bench_verified": "真实数据集须人工下载并授权；本仓库只提供离线适配器与占位清单，实测未执行",
+    "desktop_shell": "Electron/Tauri 桌面壳在 R5 计划里可选且仅评估，不实现"
+  },
+  "arms": [
+    {
+      "harness": "QCodeHarness",
+      "model": "固定由 PUBLIC_BENCH_MODEL 指定",
+      "role": "self",
+      "model_binding": "PUBLIC_BENCH_MODEL"
+    },
+    {
+      "harness": "竞品 harness",
+      "model": "与 QCodeHarness 相同",
+      "role": "control",
+      "model_binding": "PUBLIC_BENCH_MODEL",
+      "required": true,
+      "status": "未执行"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "public-rust-helper",
+      "language": "Rust",
+      "size": "large_repository_fixture",
+      "description": "跨模块 Rust 仓库：定位工具函数定义、引用与回归测试入口",
+      "fixture": "benchmarks/public/fixtures/rust/large-repo.txt",
+      "criteria": ["构建命令退出码为 0", "工作区有实际改动", "最终答案说明根因"]
+    },
+    {
+      "id": "public-js-service",
+      "language": "JavaScript",
+      "size": "large_repository_fixture",
+      "description": "跨模块 JS 服务：修复接口边界并跑 node --test",
+      "fixture": "benchmarks/public/fixtures/js/large-repo.txt",
+      "criteria": ["node --test 退出码为 0", "工作区有实际改动", "最终答案说明根因"]
+    },
+    {
+      "id": "public-python-pipeline",
+      "language": "Python",
+      "size": "large_repository_fixture",
+      "description": "跨模块 Python 管道：修复数据转换并跑 unittest",
+      "fixture": "benchmarks/public/fixtures/python/large-repo.txt",
+      "criteria": ["python -m unittest 退出码为 0", "工作区有实际改动", "最终答案说明根因"]
+    },
+    {
+      "id": "public-go-client",
+      "language": "Go",
+      "size": "large_repository_fixture",
+      "description": "跨模块 Go 客户端：修复错误传播并跑 go test ./...",
+      "fixture": "benchmarks/public/fixtures/go/large-repo.txt",
+      "criteria": ["go test ./... 退出码为 0", "工作区有实际改动", "最终答案说明根因"]
+    }
+  ],
+  "swe_bench_verified": {
+    "adapter": "scripts/public-benchmark.sh --swe-adapter",
+    "subset_manifest": "benchmarks/public/swebench_subset.json",
+    "dataset_download": "人工完成，仓库不附带公开数据集",
+    "real_run": "未执行",
+    "result_status": "未知"
+  },
+  "security_cases": [
+    {
+      "case_id": "workspace_escape_refused",
+      "passed": null,
+      "evidence_path": null,
+      "reason": "未运行"
+    },
+    {
+      "case_id": "approval_required_for_memory_write",
+      "passed": null,
+      "evidence_path": null,
+      "reason": "未运行"
+    },
+    {
+      "case_id": "mcp_disconnect_result_unknown",
+      "passed": null,
+      "evidence_path": null,
+      "reason": "未运行"
+    }
+  ],
+  "metrics": {
+    "pass_rate": "未知",
+    "cost_usd": "未知",
+    "latency_ms": "未知",
+    "security_cases": "未知"
+  }
+}

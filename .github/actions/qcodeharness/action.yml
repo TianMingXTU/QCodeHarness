@@ -1,0 +1,113 @@
+# QCodeHarness 官方 GitHub Action。
+#
+# 封装无头模式（exec）：在 CI 中启动一个"评审"或"修复"任务，任务的审批与
+# 证据链仍由 QCodeHarness 自身负责。秘密一律走 Action 注入（secrets），不进入
+# 仓库，也不写入产物。本 action 是 composite，先构建本体再调用其 exec 子命令。
+#
+# exec 子命令由主代理在 cli.rs 接线；当前它支持的参数（见 headless.rs 的
+# parse_exec）为：位置参数任务文本、--permissions、--timeout、--workspace、--json。
+# 其余运行维度（模型、轮数）通过既有环境变量（LLM_MODEL / LLM_MAX_TURNS）传入，
+# main.rs 会读取它们；本 action 不做任何语义猜测，未知选项直接让 exec 报错。
+#
+# 两种典型用法：
+#   - PR 评审（mode: review）：只读权限，运行结束后把结论作为 PR 评论贴出，
+#     需要落地的修改留给人工或其他 job，不自动改写代码。
+#   - PR 自动修复（mode: fix）：工作区写权限，配合 QCH_AUTO_APPROVE=1 自动
+#     应用被批准的修改，再提交一个修复分支 / PR。
+
+name: QCodeHarness
+description: 在 CI 中以无头模式运行 QCodeHarness 评审或修复任务（基于 versioned stdio 与审批链）。
+author: QCodeHarness
+
+inputs:
+  goal:
+    description: 交给任务的自然语言目标，例如"评审本次 PR 的并发安全性"。
+    required: true
+  mode:
+    description: 运行模式。review=只读评审，fix=工作区写权限的自动修复。
+    required: false
+    default: review
+  permissions:
+    description: 覆盖 mode 的权限档（read-only | workspace-write | full）。为空时由 mode 决定。
+    required: false
+    default: ""
+  model:
+    description: 使用的模型标识；通过 LLM_MODEL 环境变量传入，为空时沿用运行环境默认配置。
+    required: false
+    default: ""
+  max-turns:
+    description: 单任务最大轮数上限；通过 LLM_MAX_TURNS 环境变量传入。
+    required: false
+    default: "40"
+  timeout:
+    description: 单任务超时秒数；超时后无头模式以独立退出码返回。
+    required: false
+    default: "600"
+  workspace:
+    description: 任务工作区目录；为空时使用当前仓库根。
+    required: false
+    default: "."
+  auto-approve:
+    description: 是否让任务自行批准被批准的修改（仅建议配合 mode: fix）。
+    required: false
+    default: "false"
+
+outputs:
+  report:
+    description: 任务报告路径（JSON，复用基准输出结构）；便于后续步骤读取或贴 PR。
+    value: ${{ steps.run.outputs.report }}
+  exit-code:
+    description: 无头模式退出码（0 成功 / 3 审批被拒 / 4 超时 / 其他失败）。
+    value: ${{ steps.run.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: 解析权限档与自动批准开关
+      id: cfg
+      shell: bash
+      run: |
+        perms="${{ inputs.permissions }}"
+        if [ -z "$perms" ]; then
+          if [ "${{ inputs.mode }}" = "fix" ]; then
+            perms="workspace-write"
+          else
+            perms="read-only"
+          fi
+        fi
+        echo "perms=$perms" >> "$GITHUB_OUTPUT"
+        if [ "${{ inputs.mode }}" = "fix" ] && [ "${{ inputs.auto-approve }}" = "true" ]; then
+          echo "auto_approve=1" >> "$GITHUB_OUTPUT"
+        else
+          echo "auto_approve=0" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: 构建 QCodeHarness
+      shell: bash
+      run: cargo build --release --bin QCodeHarness
+
+    - name: 运行无头任务
+      id: run
+      shell: bash
+      env:
+        QCH_AUTO_APPROVE: ${{ steps.cfg.outputs.auto_approve }}
+        LLM_MAX_TURNS: ${{ inputs.max-turns }}
+        LLM_MODEL: ${{ inputs.model }}
+      run: |
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          bin="target/release/QCodeHarness.exe"
+        else
+          bin="target/release/QCodeHarness"
+        fi
+        report="${{ inputs.workspace }}/qcodeharness-report.json"
+        set +e
+        "$bin" --exec "${{ inputs.goal }}" \
+          --permissions "${{ steps.cfg.outputs.perms }}" \
+          --timeout "${{ inputs.timeout }}" \
+          --workspace "${{ inputs.workspace }}" \
+          --json > "$report"
+        code=$?
+        set -e
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        exit $code

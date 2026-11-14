@@ -1,0 +1,4 @@
+# 构建产物与依赖不入库；npm 包发布时由 CI 或维护者本地构建 dist。
+node_modules/
+dist/
+dist-test/
