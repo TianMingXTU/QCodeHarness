@@ -44,9 +44,11 @@ R1-R5 竞品对齐（OpenAI Codex / Claude Code / DeepSeek Harness 对齐，保�
   托管）；ACP stdio 适配层；官方 GitHub Action 与 TypeScript SDK。
 - R4 长任务与上下文：计划项绑定任务快照步骤、恢复停在计划边界；手动
   压缩端口与摘要证据；跨会话自动记忆（写入走审批与证据）；后台作业
-  进程注册表；MCP HTTP/SSE 传输握手与故障分类；符号级只读代码导航与
-  图片证据；公开基准清单（固定 seed 20261114，竞品对照与 SWE-bench
-  Verified 实测未执行，指标全部标"未知"）。
+  进程注册表（`run_command` 的 `background` 参数 + `job_list`，已装配）；
+  `--report` 汇总 todo 完成率；MCP HTTP/SSE 传输握手与故障分类；符号级
+  只读代码导航与图片证据；公开基准清单（固定 seed 20261114，竞品对照与
+  SWE-bench Verified 实测未执行，指标全部标"未知"）。计划/压缩/记忆/
+  HTTP-SSE/导航的终端与服务挂点为后继切片。
 - R5 平台形态：本机 Web UI（`--web-ui`，127.0.0.1 单用户，与 CLI 共享
   TaskService 与证据语义）；显式审批协议帧与有限嵌套框架（生产多层
   委派接线为后继切片）；商业化评估文档（纯文档）。

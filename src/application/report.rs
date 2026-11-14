@@ -146,6 +146,12 @@ pub struct SessionSummary {
     /// 沙箱降级事件次数：隔离未生效或未实测，单独计数避免掩盖能力缺口。
     #[serde(default)]
     pub sandbox_degraded_runs: usize,
+    /// 会话结束时任务清单的完成率汇总。
+    ///
+    /// 从 `todo` 工具的成功观察结果重放得出（`todo_completion_rate`）；
+    /// 会话未用过 `todo` 时为 `None`，与“零完成”区分。
+    #[serde(default)]
+    pub todo_completion: Option<crate::application::todo::TodoCompletion>,
     /// 首事件时刻。
     pub started_at: Option<SystemTime>,
     /// 末事件时刻。
@@ -541,6 +547,7 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
         sandbox_protected_runs: 0,
         sandbox_unprotected_runs: 0,
         sandbox_degraded_runs: 0,
+        todo_completion: None,
         started_at: log.started_at(),
         ended_at: log.ended_at(),
         wall_clock_ms: wall_clock_of(log),
@@ -702,6 +709,13 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
         }
     }
     summary.repeated_calls = repeated;
+    // 会话用过的待办按事件重放完成率；没用过保持 None，避免“0 完成”
+    // 与“没有待办”混淆。
+    let todo_events = crate::application::todo::todo_events_from_evidence(&log.events);
+    if !todo_events.is_empty() {
+        summary.todo_completion =
+            Some(crate::application::todo::todo_completion_rate(&todo_events));
+    }
     // 证据台账，与模型上下文中的一致。
     summary.evidence_index =
         EvidenceIndex::from_events(log.events.iter().map(|evidence| &evidence.event));
@@ -1099,6 +1113,44 @@ mod tests {
         }
     }
 
+    // todo 观察结果的载荷是 TodoToolReply 的 JSON（真实工具输出形状），
+    // 重放逻辑以最后一份非空 snapshot 为准。
+    fn todo_observation(sequence: u64, total: usize, done: usize) -> Evidence {
+        use crate::application::todo::{TodoEvent, TodoOperation, TodoToolReply};
+        use crate::domain::todo::{TodoItem, TodoStatus};
+        let items: Vec<TodoItem> = (0..total)
+            .map(|index| TodoItem {
+                id: format!("item-{index}"),
+                content: format!("待办 {index}"),
+                status: if index < done {
+                    TodoStatus::Completed
+                } else {
+                    TodoStatus::Pending
+                },
+            })
+            .collect();
+        let reply = TodoToolReply {
+            id: None,
+            items: items.clone(),
+            event: TodoEvent {
+                operation: TodoOperation::Update {
+                    id: format!("item-{}", done.saturating_sub(1)),
+                    from: TodoStatus::InProgress,
+                    to: TodoStatus::Completed,
+                },
+                snapshot: items,
+            },
+        };
+        evidence(
+            sequence,
+            AuditEvent::ToolObserved {
+                turn: 1,
+                call: call("todo"),
+                outcome: ToolOutcome::success(&serde_json::to_string(&reply).unwrap_or_default()),
+            },
+        )
+    }
+
     fn evidence(sequence: u64, event: AuditEvent) -> Evidence {
         // 毫秒间隔：序号即毫秒偏移，合成数据因此具有亚秒级时序，便于
         // 验证墙钟与轮延迟统计。
@@ -1381,6 +1433,58 @@ mod tests {
             .remove("sandbox_degraded_runs");
         let back: BenchmarkReport = serde_json::from_value(legacy).expect("缺字段的旧报表可反序列化");
         assert_eq!(back.sessions[0].sandbox_degraded_runs, 0);
+    }
+
+    #[test]
+    fn todo_completion_is_replayed_from_observations() {
+        // 会话用过 todo：按最后一次快照算完成率（2/3）。
+        let used = SessionLog {
+            session_id: SessionId::new("todo-used"),
+            events: vec![
+                todo_observation(1, 3, 1),
+                todo_observation(2, 3, 2),
+            ],
+            skipped_lines: 0,
+        };
+        let summary = summarize(&used);
+        let completion = summary
+            .todo_completion
+            .expect("用过 todo 就应有完成率");
+        assert_eq!(completion.total, 3);
+        assert_eq!(completion.completed, 2);
+
+        let report = BenchmarkReport::from_sessions(&[used]);
+        let text = render_json(&report).expect("序列化");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("JSON 报表");
+        assert_eq!(value["sessions"][0]["todo_completion"]["total"], 3);
+        assert_eq!(value["sessions"][0]["todo_completion"]["completed"], 2);
+
+        // 旧报表没有该字段：反序列化补 None，不能判整份报表损坏。
+        let mut legacy = value;
+        legacy["sessions"][0]
+            .as_object_mut()
+            .expect("会话是对象")
+            .remove("todo_completion");
+        let back: BenchmarkReport = serde_json::from_value(legacy).expect("缺字段的旧报表可反序列化");
+        assert_eq!(back.sessions[0].todo_completion, None);
+
+        // 会话没用过 todo：保持 None，与“零完成”区分。
+        let unused = SessionLog {
+            session_id: SessionId::new("todo-unused"),
+            events: vec![evidence(1, AuditEvent::Thought {
+                turn: 1,
+                text: "与待办无关".to_owned(),
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cost_usd: None,
+                },
+            })],
+            skipped_lines: 0,
+        };
+        assert_eq!(summarize(&unused).todo_completion, None);
     }
 
     #[test]
