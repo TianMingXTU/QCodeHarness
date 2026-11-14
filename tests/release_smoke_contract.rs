@@ -1,4 +1,4 @@
-﻿//! 发布冒烟脚本的契约测试。
+//! 发布冒烟脚本的契约测试。
 //!
 //! R0 验收要求三平台冒烟脚本齐备、校验失败必须停下。这里在真实 POSIX
 //! shell 里演练干净安装、冒烟、回滚与篡改校验拒绝路径；不依赖模型或网络。
@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 
 fn scratch(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -29,15 +29,20 @@ fn posix_bin(name: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn sh(script: &Path, args: &[&str], workdir: &Path) -> Output {
     let mut cmd = Command::new("sh");
     cmd.arg(script).args(args).current_dir(workdir);
     // 冒烟脚本把安装根放在 $HOME 下；隔离 HOME 避免碰真实用户目录。
     // QCH_* 环境变量一并清掉，防止开发者机器上的策略配置让假二进制跑偏。
     cmd.env("HOME", workdir.join("home"));
-    cmd.arg("--root")
-        .arg(workdir.join("install-root"));
-    for key in ["QCH_CONFIG", "QCH_POLICY", "QCH_MCP_CONFIG", "QCH_AUTO_APPROVE"] {
+    cmd.arg("--root").arg(workdir.join("install-root"));
+    for key in [
+        "QCH_CONFIG",
+        "QCH_POLICY",
+        "QCH_MCP_CONFIG",
+        "QCH_AUTO_APPROVE",
+    ] {
         cmd.env_remove(key);
     }
     cmd.output().expect("运行 POSIX 脚本")
@@ -45,7 +50,7 @@ fn sh(script: &Path, args: &[&str], workdir: &Path) -> Output {
 
 fn fake_package(package: &Path, binary_body: &str) {
     fs::create_dir_all(package).expect("创建发行包目录");
-    let mut exe = package.join("QCodeHarness");
+    let exe = package.join("QCodeHarness");
     fs::write(&exe, binary_body).expect("写入假二进制");
     #[cfg(unix)]
     {
@@ -107,8 +112,7 @@ fn 三平台冒烟脚本必须齐备() {
     for name in ["smoke.sh", "smoke.ps1"] {
         assert!(scripts.join(name).is_file(), "缺少冒烟脚本 {name}");
     }
-    let ci = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(".github/workflows/ci.yml");
+    let ci = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
     let ci_text = fs::read_to_string(ci).expect("读取 ci.yml");
     assert!(
         ci_text.contains("smoke.sh") && ci_text.contains("smoke.ps1"),
@@ -156,8 +160,11 @@ fn powershell冒烟脚本执行校验_安装_冒烟_回滚全链路() {
     // Windows 冒烟脚本按 QCodeHarness.exe 定位主程序。这里放一个字节数
     // 为空的占位文件供 install.ps1 复制；实际执行交给同名的 .cmd 包装，
     // Windows 会优先按 PATHEXT 找到它。这样不必编译假 exe 也能走完整链路。
-    fs::rename(package.join("QCodeHarness"), package.join("QCodeHarness.exe"))
-        .expect("改成 .exe 名称");
+    fs::rename(
+        package.join("QCodeHarness"),
+        package.join("QCodeHarness.exe"),
+    )
+    .expect("改成 .exe 名称");
     let script = "@echo off\r\n\
 if \"%1\"==\"--version\" echo QCodeHarness 1.0.0\r\n\
 if \"%1\"==\"--doctor\" echo {\"schema_version\":1,\"checks\":[{\"code\":\"model_configuration\",\"status\":\"warn\"}]}\r\n\
@@ -207,8 +214,11 @@ fn powershell校验和被篡改时必须拒绝安装() {
     let root = scratch("ps-bad");
     let package = root.join("QCodeHarness-v1.0.0-x86_64-pc-windows-msvc");
     fake_package(&package, "");
-    fs::rename(package.join("QCodeHarness"), package.join("QCodeHarness.exe"))
-        .expect("改成 .exe 名称");
+    fs::rename(
+        package.join("QCodeHarness"),
+        package.join("QCodeHarness.exe"),
+    )
+    .expect("改成 .exe 名称");
     let sums = fs::read_to_string(package.join("SHA256SUMS")).expect("读校验和");
     fs::write(
         package.join("SHA256SUMS"),

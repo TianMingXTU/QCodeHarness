@@ -28,7 +28,8 @@ fn signing_step_source(workflow: &str) -> String {
 
 #[test]
 fn 签名步骤必须从_secret注入签名密钥环境变量() {
-    let workflow = std::fs::read_to_string(workflow_path()).expect("读取 release.yml");    let step = signing_step_source(&workflow);
+    let workflow = std::fs::read_to_string(workflow_path()).expect("读取 release.yml");
+    let step = signing_step_source(&workflow);
 
     assert!(
         step.contains("QCH_SIGNING_KEY: ${{ secrets.QCH_SIGNING_KEY }}"),
