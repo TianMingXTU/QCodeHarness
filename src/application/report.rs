@@ -143,6 +143,9 @@ pub struct SessionSummary {
     /// 以及外部 MCP Server 的调用尝试。
     #[serde(default)]
     pub sandbox_unprotected_runs: usize,
+    /// 沙箱降级事件次数：隔离未生效或未实测，单独计数避免掩盖能力缺口。
+    #[serde(default)]
+    pub sandbox_degraded_runs: usize,
     /// 首事件时刻。
     pub started_at: Option<SystemTime>,
     /// 末事件时刻。
@@ -284,7 +287,11 @@ pub fn summarize_service_events(contents: &[u8], events_path: &Path) -> ServiceS
     for (index, line) in contents.split_inclusive(|byte| *byte == b'\n').enumerate() {
         let number = Some(index + 1);
         if line.last() != Some(&b'\n') {
-            summary.record_corrupt(events_path, number, "事件末行缺少换行，记录尚未完整提交".to_owned());
+            summary.record_corrupt(
+                events_path,
+                number,
+                "事件末行缺少换行，记录尚未完整提交".to_owned(),
+            );
             continue;
         }
         let event: ServiceEventMetadata = match serde_json::from_slice(line) {
@@ -298,7 +305,10 @@ pub fn summarize_service_events(contents: &[u8], events_path: &Path) -> ServiceS
             summary.record_corrupt(
                 events_path,
                 number,
-                format!("不支持的事件 version {}，当前版本为 {PROTOCOL_VERSION}", event.version),
+                format!(
+                    "不支持的事件 version {}，当前版本为 {PROTOCOL_VERSION}",
+                    event.version
+                ),
             );
             continue;
         }
@@ -334,7 +344,11 @@ pub fn summarize_service_events(contents: &[u8], events_path: &Path) -> ServiceS
     summary.events_total = Some(events_total);
     summary.status_counts = Some(counts);
     // 先去重再按最大序号求缺号数，乱序补回的序号不会被重复计为缺失。
-    summary.sequence_gaps = Some(sequences.last().map_or(0, |last| *last - sequences.len() as u64));
+    summary.sequence_gaps = Some(
+        sequences
+            .last()
+            .map_or(0, |last| *last - sequences.len() as u64),
+    );
     summary
 }
 
@@ -526,6 +540,7 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
         approval_reasks: 0,
         sandbox_protected_runs: 0,
         sandbox_unprotected_runs: 0,
+        sandbox_degraded_runs: 0,
         started_at: log.started_at(),
         ended_at: log.ended_at(),
         wall_clock_ms: wall_clock_of(log),
@@ -558,9 +573,7 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
                 add_usage(&mut summary, usage);
                 let at = evidence.recorded_at_millis();
                 if let Some(previous) = previous_thought_at {
-                    summary
-                        .turn_latencies_ms
-                        .push(at.saturating_sub(previous));
+                    summary.turn_latencies_ms.push(at.saturating_sub(previous));
                 }
                 previous_thought_at = Some(at);
             }
@@ -584,7 +597,12 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
                 crate::domain::tool::OutcomeStatus::Failed => summary.failed += 1,
                 crate::domain::tool::OutcomeStatus::Refused => summary.refused += 1,
             },
-            AuditEvent::ApprovalDecided { allowed, turn, tool, .. } => {
+            AuditEvent::ApprovalDecided {
+                allowed,
+                turn,
+                tool,
+                ..
+            } => {
                 summary.approvals += 1;
                 if *allowed {
                     summary.approved += 1;
@@ -616,9 +634,8 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
                 // 取不到锚点时不计。日志被截断或确实没有可追溯裁决时，间隔
                 // 只能猜测，猜测值比缺失更糟。
                 if let Some(asked_at) = asked_at {
-                    summary.approval_wait_ms += evidence
-                        .recorded_at_millis()
-                        .saturating_sub(asked_at);
+                    summary.approval_wait_ms +=
+                        evidence.recorded_at_millis().saturating_sub(asked_at);
                 }
             }
             AuditEvent::PolicyEvaluated { verdict, .. } => match verdict {
@@ -679,6 +696,9 @@ pub fn summarize(log: &SessionLog) -> SessionSummary {
                     summary.mcp_unknown_results += 1;
                 }
             }
+            // 降级不等于"未保护"：后者是进程边界未纳管，前者是隔离能力
+            // 未被证明生效。审计必须能单独看到后者。
+            AuditEvent::SandboxDegraded { .. } => summary.sandbox_degraded_runs += 1,
         }
     }
     summary.repeated_calls = repeated;
@@ -792,35 +812,56 @@ pub fn service_summary_lines(service: &ServiceSummary) -> Vec<String> {
         ServiceSummaryStatus::Read => "元数据已读取（read）",
         ServiceSummaryStatus::Incomplete => "读取不完整（incomplete）",
     };
-    let number = |value: Option<u64>| value.map_or_else(|| "未知".to_owned(), |value| value.to_string());
+    let number =
+        |value: Option<u64>| value.map_or_else(|| "未知".to_owned(), |value| value.to_string());
     let counts = |values: Option<Vec<String>>| match values {
         Some(values) if values.is_empty() => "无".to_owned(),
         Some(values) => values.join(", "),
         None => "未知".to_owned(),
     };
-    let versions = |values: &Option<BTreeMap<u64, usize>>| counts(values.as_ref().map(|values| {
-        values.iter().map(|(version, count)| format!("{version}={count}")).collect()
-    }));
+    let versions = |values: &Option<BTreeMap<u64, usize>>| {
+        counts(values.as_ref().map(|values| {
+            values
+                .iter()
+                .map(|(version, count)| format!("{version}={count}"))
+                .collect()
+        }))
+    };
     let mut lines = vec![
         format!("常驻服务：{label}"),
         format!(
             "  事件 {}；序号 {}..{}；缺号 {}；任务快照 {}",
             number(service.events_total.map(|value| value as u64)),
-            number(service.first_sequence), number(service.last_sequence),
-            number(service.sequence_gaps), number(service.task_count.map(|value| value as u64)),
+            number(service.first_sequence),
+            number(service.last_sequence),
+            number(service.sequence_gaps),
+            number(service.task_count.map(|value| value as u64)),
         ),
         format!(
             "  状态版本 {}；任务快照版本 {}；运行快照版本 {}",
-            number(service.state_schema_version), versions(&service.task_version_counts),
+            number(service.state_schema_version),
+            versions(&service.task_version_counts),
             versions(&service.snapshot_version_counts),
         ),
-        format!("  事件类型：{}", counts(service.status_counts.as_ref().map(|values| {
-            values.iter().map(|(kind, count)| format!("{kind}={count}")).collect()
-        }))),
+        format!(
+            "  事件类型：{}",
+            counts(service.status_counts.as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(|(kind, count)| format!("{kind}={count}"))
+                    .collect()
+            }))
+        ),
     ];
     for issue in &service.corrupt_files {
-        let line = issue.line.map_or_else(String::new, |line| format!(":{line}"));
-        lines.push(format!("  {}{line}：{}", issue.path.display(), issue.reason));
+        let line = issue
+            .line
+            .map_or_else(String::new, |line| format!(":{line}"));
+        lines.push(format!(
+            "  {}{line}：{}",
+            issue.path.display(),
+            issue.reason
+        ));
     }
     lines
 }
@@ -833,7 +874,19 @@ pub fn service_summary_lines(service: &ServiceSummary) -> Vec<String> {
 pub fn render_text(report: &BenchmarkReport) -> String {
     // 列定义：表头固定，数据取自摘要。
     let headers = [
-        "会话", "事件", "模型", "工具成", "工具败", "工具拒", "审批", "等审ms", "输入tok", "缓存tok", "命中率", "墙钟ms", "成本",
+        "会话",
+        "事件",
+        "模型",
+        "工具成",
+        "工具败",
+        "工具拒",
+        "审批",
+        "等审ms",
+        "输入tok",
+        "缓存tok",
+        "命中率",
+        "墙钟ms",
+        "成本",
     ];
     let rows_of = |summary: &SessionSummary| -> Vec<String> {
         vec![
@@ -854,10 +907,7 @@ pub fn render_text(report: &BenchmarkReport) -> String {
     };
 
     let data: Vec<Vec<String>> = report.sessions.iter().map(rows_of).collect();
-    let mut widths: Vec<usize> = headers
-        .iter()
-        .map(|header| display_width(header))
-        .collect();
+    let mut widths: Vec<usize> = headers.iter().map(|header| display_width(header)).collect();
     for row in &data {
         for (index, cell) in row.iter().enumerate() {
             widths[index] = widths[index].max(display_width(cell));
@@ -893,11 +943,36 @@ pub fn render_text(report: &BenchmarkReport) -> String {
     }
     let total = vec![
         "合计".to_owned(),
-        report.sessions.iter().map(|s| s.events).sum::<usize>().to_string(),
-        report.sessions.iter().map(|s| s.model_calls).sum::<usize>().to_string(),
-        report.sessions.iter().map(|s| s.succeeded).sum::<usize>().to_string(),
-        report.sessions.iter().map(|s| s.failed).sum::<usize>().to_string(),
-        report.sessions.iter().map(|s| s.refused).sum::<usize>().to_string(),
+        report
+            .sessions
+            .iter()
+            .map(|s| s.events)
+            .sum::<usize>()
+            .to_string(),
+        report
+            .sessions
+            .iter()
+            .map(|s| s.model_calls)
+            .sum::<usize>()
+            .to_string(),
+        report
+            .sessions
+            .iter()
+            .map(|s| s.succeeded)
+            .sum::<usize>()
+            .to_string(),
+        report
+            .sessions
+            .iter()
+            .map(|s| s.failed)
+            .sum::<usize>()
+            .to_string(),
+        report
+            .sessions
+            .iter()
+            .map(|s| s.refused)
+            .sum::<usize>()
+            .to_string(),
         report.total_approvals.to_string(),
         report.total_approval_wait_ms.to_string(),
         report.total_input_tokens.to_string(),
@@ -1039,13 +1114,25 @@ mod tests {
         SessionLog {
             session_id: SessionId::new("session-test-1"),
             events: vec![
-                evidence(1, AuditEvent::StepStarted { turn: 1, role: AgentRole::Coder }),
+                evidence(
+                    1,
+                    AuditEvent::StepStarted {
+                        turn: 1,
+                        role: AgentRole::Coder,
+                    },
+                ),
                 evidence(
                     2,
                     AuditEvent::Thought {
                         turn: 1,
                         text: "先写".to_owned(),
-                        usage: TokenUsage { input_tokens: 100, output_tokens: 20, cached_input_tokens: 0, cache_creation_input_tokens: 0, cost_usd: Some(0.25) },
+                        usage: TokenUsage {
+                            input_tokens: 100,
+                            output_tokens: 20,
+                            cached_input_tokens: 0,
+                            cache_creation_input_tokens: 0,
+                            cost_usd: Some(0.25),
+                        },
                     },
                 ),
                 evidence(
@@ -1058,7 +1145,13 @@ mod tests {
                         reason: "默认".to_owned(),
                     },
                 ),
-                evidence(4, AuditEvent::ToolRequested { turn: 1, call: call("write_file") }),
+                evidence(
+                    4,
+                    AuditEvent::ToolRequested {
+                        turn: 1,
+                        call: call("write_file"),
+                    },
+                ),
                 evidence(
                     5,
                     AuditEvent::ApprovalDecided {
@@ -1100,7 +1193,13 @@ mod tests {
                         reason: "只读".to_owned(),
                     },
                 ),
-                evidence(9, AuditEvent::ToolRequested { turn: 2, call: call("read_file") }),
+                evidence(
+                    9,
+                    AuditEvent::ToolRequested {
+                        turn: 2,
+                        call: call("read_file"),
+                    },
+                ),
                 evidence(
                     10,
                     AuditEvent::ToolObserved {
@@ -1144,8 +1243,14 @@ mod tests {
         assert_eq!(summary.events, 12);
         assert_eq!(summary.model_calls, 2);
         assert_eq!(summary.tool_calls, 2);
-        assert_eq!((summary.succeeded, summary.failed, summary.refused), (1, 1, 0));
-        assert_eq!((summary.approvals, summary.approved, summary.denied), (1, 1, 0));
+        assert_eq!(
+            (summary.succeeded, summary.failed, summary.refused),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            (summary.approvals, summary.approved, summary.denied),
+            (1, 1, 0)
+        );
         assert_eq!(
             (
                 summary.policy_allow,
@@ -1208,6 +1313,76 @@ mod tests {
         assert_eq!(back, report);
     }
 
+    /// 沙箱降级必须单列计数，不能并入"已保护"或"未保护"任一侧：
+    /// 降级表示隔离未证明生效，把它算成受保护会掩盖能力缺口。
+    #[test]
+    fn sandbox_degraded_runs_are_counted_separately() {
+        use crate::domain::sandbox_fact::{
+            SandboxCapability, SandboxDegradedFact, SandboxSliceFact, SandboxSliceStatus,
+        };
+
+        let fact = SandboxDegradedFact::from_slices(
+            "本平台缺少文件系统隔离，按降级处理",
+            vec![SandboxSliceFact::new(
+                SandboxCapability::FileSystem,
+                SandboxSliceStatus::Untested,
+                "未实测",
+                "本平台没有已实测的文件系统隔离",
+            )],
+        );
+        let log = SessionLog {
+            session_id: SessionId::new("degraded-slices"),
+            events: vec![
+                evidence(
+                    1,
+                    AuditEvent::SandboxDegraded {
+                        turn: 1,
+                        call: call("run_command"),
+                        fact: fact.clone(),
+                    },
+                ),
+                evidence(
+                    2,
+                    AuditEvent::SandboxDegraded {
+                        turn: 2,
+                        call: call("mcp__server__fetch"),
+                        fact,
+                    },
+                ),
+                evidence(
+                    3,
+                    AuditEvent::SandboxApplied {
+                        turn: 3,
+                        call: call("run_command"),
+                        platform: "Linux".to_owned(),
+                        active: false,
+                        boundary_checked: false,
+                    },
+                ),
+            ],
+            skipped_lines: 0,
+        };
+
+        let summary = summarize(&log);
+        assert_eq!(summary.sandbox_degraded_runs, 2);
+        assert_eq!(summary.sandbox_unprotected_runs, 1);
+        assert_eq!(summary.sandbox_protected_runs, 0);
+
+        let report = BenchmarkReport::from_sessions(&[log]);
+        let text = render_json(&report).expect("序列化");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("JSON 报表");
+        assert_eq!(value["sessions"][0]["sandbox_degraded_runs"], 2);
+
+        // 旧报表没有该字段：反序列化必须补 0，不能因此判整份报表损坏。
+        let mut legacy = value;
+        legacy["sessions"][0]
+            .as_object_mut()
+            .expect("会话是对象")
+            .remove("sandbox_degraded_runs");
+        let back: BenchmarkReport = serde_json::from_value(legacy).expect("缺字段的旧报表可反序列化");
+        assert_eq!(back.sessions[0].sandbox_degraded_runs, 0);
+    }
+
     #[test]
     fn one_unknown_cost_makes_the_whole_session_unknown() {
         let summary = summarize(&synthetic_log(None));
@@ -1242,7 +1417,13 @@ mod tests {
             AuditEvent::Thought {
                 turn,
                 text: "最终答案".to_owned(),
-                usage: TokenUsage { input_tokens: 10, output_tokens: 5, cached_input_tokens: 0, cache_creation_input_tokens: 0, cost_usd: cost },
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cost_usd: cost,
+                },
             },
         ));
         log
@@ -1318,7 +1499,10 @@ mod tests {
             skipped_lines: 0,
         });
 
-        assert_eq!(summary.cache_hit_ratio, None, "没有输入 token 时是未知而非 0%");
+        assert_eq!(
+            summary.cache_hit_ratio, None,
+            "没有输入 token 时是未知而非 0%"
+        );
         assert_eq!(hit_ratio_label(summary.cache_hit_ratio), "—");
     }
 
@@ -1374,7 +1558,13 @@ mod tests {
         // 合成数据的步进是 250ms：三轮思考 → 两个 250ms 间隔。
         log.events.clear();
         log.events = vec![
-            evidence(1, AuditEvent::StepStarted { turn: 1, role: AgentRole::Coder }),
+            evidence(
+                1,
+                AuditEvent::StepStarted {
+                    turn: 1,
+                    role: AgentRole::Coder,
+                },
+            ),
             evidence(
                 2,
                 AuditEvent::Thought {
@@ -1524,7 +1714,10 @@ mod tests {
         let summary = summarize(&log);
 
         assert_eq!(summary.policy_allow, 1, "证据里仍是策略原判");
-        assert_eq!(summary.policy_require_approval, 0, "升级不增加 RequireApproval 计数");
+        assert_eq!(
+            summary.policy_require_approval, 0,
+            "升级不增加 RequireApproval 计数"
+        );
         assert_eq!(summary.approvals, 1);
         assert_eq!(summary.approval_wait_ms, 250, "升级路径的等待必须计入");
     }
@@ -1557,13 +1750,43 @@ mod tests {
             arguments: json!({"path": path}),
         };
         log.events = vec![
-            evidence(1, AuditEvent::ToolRequested { turn: 1, call: read("Cargo.toml") }),
-            evidence(1, AuditEvent::ToolRequested { turn: 1, call: read("src/lib.rs") }),
+            evidence(
+                1,
+                AuditEvent::ToolRequested {
+                    turn: 1,
+                    call: read("Cargo.toml"),
+                },
+            ),
+            evidence(
+                1,
+                AuditEvent::ToolRequested {
+                    turn: 1,
+                    call: read("src/lib.rs"),
+                },
+            ),
             // 同一个文件再来一遍：重复。
-            evidence(2, AuditEvent::ToolRequested { turn: 2, call: read("Cargo.toml") }),
+            evidence(
+                2,
+                AuditEvent::ToolRequested {
+                    turn: 2,
+                    call: read("Cargo.toml"),
+                },
+            ),
             // 同名不同参：不是重复。
-            evidence(3, AuditEvent::ToolRequested { turn: 3, call: read("README.md") }),
-            evidence(4, AuditEvent::ToolRequested { turn: 4, call: read("README.md") }),
+            evidence(
+                3,
+                AuditEvent::ToolRequested {
+                    turn: 3,
+                    call: read("README.md"),
+                },
+            ),
+            evidence(
+                4,
+                AuditEvent::ToolRequested {
+                    turn: 4,
+                    call: read("README.md"),
+                },
+            ),
         ];
 
         let summary = summarize(&log);
@@ -1658,8 +1881,9 @@ mod tests {
         let mut bare = synthetic_log(Some(0.25));
         for evidence in &mut bare.events {
             match &mut evidence.event {
-                AuditEvent::Thought { usage, .. }
-                | AuditEvent::SummaryGenerated { usage, .. } => *usage = TokenUsage::default(),
+                AuditEvent::Thought { usage, .. } | AuditEvent::SummaryGenerated { usage, .. } => {
+                    *usage = TokenUsage::default()
+                }
                 _ => {}
             }
         }
@@ -1685,7 +1909,9 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(&text).expect("JSON 报表");
         let session = value["sessions"][0].as_object_mut().expect("会话摘要");
         session.remove("sandbox_protected_runs").expect("新增字段");
-        session.remove("sandbox_unprotected_runs").expect("新增字段");
+        session
+            .remove("sandbox_unprotected_runs")
+            .expect("新增字段");
 
         let back: BenchmarkReport = serde_json::from_value(value).expect("旧报表必须能读");
         assert_eq!(back.sessions[0].sandbox_protected_runs, 0);
@@ -1753,7 +1979,13 @@ mod tests {
                         reason: "只读".to_owned(),
                     },
                 ),
-                evidence(2, AuditEvent::ToolRequested { turn: 1, call: call("read_file") }),
+                evidence(
+                    2,
+                    AuditEvent::ToolRequested {
+                        turn: 1,
+                        call: call("read_file"),
+                    },
+                ),
                 evidence(
                     3,
                     AuditEvent::ToolObserved {
@@ -1804,10 +2036,8 @@ mod tests {
     /// 为该值下降。否则"等待成本降低"无法核对。
     #[test]
     fn report_shows_approval_wait_beside_the_approval_count() {
-        let report = BenchmarkReport::from_sessions(&[
-            synthetic_log(Some(0.25)),
-            synthetic_log(Some(0.25)),
-        ]);
+        let report =
+            BenchmarkReport::from_sessions(&[synthetic_log(Some(0.25)), synthetic_log(Some(0.25))]);
 
         assert_eq!(report.total_approvals, 2);
         assert_eq!(report.total_approval_wait_ms, 1000);

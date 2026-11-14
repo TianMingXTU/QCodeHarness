@@ -138,11 +138,7 @@ impl PolicyRule {
     /// 工具名与作用域两个条件都满足才算匹配：`tool` 为 `None` 是通配，
     /// 否则必须精确匹配；作用域为 `None` 表示不再卡参数。
     pub fn matches(&self, call: &ToolCall) -> bool {
-        self.tool_matches(call)
-            && self
-                .scope
-                .as_ref()
-                .is_none_or(|scope| scope.matches(call))
+        self.tool_matches(call) && self.scope.as_ref().is_none_or(|scope| scope.matches(call))
     }
 
     /// 工具名是否匹配（不看作用域）。
@@ -211,7 +207,12 @@ pub struct PolicyEngine {
 /// 需要放宽或收窄时，复制 `policy.example.toml` 修改并设置 `QCH_POLICY`；
 /// 显式配置整体取代基线，不与之合并。
 fn baseline_rules() -> Vec<PolicyRule> {
-    const SAFE_HEADS: &[&str] = &["cargo test *", "cargo build *", "git status *", "git diff *"];
+    const SAFE_HEADS: &[&str] = &[
+        "cargo test *",
+        "cargo build *",
+        "git status *",
+        "git diff *",
+    ];
     SAFE_HEADS
         .iter()
         .map(|head| PolicyRule {
@@ -283,7 +284,10 @@ impl PolicyEngine {
             }
             // 工具名匹配但作用域无从求值（参数缺失或不是字符串），且规则
             // 为 deny：按命中处理。
-            if rule.verdict == PolicyVerdict::Deny && rule.tool_matches(call) && rule.scope_unevaluable(call) {
+            if rule.verdict == PolicyVerdict::Deny
+                && rule.tool_matches(call)
+                && rule.scope_unevaluable(call)
+            {
                 return PolicyDecision {
                     verdict: PolicyVerdict::Deny,
                     reason: format!(
@@ -297,7 +301,10 @@ impl PolicyEngine {
 
         // 默认策略：只读放行、非只读审批
         let (verdict, reason) = if spec.annotations.read_only {
-            (PolicyVerdict::Allow, "默认策略：只读工具自动放行".to_owned())
+            (
+                PolicyVerdict::Allow,
+                "默认策略：只读工具自动放行".to_owned(),
+            )
         } else {
             (
                 PolicyVerdict::RequireApproval,
@@ -342,11 +349,7 @@ mod tests {
     /// 生产路径通过 `PolicyEngine::with_rules` 与
     /// `infrastructure::policy::parse` 装配。`PolicyRule::new` 只供测试使用，
     /// 因此保留在这里，不放入公开 API。
-    fn rule(
-        tool: Option<&str>,
-        verdict: PolicyVerdict,
-        description: &str,
-    ) -> PolicyRule {
+    fn rule(tool: Option<&str>, verdict: PolicyVerdict, description: &str) -> PolicyRule {
         PolicyRule {
             tool: tool.map(ToOwned::to_owned),
             scope: None,
@@ -464,8 +467,12 @@ mod tests {
                 .verdict,
             PolicyVerdict::Allow
         );
-        let suspect = crate::domain::sandbox::write_escape_suspect(r"cargo test > C:\Windows\temp\x");
-        assert!(suspect.is_some(), "越界写入必须能被认出来，否则升级无从触发");
+        let suspect =
+            crate::domain::sandbox::write_escape_suspect(r"cargo test > C:\Windows\temp\x");
+        assert!(
+            suspect.is_some(),
+            "越界写入必须能被认出来，否则升级无从触发"
+        );
     }
 
     /// 基线放行的命令族中，不带 `>` 也不带写入型动词的越界同样要能识别。
@@ -496,7 +503,12 @@ mod tests {
         }
 
         // 同一族命令不带越界参数时照旧免审，否则基线就白放了。
-        for command in ["git diff", "cargo test", "cargo build --release", "git status"] {
+        for command in [
+            "git diff",
+            "cargo test",
+            "cargo build --release",
+            "git status",
+        ] {
             assert!(
                 crate::domain::sandbox::write_escape_suspect(command).is_none(),
                 "`{command}` 没有提到 workspace 外的路径，不该被升级拖去审批"
@@ -529,7 +541,11 @@ mod tests {
 
     #[test]
     fn explicit_allow_rule_overrides_default() {
-        let engine = engine_with(Some("write_file"), PolicyVerdict::Allow, "测试规则：write_file 自动放行");
+        let engine = engine_with(
+            Some("write_file"),
+            PolicyVerdict::Allow,
+            "测试规则：write_file 自动放行",
+        );
 
         let call = test_call("write_file");
         let spec = test_spec(false);
@@ -593,7 +609,11 @@ mod tests {
 
     #[test]
     fn wildcard_rule_matches_all_tools() {
-        let engine = engine_with(None, PolicyVerdict::RequireApproval, "安全策略：所有工具都要审批");
+        let engine = engine_with(
+            None,
+            PolicyVerdict::RequireApproval,
+            "安全策略：所有工具都要审批",
+        );
 
         let call1 = test_call("read_file");
         let call2 = test_call("write_file");
@@ -783,7 +803,10 @@ mod tests {
         // 参数名不是 path：条件无从求值。
         assert_eq!(
             engine
-                .evaluate(&test_call_with("mcp__x__get_file", json!({"file": "secrets/k"})), &spec)
+                .evaluate(
+                    &test_call_with("mcp__x__get_file", json!({"file": "secrets/k"})),
+                    &spec
+                )
                 .verdict,
             PolicyVerdict::Deny,
             "deny 的条件求值不了时必须拒绝，不能落回默认策略放行"
@@ -791,7 +814,10 @@ mod tests {
         // 参数名对、且命中：照旧拒绝。
         assert_eq!(
             engine
-                .evaluate(&test_call_with("mcp__x__get_file", json!({"path": "secrets/k"})), &spec)
+                .evaluate(
+                    &test_call_with("mcp__x__get_file", json!({"path": "secrets/k"})),
+                    &spec
+                )
                 .verdict,
             PolicyVerdict::Deny
         );
@@ -871,7 +897,10 @@ mod tests {
 
         assert_eq!(
             engine
-                .evaluate(&test_call_with("write_file", json!({"path": "src/main.rs"})), &spec)
+                .evaluate(
+                    &test_call_with("write_file", json!({"path": "src/main.rs"})),
+                    &spec
+                )
                 .verdict,
             PolicyVerdict::Allow
         );
@@ -906,13 +935,19 @@ mod tests {
 
         assert_eq!(
             engine
-                .evaluate(&test_call_with("write_file", json!({"path": "src/"})), &spec)
+                .evaluate(
+                    &test_call_with("write_file", json!({"path": "src/"})),
+                    &spec
+                )
                 .verdict,
             PolicyVerdict::Allow
         );
         assert_eq!(
             engine
-                .evaluate(&test_call_with("write_file", json!({"path": "src/main.rs"})), &spec)
+                .evaluate(
+                    &test_call_with("write_file", json!({"path": "src/main.rs"})),
+                    &spec
+                )
                 .verdict,
             PolicyVerdict::RequireApproval
         );

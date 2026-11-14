@@ -52,7 +52,11 @@ fn suffixed(path: &str, suffix: &str) -> String {
 fn run_victim(log_path: &str) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
             let millis = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis())

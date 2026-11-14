@@ -38,7 +38,10 @@ pub struct GitStatus {
 impl GitStatus {
     /// 以 `root` 为仓库根构造。
     pub fn new(root: WorkspaceRoot) -> Self {
-        Self { root, policy: SandboxPolicy::default() }
+        Self {
+            root,
+            policy: SandboxPolicy::default(),
+        }
     }
 
     /// 工具规格。
@@ -65,8 +68,12 @@ impl GitStatus {
             return ToolOutcome::refused(refusal);
         }
         let execution = run_with_policy(
-            &self.root, "git status --porcelain=v1", GIT_TIMEOUT, &self.policy,
-        ).await;
+            &self.root,
+            "git status --porcelain=v1",
+            GIT_TIMEOUT,
+            &self.policy,
+        )
+        .await;
         git_outcome(execution, true)
     }
 }
@@ -86,7 +93,10 @@ pub struct GitDiff {
 impl GitDiff {
     /// 以 `root` 为仓库根构造。
     pub fn new(root: WorkspaceRoot) -> Self {
-        Self { root, policy: SandboxPolicy::default() }
+        Self {
+            root,
+            policy: SandboxPolicy::default(),
+        }
     }
 
     /// 工具规格。
@@ -247,7 +257,15 @@ mod tests {
     fn commit_all(repo: &PathBuf) {
         for args in [
             vec!["add", "."],
-            vec!["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "init",
+            ],
         ] {
             let output = std::process::Command::new("git")
                 .args(&args)
@@ -353,8 +371,17 @@ mod tests {
         let tool = GitStatus::new(WorkspaceRoot::new(&repo));
         let outcome = tool.run().await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        assert!(outcome.content.contains("changed.txt"), "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("changed.txt"),
+            "{}",
+            outcome.content
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -369,7 +396,12 @@ mod tests {
         let tool = GitStatus::new(WorkspaceRoot::new(&repo));
         let outcome = tool.run().await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("干净"), "{}", outcome.content);
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -385,7 +417,12 @@ mod tests {
         let tool = GitDiff::new(WorkspaceRoot::new(&repo));
         let outcome = tool.run(false).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("+新的一行"), "{}", outcome.content);
         assert!(outcome.content.contains("-旧的一行"), "{}", outcome.content);
         let _ = std::fs::remove_dir_all(&repo);
@@ -401,7 +438,12 @@ mod tests {
         let tool = GitDiff::new(WorkspaceRoot::new(&repo));
         let outcome = tool.run(false).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("没有差异"), "{}", outcome.content);
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -419,7 +461,11 @@ mod tests {
         let staged = tool.run(true).await;
         let unstaged = tool.run(false).await;
 
-        assert!(staged.content.contains("没有差异"), "staged diff 不应看到未暂存改动: {}", staged.content);
+        assert!(
+            staged.content.contains("没有差异"),
+            "staged diff 不应看到未暂存改动: {}",
+            staged.content
+        );
         assert!(unstaged.content.contains("+未暂存"), "{}", unstaged.content);
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -470,15 +516,27 @@ mod tests {
         let capabilities = PlatformCapabilities::detect();
         for outcome in [status.run().await, diff.run(false).await] {
             if capabilities.has_process_sandbox {
-                assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
-                assert!(outcome.content.contains("沙箱创建失败"), "{}", outcome.content);
+                assert_eq!(
+                    outcome.status,
+                    OutcomeStatus::Refused,
+                    "{}",
+                    outcome.content
+                );
+                assert!(
+                    outcome.content.contains("沙箱创建失败"),
+                    "{}",
+                    outcome.content
+                );
                 assert!(outcome.execution.is_none(), "命令没跑不能记边界证据");
             } else {
                 // 降级执行：命令真的跑了，边界证据如实记 active=false。
-                assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-                let boundary = outcome
-                    .execution
-                    .expect("跑过的命令必须留下执行边界");
+                assert_eq!(
+                    outcome.status,
+                    OutcomeStatus::Success,
+                    "{}",
+                    outcome.content
+                );
+                let boundary = outcome.execution.expect("跑过的命令必须留下执行边界");
                 assert!(!boundary.active, "没有进程沙箱的平台不得声称有保护");
             }
         }

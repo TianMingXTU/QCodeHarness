@@ -17,34 +17,46 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use qcode_harness::application::agent_roster::AgentRoster;
+use qcode_harness::application::background_jobs::BackgroundJobRegistry;
 use qcode_harness::application::agent_run::{
-    AgentDependencies, AgentRunner, RunState, new_session_id,
+    AgentDependencies, AgentOutcome, AgentRunner, RunState, new_session_id,
 };
 use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::delegation::ChildAgentFactory;
 use qcode_harness::application::doctor;
 use qcode_harness::application::error::ApplicationError;
+use qcode_harness::application::headless::{self, HeadlessArgs, HeadlessOutcome};
+use qcode_harness::application::hooks;
+use qcode_harness::application::hooks_compat::{self, HookConfigFormat};
+use qcode_harness::application::permission_profile_guard::ProfileGuard;
 use qcode_harness::application::extension::{ExtensionRegistry, ExtensionSelection};
 use qcode_harness::application::isolation::{IsolationWorkspace, WorkspaceVerifier};
 use qcode_harness::application::mcp_lifecycle::McpLifecycleRecorder;
 use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
+use qcode_harness::application::tool_guard::ToolGuard;
 use qcode_harness::application::port::{
-    ApprovalGate, Clock, EvidenceSink, ModelGateway, NoopHooks, TimeLimiter, Timestamp,
+    ApprovalGate, Clock, EvidenceSink, ModelGateway, NoopHooks, RunHooks, TimeLimiter, Timestamp,
 };
 use qcode_harness::application::provider_registry::ProviderRegistry;
 use qcode_harness::application::report::{BenchmarkReport, render_json, render_text};
 use qcode_harness::application::service::TaskService;
 use qcode_harness::application::snapshot::{RunSnapshot, SessionStore, TaskStore};
 use qcode_harness::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
+use qcode_harness::application::todo::TodoToolSource;
+use qcode_harness::application::web_tools::{
+    WebFetchTool, WebSearchTool, WebToolSource, WebToolSpecs, WebTransport,
+};
+use qcode_harness::infrastructure::background_jobs::JobListToolSource;
 use qcode_harness::application::tool_registry::{ToolRegistry, ToolSource};
-use qcode_harness::domain::agent::{AgentRole, Effort, Verbosity};
+use qcode_harness::domain::agent::{AgentRole, AgentSpec, Effort, Verbosity};
 use qcode_harness::domain::budget::Budget;
 use qcode_harness::domain::config::AppConfig;
 use qcode_harness::domain::context::ContextBudget;
 use qcode_harness::domain::evidence::AuditEvent;
 use qcode_harness::domain::ids::{SessionId, TaskId};
 use qcode_harness::domain::policy::PolicyEngine;
+use qcode_harness::domain::permission_profile::PermissionProfile;
 use qcode_harness::domain::service::{ServiceCommand, ServiceError};
 use qcode_harness::domain::session::Turn;
 use qcode_harness::domain::task::TaskKind;
@@ -53,10 +65,13 @@ use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::infrastructure::approval::ai_review::AiReviewGate;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::approval::cli::CliApprovalGate;
+use qcode_harness::infrastructure::approval::profile_gate::ProfileApprovalGate;
 use qcode_harness::infrastructure::benchmark_runner::{
     language_summary_lines, run_benchmark, run_long_benchmark,
 };
+use qcode_harness::infrastructure::background_jobs::ProcessJobRegistry;
 use qcode_harness::infrastructure::clock::{SystemClock, TokioTimeLimiter};
+use qcode_harness::infrastructure::code_navigation::CodeNavigationToolSource;
 use qcode_harness::infrastructure::config;
 use qcode_harness::infrastructure::delegation::{
     CommandVerifier, StructuralVerifier, SubAgentToolSource,
@@ -68,15 +83,24 @@ use qcode_harness::infrastructure::git_worktree::GitWorktreeManager;
 use qcode_harness::infrastructure::instructions;
 use qcode_harness::infrastructure::mcp;
 use qcode_harness::infrastructure::mcp::config::McpConfig;
+use qcode_harness::application::provider_auth::{ProviderCredentials, SubscriptionCredentialSource};
+use qcode_harness::infrastructure::model::anthropic_messages::AnthropicMessagesProvider;
 use qcode_harness::infrastructure::model::openai_compat::OpenAiCompatProvider;
 use qcode_harness::infrastructure::policy;
+use qcode_harness::infrastructure::sandbox::r2;
 use qcode_harness::infrastructure::service_events;
 use qcode_harness::infrastructure::service_factory::{ProductionTaskFactory, ServiceFactoryConfig};
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
+use qcode_harness::infrastructure::skill_md;
 use qcode_harness::infrastructure::task_service::LocalTaskService;
 use qcode_harness::infrastructure::task_store::JsonTaskStore;
+use qcode_harness::infrastructure::todo::FileTodoStore;
 use qcode_harness::infrastructure::tool::{BuiltinToolSource, all_tools};
 use qcode_harness::infrastructure::worktree::RootedWorktreeScanner;
+use qcode_harness::infrastructure::web_tools::{load_web_policy, TcpWebTransport};
+use qcode_harness::application::web_ui::WebUiServer as _;
+use qcode_harness::application::web_ui;
+use qcode_harness::infrastructure::web_ui as infrastructure_web_ui;
 use qcode_harness::interface::cli::{self, ConsoleReporter, FrontendMode};
 use qcode_harness::interface::{stdio::StdioServer, terminal};
 use std::sync::Mutex;
@@ -324,6 +348,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if args.doctor {
         return render_doctor(&workspace, args.json);
     }
+    // --sandbox-debug 是只读判定入口：打印给定命令会命中的沙箱规则与
+    // 结论，不执行命令，也不需要配置或模型凭据。
+    if let Some(command) = &args.sandbox_debug {
+        let report = r2::debug_command(&workspace, command);
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|error| format!("cli_sandbox_debug: {error}"))?
+            );
+        } else {
+            println!("{report}");
+        }
+        return Ok(());
+    }
     if args.rotate_events {
         return rotate_service_events(&workspace, args.json);
     }
@@ -359,12 +398,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // 恢复探测同样不需要模型配置：只确认这个 MCP Server 能否通信，
     // 不执行任务、不涉及审批、不读会话历史。
     if let Some(server) = &args.mcp_reconnect {
-        return mcp_probe(&workspace, server, &app_config).await
+        return mcp_probe(&workspace, server, &app_config)
+            .await
             .map_err(|error| format!("cli_mcp_probe: {error}").into());
     }
 
-    let config = LlmConfig::from_env(&app_config)
-        .map_err(|error| format!("cli_llm_config: {error}"))?;
+    let config =
+        LlmConfig::from_env(&app_config).map_err(|error| format!("cli_llm_config: {error}"))?;
 
     // 命令行开关优先于环境变量：显式 --yes 覆盖配置默认值。
     let auto_approve = args.auto_approve || config.auto_approve;
@@ -382,6 +422,45 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // （/responses），DeepSeek 等兼容网关不支持。该约束封装在
     // OpenAiCompatProvider::new 中，装配方无需了解。
     let mut providers = ProviderRegistry::new();
+    // R1 多 provider 认证面：检测到订阅登录凭据（CLAUDE_CODE_OAUTH_TOKEN /
+    // ANTHROPIC_SUBSCRIPTION_TOKEN / QCH_ANTHROPIC_SUBSCRIPTION_TOKEN）时，
+    // Anthropic Messages 提供方登记为默认网关；凭据缺失时保持 OpenAI 兼容
+    // 网关不变。按角色模型/档位分配语义不受影响：网关对角色配置透明。
+    let subscription_env: Vec<(String, String)> = [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_SUBSCRIPTION_TOKEN",
+        "QCH_ANTHROPIC_SUBSCRIPTION_TOKEN",
+    ]
+    .iter()
+    .filter_map(|name| {
+        std::env::var(name).ok().map(|value| (name.to_string(), value))
+    })
+    .collect();
+    if !subscription_env.is_empty() {
+        let source = SubscriptionCredentialSource {
+            environment: subscription_env,
+            ..SubscriptionCredentialSource::default()
+        };
+        match ProviderCredentials::from_subscription(&source) {
+            Ok(credentials) => {
+                // 生产装配走 rig 的共享 reqwest 客户端（native-tls），订阅
+                // 登录的 authorization 头由 with_client 内的 middleware 注入。
+                let client = rig_reqwest::shared();
+                providers.register(Arc::new(AnthropicMessagesProvider::with_client(
+                    &credentials,
+                    "claude-default",
+                    client,
+                )));
+            }
+            Err(error) => {
+                // 凭据存在但读不出 token：明确报错退出，不用残缺凭据继续。
+                return Err(format!(
+                    "cli_provider_credentials: 订阅凭据读取失败: {error}"
+                )
+                .into());
+            }
+        }
+    }
     providers.register(Arc::new(OpenAiCompatProvider::new(
         config.base_url.as_str(),
         config.api_key.as_str(),
@@ -438,8 +517,39 @@ async fn run() -> Result<(), Box<dyn Error>> {
             mcp,
             verifier: verifier.clone(),
         });
+        // 服务打开会拿走 workspace 路径；Web UI 的事件日志路径先取好。
+        let events_path = workspace.join(".qcodeharness").join("events.jsonl");
         let service: Arc<dyn TaskService> =
             Arc::new(LocalTaskService::open(workspace, Arc::new(factory), budget, verifier).await?);
+        // --web-ui：本机单用户页面，消费同一 TaskService 事件流；页面静态
+        // 资源来自仓库 web/ 目录，缺文件启动失败而不是渲染空白页。
+        if args.web_ui {
+            let web_dir = std::env::current_dir()?.join("web");
+            let assets = web_ui::StaticAssets {
+                index_html: std::fs::read(web_dir.join("index.html"))
+                    .map_err(|error| format!("cli_web_ui: 读取 web/index.html 失败: {error}"))?,
+                app_js: std::fs::read(web_dir.join("app.js"))
+                    .map_err(|error| format!("cli_web_ui: 读取 web/app.js 失败: {error}"))?,
+            };
+            assets.validate()?;
+            let config = web_ui::WebUiConfig {
+                port: 0,
+                host: "127.0.0.1".to_owned(),
+                events_path,
+
+                assets,
+            };
+            config.validate()?;
+            let server =
+                infrastructure_web_ui::LocalWebUiServer::new(service.clone());
+            let port = server.bind(config).await?;
+            println!("Web UI 已启动: http://127.0.0.1:{port}（仅本机访问，Ctrl+C 退出）");
+            tokio::signal::ctrl_c()
+                .await
+                .map_err(|error| ServiceError::new("web_ui_signal", &error.to_string()))?;
+            server.shutdown().await?;
+            return Ok(());
+        }
         return serve_frontend(service, frontend).await.map_err(Into::into);
     }
 
@@ -471,7 +581,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         eprintln!("基准任务集: {}", benchmarks_root.display());
         eprintln!("模型: {} @ {}", config.model, config.base_url);
         if args.benchmark_long {
-            let results = run_long_benchmark(&deps, &budget, &benchmarks_root, &workspace).await
+            let results = run_long_benchmark(&deps, &budget, &benchmarks_root, &workspace)
+                .await
                 .map_err(|error| format!("cli_benchmark_long: {error}"))?;
             let passed = results.iter().filter(|result| result.passed).count();
             if args.json {
@@ -487,7 +598,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
             return Ok(());
         }
-        let results = run_benchmark(&deps, &budget, &benchmarks_root, &workspace).await
+        let results = run_benchmark(&deps, &budget, &benchmarks_root, &workspace)
+            .await
             .map_err(|error| format!("cli_benchmark: {error}"))?;
         let passed = results.iter().filter(|result| result.passed).count();
         if args.json {
@@ -509,8 +621,55 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // 工具注册表按来源装配：内置工具与每个 MCP Server 各为一个来源。
     // MCP 配置取 QCH_MCP_CONFIG，未设置时用配置文件里的 mcp_config_path。
     let workspace_root = WorkspaceRoot::new(workspace.clone());
-    let mut tool_sources: Vec<Arc<dyn ToolSource>> =
-        vec![Arc::new(BuiltinToolSource::new(workspace_root))];
+    // 后台作业注册表先建：run_command 的 background 参数与 job_list
+    // 共享同一份状态，装配顺序上必须先于内置工具源。
+    let job_registry: Arc<dyn BackgroundJobRegistry> = Arc::new(ProcessJobRegistry::new());
+    let mut tool_sources: Vec<Arc<dyn ToolSource>> = vec![Arc::new(
+        BuiltinToolSource::new(workspace_root).with_jobs(Arc::clone(&job_registry)),
+    )];
+
+    // R1 Web 工具：域名策略缺省空白名单（所有请求拒绝），可用
+    // QCH_WEB_POLICY 指定 TOML 策略文件；搜索端点取 QCH_WEB_SEARCH_ENDPOINT。
+    // 策略读不到时启动失败：残缺的域名表比"没有规则"更危险。
+    let web_rules = {
+        let path = std::env::var_os("QCH_WEB_POLICY").map(PathBuf::from);
+        load_web_policy(path.as_deref())
+            .map_err(|error| format!("cli_web_policy: {error}"))?
+    };
+    let transport = Arc::new(TcpWebTransport::new());
+    let search_endpoint = std::env::var("QCH_WEB_SEARCH_ENDPOINT").ok();
+    let web_source = WebToolSource::try_from_rules(
+        WebFetchTool::new(Arc::clone(&transport) as Arc<dyn WebTransport>),
+        WebSearchTool::new(
+            Arc::clone(&transport) as Arc<dyn WebTransport>,
+            search_endpoint.clone(),
+        ),
+        vec![WebToolSpecs::web_fetch(), WebToolSpecs::web_search()],
+        web_rules,
+    )
+    .map_err(|error| format!("cli_web_tools: {error}"))?;
+    let web_guard: Arc<dyn ToolGuard> = Arc::new(
+        web_source
+            .guard()
+            .with_search_endpoint(search_endpoint),
+    );
+    tool_sources.push(Arc::new(web_source));
+
+    // R1 Todo 工具：任务清单落 .qcodeharness/todos.json，与证据账本同根。
+    tool_sources.push(Arc::new(TodoToolSource::new(Arc::new(
+        FileTodoStore::new(workspace.join(".qcodeharness").join("todos.json")),
+    ))));
+
+    // R4 后台作业：作业清单工具从同一注册表读状态。
+    tool_sources.push(Arc::new(JobListToolSource::new(Arc::clone(
+        &job_registry,
+    ))));
+
+    // R4 代码导航：只读符号搜索/引用定位，多模态图片证据走同一证据账本。
+    tool_sources.push(Arc::new(CodeNavigationToolSource::new(
+        workspace.clone(),
+    )));
+
     // 所有连接汇总于此，三条正常结束路径都显式关闭（见
     // close_mcp_connections）。未配置 MCP 时为空。
     let mut mcp_sources: Vec<mcp::McpToolSource> = Vec::new();
@@ -520,8 +679,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if let Some(config_path) = mcp_config_path {
         // 配置文件存在但非法时进程退出。用户明确要接入 MCP，静默跳过会让
         // 模型使用残缺的工具清单运行（与策略配置同一原则）。
-        let mcp_config = McpConfig::load(&config_path)
-            .map_err(|error| format!("cli_mcp_config: {error}（文件: {}）", config_path.display()))?;
+        let mcp_config = McpConfig::load(&config_path).map_err(|error| {
+            format!("cli_mcp_config: {error}（文件: {}）", config_path.display())
+        })?;
         if let Some(mcp_config) = mcp_config {
             let recorder = mcp_lifecycle_recorder(&workspace);
             let (sources, warnings) = mcp::connect_all(&mcp_config, recorder).await;
@@ -647,6 +807,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     approval_mode,
                     store: store.clone(),
                     sessions_root: workspace.clone(),
+                    extra_guards: vec![Arc::clone(&web_guard)],
                 });
                 Some(Arc::new(SubAgentToolSource::new(
                     Arc::new(manager),
@@ -663,7 +824,35 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    // R3 hooks 阻断语义：QCH_HOOKS_CONFIG 指向 Claude Code（.json）或
+    // Codex（.toml）格式的钩子配置；存在未映射项即拒绝启动，映射成功后
+    // 合并进唯一 RunHooks 链，不另起第二套挂点。
+    let hooks_chain: Arc<dyn RunHooks> = match std::env::var_os("QCH_HOOKS_CONFIG") {
+        Some(path) => {
+            let path = PathBuf::from(&path);
+            let text = std::fs::read_to_string(&path).map_err(|error| {
+                format!("cli_hooks_config: 读取 {} 失败: {error}", path.display())
+            })?;
+            let format = match path.extension().and_then(|ext| ext.to_str()) {
+                Some("json") => HookConfigFormat::ClaudeCode,
+                Some("toml") => HookConfigFormat::Codex,
+                other => {
+                    return Err(format!(
+                        "cli_hooks_config: 无法按扩展名 {other:?} 识别 hooks 配置格式，只支持 .json（Claude Code）与 .toml（Codex）"
+                    )
+                    .into())
+                }
+            };
+            let report = hooks_compat::parse_hook_config(format, &text)
+                .map_err(|error| format!("cli_hooks_config: {error}"))?;
+            hooks::command_hooks_from_report(&report, Arc::new(NoopHooks), Some(workspace.clone()))
+                .map_err(|error| format!("cli_hooks_config: {error}"))? as Arc<dyn RunHooks>
+        }
+        None => Arc::new(NoopHooks),
+    };
+
     let shared = Shared {
+        hooks: hooks_chain,
         model,
         host_tools: registry,
         approvals,
@@ -675,11 +864,28 @@ async fn run() -> Result<(), Box<dyn Error>> {
         extensions,
         selection,
         delegate: delegate_source,
+        extra_guards: {
+            let mut guards: Vec<Arc<dyn ToolGuard>> = vec![web_guard];
+            // 档位守卫叠加在策略规则之上，只收紧或放宽基线；
+            // 只读档把非只读动作钉死为拒绝，审批在模型调用前发生。
+            if let Some(profile) = args.permission_profile {
+                guards.push(ProfileGuard::new(profile, None));
+            }
+            guards
+        },
+        permission_profile: args.permission_profile,
         limiter: Arc::new(
             TokioTimeLimiter::new(EXTENSION_TIMEOUT)
                 .map_err(|error| format!("cli_extension_timeout: {error}"))?,
         ),
     };
+
+    // ── exec 无头模式：单次任务、非交互、退出码语义明确（对标
+    // codex exec / claude -p）。复用普通任务的工具注册表与花名册，
+    // 审批换成档位闸门；无 profile 的写/开放动作在进模型前拒绝。──
+    if args.exec {
+        return run_exec(&shared, &workspace, &args, &budget, config.max_turns).await;
+    }
 
     // ── 恢复模式：任务、系统提示词与历史都来自快照，不重新拼装。──
     if let Some(id_text) = args.resume {
@@ -805,7 +1011,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // --kind 选模板；不传默认 bug-fix（最常见）。
     let kind_text = args.kind.as_deref().unwrap_or(TaskKind::BugFix.name());
     let Some(kind) = TaskKind::parse_name(kind_text) else {
-        eprintln!("cli_invalid_args: 未知的任务类型 {kind_text}；可用: bug-fix / feature / review / refactor");
+        eprintln!(
+            "cli_invalid_args: 未知的任务类型 {kind_text}；可用: bug-fix / feature / review / refactor"
+        );
         std::process::exit(2);
     };
 
@@ -877,6 +1085,105 @@ async fn run() -> Result<(), Box<dyn Error>> {
         outcome.session_id.as_str()
     );
     close_mcp_connections(&mcp_sources).await;
+    Ok(())
+}
+
+/// `exec` 无头模式的真实执行路径。
+///
+/// 复用普通任务的工具注册表与花名册，审批换成档位闸门：档位允许的动作
+/// 自动放行，禁止的直接否决，要求确认的交给非交互闸门。无 profile 时先
+/// 按 `headless` 的同一份判据做启动前收口，写/开放动作不进模型。
+/// 证据照常写 JSONL，`--json` 输出基准评测结构，退出码语义见 headless
+/// 模块常量（0 成功 / 1 失败 / 2 参数 / 3 审批拒绝 / 4 超时）。
+async fn run_exec(
+    shared: &Shared,
+    workspace: &Path,
+    args: &cli::CliArgs,
+    budget: &Budget,
+    max_turns: u32,
+) -> Result<(), Box<dyn Error>> {
+    let task_text = args.task.clone().unwrap_or_default();
+    let headless_args = HeadlessArgs {
+        task: task_text.clone(),
+        profile: args.permission_profile,
+        json: args.json,
+        timeout_secs: args.timeout_secs,
+        workspace: workspace.to_path_buf(),
+    };
+    if let Some(reason) = headless::default_read_only_refusal(&headless_args) {
+        return finish_exec(HeadlessOutcome::ApprovalRefused(reason), args.json);
+    }
+
+    let profile = args
+        .permission_profile
+        .unwrap_or(PermissionProfile::ReadOnly);
+    let session_id = SessionId::new(new_session_id(&*shared.clock).as_str());
+    let evidence_path = session_path(workspace, session_id.as_str());
+    let reporter = Arc::new(ConsoleReporter::new(max_turns));
+    let evidence = fanout_evidence(&evidence_path, reporter)?;
+    // 档位闸门包住非交互闸门：无头模式不等待人工答复，要求确认的动作
+    // 由内层闸门立即裁决，提前裁决照常写审批证据。
+    let approvals =
+        ProfileApprovalGate::new(Arc::new(AutoApproveGate), Arc::clone(&evidence), profile)
+            .boxed();
+    let profile_doc = shared
+        .roster
+        .find(AgentRole::Coder)
+        .ok_or_else(|| "cli_exec: 内置花名册缺少 Coder 档案".to_owned())?;
+    let spec = AgentSpec {
+        role: AgentRole::Coder,
+        system_prompt: profile_doc.system_prompt.clone(),
+        model: profile_doc.model.clone(),
+        effort: profile_doc.effort,
+        verbosity: profile_doc.verbosity,
+    };
+    // 档位守卫叠加在策略链之上：策略引擎照常裁决，档位只收紧或放宽
+    // 基线，不替代策略。
+    let deps = AgentDependencies {
+        model: Arc::clone(&shared.model),
+        tools: shared.host_tools.clone(),
+        approvals,
+        clock: Arc::clone(&shared.clock),
+        policy: shared.policy.clone(),
+        roster: shared.roster.clone(),
+        context_budget: shared.context_budget,
+        evidence,
+        session_store: Some(shared.store.clone()),
+        hooks: Arc::new(NoopHooks),
+        context_policy: Arc::new(DefaultContextPolicy),
+        additional_guards: vec![ProfileGuard::new(profile, None)],
+    };
+    let mut runner = AgentRunner::new(spec, session_id, task_text, deps);
+    let run = runner.run(budget);
+    let outcome = match args.timeout_secs {
+        Some(seconds) => match tokio::time::timeout(Duration::from_secs(seconds), run).await {
+            Ok(result) => exec_outcome(result),
+            Err(_) => HeadlessOutcome::TimedOut(seconds),
+        },
+        None => exec_outcome(run.await),
+    };
+    finish_exec(outcome, args.json)
+}
+
+/// 把 `AgentRunner` 的结果映射成无头结果分类。
+fn exec_outcome(result: Result<AgentOutcome, ApplicationError>) -> HeadlessOutcome {
+    match result {
+        Ok(outcome) => HeadlessOutcome::Success(outcome.answer),
+        Err(ApplicationError::WallClockExhausted { limit, .. }) => {
+            HeadlessOutcome::TimedOut(limit.as_secs())
+        }
+        Err(ApplicationError::ModelTimeout { seconds }) => HeadlessOutcome::TimedOut(seconds),
+        Err(error) => HeadlessOutcome::Failed(error.to_string()),
+    }
+}
+
+/// 输出结果并以对应退出码结束进程；成功走正常返回。
+fn finish_exec(outcome: HeadlessOutcome, json: bool) -> Result<(), Box<dyn Error>> {
+    println!("{}", headless::format_output(&outcome, json));
+    let code = outcome.exit_code();
+    if code != headless::EXIT_SUCCESS {
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -958,6 +1265,15 @@ struct Shared {
     extensions: Arc<ExtensionRegistry>,
     selection: ExtensionSelection,
     delegate: Option<Arc<dyn ToolSource>>,
+    /// 追加守卫（如 Web 域名守卫）：注入普通任务与子任务两条装配路径，
+    /// exec 模式另行叠加档位守卫。
+    extra_guards: Vec<Arc<dyn ToolGuard>>,
+    /// 唯一 RunHooks 链：未配置外部 hooks 时是 NoopHooks；配置了
+    /// QCH_HOOKS_CONFIG 时是 PreToolUseHooks（exit 2 阻断工具调用）。
+    hooks: Arc<dyn RunHooks>,
+    /// 审批分级档位（--permissions read-only|workspace-write|full）。
+    /// None 表示沿用既有策略与审批语义，不收紧也不放宽。
+    permission_profile: Option<PermissionProfile>,
     /// 扩展动作的时限；由基础设施层的 tokio 计时器实现。
     limiter: Arc<dyn TimeLimiter>,
 }
@@ -971,19 +1287,31 @@ fn assemble(
     evidence: Arc<dyn EvidenceSink>,
     initial_role: AgentRole,
 ) -> Result<AgentDependencies, String> {
+    // 档位审批闸门叠加在既有闸门之上：档位判 RequireApproval 时委托内层，
+    // 判 Deny 时直接拒绝并留证；None 保持原语义。
+    let approvals: Arc<dyn ApprovalGate> =
+        match shared.permission_profile {
+            Some(profile) => Arc::new(ProfileApprovalGate::new(
+                Arc::clone(&shared.approvals),
+                Arc::clone(&evidence),
+                profile,
+            )),
+            None => Arc::clone(&shared.approvals),
+        };
     let host = AgentDependencies {
         model: Arc::clone(&shared.model),
         tools: shared.host_tools.clone(),
-        approvals: Arc::clone(&shared.approvals),
+        approvals,
         evidence,
         clock: Arc::clone(&shared.clock),
         policy: shared.policy.clone(),
-        additional_guards: Vec::new(),
+        // 域名等附加守卫对每个装配点生效：普通任务、恢复、子任务都不绕过。
+        additional_guards: shared.extra_guards.clone(),
         roster: shared.roster.clone(),
         context_budget: shared.context_budget,
         context_policy: Arc::new(DefaultContextPolicy),
         session_store: Some(shared.store.clone()),
-        hooks: Arc::new(NoopHooks),
+        hooks: Arc::clone(&shared.hooks),
     };
     // 适配器要求绑定未含 Skill 工具的宿主注册表；它按实际工具表复核每条
     // 权限，缺工具的已启用扩展在这里报错，而不是等到模型调用才发现。
@@ -1056,6 +1384,8 @@ struct ChildFactory {
     store: Arc<JsonSessionStore>,
     /// 父工作区根：子会话的证据与快照都落在这里，复盘时一处可查。
     sessions_root: PathBuf,
+    /// 域名等附加守卫：子任务与父任务同一口径，不因委派而放宽。
+    extra_guards: Vec<Arc<dyn ToolGuard>>,
 }
 
 impl ChildAgentFactory for ChildFactory {
@@ -1103,7 +1433,7 @@ impl ChildAgentFactory for ChildFactory {
             evidence,
             clock: Arc::new(SystemClock),
             policy: self.policy.clone(),
-            additional_guards: Vec::new(),
+            additional_guards: self.extra_guards.clone(),
             roster,
             context_budget: self.context_budget,
             context_policy: Arc::new(DefaultContextPolicy),
@@ -1212,7 +1542,44 @@ fn manage_extensions(workspace: &Path, args: &cli::CliArgs) -> Result<(), Box<dy
     }
 
     if let Some(source) = &args.install_extension {
-        let descriptor = store.install(&registry, Path::new(source))?;
+        let source_path = Path::new(source);
+        let descriptor = if source_path.is_file() {
+            // 路径语义：清单文件（.toml 或 SKILL.md）直接安装。
+            if source_path.extension().is_some_and(|ext| ext == "md") {
+                // SKILL.md：先转换成 TOML 清单再安装，未识别键显式报告，
+                // 无法映射的权限直接拒绝（装出来会少于作者声明）。
+                let scratch = std::env::temp_dir().join(format!(
+                    "qch-skill-install-{}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&scratch)
+                    .map_err(|error| format!("cli_skill_install: 建临时目录失败: {error}"))?;
+                let report = skill_md::install_skill_md(&store, &registry, source_path, &scratch)?;
+                for key in &report.unrecognized_keys {
+                    eprintln!("警告：SKILL.md 中的键 `{key}` 未被本仓识别，已忽略");
+                }
+                report.descriptor
+            } else {
+                store.install(&registry, source_path)?
+            }
+        } else {
+            // 非 .toml/.md 的名字按技能 ID 查市场索引（R3 本地技能市场，
+            // 不做远程托管）；索引路径可用 QCH_SKILL_INDEX 覆盖。
+            let index = std::env::var_os("QCH_SKILL_INDEX")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| workspace.join(".qcodeharness/skills/marketplace.toml"));
+            let scratch = std::env::temp_dir()
+                .join(format!("qch-skill-install-{}", std::process::id()));
+            std::fs::create_dir_all(&scratch)
+                .map_err(|error| format!("cli_skill_install: 建临时目录失败: {error}"))?;
+            let report = skill_md::install_from_marketplace(
+                &store, &registry, &index, source, &scratch,
+            )?;
+            for key in &report.unrecognized_keys {
+                eprintln!("警告：SKILL.md 中的键 `{key}` 未被本仓识别，已忽略");
+            }
+            report.descriptor
+        };
         println!(
             "已安装扩展 `{}`（默认禁用）。启用：--enable-extension {} --permissions {}",
             descriptor.id,
@@ -1297,9 +1664,10 @@ fn rotate_service_events(workspace: &Path, json: bool) -> Result<(), Box<dyn Err
         format!(
             "是否归档: {}\n归档路径: {}\n是否空跑: {}\n恢复建议: {}",
             report.archived,
-            report.archive_path.as_deref().map_or_else(
-                || "无".to_owned(), |path| path.display().to_string()
-            ),
+            report
+                .archive_path
+                .as_deref()
+                .map_or_else(|| "无".to_owned(), |path| path.display().to_string()),
             report.empty_run,
             report.recommendation
         )

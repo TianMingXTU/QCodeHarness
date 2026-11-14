@@ -8,8 +8,13 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::domain::service::{PROTOCOL_VERSION, ServiceCommand, ServiceError, ServiceEvent, ServiceReply};
-use super::stdio::{Frame, FrameReader, MAX_FRAME_BYTES, StdioRequest, StdioResponse, frame_too_large, transport_error, unsupported_version};
+use super::stdio::{
+    Frame, FrameReader, MAX_FRAME_BYTES, StdioRequest, StdioResponse, frame_too_large,
+    transport_error, unsupported_version,
+};
+use crate::domain::service::{
+    PROTOCOL_VERSION, ServiceCommand, ServiceError, ServiceEvent, ServiceReply,
+};
 
 /// 未消费的实时事件有界；溢出后显式报错，调用方用最后成功序号补读日志。
 pub const SDK_EVENT_CAPACITY: usize = 128;
@@ -36,8 +41,13 @@ struct Shared {
 
 impl Shared {
     fn fail(&self, error: ServiceError) {
-        let mut pending = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pending.closed.is_some() { return; }
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.closed.is_some() {
+            return;
+        }
         pending.closed = Some(error.clone());
         self.failure.send_replace(Some(error.clone()));
         for (_, reply) in pending.replies.drain() {
@@ -46,9 +56,16 @@ impl Shared {
     }
 
     fn deliver(&self, id: &str, result: Result<Reply, ServiceError>) {
-        let reply = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).replies.remove(id);
+        let reply = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replies
+            .remove(id);
         // 调用方可能已取消等待；迟到的回复不能匹配到其他请求。
-        if let Some(reply) = reply { let _ = reply.send(result); }
+        if let Some(reply) = reply {
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -68,7 +85,9 @@ pub struct SdkClient {
 impl SdkClient {
     /// 接入可双向读写的字节流，并校验服务的首帧版本声明。
     pub async fn from_io<T>(io: T) -> Result<Self, ServiceError>
-    where T: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (reader, writer) = tokio::io::split(io);
         Self::from_parts(reader, writer).await
     }
@@ -80,29 +99,56 @@ impl SdkClient {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut frames = FrameReader::new(reader);
-        let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_response(&mut frames)).await
+        let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_response(&mut frames))
+            .await
             .map_err(|_| ServiceError::new("handshake_timeout", "等待服务版本声明超时"))??;
-        if hello.version() != PROTOCOL_VERSION { return Err(unsupported_version(hello.version())); }
+        if hello.version() != PROTOCOL_VERSION {
+            return Err(unsupported_version(hello.version()));
+        }
         if !matches!(hello, StdioResponse::Hello { .. }) {
-            return Err(ServiceError::new("invalid_handshake", "服务首帧必须为 hello"));
+            return Err(ServiceError::new(
+                "invalid_handshake",
+                "服务首帧必须为 hello",
+            ));
         }
         let (failure, _) = watch::channel(None);
-        let shared = Arc::new(Shared { pending: Mutex::new(Pending::default()), failure });
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(Pending::default()),
+            failure,
+        });
         let (events_tx, events_rx) = mpsc::channel(SDK_EVENT_CAPACITY);
         let (outgoing, outgoing_rx) = mpsc::channel(MAX_PENDING_CALLS);
         let reader_state = shared.clone();
         let reader = tokio::spawn(async move { read_loop(frames, reader_state, events_tx).await });
         let writer_state = shared.clone();
-        let writer = tokio::spawn(async move { write_loop(writer, outgoing_rx, writer_state).await });
-        Ok(Self { outgoing, events: tokio::sync::Mutex::new(events_rx), shared, reader, writer })
+        let writer =
+            tokio::spawn(async move { write_loop(writer, outgoing_rx, writer_state).await });
+        Ok(Self {
+            outgoing,
+            events: tokio::sync::Mutex::new(events_rx),
+            shared,
+            reader,
+            writer,
+        })
     }
 
     /// 等待与 `id` 匹配的命令回复；期间到达的事件保留在独立的有界队列中。
-    pub async fn call(&self, id: &str, command: ServiceCommand) -> Result<ServiceReply, ServiceError> {
-        let request = StdioRequest { version: PROTOCOL_VERSION, id: id.to_owned(), command };
+    pub async fn call(
+        &self,
+        id: &str,
+        command: ServiceCommand,
+    ) -> Result<ServiceReply, ServiceError> {
+        let request = StdioRequest {
+            version: PROTOCOL_VERSION,
+            id: id.to_owned(),
+            command,
+        };
         match self.exchange(id, &request).await? {
             Reply::Service(reply) => Ok(*reply),
-            Reply::Subscribed(_) => Err(ServiceError::new("unexpected_reply", "业务命令收到了订阅结论")),
+            Reply::Subscribed(_) => Err(ServiceError::new(
+                "unexpected_reply",
+                "业务命令收到了订阅结论",
+            )),
         }
     }
 
@@ -125,8 +171,12 @@ impl SdkClient {
         let mut events = self.events.lock().await;
         let mut failure = self.shared.failure.subscribe();
         loop {
-            if let Ok(event) = events.try_recv() { return event; }
-            if let Some(error) = failure.borrow().clone() { return Err(error); }
+            if let Ok(event) = events.try_recv() {
+                return event;
+            }
+            if let Some(error) = failure.borrow().clone() {
+                return Err(error);
+            }
             tokio::select! {
                 event = events.recv() => return event.unwrap_or_else(|| Err(ServiceError::new("transport_closed", "事件通道已关闭"))),
                 _ = failure.changed() => {}
@@ -134,52 +184,96 @@ impl SdkClient {
         }
     }
 
-    async fn exchange<T: serde::Serialize>(&self, id: &str, request: &T) -> Result<Reply, ServiceError> {
-        if id.trim().is_empty() { return Err(ServiceError::new("invalid_request", "请求 ID 不能为空")); }
-        let mut bytes = serde_json::to_vec(request).map_err(|error| ServiceError::new("protocol_encoding", error.to_string()))?;
+    async fn exchange<T: serde::Serialize>(
+        &self,
+        id: &str,
+        request: &T,
+    ) -> Result<Reply, ServiceError> {
+        if id.trim().is_empty() {
+            return Err(ServiceError::new("invalid_request", "请求 ID 不能为空"));
+        }
+        let mut bytes = serde_json::to_vec(request)
+            .map_err(|error| ServiceError::new("protocol_encoding", error.to_string()))?;
         bytes.push(b'\n');
-        if bytes.len() > MAX_FRAME_BYTES { return Err(frame_too_large()); }
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(frame_too_large());
+        }
         let (reply, receiver) = oneshot::channel();
         {
-            let mut pending = self.shared.pending.lock().map_err(|_| ServiceError::new("client_unhealthy", "客户端请求表锁已损坏"))?;
-            if let Some(error) = &pending.closed { return Err(error.clone()); }
-            if pending.replies.contains_key(id) { return Err(ServiceError::new("request_in_flight", "请求 ID 已有等待中的调用")); }
-            if pending.replies.len() >= MAX_PENDING_CALLS { return Err(ServiceError::new("client_busy", "等待中的调用数量已达到上限")); }
+            let mut pending = self
+                .shared
+                .pending
+                .lock()
+                .map_err(|_| ServiceError::new("client_unhealthy", "客户端请求表锁已损坏"))?;
+            if let Some(error) = &pending.closed {
+                return Err(error.clone());
+            }
+            if pending.replies.contains_key(id) {
+                return Err(ServiceError::new(
+                    "request_in_flight",
+                    "请求 ID 已有等待中的调用",
+                ));
+            }
+            if pending.replies.len() >= MAX_PENDING_CALLS {
+                return Err(ServiceError::new(
+                    "client_busy",
+                    "等待中的调用数量已达到上限",
+                ));
+            }
             pending.replies.insert(id.to_owned(), reply);
         }
-        let _wait = PendingWait { shared: self.shared.clone(), id: id.to_owned() };
+        let _wait = PendingWait {
+            shared: self.shared.clone(),
+            id: id.to_owned(),
+        };
         // 写入由单独任务完成。调用方取消等待不会在半个 JSON 帧中断 write_all。
-        self.outgoing.send(bytes).await.map_err(|_| ServiceError::new("transport_closed", "写入通道已关闭"))?;
-        receiver.await.map_err(|_| ServiceError::new("transport_closed", "回复通道已关闭"))?
+        self.outgoing
+            .send(bytes)
+            .await
+            .map_err(|_| ServiceError::new("transport_closed", "写入通道已关闭"))?;
+        receiver
+            .await
+            .map_err(|_| ServiceError::new("transport_closed", "回复通道已关闭"))?
     }
 }
 
 impl Drop for SdkClient {
     fn drop(&mut self) {
-        self.shared.fail(ServiceError::new("client_closed", "客户端已关闭"));
+        self.shared
+            .fail(ServiceError::new("client_closed", "客户端已关闭"));
         self.reader.abort();
         self.writer.abort();
     }
 }
 
-struct PendingWait { shared: Arc<Shared>, id: String }
+struct PendingWait {
+    shared: Arc<Shared>,
+    id: String,
+}
 
 impl Drop for PendingWait {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.shared.pending.lock() { pending.replies.remove(&self.id); }
+        if let Ok(mut pending) = self.shared.pending.lock() {
+            pending.replies.remove(&self.id);
+        }
     }
 }
 
-async fn read_response<R: AsyncRead + Unpin>(frames: &mut FrameReader<R>) -> Result<StdioResponse, ServiceError> {
+async fn read_response<R: AsyncRead + Unpin>(
+    frames: &mut FrameReader<R>,
+) -> Result<StdioResponse, ServiceError> {
     match frames.next().await? {
         Frame::End => Err(ServiceError::new("transport_closed", "服务关闭了输出")),
         Frame::TooLarge => Err(frame_too_large()),
-        Frame::Line(line) => serde_json::from_slice(&line).map_err(|error| ServiceError::new("invalid_response", error.to_string())),
+        Frame::Line(line) => serde_json::from_slice(&line)
+            .map_err(|error| ServiceError::new("invalid_response", error.to_string())),
     }
 }
 
 async fn read_loop<R: AsyncRead + Unpin>(
-    mut frames: FrameReader<R>, shared: Arc<Shared>, events: mpsc::Sender<Result<ServiceEvent, ServiceError>>,
+    mut frames: FrameReader<R>,
+    shared: Arc<Shared>,
+    events: mpsc::Sender<Result<ServiceEvent, ServiceError>>,
 ) {
     let mut failure = shared.failure.subscribe();
     loop {
@@ -189,28 +283,56 @@ async fn read_loop<R: AsyncRead + Unpin>(
         };
         let response = match response {
             Ok(response) if response.version() == PROTOCOL_VERSION => response,
-            Ok(response) => { shared.fail(unsupported_version(response.version())); return; }
-            Err(error) => { shared.fail(error); return; }
+            Ok(response) => {
+                shared.fail(unsupported_version(response.version()));
+                return;
+            }
+            Err(error) => {
+                shared.fail(error);
+                return;
+            }
         };
         let event = match response {
-            StdioResponse::Reply { id, result, .. } => { shared.deliver(&id, Ok(Reply::Service(Box::new(result)))); continue; }
-            StdioResponse::Subscribed { id, after, .. } => { shared.deliver(&id, Ok(Reply::Subscribed(after))); continue; }
-            StdioResponse::Error { id, error, .. } if !id.is_empty() => { shared.deliver(&id, Err(error)); continue; }
+            StdioResponse::Reply { id, result, .. } => {
+                shared.deliver(&id, Ok(Reply::Service(Box::new(result))));
+                continue;
+            }
+            StdioResponse::Subscribed { id, after, .. } => {
+                shared.deliver(&id, Ok(Reply::Subscribed(after)));
+                continue;
+            }
+            StdioResponse::Error { id, error, .. } if !id.is_empty() => {
+                shared.deliver(&id, Err(error));
+                continue;
+            }
             StdioResponse::Error { error, .. } => Err(error),
             StdioResponse::Event { event, .. } => {
-                if event.version != PROTOCOL_VERSION { shared.fail(unsupported_version(event.version)); return; }
+                if event.version != PROTOCOL_VERSION {
+                    shared.fail(unsupported_version(event.version));
+                    return;
+                }
                 Ok(*event)
             }
-            StdioResponse::Hello { .. } => { shared.fail(ServiceError::new("invalid_response", "重复的 hello 帧")); return; }
+            StdioResponse::Hello { .. } => {
+                shared.fail(ServiceError::new("invalid_response", "重复的 hello 帧"));
+                return;
+            }
         };
         if events.try_send(event).is_err() {
-            shared.fail(ServiceError::new("lagged", "客户端事件队列已满；读取已缓存事件后，用最后成功序号补读并重新连接"));
+            shared.fail(ServiceError::new(
+                "lagged",
+                "客户端事件队列已满；读取已缓存事件后，用最后成功序号补读并重新连接",
+            ));
             return;
         }
     }
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(mut writer: W, mut outgoing: mpsc::Receiver<Vec<u8>>, shared: Arc<Shared>) {
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    mut outgoing: mpsc::Receiver<Vec<u8>>,
+    shared: Arc<Shared>,
+) {
     let mut failure = shared.failure.subscribe();
     loop {
         let bytes = tokio::select! {

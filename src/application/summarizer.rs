@@ -101,7 +101,9 @@ impl Summarizer {
             .map_err(|error| ApplicationError::SummaryFailed(error.to_string()))?;
         let text = reply.turn.text.trim().to_owned();
         if text.is_empty() {
-            return Err(ApplicationError::SummaryFailed("模型返回了空摘要".to_owned()));
+            return Err(ApplicationError::SummaryFailed(
+                "模型返回了空摘要".to_owned(),
+            ));
         }
         Ok((
             Summary {
@@ -216,7 +218,8 @@ fn split_step_marker(line: &str) -> Option<(u32, &str)> {
     {
         return None;
     }
-    let body = body.trim_start_matches(['：', ':', '、', '）', ')', '】', ']', '.', '。', ' ', '\t']);
+    let body =
+        body.trim_start_matches(['：', ':', '、', '）', ')', '】', ']', '.', '。', ' ', '\t']);
     Some((digits.parse().ok()?, body))
 }
 
@@ -241,8 +244,7 @@ pub fn render_slices(slices: &[ContextSlice<'_>]) -> String {
                     text.push_str(&format!(
                         "\n  调用 {}({})",
                         call.name,
-                        serde_json::to_string(&call.arguments)
-                            .unwrap_or_else(|_| "{}".to_owned())
+                        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned())
                     ));
                 }
                 for outcome in *observations {
@@ -385,15 +387,25 @@ mod tests {
         let (summary, _) = summarizer.summarize(input(vec![1])).await.unwrap();
 
         assert!(summary.text.contains("【第 9 步】"), "{}", summary.text);
-        assert!(summary.text.contains("模型自己加的一段"), "{}", summary.text);
+        assert!(
+            summary.text.contains("模型自己加的一段"),
+            "{}",
+            summary.text
+        );
     }
 
     /// "第 3 步的观察"是正文而非步骤标记，误判会归错步骤。
     #[test]
     fn a_step_marker_must_be_followed_by_a_separator() {
         assert_eq!(split_step_marker("第 3 步的观察"), None);
-        assert_eq!(split_step_marker("第 3 步：读了配置"), Some((3, "读了配置")));
-        assert_eq!(split_step_marker("【第 3 步】读了配置"), Some((3, "读了配置")));
+        assert_eq!(
+            split_step_marker("第 3 步：读了配置"),
+            Some((3, "读了配置"))
+        );
+        assert_eq!(
+            split_step_marker("【第 3 步】读了配置"),
+            Some((3, "读了配置"))
+        );
         assert_eq!(split_step_marker("第3步:读了配置"), Some((3, "读了配置")));
     }
 

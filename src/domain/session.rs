@@ -252,9 +252,9 @@ impl Session {
     ///
     /// 交接用：同一份快照恢复两次时，第二次不再推同一句结论。
     pub fn has_user_message(&self, message: &str) -> bool {
-        self.turns.iter().any(|turn| {
-            matches!(turn, Turn::User(text) if text == message)
-        })
+        self.turns
+            .iter()
+            .any(|turn| matches!(turn, Turn::User(text) if text == message))
     }
 
     /// 已挂的摘要。
@@ -327,10 +327,7 @@ impl Session {
     /// 用户消息允许出现在历史中部：步骤边界就是用户消息，
     /// [`Session::push_user`] 可以产生。但**第一条**必须是用户消息，
     /// 那是任务交代，没有它就无法回答"这个会话在干什么"。
-    pub fn from_snapshot(
-        id: SessionId,
-        snapshot: SessionSnapshot,
-    ) -> Result<Self, SessionError> {
+    pub fn from_snapshot(id: SessionId, snapshot: SessionSnapshot) -> Result<Self, SessionError> {
         let turns = snapshot.turns;
         if !matches!(turns.first(), Some(Turn::User(_))) {
             return Err(SessionError::Corrupt {
@@ -363,9 +360,7 @@ impl Session {
                         // 最终答案轮不带观察。
                         Some(Turn::Observation(_)) => {
                             return Err(SessionError::Corrupt {
-                                reason: format!(
-                                    "第 {rounds} 轮没有工具调用，后面却跟着观察"
-                                ),
+                                reason: format!("第 {rounds} 轮没有工具调用，后面却跟着观察"),
                             });
                         }
                         // 带调用的轮次后面不是观察：历史无法回放。
@@ -399,9 +394,7 @@ impl Session {
             let (from, to) = summary.covers;
             if from == 0 || from > to || to > rounds || summary.text.trim().is_empty() {
                 return Err(SessionError::Corrupt {
-                    reason: format!(
-                        "摘要覆盖范围 {from}-{to} 或文本无效（历史共 {rounds} 轮）"
-                    ),
+                    reason: format!("摘要覆盖范围 {from}-{to} 或文本无效（历史共 {rounds} 轮）"),
                 });
             }
         }
@@ -481,7 +474,8 @@ pub fn round_step_numbers(turns: &[Turn]) -> Vec<u32> {
 }
 
 #[cfg(test)]
-mod tests {    use super::*;
+mod tests {
+    use super::*;
     use crate::domain::ids::CallId;
     use serde_json::json;
 
@@ -619,7 +613,9 @@ mod tests {    use super::*;
         // 视图里它是独立的一条用户消息，紧跟在那轮之后。
         let slices = session.slices();
         assert_eq!(slices.len(), 3);
-        assert!(matches!(&slices[2], ContextSlice::User(text) if text.as_ref() == "[第 2/3 步] 按上面的根因动手改"));
+        assert!(
+            matches!(&slices[2], ContextSlice::User(text) if text.as_ref() == "[第 2/3 步] 按上面的根因动手改")
+        );
     }
 
     #[test]
@@ -710,7 +706,17 @@ mod tests {    use super::*;
             ],
         };
         let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
-        assert!(matches!(error, SessionError::Unpaired { calls: 2, observations: 1, .. }), "{error}");
+        assert!(
+            matches!(
+                error,
+                SessionError::Unpaired {
+                    calls: 2,
+                    observations: 1,
+                    ..
+                }
+            ),
+            "{error}"
+        );
     }
 
     #[test]
@@ -759,10 +765,7 @@ mod tests {    use super::*;
             ],
         };
         let error = Session::from_snapshot(SessionId::new("s1"), snapshot).unwrap_err();
-        assert!(
-            error.to_string().contains("紧跟在带工具调用"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("紧跟在带工具调用"), "{error}");
     }
 
     #[test]

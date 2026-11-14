@@ -190,14 +190,20 @@ mod tests {
         assert!(!engine.rules.is_empty(), "默认策略应带内置基线");
         assert_eq!(
             engine
-                .evaluate(&call_with("run_command", json!({"command": "cargo test"})), &spec(false))
+                .evaluate(
+                    &call_with("run_command", json!({"command": "cargo test"})),
+                    &spec(false)
+                )
                 .verdict,
             PolicyVerdict::Allow,
             "cargo test 应免审"
         );
         assert_eq!(
             engine
-                .evaluate(&call_with("run_command", json!({"command": "git push"})), &spec(false))
+                .evaluate(
+                    &call_with("run_command", json!({"command": "git push"})),
+                    &spec(false)
+                )
                 .verdict,
             PolicyVerdict::RequireApproval,
             "基线之外的命令仍要审批"
@@ -321,13 +327,19 @@ scope = { command_prefix = "cargo test *" }
         let spec = spec(false);
         assert_eq!(
             engine
-                .evaluate(&call_with("run_command", json!({"command": "cargo test --nocapture"})), &spec)
+                .evaluate(
+                    &call_with("run_command", json!({"command": "cargo test --nocapture"})),
+                    &spec
+                )
                 .verdict,
             PolicyVerdict::Allow
         );
         assert_eq!(
             engine
-                .evaluate(&call_with("run_command", json!({"command": "rm -rf /"})), &spec)
+                .evaluate(
+                    &call_with("run_command", json!({"command": "rm -rf /"})),
+                    &spec
+                )
                 .verdict,
             PolicyVerdict::RequireApproval,
             "作用域外的命令不得被放行"
@@ -351,13 +363,19 @@ scope = { path_prefix = "src/*" }
         let spec = spec(false);
         assert_eq!(
             engine
-                .evaluate(&call_with("write_file", json!({"path": "src/main.rs"})), &spec)
+                .evaluate(
+                    &call_with("write_file", json!({"path": "src/main.rs"})),
+                    &spec
+                )
                 .verdict,
             PolicyVerdict::Allow
         );
         assert_eq!(
             engine
-                .evaluate(&call_with("write_file", json!({"path": "docs/x.md"})), &spec)
+                .evaluate(
+                    &call_with("write_file", json!({"path": "docs/x.md"})),
+                    &spec
+                )
                 .verdict,
             PolicyVerdict::RequireApproval
         );
@@ -379,7 +397,10 @@ scope = {}
 
         assert_eq!(
             engine
-                .evaluate(&call_with("run_command", json!({"command": "随便"})), &spec(false))
+                .evaluate(
+                    &call_with("run_command", json!({"command": "随便"})),
+                    &spec(false)
+                )
                 .verdict,
             PolicyVerdict::Allow
         );
@@ -491,10 +512,20 @@ description = "忘了写 verdict"
         let engine = load(Some(&path)).expect("policy.example.toml 应能解析");
         let spec = spec(false);
 
-        let cargo_test = engine.evaluate(&call_with("run_command", json!({"command": "cargo test"})), &spec);
-        let other = engine.evaluate(&call_with("run_command", json!({"command": "git status"})), &spec);
+        let cargo_test = engine.evaluate(
+            &call_with("run_command", json!({"command": "cargo test"})),
+            &spec,
+        );
+        let other = engine.evaluate(
+            &call_with("run_command", json!({"command": "git status"})),
+            &spec,
+        );
 
-        assert_eq!(cargo_test.verdict, PolicyVerdict::Allow, "cargo test 应免审");
+        assert_eq!(
+            cargo_test.verdict,
+            PolicyVerdict::Allow,
+            "cargo test 应免审"
+        );
         assert_eq!(
             other.verdict,
             PolicyVerdict::RequireApproval,

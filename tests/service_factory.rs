@@ -180,9 +180,9 @@ impl Runtime {
                         .pending(None)
                         .iter()
                         .any(|pending| pending.approval_id == request.approval_id)
-                    {
-                        return request;
-                    }
+                {
+                    return request;
+                }
             }
         })
         .await

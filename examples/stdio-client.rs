@@ -17,7 +17,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let executable = args.next().unwrap_or_else(|| "QCodeHarness".into());
-    let goal = args.next().unwrap_or_else(|| "阅读 Cargo.toml，说明本项目用了哪些依赖".into());
+    let goal = args
+        .next()
+        .unwrap_or_else(|| "阅读 Cargo.toml，说明本项目用了哪些依赖".into());
     let mut child = tokio::process::Command::new(executable)
         .arg("--stdio")
         .stdin(Stdio::piped())
@@ -41,14 +43,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     result?;
     shutdown?;
-    if !status.success() { return Err(format!("服务退出失败: {status}").into()); }
+    if !status.success() {
+        return Err(format!("服务退出失败: {status}").into());
+    }
     Ok(())
 }
 
 async fn run_task(sdk: &SdkClient, goal: String) -> Result<(), Box<dyn Error>> {
-    let ServiceReply::Task { task } = sdk.call("example-create", ServiceCommand::Create {
-        goal, kind: TaskKind::Review,
-    }).await? else { return Err("服务未返回任务".into()); };
+    let ServiceReply::Task { task } = sdk
+        .call(
+            "example-create",
+            ServiceCommand::Create {
+                goal,
+                kind: TaskKind::Review,
+            },
+        )
+        .await?
+    else {
+        return Err("服务未返回任务".into());
+    };
     println!("任务 {}，工作区 {}", task.task_id, task.workspace.display());
     let mut console = BufReader::new(tokio::io::stdin()).lines();
     let mut serial = 0u64;
@@ -66,23 +79,42 @@ async fn run_task(sdk: &SdkClient, goal: String) -> Result<(), Box<dyn Error>> {
         };
         // 保存这个序号可供断线后的 Events 补读；历史事件只用于展示。
         println!("事件 #{}，执行 {:?}", event.sequence, event.execution_id);
-        if event.task_id.as_deref() != Some(task.task_id.as_str()) { continue; }
+        if event.task_id.as_deref() != Some(task.task_id.as_str()) {
+            continue;
+        }
         match event.payload {
             ServiceEventPayload::ApprovalWaiting { request } => {
-                println!("审批 {}：{} {}\n理由：{:?}，恢复重新询问：{}\n允许本次调用？输入 y 允许，其余输入拒绝。",
-                    request.approval_id, request.call.name, request.call.arguments, request.reason, request.resumed);
+                println!(
+                    "审批 {}：{} {}\n理由：{:?}，恢复重新询问：{}\n允许本次调用？输入 y 允许，其余输入拒绝。",
+                    request.approval_id,
+                    request.call.name,
+                    request.call.arguments,
+                    request.reason,
+                    request.resumed
+                );
                 let allow = tokio::select! {
                     line = console.next_line() => line?.is_some_and(|line| line.trim() == "y"),
                     signal = tokio::signal::ctrl_c() => { signal?; false }
                 };
                 serial += 1;
-                sdk.call(&format!("example-approval-{serial}"), ServiceCommand::Decide {
-                    approval_id: request.approval_id, task_id: request.task_id,
-                    execution_id: request.execution_id, allow,
-                }).await?;
+                sdk.call(
+                    &format!("example-approval-{serial}"),
+                    ServiceCommand::Decide {
+                        approval_id: request.approval_id,
+                        task_id: request.task_id,
+                        execution_id: request.execution_id,
+                        allow,
+                    },
+                )
+                .await?;
             }
-            ServiceEventPayload::Completed { answer } => { println!("{answer}"); return Ok(()); }
-            ServiceEventPayload::Stopped { status, error } => return Err(format!("任务停止: {status:?} {error:?}").into()),
+            ServiceEventPayload::Completed { answer } => {
+                println!("{answer}");
+                return Ok(());
+            }
+            ServiceEventPayload::Stopped { status, error } => {
+                return Err(format!("任务停止: {status:?} {error:?}").into());
+            }
             payload => println!("{payload:?}"),
         }
     }

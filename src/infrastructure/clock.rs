@@ -42,6 +42,10 @@ impl TimeLimiter for TokioTimeLimiter {
         &'a self,
         action: BoxFuture<'a, ToolOutcome>,
     ) -> BoxFuture<'a, Result<ToolOutcome, Elapsed>> {
-        Box::pin(async move { tokio::time::timeout(self.limit, action).await.map_err(|_| Elapsed) })
+        Box::pin(async move {
+            tokio::time::timeout(self.limit, action)
+                .await
+                .map_err(|_| Elapsed)
+        })
     }
 }

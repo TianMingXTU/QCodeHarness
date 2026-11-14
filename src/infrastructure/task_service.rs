@@ -109,14 +109,20 @@ fn load_state(state_path: &Path) -> Result<ServiceStateFile, ServiceError> {
             return Ok(ServiceStateFile::default());
         }
         Err(cause) => {
-            return Err(corrupt_state(state_path, None, &format!("读取失败: {cause}")));
+            return Err(corrupt_state(
+                state_path,
+                None,
+                &format!("读取失败: {cause}"),
+            ));
         }
     };
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|cause| {
         corrupt_state(state_path, Some(&bytes), &format!("JSON 解析失败: {cause}"))
     })?;
     // 先检查版本，未来格式的业务字段可能已不再兼容当前结构。
-    if let Some(version) = value.get("schema_version").and_then(serde_json::Value::as_u64)
+    if let Some(version) = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
         && version > u64::from(SERVICE_STATE_FORMAT)
     {
         return Err(error(
@@ -804,7 +810,9 @@ impl LocalTaskService {
                 request_id.to_owned(),
                 Receipt {
                     command: ServiceCommand::Create { goal, kind },
-                    result: Ok(ServiceReply::Task { task: Box::new(view.clone()) }),
+                    result: Ok(ServiceReply::Task {
+                        task: Box::new(view.clone()),
+                    }),
                 },
             );
             self.persist(&next)?;
@@ -829,7 +837,9 @@ impl LocalTaskService {
                 ServiceEventPayload::ExecutionStarted,
             ],
         )?;
-        Ok(ServiceReply::Task { task: Box::new(view) })
+        Ok(ServiceReply::Task {
+            task: Box::new(view),
+        })
     }
 
     fn make_task(&self, task_id: &str, kind: TaskKind, goal: &str) -> Result<Task, ServiceError> {
@@ -972,7 +982,9 @@ impl LocalTaskService {
             start,
             [ServiceEventPayload::ExecutionStarted],
         )?;
-        Ok(ServiceReply::Task { task: Box::new(record.view) })
+        Ok(ServiceReply::Task {
+            task: Box::new(record.view),
+        })
     }
 
     fn idle_record(&self, task_id: &str) -> Result<TaskRecord, ServiceError> {
@@ -1107,7 +1119,9 @@ impl LocalTaskService {
                         task_id: task_id.to_owned(),
                         goal,
                     },
-                    result: Ok(ServiceReply::Task { task: Box::new(view.clone()) }),
+                    result: Ok(ServiceReply::Task {
+                        task: Box::new(view.clone()),
+                    }),
                 },
             );
             self.persist(&next)?;
@@ -1133,7 +1147,9 @@ impl LocalTaskService {
                 },
             ],
         )?;
-        Ok(ServiceReply::Task { task: Box::new(view) })
+        Ok(ServiceReply::Task {
+            task: Box::new(view),
+        })
     }
 
     async fn merge(&self, task_id: &str) -> Result<(), ServiceError> {
@@ -1418,15 +1434,15 @@ fn load_checkpoint(
     // 会话历史是任务快照的前缀扩展时，将这份较新的运行状态带进任务快照。
     if let Some(session) = session
         && session.session_id == snapshot.run.session_id
-            && session.session.turns.len() >= snapshot.run.session.turns.len()
-            && session
-                .session
-                .turns
-                .starts_with(&snapshot.run.session.turns)
-            && session.session.summary == snapshot.run.session.summary
-        {
-            snapshot.run = session;
-        }
+        && session.session.turns.len() >= snapshot.run.session.turns.len()
+        && session
+            .session
+            .turns
+            .starts_with(&snapshot.run.session.turns)
+        && session.session.summary == snapshot.run.session.summary
+    {
+        snapshot.run = session;
+    }
     crate::application::task_resume::check_resumable(
         &snapshot,
         Some(&SessionId::new(record.view.session_id.clone())),

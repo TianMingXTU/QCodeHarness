@@ -34,10 +34,11 @@ impl EditFile {
     pub fn spec() -> ToolSpec {
         ToolSpec {
             name: EDIT_FILE.to_owned(),
-            description: "在 workspace 内的已有文件中做一次精确替换：`old_string` 必须在文件中恰好出现一次，\
+            description:
+                "在 workspace 内的已有文件中做一次精确替换：`old_string` 必须在文件中恰好出现一次，\
                           否则拒绝执行。适合小段修改；一次改多处用 apply_patch，\
                           创建新文件或整体重写请用 write_file。"
-                .to_owned(),
+                    .to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -184,7 +185,12 @@ mod tests {
             .invoke(&call(edit_args("lib.rs", "fn b() {}", "fn renamed() {}")))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         let updated = fs::read_to_string(root.join("lib.rs")).unwrap();
         assert_eq!(updated, "fn a() {}\nfn renamed() {}\n");
         let _ = fs::remove_dir_all(&root);
@@ -201,7 +207,11 @@ mod tests {
             .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
-        assert!(outcome.content.contains("匹配到 2 处"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("匹配到 2 处"),
+            "{}",
+            outcome.content
+        );
         assert!(
             outcome.content.contains("更长的上下文"),
             "应提示模型补充上下文: {}",
@@ -221,12 +231,18 @@ mod tests {
         fs::write(root.join("lib.rs"), "aaa\n").unwrap();
         let file = tool(&root);
 
-        let outcome = file
-            .invoke(&call(edit_args("lib.rs", "aa", "b")))
-            .await;
+        let outcome = file.invoke(&call(edit_args("lib.rs", "aa", "b"))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Failed, "两个重叠位置同样不唯一");
-        assert!(outcome.content.contains("匹配到 2 处"), "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Failed,
+            "两个重叠位置同样不唯一"
+        );
+        assert!(
+            outcome.content.contains("匹配到 2 处"),
+            "{}",
+            outcome.content
+        );
         assert_eq!(fs::read_to_string(root.join("lib.rs")).unwrap(), "aaa\n");
         let _ = fs::remove_dir_all(&root);
     }
@@ -242,7 +258,11 @@ mod tests {
             .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
-        assert!(outcome.content.contains("找不到要替换的文本"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("找不到要替换的文本"),
+            "{}",
+            outcome.content
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -279,9 +299,7 @@ mod tests {
         let root = temp_workspace("missing");
         let file = tool(&root);
 
-        let outcome = file
-            .invoke(&call(edit_args("ghost.rs", "a", "b")))
-            .await;
+        let outcome = file.invoke(&call(edit_args("ghost.rs", "a", "b"))).await;
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
         assert!(outcome.content.contains("读取"), "{}", outcome.content);
@@ -302,7 +320,12 @@ mod tests {
             .invoke(&call(edit_args("lib.rs", "fn b() {}", "fn renamed() {}")))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert_eq!(
             fs::read_to_string(root.join("lib.rs")).unwrap(),
             "fn a() {}\r\nfn renamed() {}\r\n",
@@ -321,11 +344,14 @@ mod tests {
         fs::write(root.join("lib.rs"), "a\r\nb\r\nc\r\n").unwrap();
         let file = tool(&root);
 
-        let outcome = file
-            .invoke(&call(edit_args("lib.rs", "b", "B")))
-            .await;
+        let outcome = file.invoke(&call(edit_args("lib.rs", "b", "B"))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert_eq!(
             fs::read_to_string(root.join("lib.rs")).unwrap(),
             "a\r\nB\r\nc\r\n"

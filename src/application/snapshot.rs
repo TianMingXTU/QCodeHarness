@@ -9,13 +9,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::agent_run::{PendingRound, RunState};
 use crate::domain::agent::AgentSpec;
 use crate::domain::budget::Consumption;
-use crate::domain::ids::{sanitize_file_id, SessionId, TaskId};
+use crate::domain::ids::{SessionId, TaskId, sanitize_file_id};
 use crate::domain::session::SessionSnapshot;
 use crate::domain::task::{StepOutput, Task};
 use crate::domain::worktree::WorktreeManifest;
-use super::agent_run::{PendingRound, RunState};
 
 /// 当前快照格式版本。快照结构发生不兼容变化时加 1。
 ///
@@ -227,7 +227,9 @@ pub enum StoreError {
     ///
     /// 错误文本带出当前版本、文件版本、可执行动作与备份位置，旧状态不在
     /// 字段语义不明时自动迁移。
-    #[error("快照版本不匹配：文件由 v{found} 写入，当前程序是 v{expected}；拒绝加载以免带入不兼容状态。可用动作：先备份原文件到 {backup_hint}，再用写入该文件的旧版本继续，或从基线重建任务；当前版本不会修改此文件")]
+    #[error(
+        "快照版本不匹配：文件由 v{found} 写入，当前程序是 v{expected}；拒绝加载以免带入不兼容状态。可用动作：先备份原文件到 {backup_hint}，再用写入该文件的旧版本继续，或从基线重建任务；当前版本不会修改此文件"
+    )]
     VersionMismatch {
         /// 文件里的版本。
         found: u32,
@@ -324,7 +326,11 @@ mod tests {
         let error = snapshot.check_version().unwrap_err();
         assert!(matches!(
             error,
-            StoreError::VersionMismatch { found: 999, expected: RUN_FORMAT, .. }
+            StoreError::VersionMismatch {
+                found: 999,
+                expected: RUN_FORMAT,
+                ..
+            }
         ));
         assert!(error.to_string().contains("v999"), "{error}");
         assert!(error.to_string().contains("可用动作"), "{error}");
@@ -347,7 +353,10 @@ mod tests {
             backup_hint, ".qcodeharness/snapshots/s1.json.bak-v999",
             "提示应展开成该快照的实际备份路径"
         );
-        assert!(!backup_hint.contains('<') && !backup_hint.contains('{'), "{backup_hint}");
+        assert!(
+            !backup_hint.contains('<') && !backup_hint.contains('{'),
+            "{backup_hint}"
+        );
     }
 
     #[test]
@@ -357,7 +366,10 @@ mod tests {
         let mut snapshot = mid_round_snapshot();
         snapshot.format_version = 1;
         let error = snapshot.check_version().unwrap_err();
-        let StoreError::VersionMismatch { found: 1, expected, .. } = error else {
+        let StoreError::VersionMismatch {
+            found: 1, expected, ..
+        } = error
+        else {
             panic!("应报版本不匹配")
         };
         assert_eq!(expected, RUN_FORMAT);
@@ -372,7 +384,10 @@ mod tests {
         let mut snapshot = mid_round_snapshot();
         snapshot.format_version = 2;
         let error = snapshot.check_version().unwrap_err();
-        let StoreError::VersionMismatch { found: 2, expected, .. } = error else {
+        let StoreError::VersionMismatch {
+            found: 2, expected, ..
+        } = error
+        else {
             panic!("应报版本不匹配，实际 {error}")
         };
         assert_eq!(expected, RUN_FORMAT, "当前格式是 v{RUN_FORMAT}");
@@ -450,14 +465,17 @@ mod tests {
         let mut snapshot = task_snapshot();
         snapshot.format_version = 999;
         let error = snapshot.check_version().unwrap_err();
-        assert!(matches!(
-            error,
-            StoreError::VersionMismatch {
-                found: 999,
-                expected: TASK_FORMAT,
-                ..
-            }
-        ), "{error}");
+        assert!(
+            matches!(
+                error,
+                StoreError::VersionMismatch {
+                    found: 999,
+                    expected: TASK_FORMAT,
+                    ..
+                }
+            ),
+            "{error}"
+        );
         let StoreError::VersionMismatch { backup_hint, .. } = &error else {
             panic!("应报版本不匹配，实际 {error}")
         };
@@ -492,10 +510,7 @@ mod tests {
         else {
             panic!("应报版本不匹配")
         };
-        assert_eq!(
-            backup_hint,
-            ".qcodeharness/snapshots/____.json.bak-v999"
-        );
+        assert_eq!(backup_hint, ".qcodeharness/snapshots/____.json.bak-v999");
         assert!(backup_hint.starts_with(".qcodeharness/snapshots/"));
         assert!(
             !std::path::Path::new(&backup_hint)

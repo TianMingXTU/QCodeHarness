@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::application::worktree::WorktreeScanner;
-use crate::domain::worktree::{content_hash, WorktreeEntry, WorktreeManifest};
+use crate::domain::worktree::{WorktreeEntry, WorktreeManifest, content_hash};
 
 /// 参与清单的文件大小上限。超过它只记路径与大小，不算内容指纹。
 pub const MAX_HASHED_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -93,7 +93,11 @@ fn walk(root: &Path, dir: &Path, entries: &mut Vec<WorktreeEntry>) -> std::io::R
                 Err(_) => continue,
             }
         };
-        entries.push(WorktreeEntry { path: relative, hash, size });
+        entries.push(WorktreeEntry {
+            path: relative,
+            hash,
+            size,
+        });
     }
     Ok(())
 }
@@ -154,7 +158,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_workspace(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("qch-manifest-{}-{}", name, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("qch-manifest-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("建临时目录");
         dir

@@ -1,4 +1,4 @@
-﻿//! 任务编排器：按模板把任务拆成步骤，逐步驱动 `AgentRunner`。
+//! 任务编排器：按模板把任务拆成步骤，逐步驱动 `AgentRunner`。
 //!
 //! 编排策略简单可预测：任一步失败立即停。runner 按步骤的角色装配，
 //! 提示词与工具白名单都来自角色档案（`AgentRoster`）。多 Agent 并行
@@ -16,11 +16,11 @@
 use std::sync::Arc;
 
 use crate::application::agent_roster::AgentRoster;
-use crate::application::agent_run::{new_session_id, AgentDependencies, AgentRunner, RunState};
+use crate::application::agent_run::{AgentDependencies, AgentRunner, RunState, new_session_id};
 use crate::application::control::ExecutionControl;
 use crate::application::error::ApplicationError;
 use crate::application::port::{CancelHandle, EvidenceSink};
-use crate::application::snapshot::{TaskSnapshot, TaskStore, TASK_FORMAT};
+use crate::application::snapshot::{TASK_FORMAT, TaskSnapshot, TaskStore};
 use crate::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
 use crate::application::worktree::WorktreeScanner;
 use crate::domain::agent::AgentSpec;
@@ -139,7 +139,11 @@ impl Orchestrator {
     }
 
     /// 接入宿主执行控制与取消开关，随每次运行传给 runner。
-    pub fn with_execution_control(mut self, control: Arc<dyn ExecutionControl>, cancel: CancelHandle) -> Self {
+    pub fn with_execution_control(
+        mut self,
+        control: Arc<dyn ExecutionControl>,
+        cancel: CancelHandle,
+    ) -> Self {
         self.execution_control = Some(control);
         self.execution_cancel = Some(cancel);
         self
@@ -240,13 +244,17 @@ impl Orchestrator {
         for index in start..task.steps().len() {
             let step_role = task.steps()[index].role;
             match self
-                .run_step(task, StepContext {
-                    index,
-                    budget,
-                    session_id: &session_id,
-                    evidence: &evidence,
-                    completed_outputs: &completed_outputs,
-                }, &mut runner)
+                .run_step(
+                    task,
+                    StepContext {
+                        index,
+                        budget,
+                        session_id: &session_id,
+                        evidence: &evidence,
+                        completed_outputs: &completed_outputs,
+                    },
+                    &mut runner,
+                )
                 .await
             {
                 Ok(answer) => {
@@ -448,13 +456,17 @@ impl Orchestrator {
         for index in start..task.steps().len() {
             let step_role = task.steps()[index].role;
             match self
-                .run_step(&task, StepContext {
-                    index,
-                    budget,
-                    session_id: &session_id,
-                    evidence: &evidence,
-                    completed_outputs: &completed_outputs,
-                }, &mut runner)
+                .run_step(
+                    &task,
+                    StepContext {
+                        index,
+                        budget,
+                        session_id: &session_id,
+                        evidence: &evidence,
+                        completed_outputs: &completed_outputs,
+                    },
+                    &mut runner,
+                )
                 .await
             {
                 Ok(answer) => {
@@ -589,14 +601,14 @@ impl Orchestrator {
         let evidence = context.evidence;
         let completed_outputs = context.completed_outputs;
         let total = task.steps().len();
-        let profile = self
-            .deps
-            .roster
-            .find(step.role)
-            .ok_or_else(|| ApplicationError::ProfileMissing {
-                step: index + 1,
-                role: step.role.name().to_owned(),
-            })?;
+        let profile =
+            self.deps
+                .roster
+                .find(step.role)
+                .ok_or_else(|| ApplicationError::ProfileMissing {
+                    step: index + 1,
+                    role: step.role.name().to_owned(),
+                })?;
         let spec = AgentSpec {
             role: step.role,
             system_prompt: profile.system_prompt.clone(),
@@ -606,12 +618,7 @@ impl Orchestrator {
             effort: profile.effort,
             verbosity: profile.verbosity,
         };
-        let prompt = crate::application::step_prompt::step_prompt(
-            task.goal(),
-            step,
-            index,
-            total,
-        );
+        let prompt = crate::application::step_prompt::step_prompt(task.goal(), step, index, total);
 
         let mut active = match runner.take() {
             Some(mut existing) => {
@@ -656,6 +663,7 @@ mod tests {
 
     use super::*;
     use crate::application::context_policy::DefaultContextPolicy;
+    use crate::application::memory_evidence::MemoryEvidenceSink;
     use crate::application::port::{ApprovalGate, EvidenceSink, NoopHooks};
     use crate::application::tool_registry::ToolRegistry;
     use crate::domain::agent::AgentRole;
@@ -664,7 +672,6 @@ mod tests {
     use crate::domain::workspace::WorkspaceRoot;
     use crate::infrastructure::approval::auto::AutoApproveGate;
     use crate::infrastructure::clock::SystemClock;
-    use crate::application::memory_evidence::MemoryEvidenceSink;
     use crate::infrastructure::model::rig_chat::RigChatGateway;
     use crate::infrastructure::tool::all_tools;
 
@@ -827,7 +834,8 @@ mod tests {
         // 因此判别断言落在历史文本上：若回归成每步一个会话，第 2 步的
         // 请求只剩步骤指令，断言会失败。mock 脚本第 2 步不再发 read_file，
         // 模拟的是模型已经看到内容的行为。
-        let workspace = std::env::temp_dir().join(format!("qch-orch-reread-{}", std::process::id()));
+        let workspace =
+            std::env::temp_dir().join(format!("qch-orch-reread-{}", std::process::id()));
         std::fs::create_dir_all(&workspace).expect("建临时工作区");
         std::fs::write(workspace.join("notes.txt"), "根因在解析层").expect("写 fixture 文件");
         let registry = ToolRegistry::new(all_tools(WorkspaceRoot::new(workspace.clone())));
@@ -848,7 +856,11 @@ mod tests {
         };
         let (factory, evidence) = shared_factory();
         let mut orchestrator = Orchestrator::new(deps, Budget::new(20), factory);
-        let mut task = orchestrator.create_task(TaskId::new("t-reread"), TaskKind::BugFix, "读 notes.txt 定位并修复");
+        let mut task = orchestrator.create_task(
+            TaskId::new("t-reread"),
+            TaskKind::BugFix,
+            "读 notes.txt 定位并修复",
+        );
 
         let outcome = orchestrator.run(&mut task).await.unwrap();
 
@@ -856,12 +868,18 @@ mod tests {
         // 判别断言：第 2 步的请求里带有第 1 步读到的内容。每步一个会话
         // 的旧实现下历史为空，这条断言会失败。
         let second = history_text(&mock, 2);
-        assert!(second.contains("根因在解析层"), "第 2 步应已拿到文件内容: {second}");
+        assert!(
+            second.contains("根因在解析层"),
+            "第 2 步应已拿到文件内容: {second}"
+        );
         // 内容在后续步骤中仍然可见：第 3、4 步也能看到。两处都断言，
         // 才能确认单会话编排的连续性。
         for index in [3, 4] {
             let text = history_text(&mock, index);
-            assert!(text.contains("根因在解析层"), "第 {index} 步应仍带着第 1 步的内容: {text}");
+            assert!(
+                text.contains("根因在解析层"),
+                "第 {index} 步应仍带着第 1 步的内容: {text}"
+            );
         }
         // 脚本里模型只发出过一次 read_file。
         let reads = evidence
@@ -1031,7 +1049,8 @@ mod tests {
             ..deps(&mock)
         };
         let mut orchestrator = Orchestrator::new(deps, Budget::new(20), test_factory());
-        let mut task = orchestrator.create_task(TaskId::new("t7"), TaskKind::BugFix, "改 notes.txt");
+        let mut task =
+            orchestrator.create_task(TaskId::new("t7"), TaskKind::BugFix, "改 notes.txt");
 
         orchestrator.run(&mut task).await.unwrap();
 
@@ -1227,7 +1246,8 @@ mod tests {
             (AgentRole::Tester, "tester-model".to_owned()),
             (AgentRole::Reviewer, "reviewer-model".to_owned()),
         ]);
-        let roster = AgentRoster::builtin().with_role_models(&models, &HashMap::new(), &HashMap::new());
+        let roster =
+            AgentRoster::builtin().with_role_models(&models, &HashMap::new(), &HashMap::new());
         let mut orchestrator =
             Orchestrator::with_roster(deps(&mock), Budget::new(20), test_factory(), roster);
         let mut task =
@@ -1273,7 +1293,8 @@ mod tests {
             MockTurn::text("汇总完了"),
         ]);
         let mut orchestrator = Orchestrator::new(deps(&mock), Budget::new(20), test_factory());
-        let mut task = orchestrator.create_task(TaskId::new("t-no-model"), TaskKind::BugFix, "修好它");
+        let mut task =
+            orchestrator.create_task(TaskId::new("t-no-model"), TaskKind::BugFix, "修好它");
 
         orchestrator.run(&mut task).await.expect("四步都应跑完");
 
@@ -1308,10 +1329,7 @@ mod tests {
             matches!(&error, ApplicationError::StepFailed { step: 3, .. }),
             "第 3 步一进来就该撞上累计轮数上限，实际: {error}"
         );
-        assert!(
-            error.to_string().contains("已达最大轮数"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("已达最大轮数"), "{error}");
     }
 
     #[tokio::test]
@@ -1334,10 +1352,14 @@ mod tests {
         turns.push(MockTurn::text("第4步产出"));
         let mock = MockCompletionModel::from_turns(turns);
 
-        let workspace = std::env::temp_dir().join(format!("qch-orch-compact-{}", std::process::id()));
+        let workspace =
+            std::env::temp_dir().join(format!("qch-orch-compact-{}", std::process::id()));
         std::fs::create_dir_all(&workspace).expect("建临时工作区");
-        for name in ["r1-1.txt", "r1-2.txt", "r1-3.txt", "r2-1.txt", "r2-2.txt", "r2-3.txt"] {
-            std::fs::write(workspace.join(name), format!("{name} 的内容")).expect("写 fixture 文件");
+        for name in [
+            "r1-1.txt", "r1-2.txt", "r1-3.txt", "r2-1.txt", "r2-2.txt", "r2-3.txt",
+        ] {
+            std::fs::write(workspace.join(name), format!("{name} 的内容"))
+                .expect("写 fixture 文件");
         }
         let registry = ToolRegistry::new(all_tools(WorkspaceRoot::new(workspace.clone())));
         let deps = AgentDependencies {
@@ -1353,7 +1375,8 @@ mod tests {
         let mut deps = deps;
         deps.context_budget = budget_context;
         let mut orchestrator = Orchestrator::new(deps, Budget::new(20), test_factory());
-        let mut task = orchestrator.create_task(TaskId::new("t11"), TaskKind::BugFix, "读六个文件再汇总");
+        let mut task =
+            orchestrator.create_task(TaskId::new("t11"), TaskKind::BugFix, "读六个文件再汇总");
 
         let outcome = orchestrator.run(&mut task).await.unwrap();
 
@@ -1361,7 +1384,12 @@ mod tests {
         assert_eq!(outcome.answer, "第4步产出");
         // 最后一次请求（第 4 步）只保留 2 轮，四条步骤交代都在。
         let last = user_messages(&mock, mock.requests().len() - 1);
-        for expected in ["任务：读六个文件再汇总", "第 2/4 步", "第 3/4 步", "第 4/4 步"] {
+        for expected in [
+            "任务：读六个文件再汇总",
+            "第 2/4 步",
+            "第 3/4 步",
+            "第 4/4 步",
+        ] {
             assert!(
                 last.iter().any(|text| text.contains(expected)),
                 "裁剪后仍应看到 {expected}: {last:?}"

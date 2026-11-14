@@ -133,14 +133,7 @@ pub fn load_layered_instructions(
         let directory = normalized_absolute(user_dir)?;
         if optional_path_exists(&directory, None)? {
             let boundary = canonical_directory(&directory, None)?;
-            if !append_layer(
-                &mut loaded,
-                &mut seen,
-                &directory,
-                &boundary,
-                1,
-                true,
-            )? {
+            if !append_layer(&mut loaded, &mut seen, &directory, &boundary, 1, true)? {
                 return Ok(loaded);
             }
         }
@@ -159,7 +152,6 @@ pub fn load_layered_instructions(
     }
     Ok(loaded)
 }
-
 
 fn normalized_absolute(path: &Path) -> Result<PathBuf, String> {
     if path

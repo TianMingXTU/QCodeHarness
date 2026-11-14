@@ -1512,8 +1512,9 @@ async fn model_and_factory_panics_still_close_resources_and_publish_failure() {
             "model-panic"
         });
         let model = Arc::new(Model {
-            after_reply: (!close_panics)
-                .then(|| Box::new(|_| -> () { panic!("模拟模型崩溃") }) as Box<dyn Fn(usize) + Send + Sync>),
+            after_reply: (!close_panics).then(|| {
+                Box::new(|_| -> () { panic!("模拟模型崩溃") }) as Box<dyn Fn(usize) + Send + Sync>
+            }),
             ..Model::new()
         });
         let factory = Factory::new(model.clone()).configure(|factory| {

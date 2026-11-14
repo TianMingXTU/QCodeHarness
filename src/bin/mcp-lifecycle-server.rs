@@ -97,12 +97,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
-fn serve(
-    counter_path: Option<PathBuf>,
-    threshold: u64,
-    then_exit: bool,
-    never_init_reply: bool,
-) {
+fn serve(counter_path: Option<PathBuf>, threshold: u64, then_exit: bool, never_init_reply: bool) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     // 跨进程续接计数：重连拉起的新进程从已有副作用数之后接着数。
@@ -145,10 +140,14 @@ fn serve(
                         .append(true)
                         .open(path)
                         .and_then(|mut file| writeln!(file, "{calls}"))
-                    {
-                        eprintln!("helper 计数失败: {error}");
-                    }
-                let triggered = if then_exit { calls == threshold } else { calls >= threshold };
+                {
+                    eprintln!("helper 计数失败: {error}");
+                }
+                let triggered = if then_exit {
+                    calls == threshold
+                } else {
+                    calls >= threshold
+                };
                 if triggered {
                     if then_exit {
                         std::process::exit(0);
@@ -168,10 +167,10 @@ fn serve(
             && (serde_json::to_writer(&mut stdout, &response).is_err()
                 || writeln!(&mut stdout).is_err()
                 || stdout.flush().is_err())
-            {
-                eprintln!("helper stdout 写失败：父进程可能已退出");
-                return;
-            }
+        {
+            eprintln!("helper stdout 写失败：父进程可能已退出");
+            return;
+        }
     }
     // stdin EOF：父进程关闭了写端。写一个标记文件，让"清理到达子进程"
     // 成为可断言的事实，无需等待数秒后再检查进程是否存在。

@@ -245,9 +245,10 @@ impl ManagedServer {
     ) -> ToolOutcome {
         let mut state = self.state.lock().await;
         if let Connection::Ready(client) = &state.connection
-            && client.is_closed() {
-                self.disconnect(&mut state, Some(call.id.clone())).await;
-            }
+            && client.is_closed()
+        {
+            self.disconnect(&mut state, Some(call.id.clone())).await;
+        }
         let client = match &state.connection {
             Connection::Ready(client) => client,
             // 短路失败没有发出请求：没有执行边界，也没有结果未知，
@@ -292,7 +293,10 @@ impl ManagedServer {
             Err(mut error) => {
                 // 请求已在本连接发出：超时或断连无法证明远端未执行。
                 // 下层只做分类，不判断请求是否发出；该事实只有调用点知道。
-                if matches!(error.kind, McpFaultKind::CallTimeout | McpFaultKind::Disconnected) {
+                if matches!(
+                    error.kind,
+                    McpFaultKind::CallTimeout | McpFaultKind::Disconnected
+                ) {
                     error.result_unknown = true;
                 }
                 let outcome = self.failure(state.generation, error.clone(), active, true);

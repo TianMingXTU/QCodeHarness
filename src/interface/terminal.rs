@@ -1370,5 +1370,14 @@ fn render_audit(event: &AuditEvent) -> String {
             },
             failure.process_isolation
         ),
+        // 渲染稳定码而不是中文原因：稳定码用于脚本/审计做结构化匹配，
+        // 中文理由作为人读补充，不承担匹配职责。
+        AuditEvent::SandboxDegraded { fact, .. } => {
+            let unproven = fact.ineffective_slices().count();
+            format!(
+                "沙箱降级：{}（{}，未证明生效切片 {} 个）",
+                fact.stable_code, fact.reason, unproven
+            )
+        }
     }
 }

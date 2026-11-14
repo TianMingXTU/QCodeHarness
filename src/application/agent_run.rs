@@ -15,7 +15,7 @@ use crate::application::control::ExecutionControl;
 use crate::application::error::ApplicationError;
 use crate::application::port::{
     ApprovalGate, ApprovalRequest, CancelHandle, Clock, EvidenceSink, ModelGateway, ModelReply,
-    ModelRequest, RunHooks,
+    ModelRequest, PreToolUseVerdict, RunHooks,
 };
 use crate::application::snapshot::{RUN_FORMAT, RunSnapshot, SessionStore, StoreError};
 use crate::application::summarizer::{SummarizeInput, Summarizer, render_slices};
@@ -328,12 +328,12 @@ impl AgentRunner {
         // 调用，按 pending 收观察，不一致会导致调用与观察错位配对。
         if let (Some(pending), RunState::Evaluating(calls) | RunState::Dispatching(calls)) =
             (&snapshot.pending, &snapshot.state)
-            && calls != &pending.turn.calls {
-                return Err(StoreError::Corrupt(
-                    "状态机记录的调用清单与待配平轮次不一致".to_owned(),
-                )
-                .into());
-            }
+            && calls != &pending.turn.calls
+        {
+            return Err(
+                StoreError::Corrupt("状态机记录的调用清单与待配平轮次不一致".to_owned()).into(),
+            );
+        }
         // 观察数即本轮已完成的调用数。它不能超过调用数；在 Dispatching 状态下
         // 必须小于调用数，全部配平表示本轮已结束，应停在等待模型而非执行中。
         // 这两种情况正常构造路径产生不出来，在入口拦下。
@@ -1003,7 +1003,19 @@ impl AgentRunner {
                 // 在等待模型，恢复时将当作什么都没发生。
                 self.state = RunState::Dispatching(calls.clone());
                 self.save_snapshot();
-                self.hooks.before_tool_call(&call).await;
+                let verdict = self.hooks.pre_tool_use(&call).await;
+                if let PreToolUseVerdict::Deny(reason) = verdict {
+                    // 拒绝必须留下可审计的决定，再以 Refused 观察回填给模型；
+                    // 执行器此时尚未启动，恢复时也不会重放这次调用。
+                    let turn = self.session.rounds() + 1;
+                    self.record(AuditEvent::ApprovalDecided {
+                        turn,
+                        tool: call.name.clone(),
+                        allowed: false,
+                        reason: Some(reason.clone()),
+                    });
+                    return self.record_and_advance(call, ToolOutcome::refused(reason)).await;
+                }
                 let outcome = self.tools.invoke(&call).await;
                 self.hooks.after_tool_result(&call, &outcome).await;
                 self.record_and_advance(call, outcome).await
@@ -1043,13 +1055,14 @@ impl AgentRunner {
                     // exhausted 命中后先区分维度：两种超限的处理方式不同，
                     // 错误需要能指导调用方采取动作。
                     if let Some(limit) = budget.max_wall_clock
-                        && self.consumption.elapsed >= limit {
-                            self.save_snapshot();
-                            return Err(ApplicationError::WallClockExhausted {
-                                elapsed: self.consumption.elapsed,
-                                limit,
-                            });
-                        }
+                        && self.consumption.elapsed >= limit
+                    {
+                        self.save_snapshot();
+                        return Err(ApplicationError::WallClockExhausted {
+                            elapsed: self.consumption.elapsed,
+                            limit,
+                        });
+                    }
                     self.save_snapshot();
                     return Err(ApplicationError::BudgetExhausted {
                         max_turns: budget.max_turns,

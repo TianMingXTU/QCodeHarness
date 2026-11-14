@@ -73,7 +73,12 @@ impl AgentProfile {
 - 最终答案要包含：对目标的理解、有序步骤清单（每步带完成判据）、遗漏与风险。"
                 ),
                 // 只读工具，共 6 个。
-                tools: Some(READ_ONLY_TOOLS.iter().map(|name| (*name).to_owned()).collect()),
+                tools: Some(
+                    READ_ONLY_TOOLS
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect(),
+                ),
                 model: None,
                 effort: None,
                 verbosity: None,
@@ -150,7 +155,12 @@ impl AgentProfile {
 - 任务完成时停止调用工具，直接输出最终答案；
 - 最终答案要包含：改动范围的理解、问题清单（按严重程度排序，引用具体代码）、明确的合并建议。"
                 ),
-                tools: Some(READ_ONLY_TOOLS.iter().map(|name| (*name).to_owned()).collect()),
+                tools: Some(
+                    READ_ONLY_TOOLS
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect(),
+                ),
                 model: None,
                 effort: None,
                 verbosity: None,
@@ -197,8 +207,14 @@ mod tests {
     #[test]
     fn planner_and_reviewer_share_the_read_only_set() {
         let profiles = AgentProfile::builtin();
-        let planner = profiles.iter().find(|p| p.role == AgentRole::Planner).unwrap();
-        let reviewer = profiles.iter().find(|p| p.role == AgentRole::Reviewer).unwrap();
+        let planner = profiles
+            .iter()
+            .find(|p| p.role == AgentRole::Planner)
+            .unwrap();
+        let reviewer = profiles
+            .iter()
+            .find(|p| p.role == AgentRole::Reviewer)
+            .unwrap();
         assert_eq!(planner.tools, reviewer.tools);
     }
 

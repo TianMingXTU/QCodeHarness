@@ -9,7 +9,7 @@ use qcode_harness::application::report::{
     summarize_service_events,
 };
 use qcode_harness::domain::service::PROTOCOL_VERSION;
-use qcode_harness::infrastructure::service_report::{summarize_service};
+use qcode_harness::infrastructure::service_report::summarize_service;
 use serde_json::{Value, json};
 
 struct Workspace(PathBuf);
@@ -98,12 +98,21 @@ fn absent_service_returns_an_explicit_empty_summary() {
     assert_eq!(summary.task_version_counts, None);
     assert_eq!(summary.snapshot_version_counts, None);
     assert!(summary.corrupt_files.is_empty());
-    assert_eq!(summary.state_path, Some(workspace.0.join(".qcodeharness/service/state.json")));
-    assert_eq!(summary.events_path, Some(workspace.0.join(".qcodeharness/service/events.jsonl")));
+    assert_eq!(
+        summary.state_path,
+        Some(workspace.0.join(".qcodeharness/service/state.json"))
+    );
+    assert_eq!(
+        summary.events_path,
+        Some(workspace.0.join(".qcodeharness/service/events.jsonl"))
+    );
     let text = service_summary_lines(&summary).join("\n");
     assert!(text.contains("not_present"), "{text}");
     assert!(text.contains("未知"), "{text}");
-    assert!(!workspace.0.join(".qcodeharness").exists(), "报表读取不创建状态目录");
+    assert!(
+        !workspace.0.join(".qcodeharness").exists(),
+        "报表读取不创建状态目录"
+    );
 }
 
 #[test]
@@ -119,23 +128,36 @@ fn continuous_events_and_independent_snapshot_versions_are_reported() {
     workspace.snapshot("tasks", "task-b.json", br#"{"format_version":1}"#);
     workspace.snapshot("snapshots", "run-a.json", br#"{"format_version":4}"#);
     workspace.snapshot("snapshots", "run-b.json", br#"{"format_version":99}"#);
-    workspace.snapshot("snapshots", "run-a.json.bak-v3", b"backup is not a snapshot");
+    workspace.snapshot(
+        "snapshots",
+        "run-a.json.bak-v3",
+        b"backup is not a snapshot",
+    );
 
     let summary = summarize_service(&workspace.0);
 
     assert_eq!(summary.status, ServiceSummaryStatus::Read);
     assert_eq!(summary.events_total, Some(3));
-    assert_eq!((summary.first_sequence, summary.last_sequence), (Some(1), Some(3)));
+    assert_eq!(
+        (summary.first_sequence, summary.last_sequence),
+        (Some(1), Some(3))
+    );
     assert_eq!(summary.sequence_gaps, Some(0));
     let counts = summary.status_counts.as_ref().expect("事件类型计数");
     assert_eq!(counts["execution_started"], 2);
     assert_eq!(counts["cancel_requested"], 1);
     assert_eq!(summary.task_count, Some(2));
     assert_eq!(summary.state_schema_version, Some(2));
-    assert_eq!(summary.task_version_counts.as_ref().expect("任务版本")[&1], 2);
+    assert_eq!(
+        summary.task_version_counts.as_ref().expect("任务版本")[&1],
+        2
+    );
     let versions = summary.snapshot_version_counts.as_ref().expect("运行版本");
     assert_eq!(versions[&4], 1);
-    assert_eq!(versions[&99], 1, "报表盘点版本，不代替恢复逻辑拒绝未知快照版本");
+    assert_eq!(
+        versions[&99], 1,
+        "报表盘点版本，不代替恢复逻辑拒绝未知快照版本"
+    );
     assert!(summary.corrupt_files.is_empty());
 
     let pure = summarize_service_events(&events, summary.events_path.as_deref().unwrap());
@@ -167,7 +189,10 @@ fn sequence_gap_is_counted_and_has_a_file_and_line_diagnostic() {
     assert_eq!(summary.events_total, Some(2));
     assert_eq!(summary.sequence_gaps, Some(1));
     let issue = summary.corrupt_files.first().expect("断号诊断");
-    assert_eq!(issue.path, workspace.0.join(".qcodeharness/service/events.jsonl"));
+    assert_eq!(
+        issue.path,
+        workspace.0.join(".qcodeharness/service/events.jsonl")
+    );
     assert_eq!(issue.line, Some(2));
     assert!(issue.reason.contains("期望 2"), "{}", issue.reason);
 }
@@ -184,11 +209,19 @@ fn corrupt_task_and_run_snapshots_remain_visible() {
     let summary = summarize_service(&workspace.0);
 
     assert_eq!(summary.status, ServiceSummaryStatus::Incomplete);
-    assert_eq!(summary.task_count, Some(2), "文件数包括损坏文件，版本计数只包括可读文件");
+    assert_eq!(
+        summary.task_count,
+        Some(2),
+        "文件数包括损坏文件，版本计数只包括可读文件"
+    );
     assert_eq!(summary.task_version_counts.as_ref().unwrap()[&1], 1);
     assert!(summary.snapshot_version_counts.as_ref().unwrap().is_empty());
     for path in [&bad_task, &bad_run, &missing_version] {
-        let issue = summary.corrupt_files.iter().find(|issue| &issue.path == path).expect("损坏快照诊断");
+        let issue = summary
+            .corrupt_files
+            .iter()
+            .find(|issue| &issue.path == path)
+            .expect("损坏快照诊断");
         assert!(!issue.reason.is_empty());
         assert_eq!(issue.line, None);
     }
@@ -247,6 +280,9 @@ fn invalid_state_metadata_is_not_reported_as_a_legacy_version() {
         assert_eq!(summary.status, ServiceSummaryStatus::Incomplete);
         assert_eq!(summary.state_schema_version, None);
         assert_eq!(summary.corrupt_files.len(), 1);
-        assert_eq!(summary.corrupt_files[0].path, workspace.0.join(".qcodeharness/service/state.json"));
+        assert_eq!(
+            summary.corrupt_files[0].path,
+            workspace.0.join(".qcodeharness/service/state.json")
+        );
     }
 }

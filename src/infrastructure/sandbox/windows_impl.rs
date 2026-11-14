@@ -9,14 +9,12 @@
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
 };
-use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
-};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 // windows crate 将 windows-core 重导出为 windows::core（句柄所有权
 // 原语 Owned 在此），因此不单独声明 windows-core 依赖。
 use windows::core::Owned;
@@ -199,7 +197,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use windows::Win32::System::Threading::{
-        GetExitCodeProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess,
     };
 
     /// `GetExitCodeProcess` 对仍在运行的进程报告的退出码。
@@ -246,11 +244,8 @@ mod tests {
     impl Fixture {
         /// `tag` 区分同一测试进程内的多个脚手架。
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "qch-sandbox-{}-{}",
-                tag,
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("qch-sandbox-{}-{}", tag, std::process::id()));
             // 上次崩溃残留的文件会让"文件已出现"变成假信号，先清理。
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("创建测试临时目录");
@@ -277,7 +272,13 @@ mod tests {
             );
             let stderr_file = std::fs::File::create(&self.launcher_err).expect("建 stderr 日志");
             tokio::process::Command::new("powershell")
-                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+                .args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    &script,
+                ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(stderr_file))
@@ -295,9 +296,10 @@ mod tests {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             loop {
                 if let Ok(text) = std::fs::read_to_string(&self.child_pid)
-                    && let Ok(pid) = text.trim().parse::<u32>() {
-                        return pid;
-                    }
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    return pid;
+                }
                 if tokio::time::Instant::now() >= deadline {
                     let reason = std::fs::read_to_string(&self.launcher_err)
                         .unwrap_or_else(|_| "<空>".to_owned());
@@ -345,8 +347,18 @@ mod tests {
 
         drop(job); // 最后一个 Job 句柄关闭 → KILL_ON_JOB_CLOSE 整树终止
         // 约 300 秒的 ping 在 10 秒内消失，只能是被 Job 提前终止。
-        assert_dead(child_pid, Duration::from_secs(10), "纳入后才创建的孙进程应被整树终止").await;
-        assert_dead(launcher_pid, Duration::from_secs(10), "launcher 应被整树终止").await;
+        assert_dead(
+            child_pid,
+            Duration::from_secs(10),
+            "纳入后才创建的孙进程应被整树终止",
+        )
+        .await;
+        assert_dead(
+            launcher_pid,
+            Duration::from_secs(10),
+            "launcher 应被整树终止",
+        )
+        .await;
         let _ = tokio::time::timeout(Duration::from_secs(10), launcher.wait()).await;
         fixture.cleanup();
     }

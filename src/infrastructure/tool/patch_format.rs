@@ -73,10 +73,7 @@ pub struct Hunk {
 /// 文件查找报"找不到"。
 pub fn parse_patch(text: &str) -> Result<Vec<Operation>, String> {
     let lines: Vec<&str> = text.lines().collect();
-    let trimmed: Vec<&str> = lines
-        .iter()
-        .map(|line| line.trim_end())
-        .collect();
+    let trimmed: Vec<&str> = lines.iter().map(|line| line.trim_end()).collect();
 
     if trimmed.first().copied() != Some(BEGIN_MARKER) {
         return Err(format!(
@@ -288,8 +285,16 @@ pub fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
     for (number, hunk) in hunks.iter().enumerate() {
         // 补丁片段也统一成 LF。比较在 LF 空间里做，写回时统一还原成文件
         // 的风格，片段里混进来的 `\r` 不会漏到结果里。
-        let old: Vec<String> = hunk.old.iter().map(|line| LineEnding::to_lf(line)).collect();
-        let new: Vec<String> = hunk.new.iter().map(|line| LineEnding::to_lf(line)).collect();
+        let old: Vec<String> = hunk
+            .old
+            .iter()
+            .map(|line| LineEnding::to_lf(line))
+            .collect();
+        let new: Vec<String> = hunk
+            .new
+            .iter()
+            .map(|line| LineEnding::to_lf(line))
+            .collect();
         let start = match &hunk.anchor {
             Some(anchor) => match lines.iter().position(|line| line.contains(anchor.as_str())) {
                 Some(position) => position,
@@ -334,9 +339,7 @@ fn find_unique(lines: &[String], old: &[String], start: usize) -> Result<usize, 
     match positions.len() {
         0 => Err("在文件里找不到要替换的内容（上下文与文件内容不一致）".to_owned()),
         1 => Ok(positions[0]),
-        n => Err(format!(
-            "匹配到 {n} 处，请提供更长的上下文以唯一定位"
-        )),
+        n => Err(format!("匹配到 {n} 处，请提供更长的上下文以唯一定位")),
     }
 }
 
@@ -607,7 +610,10 @@ mod tests {
         let error = apply_hunks(content, &hunks).unwrap_err();
 
         assert!(error.contains("定位不到"), "实际: {error}");
-        assert!(error.contains("fn nowhere()"), "应点出找不到的锚点: {error}");
+        assert!(
+            error.contains("fn nowhere()"),
+            "应点出找不到的锚点: {error}"
+        );
     }
 
     /// 多个改动块按顺序应用，后一个块在前一个的结果上查找。

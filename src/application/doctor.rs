@@ -11,8 +11,9 @@ use std::path::Path;
 use crate::application::snapshot::{RUN_FORMAT, TASK_FORMAT};
 use crate::domain::doctor::{
     ConfigFacts, DoctorCheck, DoctorFacts, DoctorReport, DoctorStatus, JournalFacts, LeaseFacts,
-    ModelFacts, StateFacts, snapshot_version_status,
+    ModelFacts, ProviderConnectivityFacts, StateFacts, snapshot_version_status,
 };
+use crate::domain::sandbox_fact::SandboxSliceFact;
 use crate::domain::service::{MAX_JOURNAL_BYTES, PROTOCOL_VERSION, SERVICE_STATE_FORMAT};
 
 /// 依据采集到的事实生成只读诊断报告。
@@ -23,11 +24,11 @@ pub fn diagnose(facts: &DoctorFacts) -> DoctorReport {
     let checks = vec![
         model_config_check(&facts.model),
         config_check(&facts.config),
-        policy_check(facts.policy_path.as_deref(), facts.policy_parse_error.as_deref()),
-        mcp_check(
-            facts.mcp_path.as_deref(),
-            facts.mcp_parse_error.as_deref(),
+        policy_check(
+            facts.policy_path.as_deref(),
+            facts.policy_parse_error.as_deref(),
         ),
+        mcp_check(facts.mcp_path.as_deref(), facts.mcp_parse_error.as_deref()),
         approval_gate_check(facts.auto_approve_raw.as_deref()),
         sandbox_capability_check(facts.capabilities),
         snapshot_version_check(&facts.snapshots),
@@ -36,6 +37,13 @@ pub fn diagnose(facts: &DoctorFacts) -> DoctorReport {
         state_schema_check(&facts.state),
         journal_size_check(facts.journal_bytes),
         privacy_check(),
+        crate::application::doctor_provider::provider_connectivity_check(
+            &facts
+                .provider_connectivity
+                .clone()
+                .unwrap_or_else(ProviderConnectivityFacts::unknown),
+        ),
+        sandbox_slices_check(&facts.sandbox_slices),
     ];
 
     DoctorReport {
@@ -75,7 +83,8 @@ fn model_config_check(facts: &ModelFacts) -> DoctorCheck {
         },
         path: Some(".env（用户级或项目工作区）".to_owned()),
         recommendation: Some(
-            "通过父进程环境或用户级 .env 注入缺失变量；不要在聊天、任务描述、日志或报告中填写密钥".to_owned(),
+            "通过父进程环境或用户级 .env 注入缺失变量；不要在聊天、任务描述、日志或报告中填写密钥"
+                .to_owned(),
         ),
     }
 }
@@ -94,7 +103,9 @@ fn config_check(facts: &ConfigFacts) -> DoctorCheck {
             status: DoctorStatus::Error,
             message: format!("配置加载失败：{error}"),
             path: path.as_ref().map(|value| value.display().to_string()),
-            recommendation: Some("修复 TOML 语法或删除损坏文件；运行 `QCodeHarness --doctor` 复核".to_owned()),
+            recommendation: Some(
+                "修复 TOML 语法或删除损坏文件；运行 `QCodeHarness --doctor` 复核".to_owned(),
+            ),
         },
         (None, Some(path)) => DoctorCheck {
             code: "configuration".to_owned(),
@@ -167,7 +178,10 @@ fn mcp_check(path: Option<&Path>, parse_error: Option<&str>) -> DoctorCheck {
         ),
         (Some(path), None) => (
             DoctorStatus::Warn,
-            format!("已配置 MCP 清单：{}；doctor 不启动子进程，连接状态未知", path.display()),
+            format!(
+                "已配置 MCP 清单：{}；doctor 不启动子进程，连接状态未知",
+                path.display()
+            ),
             Some("执行 `QCodeHarness --mcp-reconnect <服务器名>` 做有界握手探测".to_owned()),
         ),
         (None, None) => (DoctorStatus::Ok, "未配置 MCP 清单".to_owned(), None),
@@ -205,20 +219,22 @@ fn approval_gate_check(raw: Option<&str>) -> DoctorCheck {
         status,
         message,
         path: None,
-        recommendation: auto.then(|| "仅无人值守的隔离实验设置该变量；生产任务优先逐项审批".to_owned()),
+        recommendation: auto
+            .then(|| "仅无人值守的隔离实验设置该变量；生产任务优先逐项审批".to_owned()),
     }
 }
 
 /// 平台能力：如实反映当前平台具备的隔离能力，不虚报保护。
-fn sandbox_capability_check(capabilities: crate::domain::sandbox::PlatformCapabilities) -> DoctorCheck {
+fn sandbox_capability_check(
+    capabilities: crate::domain::sandbox::PlatformCapabilities,
+) -> DoctorCheck {
     let statement = capabilities.unisolation_statement();
     let status = if statement.is_some() {
         DoctorStatus::Warn
     } else {
         DoctorStatus::Ok
     };
-    let declaration =
-        statement.unwrap_or("完整隔离能力已声明生效");
+    let declaration = statement.unwrap_or("完整隔离能力已声明生效");
     DoctorCheck {
         code: "sandbox_capabilities".to_owned(),
         status,
@@ -240,8 +256,7 @@ fn sandbox_capability_check(capabilities: crate::domain::sandbox::PlatformCapabi
 
 /// 快照版本：两个目录各自与当前格式比较，混入旧版本即 Error。
 fn snapshot_version_check(facts: &crate::domain::doctor::SnapshotFacts) -> DoctorCheck {
-    let (status, run_count, task_count) =
-        snapshot_version_status(facts, RUN_FORMAT, TASK_FORMAT);
+    let (status, run_count, task_count) = snapshot_version_status(facts, RUN_FORMAT, TASK_FORMAT);
     DoctorCheck {
         code: "snapshot_versions".to_owned(),
         status,
@@ -251,7 +266,8 @@ fn snapshot_version_check(facts: &crate::domain::doctor::SnapshotFacts) -> Docto
         ),
         path: Some(".qcodeharness/".to_owned()),
         recommendation: (status != DoctorStatus::Ok).then(|| {
-            "先备份原快照，再用写入它的旧版本继续，或从基线重建；当前版本不会自动改写旧文件".to_owned()
+            "先备份原快照，再用写入它的旧版本继续，或从基线重建；当前版本不会自动改写旧文件"
+                .to_owned()
         }),
     }
 }
@@ -294,7 +310,10 @@ fn journal_error(reason: String) -> DoctorCheck {
         status: DoctorStatus::Error,
         message: format!("事件日志无法回放：{reason}"),
         path: None,
-        recommendation: Some("先停止服务，备份当前日志，再运行 `QCodeHarness --rotate-events` 归档后重建日志".to_owned()),
+        recommendation: Some(
+            "先停止服务，备份当前日志，再运行 `QCodeHarness --rotate-events` 归档后重建日志"
+                .to_owned(),
+        ),
     }
 }
 
@@ -323,14 +342,18 @@ fn service_lease_check(facts: &LeaseFacts) -> DoctorCheck {
             status: DoctorStatus::Warn,
             message: "服务租约文件存在但锁空闲：可能是崩溃残留".to_owned(),
             path: Some(lease_path),
-            recommendation: Some("确认没有 QCodeHarness stdio/服务进程后可删除该文件；不要在运行中删除".to_owned()),
+            recommendation: Some(
+                "确认没有 QCodeHarness stdio/服务进程后可删除该文件；不要在运行中删除".to_owned(),
+            ),
         },
         None => DoctorCheck {
             code: "service_lease".to_owned(),
             status: DoctorStatus::Unknown,
             message: "服务租约文件存在，但锁探测失败，无法判断是否有服务在运行".to_owned(),
             path: Some(lease_path),
-            recommendation: Some("检查文件权限或占用该文件的进程后重试 `QCodeHarness --doctor`".to_owned()),
+            recommendation: Some(
+                "检查文件权限或占用该文件的进程后重试 `QCodeHarness --doctor`".to_owned(),
+            ),
         },
     }
 }
@@ -431,6 +454,61 @@ fn privacy_check() -> DoctorCheck {
     }
 }
 
+/// R2 系统级沙箱切片：如实反映未实测/未生效的隔离面。
+///
+/// 只消费 `DoctorFacts::sandbox_slices`，不读内核。判定规则：
+/// 全部 Effective 才 Ok；任一 Untested/Ineffective 即 Warn，列出未证明
+/// 生效的切片名与原因，让用户明确看到能力缺口，不虚报"有隔离"。
+fn sandbox_slices_check(slices: &[SandboxSliceFact]) -> DoctorCheck {
+    use crate::domain::sandbox_fact::SandboxSliceStatus;
+    if slices.is_empty() {
+        return DoctorCheck {
+            code: "sandbox_r2_slices".to_owned(),
+            status: DoctorStatus::Unknown,
+            message: "未采集到 R2 沙箱切片事实".to_owned(),
+            path: None,
+            recommendation: Some(
+                "该结果表示没有执行平台能力探测，不代表隔离已经生效".to_owned(),
+            ),
+        };
+    }
+    let unproven: Vec<String> = slices
+        .iter()
+        .filter(|slice| slice.status != SandboxSliceStatus::Effective)
+        .map(|slice| {
+            format!(
+                "{}（{}）{}",
+                slice.capability.label(),
+                slice.status.label(),
+                slice.reason
+            )
+        })
+        .collect();
+    let status = if unproven.is_empty() {
+        DoctorStatus::Ok
+    } else {
+        DoctorStatus::Warn
+    };
+    DoctorCheck {
+        code: "sandbox_r2_slices".to_owned(),
+        status,
+        message: if unproven.is_empty() {
+            format!("R2 系统级沙箱 {} 项切片均已实测生效", slices.len())
+        } else {
+            format!(
+                "R2 系统级沙箱未证明生效切片：{}",
+                unproven.join("，")
+            )
+        },
+        path: None,
+        recommendation: if unproven.is_empty() {
+            None
+        } else {
+            Some("未实测/未生效切片表示对应隔离能力尚未在当前平台验证；开放命令仍按基线策略拒绝，详见 docs/sandbox.md".to_owned())
+        },
+    }
+}
+
 /// 渲染人读诊断文本。`--json` 的输出由调用方序列化 [`DoctorReport`]。
 pub fn render_text(report: &DoctorReport) -> String {
     let mut lines = vec![
@@ -488,11 +566,17 @@ mod tests {
             lease: LeaseFacts::default(),
             state: StateFacts::default(),
             journal_bytes: 0,
+            sandbox_slices: Vec::new(),
+            provider_connectivity: None,
         }
     }
 
     fn find<'a>(report: &'a DoctorReport, code: &str) -> &'a DoctorCheck {
-        report.checks.iter().find(|check| check.code == code).unwrap()
+        report
+            .checks
+            .iter()
+            .find(|check| check.code == code)
+            .unwrap()
     }
 
     /// 生成报告并取出指定诊断项的拥有值，避免调用方自己处理临时值生命周期。
@@ -510,13 +594,58 @@ mod tests {
     }
 
     #[test]
+    fn diagnose_reports_fourteen_checks_including_provider_and_r2_slices() {
+        let report = diagnose(&base_facts());
+        assert_eq!(report.checks.len(), 14);
+        assert!(report.checks.iter().any(|c| c.code == "provider_connectivity"));
+        assert!(report.checks.iter().any(|c| c.code == "sandbox_r2_slices"));
+    }
+
+    #[test]
+    fn unproven_sandbox_slices_are_warned_not_reported_as_protected() {
+        use crate::domain::sandbox_fact::{
+            SandboxCapability, SandboxSliceFact, SandboxSliceStatus,
+        };
+
+        let mut facts = base_facts();
+        facts.sandbox_slices = vec![
+            SandboxSliceFact::new(
+                SandboxCapability::ProcessTreeKill,
+                SandboxSliceStatus::Effective,
+                "Job Object",
+                "任务运行于作业对象",
+            ),
+            SandboxSliceFact::new(
+                SandboxCapability::Network,
+                SandboxSliceStatus::Untested,
+                "未实测",
+                "当前平台没有已实测的网络隔离",
+            ),
+        ];
+        let check = check_of("sandbox_r2_slices", &facts);
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.message.contains("网络隔离"));
+        assert!(check.message.contains("未实测"));
+        assert!(
+            !check.message.contains("均已实测生效"),
+            "未实测切片不得被报告成全部生效"
+        );
+    }
+
+    #[test]
     fn broken_journal_sequence_carries_an_action() {
         let mut facts = base_facts();
         facts.journal.exists = true;
         facts.journal.corrupt = Some("第 1 行版本或序号不连续".into());
         let check = check_of("journal_sequence", &facts);
         assert_eq!(check.status, DoctorStatus::Error);
-        assert!(check.recommendation.as_deref().unwrap().contains("--rotate-events"));
+        assert!(
+            check
+                .recommendation
+                .as_deref()
+                .unwrap()
+                .contains("--rotate-events")
+        );
     }
 
     #[test]
@@ -589,7 +718,10 @@ mod tests {
         let mut facts = base_facts();
         facts.snapshots.run_versions = [(1, 1)].into_iter().collect();
         facts.snapshots.task_versions = [(TASK_FORMAT as u64, 2)].into_iter().collect();
-        assert_eq!(check_of("snapshot_versions", &facts).status, DoctorStatus::Error);
+        assert_eq!(
+            check_of("snapshot_versions", &facts).status,
+            DoctorStatus::Error
+        );
 
         // 两目录都空：Unknown，不是 Ok 也不是 Error。
         assert_eq!(
@@ -601,12 +733,18 @@ mod tests {
         let mut facts = base_facts();
         facts.snapshots.run_versions = [(RUN_FORMAT as u64, 1)].into_iter().collect();
         facts.snapshots.task_versions = [(TASK_FORMAT as u64, 1)].into_iter().collect();
-        assert_eq!(check_of("snapshot_versions", &facts).status, DoctorStatus::Ok);
+        assert_eq!(
+            check_of("snapshot_versions", &facts).status,
+            DoctorStatus::Ok
+        );
 
         // 损坏文件单独触发 Error。
         let mut facts = base_facts();
         facts.snapshots.corrupt = vec!["bad.json".into()];
-        assert_eq!(check_of("snapshot_versions", &facts).status, DoctorStatus::Error);
+        assert_eq!(
+            check_of("snapshot_versions", &facts).status,
+            DoctorStatus::Error
+        );
     }
 
     #[test]
@@ -673,7 +811,10 @@ mod tests {
         let mut facts = base_facts();
         facts.lease.lock_present = true;
         facts.lease.lock_held = None;
-        assert_eq!(check_of("service_lease", &facts).status, DoctorStatus::Unknown);
+        assert_eq!(
+            check_of("service_lease", &facts).status,
+            DoctorStatus::Unknown
+        );
 
         // 无文件：Ok。
         let mut facts = base_facts();
@@ -709,7 +850,13 @@ mod tests {
         let check = check_of("privacy_retention", &base_facts());
         assert_eq!(check.status, DoctorStatus::Warn);
         assert!(check.message.contains("明文"));
-        assert!(check.recommendation.as_deref().unwrap().contains("不会静默删除"));
+        assert!(
+            check
+                .recommendation
+                .as_deref()
+                .unwrap()
+                .contains("不会静默删除")
+        );
     }
 
     /// 状态文件各版本分别判定：缺文件常态、v0 待迁移、v1 一致、高版本
@@ -729,11 +876,13 @@ mod tests {
         let check = check_of("service_state_schema", &facts);
         assert_eq!(check.status, DoctorStatus::Ok);
         assert!(check.message.contains("v0"));
-        assert!(check
-            .recommendation
-            .as_deref()
-            .unwrap()
-            .contains("--doctor"));
+        assert!(
+            check
+                .recommendation
+                .as_deref()
+                .unwrap()
+                .contains("--doctor")
+        );
 
         let mut facts = facts.clone();
         facts.state.schema_version = Some(u64::from(SERVICE_STATE_FORMAT));

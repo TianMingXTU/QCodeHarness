@@ -11,17 +11,17 @@ use qcode_harness::application::port::{
 };
 use qcode_harness::application::service::{EventJournal, EventSubscription};
 use qcode_harness::domain::agent::{AgentRole, AgentSpec, AgentTurn};
-use qcode_harness::domain::evidence::{AuditEvent, TokenUsage};
 use qcode_harness::domain::budget::Consumption;
+use qcode_harness::domain::evidence::{AuditEvent, TokenUsage};
 use qcode_harness::domain::ids::CallId;
 use qcode_harness::domain::service::{
-    EventContext, EventOrigin, ServiceCommand, ServiceError, ServiceEvent, ServiceEventPayload,
-    TaskStatus, TaskView, PROTOCOL_VERSION,
+    EventContext, EventOrigin, PROTOCOL_VERSION, ServiceCommand, ServiceError, ServiceEvent,
+    ServiceEventPayload, TaskStatus, TaskView,
 };
 use qcode_harness::domain::tool::{ToolAnnotations, ToolCall};
 use qcode_harness::infrastructure::approval::async_gate::ApprovalBroker;
 use qcode_harness::infrastructure::service_events::{
-    JsonEventJournal, ServiceEvidence, EVENT_QUEUE_CAPACITY, MAX_EVENT_BYTES, MAX_JOURNAL_BYTES,
+    EVENT_QUEUE_CAPACITY, JsonEventJournal, MAX_EVENT_BYTES, MAX_JOURNAL_BYTES, ServiceEvidence,
 };
 use serde_json::json;
 use tokio::time::timeout;
@@ -32,10 +32,14 @@ struct TestDirectory(PathBuf);
 
 impl TestDirectory {
     fn new() -> Self {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let serial = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "qcode-service-events-{}-{stamp}-{serial}", std::process::id()
+            "qcode-service-events-{}-{stamp}-{serial}",
+            std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -57,7 +61,10 @@ fn context(task: &str, execution: &str) -> EventContext {
         task_id: task.into(),
         session_id: format!("session-{task}"),
         execution_id: execution.into(),
-        origin: EventOrigin { parent_session_id: Some("parent".into()), extension_id: None },
+        origin: EventOrigin {
+            parent_session_id: Some("parent".into()),
+            extension_id: None,
+        },
     }
 }
 
@@ -76,16 +83,26 @@ fn request(id: &str) -> ApprovalRequest {
 }
 
 async fn next(subscription: &mut dyn EventSubscription) -> ServiceEvent {
-    timeout(Duration::from_secs(3), subscription.next()).await.unwrap().unwrap()
+    timeout(Duration::from_secs(3), subscription.next())
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 #[test]
 fn commands_use_the_public_operation_tag() {
     let command: ServiceCommand = serde_json::from_value(json!({
         "op": "decide", "approval_id": "a1", "task_id": "t1", "execution_id": "e1", "allow": true
-    })).unwrap();
-    assert!(matches!(command, ServiceCommand::Decide { allow: true, .. }));
-    assert_eq!(serde_json::to_value(ServiceCommand::Shutdown).unwrap(), json!({"op": "shutdown"}));
+    }))
+    .unwrap();
+    assert!(matches!(
+        command,
+        ServiceCommand::Decide { allow: true, .. }
+    ));
+    assert_eq!(
+        serde_json::to_value(ServiceCommand::Shutdown).unwrap(),
+        json!({"op": "shutdown"})
+    );
 }
 
 #[test]
@@ -94,7 +111,9 @@ fn restart_continues_the_service_sequence_and_preserves_context() {
     let ctx = context("t1", "e1");
     {
         let journal = JsonEventJournal::open(dir.log()).unwrap();
-        let first = journal.append(Some(&ctx), ServiceEventPayload::ExecutionStarted).unwrap();
+        let first = journal
+            .append(Some(&ctx), ServiceEventPayload::ExecutionStarted)
+            .unwrap();
         assert_eq!(first.version, PROTOCOL_VERSION);
         assert_eq!(first.sequence, 1);
         assert_eq!(first.origin.parent_session_id.as_deref(), Some("parent"));
@@ -102,7 +121,9 @@ fn restart_continues_the_service_sequence_and_preserves_context() {
     }
     let journal = JsonEventJournal::open(dir.log()).unwrap();
     assert_eq!(journal.latest().unwrap(), 1);
-    let second = journal.append(None, ServiceEventPayload::WorkspaceRemoved).unwrap();
+    let second = journal
+        .append(None, ServiceEventPayload::WorkspaceRemoved)
+        .unwrap();
     assert_eq!(second.sequence, 2);
     assert_eq!(journal.read(0, 10).unwrap().len(), 2);
     assert_eq!(journal.read(1, 10).unwrap()[0], second);
@@ -112,12 +133,18 @@ fn restart_continues_the_service_sequence_and_preserves_context() {
 async fn replay_is_read_only_and_the_replay_to_live_boundary_has_no_gap() {
     let dir = TestDirectory::new();
     let journal = JsonEventJournal::open(dir.log()).unwrap();
-    journal.append(None, ServiceEventPayload::ExecutionStarted).unwrap();
+    journal
+        .append(None, ServiceEventPayload::ExecutionStarted)
+        .unwrap();
     let mut subscription = journal.subscribe(0).unwrap();
-    journal.append(None, ServiceEventPayload::CancelRequested).unwrap();
+    journal
+        .append(None, ServiceEventPayload::CancelRequested)
+        .unwrap();
     assert_eq!(next(subscription.as_mut()).await.sequence, 1);
     assert_eq!(next(subscription.as_mut()).await.sequence, 2);
-    journal.append(None, ServiceEventPayload::WorkspaceRemoved).unwrap();
+    journal
+        .append(None, ServiceEventPayload::WorkspaceRemoved)
+        .unwrap();
     assert_eq!(next(subscription.as_mut()).await.sequence, 3);
     assert_eq!(journal.read(0, 100).unwrap().len(), 3);
     assert_eq!(fs::read_to_string(dir.log()).unwrap().lines().count(), 3);
@@ -131,7 +158,9 @@ async fn a_slow_client_is_told_to_recover_from_its_cursor() {
     let journal = JsonEventJournal::open(dir.log()).unwrap();
     let mut slow = journal.subscribe(0).unwrap();
     for _ in 0..EVENT_QUEUE_CAPACITY + 1 {
-        journal.append(None, ServiceEventPayload::ExecutionStarted).unwrap();
+        journal
+            .append(None, ServiceEventPayload::ExecutionStarted)
+            .unwrap();
     }
     let error = slow.next().await.unwrap_err();
     assert_eq!(error.code, "lagged");
@@ -139,7 +168,9 @@ async fn a_slow_client_is_told_to_recover_from_its_cursor() {
     assert_eq!(replay.len(), EVENT_QUEUE_CAPACITY + 1);
     let cursor = replay.last().unwrap().sequence;
     let mut recovered = journal.subscribe(cursor).unwrap();
-    let live = journal.append(None, ServiceEventPayload::WorkspaceRemoved).unwrap();
+    let live = journal
+        .append(None, ServiceEventPayload::WorkspaceRemoved)
+        .unwrap();
     assert_eq!(next(recovered.as_mut()).await, live);
 }
 
@@ -148,19 +179,33 @@ fn corrupt_unknown_duplicate_and_out_of_order_logs_are_rejected() {
     for defect in ["version", "duplicate", "order", "truncated", "evidence"] {
         let dir = TestDirectory::new();
         let journal = JsonEventJournal::open(dir.log()).unwrap();
-        let event = journal.append(None, ServiceEventPayload::ExecutionStarted).unwrap();
+        let event = journal
+            .append(None, ServiceEventPayload::ExecutionStarted)
+            .unwrap();
         drop(journal);
         let mut value = serde_json::to_value(&event).unwrap();
         let contents = match defect {
-            "version" => { value["version"] = json!(999); format!("{value}\n") }
+            "version" => {
+                value["version"] = json!(999);
+                format!("{value}\n")
+            }
             "duplicate" => format!("{value}\n{value}\n"),
-            "order" => { value["sequence"] = json!(2); format!("{value}\n") }
+            "order" => {
+                value["sequence"] = json!(2);
+                format!("{value}\n")
+            }
             "truncated" => "{\"version\":1".into(),
-            "evidence" => "{\"sequence\":900,\"event\":{\"StepStarted\":{\"turn\":1,\"role\":\"Coder\"}}}\n".into(),
+            "evidence" => {
+                "{\"sequence\":900,\"event\":{\"StepStarted\":{\"turn\":1,\"role\":\"Coder\"}}}\n"
+                    .into()
+            }
             _ => unreachable!(),
         };
         fs::write(dir.log(), contents).unwrap();
-        assert!(JsonEventJournal::open(dir.log()).is_err(), "应拒绝 {defect}");
+        assert!(
+            JsonEventJournal::open(dir.log()).is_err(),
+            "应拒绝 {defect}"
+        );
     }
 }
 
@@ -168,14 +213,27 @@ fn corrupt_unknown_duplicate_and_out_of_order_logs_are_rejected() {
 fn journal_and_event_size_limits_are_explicit() {
     let dir = TestDirectory::new();
     let journal = JsonEventJournal::open(dir.log()).unwrap();
-    let error = journal.append(None, ServiceEventPayload::Completed {
-        answer: "x".repeat(MAX_EVENT_BYTES),
-    }).unwrap_err();
+    let error = journal
+        .append(
+            None,
+            ServiceEventPayload::Completed {
+                answer: "x".repeat(MAX_EVENT_BYTES),
+            },
+        )
+        .unwrap_err();
     assert_eq!(error.code, "event_too_large");
     assert_eq!(journal.latest().unwrap(), 0);
     drop(journal);
-    OpenOptions::new().write(true).open(dir.log()).unwrap().set_len(MAX_JOURNAL_BYTES + 1).unwrap();
-    let error = match JsonEventJournal::open(dir.log()) { Ok(_) => panic!("超大文件必须拒绝"), Err(error) => error };
+    OpenOptions::new()
+        .write(true)
+        .open(dir.log())
+        .unwrap()
+        .set_len(MAX_JOURNAL_BYTES + 1)
+        .unwrap();
+    let error = match JsonEventJournal::open(dir.log()) {
+        Ok(_) => panic!("超大文件必须拒绝"),
+        Err(error) => error,
+    };
     assert_eq!(error.code, "journal_too_large");
 }
 
@@ -207,48 +265,114 @@ struct SwitchJournal {
 }
 
 impl EventJournal for SwitchJournal {
-    fn append(&self, context: Option<&EventContext>, payload: ServiceEventPayload) -> Result<ServiceEvent, ServiceError> {
+    fn append(
+        &self,
+        context: Option<&EventContext>,
+        payload: ServiceEventPayload,
+    ) -> Result<ServiceEvent, ServiceError> {
         if self.fail.load(Ordering::SeqCst) {
             return Err(ServiceError::new("journal_io", "测试模拟写入失败"));
         }
         self.journal.append(context, payload)
     }
-    fn read(&self, after: u64, limit: usize) -> Result<Vec<ServiceEvent>, ServiceError> { self.journal.read(after, limit) }
-    fn subscribe(&self, after: u64) -> Result<Box<dyn EventSubscription>, ServiceError> { self.journal.subscribe(after) }
-    fn latest(&self) -> Result<u64, ServiceError> { self.journal.latest() }
+    fn read(&self, after: u64, limit: usize) -> Result<Vec<ServiceEvent>, ServiceError> {
+        self.journal.read(after, limit)
+    }
+    fn subscribe(&self, after: u64) -> Result<Box<dyn EventSubscription>, ServiceError> {
+        self.journal.subscribe(after)
+    }
+    fn latest(&self) -> Result<u64, ServiceError> {
+        self.journal.latest()
+    }
 }
 
 #[tokio::test]
 async fn evidence_and_model_hooks_preserve_origins_without_duplicate_audits() {
     let dir = TestDirectory::new();
     let journal = Arc::new(JsonEventJournal::open(dir.log()).unwrap());
-    let evidence = ServiceEvidence::new(journal.clone(), context("t1", "e1"), CancelHandle::default());
+    let evidence = ServiceEvidence::new(
+        journal.clone(),
+        context("t1", "e1"),
+        CancelHandle::default(),
+    );
     let call = request("extension__sample__call1").call;
-    evidence.record(SystemTime::now(), AuditEvent::ToolRequested { turn: 1, call: call.clone() });
+    evidence.record(
+        SystemTime::now(),
+        AuditEvent::ToolRequested {
+            turn: 1,
+            call: call.clone(),
+        },
+    );
     evidence.before_tool_call(&call).await;
-    evidence.after_tool_result(&call, &qcode_harness::domain::tool::ToolOutcome::success("done")).await;
+    evidence
+        .after_tool_result(
+            &call,
+            &qcode_harness::domain::tool::ToolOutcome::success("done"),
+        )
+        .await;
     let spec = AgentSpec::new(AgentRole::Coder, "test");
-    evidence.before_model_call(&ModelRequest { history: vec![], spec: &spec, tools: &[], cache_key: None }).await;
-    evidence.after_model_reply(&ModelReply {
-        turn: AgentTurn { text: "answer".into(), calls: vec![call] }, usage: TokenUsage::default(),
-    }, true).await;
+    evidence
+        .before_model_call(&ModelRequest {
+            history: vec![],
+            spec: &spec,
+            tools: &[],
+            cache_key: None,
+        })
+        .await;
+    evidence
+        .after_model_reply(
+            &ModelReply {
+                turn: AgentTurn {
+                    text: "answer".into(),
+                    calls: vec![call],
+                },
+                usage: TokenUsage::default(),
+            },
+            true,
+        )
+        .await;
     let events = journal.read(0, 10).unwrap();
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].origin.extension_id.as_deref(), Some("sample"));
-    assert_eq!(events[0].origin.parent_session_id.as_deref(), Some("parent"));
-    assert!(matches!(&events[0].payload, ServiceEventPayload::Audit { event: AuditEvent::ToolRequested { .. } }));
-    assert!(matches!(&events[1].payload, ServiceEventPayload::ModelCallStarted { role: AgentRole::Coder }));
-    assert!(matches!(&events[2].payload, ServiceEventPayload::ModelCallFinished { retried: true, .. }));
+    assert_eq!(
+        events[0].origin.parent_session_id.as_deref(),
+        Some("parent")
+    );
+    assert!(matches!(
+        &events[0].payload,
+        ServiceEventPayload::Audit {
+            event: AuditEvent::ToolRequested { .. }
+        }
+    ));
+    assert!(matches!(
+        &events[1].payload,
+        ServiceEventPayload::ModelCallStarted {
+            role: AgentRole::Coder
+        }
+    ));
+    assert!(matches!(
+        &events[2].payload,
+        ServiceEventPayload::ModelCallFinished { retried: true, .. }
+    ));
     assert!(evidence.health().is_ok());
 }
 
 #[test]
 fn a_failed_evidence_sink_reports_unhealthy_and_requests_cancellation() {
     let dir = TestDirectory::new();
-    let journal = Arc::new(SwitchJournal { journal: JsonEventJournal::open(dir.log()).unwrap(), fail: AtomicBool::new(true) });
+    let journal = Arc::new(SwitchJournal {
+        journal: JsonEventJournal::open(dir.log()).unwrap(),
+        fail: AtomicBool::new(true),
+    });
     let cancel = CancelHandle::default();
     let evidence = ServiceEvidence::new(journal.clone(), context("t1", "e1"), cancel.clone());
-    evidence.record(SystemTime::now(), AuditEvent::StepStarted { turn: 1, role: AgentRole::Coder });
+    evidence.record(
+        SystemTime::now(),
+        AuditEvent::StepStarted {
+            turn: 1,
+            role: AgentRole::Coder,
+        },
+    );
     assert!(cancel.is_cancelled());
     assert_eq!(evidence.health().unwrap_err().code, "journal_io");
     assert_eq!(journal.latest().unwrap(), 0);
@@ -267,13 +391,18 @@ fn a_failed_start_batch_leaves_no_partial_events() {
             Some(&context("t1", "e1")),
             vec![
                 ServiceEventPayload::ExecutionStarted,
-                ServiceEventPayload::Completed { answer: "x".repeat(MAX_EVENT_BYTES) },
+                ServiceEventPayload::Completed {
+                    answer: "x".repeat(MAX_EVENT_BYTES),
+                },
             ],
         )
         .unwrap_err();
     assert_eq!(error.code, "event_too_large");
     assert_eq!(journal.latest().unwrap(), 0);
-    assert!(fs::read_to_string(dir.log()).unwrap().is_empty(), "超限批不得留下任何字节");
+    assert!(
+        fs::read_to_string(dir.log()).unwrap().is_empty(),
+        "超限批不得留下任何字节"
+    );
 }
 
 /// 成功批次整组落盘，序号连续且字节数与状态一致，重开后可正常加载。
@@ -323,22 +452,42 @@ async fn approval_decisions_are_owned_durable_and_cannot_be_reused() {
     let broker = ApprovalBroker::new(journal.clone());
     let gate = broker.gate(context("t1", "e1"));
     let mut subscription = journal.subscribe(0).unwrap();
-    let waiter = tokio::spawn(async move { gate.request(&request("extension__sample__call1")).await });
+    let waiter =
+        tokio::spawn(async move { gate.request(&request("extension__sample__call1")).await });
     let waiting = next(subscription.as_mut()).await;
-    let ServiceEventPayload::ApprovalWaiting { request: pending } = waiting.payload else { panic!("必须先发审批等待事件") };
+    let ServiceEventPayload::ApprovalWaiting { request: pending } = waiting.payload else {
+        panic!("必须先发审批等待事件")
+    };
     assert!(pending.resumed);
     assert_eq!(pending.reason, request("call").reason);
     assert_eq!(pending.origin.extension_id.as_deref(), Some("sample"));
     assert!(broker.pending(Some("other")).is_empty());
     assert_eq!(broker.pending(Some("t1")).len(), 1);
-    assert!(broker.decide(&pending.approval_id, "other", "e1", true).is_err());
-    assert!(broker.decide(&pending.approval_id, "t1", "other", true).is_err());
+    assert!(
+        broker
+            .decide(&pending.approval_id, "other", "e1", true)
+            .is_err()
+    );
+    assert!(
+        broker
+            .decide(&pending.approval_id, "t1", "other", true)
+            .is_err()
+    );
     assert!(!waiter.is_finished());
-    broker.decide(&pending.approval_id, "t1", "e1", true).unwrap();
+    broker
+        .decide(&pending.approval_id, "t1", "e1", true)
+        .unwrap();
     assert!(waiter.await.unwrap().is_ok());
     assert!(broker.pending(None).is_empty());
-    assert!(broker.decide(&pending.approval_id, "t1", "e1", true).is_err());
-    assert!(matches!(next(subscription.as_mut()).await.payload, ServiceEventPayload::ApprovalResolved { allowed: true, .. }));
+    assert!(
+        broker
+            .decide(&pending.approval_id, "t1", "e1", true)
+            .is_err()
+    );
+    assert!(matches!(
+        next(subscription.as_mut()).await.payload,
+        ServiceEventPayload::ApprovalResolved { allowed: true, .. }
+    ));
     let persisted = fs::read_to_string(dir.log()).unwrap();
     assert_eq!(persisted.lines().count(), 2);
     assert!(persisted.contains("approval_resolved"));
@@ -357,18 +506,38 @@ async fn independent_approvals_can_resolve_out_of_order() {
     next(subscription.as_mut()).await;
     next(subscription.as_mut()).await;
     let requests = broker.pending(None);
-    let second_request = requests.iter().find(|request| request.task_id == "t2").unwrap();
-    broker.decide(&second_request.approval_id, "t2", "e2", true).unwrap();
-    assert!(timeout(Duration::from_secs(2), two).await.unwrap().unwrap().is_ok());
+    let second_request = requests
+        .iter()
+        .find(|request| request.task_id == "t2")
+        .unwrap();
+    broker
+        .decide(&second_request.approval_id, "t2", "e2", true)
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(2), two)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok()
+    );
     assert!(!one.is_finished());
     broker.cancel_execution("e1", "任务已取消");
-    assert!(timeout(Duration::from_secs(2), one).await.unwrap().unwrap().is_err());
+    assert!(
+        timeout(Duration::from_secs(2), one)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
 }
 
 #[tokio::test]
 async fn failed_waiting_or_resolution_writes_never_authorize_the_tool() {
     let dir = TestDirectory::new();
-    let journal = Arc::new(SwitchJournal { journal: JsonEventJournal::open(dir.log()).unwrap(), fail: AtomicBool::new(true) });
+    let journal = Arc::new(SwitchJournal {
+        journal: JsonEventJournal::open(dir.log()).unwrap(),
+        fail: AtomicBool::new(true),
+    });
     let broker = ApprovalBroker::new(journal.clone());
     let gate = broker.gate(context("t1", "e1"));
     assert!(gate.request(&request("call1")).await.is_err());
@@ -380,8 +549,18 @@ async fn failed_waiting_or_resolution_writes_never_authorize_the_tool() {
     next(subscription.as_mut()).await;
     let pending = broker.pending(None).pop().unwrap();
     journal.fail.store(true, Ordering::SeqCst);
-    assert!(broker.decide(&pending.approval_id, "t2", "e2", true).is_err());
-    assert!(timeout(Duration::from_secs(2), waiter).await.unwrap().unwrap().is_err());
+    assert!(
+        broker
+            .decide(&pending.approval_id, "t2", "e2", true)
+            .is_err()
+    );
+    assert!(
+        timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
     assert!(broker.pending(None).is_empty());
 }
 
@@ -401,17 +580,39 @@ async fn cancellation_and_shutdown_release_waiters_and_bind_cancel_can_be_replac
     next(subscription.as_mut()).await;
     let pending = broker.pending(None).pop().unwrap();
     fresh.cancel();
-    assert!(broker.decide(&pending.approval_id, "t1", "e1", true).is_err());
-    assert!(timeout(Duration::from_secs(2), waiter).await.unwrap().unwrap().is_err());
+    assert!(
+        broker
+            .decide(&pending.approval_id, "t1", "e1", true)
+            .is_err()
+    );
+    assert!(
+        timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
     assert!(broker.pending(None).is_empty());
     let second = broker.gate(context("t2", "e2"));
     let mut subscription = journal.subscribe(journal.latest().unwrap()).unwrap();
     let waiter = tokio::spawn(async move { second.request(&request("call2")).await });
     next(subscription.as_mut()).await;
     broker.shutdown();
-    assert!(timeout(Duration::from_secs(2), waiter).await.unwrap().unwrap().is_err());
+    assert!(
+        timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
     assert!(broker.pending(None).is_empty());
-    assert!(broker.gate(context("t3", "e3")).request(&request("call3")).await.is_err());
+    assert!(
+        broker
+            .gate(context("t3", "e3"))
+            .request(&request("call3"))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -426,7 +627,13 @@ async fn polling_a_cancel_handle_and_dropping_a_request_both_remove_pending_appr
     let waiter = tokio::spawn(async move { gate.request(&request("call1")).await });
     next(subscription.as_mut()).await;
     cancel.cancel();
-    assert!(timeout(Duration::from_secs(2), waiter).await.unwrap().unwrap().is_err());
+    assert!(
+        timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
     assert!(broker.pending(None).is_empty());
     let gate = broker.gate(context("t2", "e2"));
     let mut subscription = journal.subscribe(journal.latest().unwrap()).unwrap();

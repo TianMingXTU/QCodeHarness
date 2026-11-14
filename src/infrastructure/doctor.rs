@@ -50,8 +50,30 @@ pub fn collect(workspace: &Path) -> DoctorFacts {
         journal: journal_facts(&journal_path),
         lease: lease_facts(&journal_path),
         state: state_facts(&service),
-        journal_bytes: fs::metadata(&journal_path).map(|meta| meta.len()).unwrap_or(0),
+        journal_bytes: fs::metadata(&journal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0),
+        // R2 探测只读取当前进程内可获得的能力事实，不启动子进程。
+        sandbox_slices: crate::infrastructure::sandbox::r2::probe_platform_slices(),
+        // `--doctor` 不主动探测模型端点；凭据存在性只作静态事实收集。
+        provider_connectivity: provider_connectivity_facts(),
     }
+}
+
+/// 收集 Anthropic Messages 凭据存在性，不打印或保存凭据值。
+///
+/// 连通探测是可选显式动作，本函数一律返回 Unknown：绝不把"没探测"写成
+/// "连通成功"，也不让 --doctor 因为外部服务不可达而阻塞。
+fn provider_connectivity_facts() -> Option<crate::domain::doctor::ProviderConnectivityFacts> {
+    use crate::domain::doctor::{ProviderConnectivityFacts, ProviderConnectivityProbe};
+    let credential_present = ["LLM_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_SUBSCRIPTION_TOKEN", "QCH_ANTHROPIC_SUBSCRIPTION_TOKEN"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+    Some(ProviderConnectivityFacts {
+        credential_present,
+        probe: ProviderConnectivityProbe::Unknown,
+        detail: Some("未执行主动网络探测".to_owned()),
+    })
 }
 
 /// 配置事实：按错误文本与来源路径判定，缺省与损坏分别处理。
@@ -163,8 +185,11 @@ fn snapshot_facts(root: &Path) -> SnapshotFacts {
             match fs::read_to_string(&path)
                 .ok()
                 .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                .and_then(|value| value.get("format_version").and_then(serde_json::Value::as_u64))
-            {
+                .and_then(|value| {
+                    value
+                        .get("format_version")
+                        .and_then(serde_json::Value::as_u64)
+                }) {
                 Some(version) => *versions.entry(version).or_insert(0) += 1,
                 None => facts.corrupt.push(path.display().to_string()),
             }
@@ -366,4 +391,3 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 }
-

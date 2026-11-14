@@ -6,10 +6,10 @@
 
 use std::sync::Mutex;
 
+use crate::application::memory_evidence::MemoryEvidenceSink;
 use crate::application::port::{EvidenceSink, Timestamp};
 use crate::domain::evidence::AuditEvent;
 use crate::domain::tool::ToolCall;
-use crate::application::memory_evidence::MemoryEvidenceSink;
 
 /// 观察结果在控制台最多显示的字符数，超出截断；完整内容仍会回填给模型。
 const OBSERVE_PREVIEW_CHARS: usize = 400;
@@ -20,6 +20,7 @@ const OBSERVE_PREVIEW_CHARS: usize = 400;
 /// 照着 `cargo run --` 抄会抄不动。从源码运行的差异放在末尾一行说明。
 pub const USAGE: &str = "\
 用法: QCodeHarness [--yes] [--ai-review] [--kind <模板>] \"任务描述\"
+      QCodeHarness exec [--permissions <档位>] [--timeout <秒>] [--json] \"任务\"
       QCodeHarness --list-sessions
       QCodeHarness [--yes] --resume <会话ID>
       QCodeHarness [--yes] [--force-worktree] --resume-task <任务ID>
@@ -30,15 +31,17 @@ pub const USAGE: &str = "\
       QCodeHarness --benchmark-long [--json]
       QCodeHarness --mcp-reconnect <服务器名>
       QCodeHarness --list-extensions
-      QCodeHarness --install-extension <清单文件>
+      QCodeHarness --install-extension <清单文件|技能ID>
       QCodeHarness --enable-extension <ID> [--permissions <工具名,...>]
       QCodeHarness --disable-extension <ID>
+      QCodeHarness --sandbox-debug \"<命令>\"
+      QCodeHarness --web-ui
       QCodeHarness --stdio | --interactive | --text | --tui
       QCodeHarness --help
       QCodeHarness --version
 示例: QCodeHarness \"阅读 Cargo.toml，说明本项目用了哪些依赖\"
+      QCodeHarness exec --permissions workspace-write \"修一下失败的测试\"
       QCodeHarness --yes \"非交互场景下跑同一个任务\"
-      QCodeHarness --ai-review \"让模型先审一遍，拿不准的再问人\"
       QCodeHarness --list-sessions
       QCodeHarness --resume <会话ID>
       QCodeHarness --resume-task <任务ID>
@@ -51,6 +54,8 @@ pub const USAGE: &str = "\
       QCodeHarness --install-extension ./my-skill.toml
       QCodeHarness --enable-extension my-skill --permissions read_file,search_text
       QCodeHarness --list-extensions
+      QCodeHarness --sandbox-debug \"curl https://example.com\"
+      QCodeHarness --web-ui
       QCodeHarness --stdio        标准输入输出的 NDJSON 服务
       QCodeHarness --interactive 自动选择终端界面
       QCodeHarness --text         逐行文本界面（适合屏幕阅读器）
@@ -129,6 +134,23 @@ pub struct CliArgs {
     pub permissions: Vec<String>,
     /// 禁用扩展并清空批准（`--disable-extension <ID>`）。
     pub disable_extension: Option<String>,
+    /// 无头执行模式（`exec "<任务>"`）：单次任务、非交互、退出码区分结局。
+    ///
+    /// 与普通任务共用 runner，区别只在审批与输出：无 profile 时默认按
+    /// read-only 拒绝非只读动作，且不接受交互式补充输入。
+    pub exec: bool,
+    /// 无头执行的审批档位（`--permissions read-only|workspace-write|full`）。
+    ///
+    /// 与扩展的 `--permissions <工具名,...>` 分开保存：后者是扩展授权
+    /// 工具子集，前者是运行期审批基线，语义不同，不能混在一个字段里。
+    pub permission_profile: Option<crate::domain::permission_profile::PermissionProfile>,
+    /// 无头执行的墙钟超时秒数（`--timeout <秒>`）。
+    pub timeout_secs: Option<u64>,
+    /// 沙箱调试入口（`--sandbox-debug "<命令>"`）：只输出命中的规则与判定，
+    /// 不执行命令，不需要模型配置。
+    pub sandbox_debug: Option<String>,
+    /// 本地 Web UI（`--web-ui`）：单机单用户，消费常驻任务服务事件流。
+    pub web_ui: bool,
     /// 打印用法后正常退出（`--help` / `-h`）。
     ///
     /// 与其他开关同时出现时仅处理帮助，不运行任务，也不做模式校验。
@@ -175,6 +197,11 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     let mut permissions = Vec::new();
     let mut permissions_supplied = false;
     let mut disable_extension = None;
+    let mut exec = false;
+    let mut permission_profile = None;
+    let mut timeout_secs = None;
+    let mut sandbox_debug = None;
+    let mut web_ui = false;
     let mut help = false;
     let mut version = false;
     let mut positional: Vec<String> = Vec::new();
@@ -196,10 +223,22 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--version" | "-V" => version = true,
             // 服务前端：本进程持续运行，不接受任务描述与其他运行模式。
             // 重复出现即计数，结尾按数量拒绝。
-            "--stdio" => { frontend = Some(FrontendMode::Stdio); frontend_count += 1; }
-            "--interactive" => { frontend = Some(FrontendMode::Interactive); frontend_count += 1; }
-            "--text" => { frontend = Some(FrontendMode::Text); frontend_count += 1; }
-            "--tui" => { frontend = Some(FrontendMode::Tui); frontend_count += 1; }
+            "--stdio" => {
+                frontend = Some(FrontendMode::Stdio);
+                frontend_count += 1;
+            }
+            "--interactive" => {
+                frontend = Some(FrontendMode::Interactive);
+                frontend_count += 1;
+            }
+            "--text" => {
+                frontend = Some(FrontendMode::Text);
+                frontend_count += 1;
+            }
+            "--tui" => {
+                frontend = Some(FrontendMode::Tui);
+                frontend_count += 1;
+            }
             "--report-dir" => match iter.next() {
                 Some(dir) => report_dir = Some(dir),
                 None => {
@@ -218,7 +257,9 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--resume-task" => match iter.next() {
                 Some(id) => resume_task = Some(id),
                 None => {
-                    eprintln!("cli_invalid_args: --resume-task 需要一个任务 ID：--resume-task <id>");
+                    eprintln!(
+                        "cli_invalid_args: --resume-task 需要一个任务 ID：--resume-task <id>"
+                    );
                     return None;
                 }
             },
@@ -232,43 +273,89 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             "--mcp-reconnect" => match iter.next() {
                 Some(name) => mcp_reconnect = Some(name),
                 None => {
-                    eprintln!("cli_invalid_args: --mcp-reconnect 需要一个服务器名：--mcp-reconnect <服务器名>");
+                    eprintln!(
+                        "cli_invalid_args: --mcp-reconnect 需要一个服务器名：--mcp-reconnect <服务器名>"
+                    );
                     return None;
                 }
             },
             "--install-extension" => match iter.next() {
                 Some(path) => install_extension = Some(path),
                 None => {
-                    eprintln!("cli_invalid_args: --install-extension 需要一个清单文件：--install-extension <清单文件>");
+                    eprintln!(
+                        "cli_invalid_args: --install-extension 需要一个清单文件：--install-extension <清单文件>"
+                    );
                     return None;
                 }
             },
             "--enable-extension" => match iter.next() {
                 Some(id) => enable_extension = Some(id),
                 None => {
-                    eprintln!("cli_invalid_args: --enable-extension 需要一个扩展 ID：--enable-extension <ID>");
+                    eprintln!(
+                        "cli_invalid_args: --enable-extension 需要一个扩展 ID：--enable-extension <ID>"
+                    );
                     return None;
                 }
             },
             "--disable-extension" => match iter.next() {
                 Some(id) => disable_extension = Some(id),
                 None => {
-                    eprintln!("cli_invalid_args: --disable-extension 需要一个扩展 ID：--disable-extension <ID>");
+                    eprintln!(
+                        "cli_invalid_args: --disable-extension 需要一个扩展 ID：--disable-extension <ID>"
+                    );
+                    return None;
+                }
+            },
+            "--web-ui" => web_ui = true,
+            "--sandbox-debug" => match iter.next() {
+                Some(command) => sandbox_debug = Some(command),
+                None => {
+                    eprintln!(
+                        "cli_invalid_args: --sandbox-debug 需要一条命令：--sandbox-debug \"<命令>\""
+                    );
+                    return None;
+                }
+            },
+            "--timeout" => match iter.next().and_then(|raw| raw.parse::<u64>().ok()) {
+                Some(seconds) if seconds > 0 => timeout_secs = Some(seconds),
+                _ => {
+                    eprintln!("cli_invalid_args: --timeout 需要正整数秒数：--timeout <秒>");
                     return None;
                 }
             },
             "--permissions" => match iter.next() {
                 Some(list) => {
                     permissions_supplied = true;
-                    permissions = list
+                    let values: Vec<String> = list
                         .split(',')
                         .map(str::trim)
                         .filter(|item| !item.is_empty())
                         .map(str::to_owned)
                         .collect();
+                    // 三档档位是审批基线，不是扩展工具名。混用会让两组语义
+                    // 都变得不可预测，直接拒绝而不是静默取其一。
+                    let profiles: Vec<_> = values
+                        .iter()
+                        .filter_map(|value| {
+                            crate::domain::permission_profile::PermissionProfile::parse(value)
+                        })
+                        .collect();
+                    if !profiles.is_empty() {
+                        if values.len() != profiles.len() || profiles.len() != 1 {
+                            eprintln!(
+                                "cli_invalid_args: --permissions 的 read-only/workspace-write/full 不能与工具名混用"
+                            );
+                            return None;
+                        }
+                        permission_profile = Some(profiles[0]);
+                    } else {
+                        permissions = values;
+                    }
                 }
                 None => {
-                    eprintln!("cli_invalid_args: --permissions 需要一个逗号分隔的工具名列表：--permissions read_file,write_file");
+                    eprintln!(
+                        "cli_invalid_args: --permissions 需要档位或逗号分隔的工具名列表：--permissions read-only|workspace-write|full"
+                    );
                     return None;
                 }
             },
@@ -302,14 +389,26 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             enable_extension: None,
             permissions: Vec::new(),
             disable_extension: None,
+            exec: false,
+            permission_profile: None,
+            timeout_secs: None,
+            sandbox_debug: None,
+            web_ui: false,
             help,
             version,
         });
     }
 
     if positional.len() > 1 {
-        eprintln!("cli_invalid_args: 任务描述只能是其中一个位置参数，请用引号包住完整描述");
-        return None;
+        // `exec "<任务>"` 把子命令名放在位置参数首位；其余模式仍只允许
+        // 一个位置参数，避免多段任务被静默丢弃。
+        if positional.first().is_some_and(|value| value == "exec") && positional.len() == 2 {
+            exec = true;
+            positional.remove(0);
+        } else {
+            eprintln!("cli_invalid_args: 任务描述只能是其中一个位置参数，请用引号包住完整描述");
+            return None;
+        }
     }
     let task = positional.into_iter().next();
     if doctor && rotate_events {
@@ -359,13 +458,18 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     // 会话级与任务级恢复不能同时使用。二者恢复的对象不同，同时指定时
     // 只有一方生效，用户不会察觉另一项被忽略。
     if resume.is_some() && resume_task.is_some() {
-        eprintln!("cli_invalid_args: --resume 与 --resume-task 不能同时使用：一个恢复会话，一个恢复任务");
+        eprintln!(
+            "cli_invalid_args: --resume 与 --resume-task 不能同时使用：一个恢复会话，一个恢复任务"
+        );
         return None;
     }
     // 组合无效的开关应立即报错。静默忽略会丢弃用户的意图。
     // JSON 输出只用于会生成结构化报告的模式。
-    if json && !report && !doctor && !rotate_events && !benchmark && !benchmark_long {
-        eprintln!("cli_invalid_args: --json 需要与 --report、--doctor、--rotate-events、--benchmark 或 --benchmark-long 搭配");
+    if json && !report && !doctor && !rotate_events && !benchmark && !benchmark_long && !exec
+    {
+        eprintln!(
+            "cli_invalid_args: --json 需要与 exec、--report、--doctor、--rotate-events、--benchmark 或 --benchmark-long 搭配"
+        );
         return None;
     }
     if report_dir.is_some() && !report {
@@ -403,7 +507,9 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
             || benchmark
             || benchmark_long)
     {
-        eprintln!("cli_invalid_args: --mcp-reconnect 是独立模式，不接任务描述，也不与其他模式同场使用");
+        eprintln!(
+            "cli_invalid_args: --mcp-reconnect 是独立模式，不接任务描述，也不与其他模式同场使用"
+        );
         return None;
     }
     // 扩展管理是独立模式：装、列、启、停各自结束进程，不接任务描述，
@@ -419,7 +525,9 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
     .filter(|active| *active)
     .count();
     if extension_modes > 1 {
-        eprintln!("cli_invalid_args: --list-extensions / --install-extension / --enable-extension / --disable-extension 一次只能用一个");
+        eprintln!(
+            "cli_invalid_args: --list-extensions / --install-extension / --enable-extension / --disable-extension 一次只能用一个"
+        );
         return None;
     }
     if extension_modes == 1
@@ -436,7 +544,57 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         return None;
     }
     if !permissions.is_empty() && enable_extension.is_none() {
-        eprintln!("cli_invalid_args: --permissions 只与 --enable-extension 搭配");
+        eprintln!("cli_invalid_args: --permissions 的扩展工具名只与 --enable-extension 搭配");
+        return None;
+    }
+    if permission_profile.is_some() && enable_extension.is_some() {
+        eprintln!(
+            "cli_invalid_args: --permissions 档位与 --enable-extension 工具名是两种语义，不能同时使用"
+        );
+        return None;
+    }
+    if timeout_secs.is_some() && !exec {
+        eprintln!("cli_invalid_args: --timeout 只用于 exec 无头模式");
+        return None;
+    }
+    // `--sandbox-debug` 只报告规则判定，不执行命令、不需要模型；与其他
+    // 运行意图同场会让用户误以为命令真的跑了。
+    if sandbox_debug.is_some()
+        && (task.is_some()
+            || exec
+            || auto_approve
+            || ai_review
+            || resume.is_some()
+            || resume_task.is_some()
+            || list_sessions
+            || report
+            || benchmark
+            || benchmark_long
+            || mcp_reconnect.is_some()
+            || frontend.is_some()
+            || web_ui
+            || extension_modes == 1)
+    {
+        eprintln!("cli_invalid_args: --sandbox-debug 是独立模式，只输出判定，不执行命令");
+        return None;
+    }
+    if web_ui
+        && (task.is_some()
+            || exec
+            || auto_approve
+            || ai_review
+            || resume.is_some()
+            || resume_task.is_some()
+            || list_sessions
+            || report
+            || benchmark
+            || benchmark_long
+            || mcp_reconnect.is_some()
+            || frontend.is_some()
+            || sandbox_debug.is_some()
+            || extension_modes == 1)
+    {
+        eprintln!("cli_invalid_args: --web-ui 是独立前端模式，不接任务描述，也不与其他前端同场");
         return None;
     }
     // 服务前端是持续运行模式：彼此互斥，也不接任务描述，
@@ -474,8 +632,13 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         && mcp_reconnect.is_none()
         && extension_modes == 0
         && frontend.is_none()
+        && sandbox_debug.is_none()
+        && !web_ui
+        && !exec
     {
-        eprintln!("cli_invalid_args: 缺少任务描述；恢复请用 --resume <id> 或 --resume-task <id>，诊断请用 --doctor，事件归档请用 --rotate-events，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long，MCP 恢复探测请用 --mcp-reconnect <服务器名>，扩展管理请用 --list-extensions 或 --install-extension <清单文件>\n\n{USAGE}");
+        eprintln!(
+            "cli_invalid_args: 缺少任务描述；无头执行请用 exec \"<任务>\"，恢复请用 --resume <id> 或 --resume-task <id>，诊断请用 --doctor，事件归档请用 --rotate-events，查看请用 --report，基准请用 --benchmark，长任务基准请用 --benchmark-long，MCP 恢复探测请用 --mcp-reconnect <服务器名>，扩展管理请用 --list-extensions 或 --install-extension <清单文件>\n\n{USAGE}"
+        );
         return None;
     }
 
@@ -502,6 +665,11 @@ pub fn parse_from<I: IntoIterator<Item = String>>(argv: I) -> Option<CliArgs> {
         enable_extension,
         permissions,
         disable_extension,
+        exec,
+        permission_profile,
+        timeout_secs,
+        sandbox_debug,
+        web_ui,
         help,
         version,
     })
@@ -564,14 +732,18 @@ impl ConsoleReporter {
             AuditEvent::ToolObserved { outcome, .. } => {
                 println!("[观察] {}", preview(&outcome.content));
             }
-            AuditEvent::SandboxApplied { platform, active, .. } => {
+            AuditEvent::SandboxApplied {
+                platform, active, ..
+            } => {
                 // 生效时不播报，这是默认预期；每条命令输出一行会让人跳过
                 // 所有输出。未生效必须立即显示，否则沙箱状态不会被检查。
                 if !active {
                     println!("[边界] {platform}：本次执行无进程沙箱保护");
                 }
             }
-            AuditEvent::PolicyEvaluated { verdict, reason, .. } => {
+            AuditEvent::PolicyEvaluated {
+                verdict, reason, ..
+            } => {
                 // 只播报拒绝的裁决。放行与要求审批不提供新信息；拒绝表示
                 // 模型被拦截，需要立即显示。
                 if matches!(verdict, crate::domain::policy::PolicyVerdict::Deny) {
@@ -668,6 +840,11 @@ impl ConsoleReporter {
                     );
                 }
             }
+            // 沙箱降级必须可见，否则隔离没生效时用户会默认它是安全的。
+            // 详情留在证据台账与 `--report`，控制台只报事实与原因。
+            AuditEvent::SandboxDegraded { fact, .. } => {
+                println!("[沙箱] 隔离降级：{}", fact.reason);
+            }
             // 审批与 token 用量暂不输出到控制台，避免淹没主要流程。
             AuditEvent::ApprovalDecided { .. } => {}
         }
@@ -727,13 +904,21 @@ mod tests {
         for mode in ["--stdio", "--interactive", "--text", "--tui"] {
             assert!(parse_from(argv(&[mode])).is_some(), "{mode}");
             for extra in [
-                vec!["修复问题"], vec!["--yes"], vec!["--ai-review"],
-                vec!["--resume", "s1"], vec!["--resume-task", "t1"],
-                vec!["--list-sessions"], vec!["--kind", "review"],
-                vec!["--report"], vec!["--benchmark"], vec!["--benchmark-long"],
-                vec!["--mcp-reconnect", "demo"], vec!["--list-extensions"],
+                vec!["修复问题"],
+                vec!["--yes"],
+                vec!["--ai-review"],
+                vec!["--resume", "s1"],
+                vec!["--resume-task", "t1"],
+                vec!["--list-sessions"],
+                vec!["--kind", "review"],
+                vec!["--report"],
+                vec!["--benchmark"],
+                vec!["--benchmark-long"],
+                vec!["--mcp-reconnect", "demo"],
+                vec!["--list-extensions"],
                 vec!["--install-extension", "demo.toml"],
-                vec!["--enable-extension", "demo"], vec!["--disable-extension", "demo"],
+                vec!["--enable-extension", "demo"],
+                vec!["--disable-extension", "demo"],
             ] {
                 let mut flags = vec![mode];
                 flags.extend(extra);
@@ -863,7 +1048,10 @@ mod tests {
         assert!(parsed.is_none(), "--force-worktree 单独给出没有意义");
 
         let parsed = parse_from(argv(&["--force-worktree", "--resume-task", "t1"]));
-        assert!(parsed.is_some(), "--force-worktree 与 --resume-task 搭配应当放行");
+        assert!(
+            parsed.is_some(),
+            "--force-worktree 与 --resume-task 搭配应当放行"
+        );
         let args = parse_from(argv(&["--force-worktree", "--resume-task", "t1"])).unwrap();
         assert!(args.force_worktree);
     }
@@ -995,8 +1183,23 @@ mod tests {
     /// 扩展管理与其他意图同场即拒：只有一项会执行，另一项被静默忽略。
     #[test]
     fn extension_modes_reject_company() {
-        assert!(parse_from(argv(&["--list-extensions", "--install-extension", "a.toml"])).is_none());
-        assert!(parse_from(argv(&["--enable-extension", "demo", "--disable-extension", "demo"])).is_none());
+        assert!(
+            parse_from(argv(&[
+                "--list-extensions",
+                "--install-extension",
+                "a.toml"
+            ]))
+            .is_none()
+        );
+        assert!(
+            parse_from(argv(&[
+                "--enable-extension",
+                "demo",
+                "--disable-extension",
+                "demo"
+            ]))
+            .is_none()
+        );
         assert!(parse_from(argv(&["--list-extensions", "跑个任务"])).is_none());
         assert!(parse_from(argv(&["--enable-extension", "demo", "--report"])).is_none());
         assert!(parse_from(argv(&["--install-extension", "a.toml", "--resume", "s1"])).is_none());

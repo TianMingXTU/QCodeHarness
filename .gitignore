@@ -7,3 +7,7 @@
 .qcodeharness/
 # Claude Code 的会话内调度锁，由工具自己维护，不进仓库
 .claude/scheduled_tasks.lock
+
+# TypeScript SDK 构建产物与依赖，不入仓库
+node_modules/
+sdk/typescript/dist/

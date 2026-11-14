@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::application::snapshot::{StoreError, TaskSnapshot, TaskStore};
-use crate::domain::ids::{sanitize_file_id, TaskId};
+use crate::domain::ids::{TaskId, sanitize_file_id};
 
 /// 把任务快照存成 workspace 下的单文件 JSON。
 #[derive(Debug, Clone)]
@@ -101,7 +101,7 @@ impl TaskStore for JsonTaskStore {
 mod tests {
     use super::*;
     use crate::application::agent_run::RunState;
-    use crate::application::snapshot::{RunSnapshot, RUN_FORMAT, TASK_FORMAT};
+    use crate::application::snapshot::{RUN_FORMAT, RunSnapshot, TASK_FORMAT};
     use crate::domain::agent::{AgentRole, AgentSpec};
     use crate::domain::budget::Consumption;
     use crate::domain::ids::SessionId;
@@ -112,7 +112,8 @@ mod tests {
 
     /// 每次测试使用独立的临时目录，避免并行测试相互干扰。
     fn temp_workspace(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("qch-task-store-{}-{}", name, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("qch-task-store-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -219,7 +220,12 @@ mod tests {
         let loaded = store.load(&TaskId::new("t1")).unwrap().unwrap();
         assert_eq!(loaded.completed_outputs.len(), 2, "后一次保存应覆盖前一次");
         // 临时文件不应残留。
-        assert!(!store.path_for(&TaskId::new("t1")).with_extension("json.tmp").exists());
+        assert!(
+            !store
+                .path_for(&TaskId::new("t1"))
+                .with_extension("json.tmp")
+                .exists()
+        );
     }
 
     #[test]
@@ -231,10 +237,10 @@ mod tests {
         store.save(&snapshot).unwrap();
 
         let error = store.load(&TaskId::new("t1")).unwrap_err();
-        assert!(matches!(
-            error,
-            StoreError::VersionMismatch { found: 999, .. }
-        ), "{error}");
+        assert!(
+            matches!(error, StoreError::VersionMismatch { found: 999, .. }),
+            "{error}"
+        );
     }
 
     #[test]

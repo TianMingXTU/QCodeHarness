@@ -124,13 +124,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let selection = ExtensionSelection::all();
     let instructions = extensions.enabled_instructions(&selection)?;
-    let adapters =
-        extensions.adapters(
-            &deps,
-            AgentRole::Coder,
-            selection,
-            Arc::new(TokioTimeLimiter::new(Duration::from_secs(10))?),
-        )?;
+    let adapters = extensions.adapters(
+        &deps,
+        AgentRole::Coder,
+        selection,
+        Arc::new(TokioTimeLimiter::new(Duration::from_secs(10))?),
+    )?;
     deps.tools = ToolRegistry::from_sources(&[builtin, adapters.source]);
     deps.hooks = adapters.hooks;
     let mut runner = AgentRunner::new(

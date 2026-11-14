@@ -110,7 +110,9 @@ mod tests {
         )
         .unwrap();
 
-        let config = McpConfig::load(&path).unwrap().expect("文件存在应返回 Some");
+        let config = McpConfig::load(&path)
+            .unwrap()
+            .expect("文件存在应返回 Some");
         assert_eq!(config.mcp_servers.len(), 2);
         assert_eq!(config.mcp_servers[0].name, "filesystem");
         assert_eq!(config.mcp_servers[0].command, "npx");
@@ -126,7 +128,11 @@ mod tests {
     fn missing_file_means_no_mcp() {
         let path = temp_path("absent.toml");
         let _ = fs::remove_file(&path);
-        assert_eq!(McpConfig::load(&path).unwrap(), None, "缺文件是常态，不是错误");
+        assert_eq!(
+            McpConfig::load(&path).unwrap(),
+            None,
+            "缺文件是常态，不是错误"
+        );
     }
 
     #[test]
@@ -153,7 +159,11 @@ mod tests {
         // serde 默认忽略未知字段。不拦截时，`[[mcp_server]]` 拼写错误会
         // 让 MCP 关闭（解析为 0 个 Server），用户没有线索。
         let typo = temp_path("typo.toml");
-        fs::write(&typo, "[[mcp_server]]\nname = \"fetch\"\ncommand = \"uvx\"\n").unwrap();
+        fs::write(
+            &typo,
+            "[[mcp_server]]\nname = \"fetch\"\ncommand = \"uvx\"\n",
+        )
+        .unwrap();
         let error = McpConfig::load(&typo).unwrap_err();
         assert!(error.contains("解析失败"), "{error}");
         fs::remove_file(&typo).ok();

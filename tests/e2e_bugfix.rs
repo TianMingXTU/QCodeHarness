@@ -11,9 +11,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use qcode_harness::application::agent_run::{AgentDependencies, AgentRunner};
 use qcode_harness::application::agent_roster::AgentRoster;
+use qcode_harness::application::agent_run::{AgentDependencies, AgentRunner};
 use qcode_harness::application::context_policy::DefaultContextPolicy;
+use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::application::port::NoopHooks;
 use qcode_harness::application::tool_registry::ToolRegistry;
 use qcode_harness::domain::agent::{AgentRole, AgentSpec};
@@ -23,7 +24,6 @@ use qcode_harness::domain::policy::PolicyEngine;
 use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::clock::SystemClock;
-use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 use qcode_harness::infrastructure::tool::all_tools;
 
@@ -42,10 +42,7 @@ const FIXED_LINE: &str = r#"format!("Hello, {name}!")"#;
 /// 并行冲突。
 fn copy_fixture_to_temp() -> PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/broken-repo");
-    let dest = std::env::temp_dir().join(format!(
-        "qch-e2e-bugfix-{}",
-        std::process::id()
-    ));
+    let dest = std::env::temp_dir().join(format!("qch-e2e-bugfix-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dest);
     copy_dir(&source, &dest).expect("拷贝 fixture");
     dest
@@ -104,7 +101,9 @@ async fn fixes_a_failing_test_in_an_isolated_repo() {
             json!({"path": "src/lib.rs", "old_string": BUGGY_LINE, "new_string": FIXED_LINE}),
         ),
         MockTurn::tool_call("call_3", "run_command", json!({"command": "cargo test"})),
-        MockTurn::text("已修复：greet 忘了拼名字，已改为 format!(\"Hello, {{name}}!\")，cargo test 通过。"),
+        MockTurn::text(
+            "已修复：greet 忘了拼名字，已改为 format!(\"Hello, {{name}}!\")，cargo test 通过。",
+        ),
     ]);
 
     // 全真实工具注册表：真实文件工具与真实 shell，不是测试替身。

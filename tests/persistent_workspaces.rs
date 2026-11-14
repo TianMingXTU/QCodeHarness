@@ -259,19 +259,8 @@ async fn adopt_rejects_arbitrary_roots_even_if_they_are_registered_git_worktrees
     let path = raw
         .strip_prefix(r"\\?\UNC\")
         .map(|unc| format!(r"\\{unc}"))
-        .unwrap_or_else(|| {
-            raw.strip_prefix(r"\\?\").unwrap_or(raw).to_owned()
-        });
-    git(
-        &repo.0,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            &path,
-            &base,
-        ],
-    );
+        .unwrap_or_else(|| raw.strip_prefix(r"\\?\").unwrap_or(raw).to_owned());
+    git(&repo.0, &["worktree", "add", "--detach", &path, &base]);
     forged.id = "user-owned".to_owned();
     forged.root = unissued;
     assert!(manager.adopt(&forged).await.is_err());

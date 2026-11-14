@@ -143,7 +143,11 @@ impl ExtFilter {
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase());
         if !self.include.is_empty() {
-            return ext.is_some() && self.include.iter().any(|want| ext.as_deref() == Some(want.as_str()));
+            return ext.is_some()
+                && self
+                    .include
+                    .iter()
+                    .any(|want| ext.as_deref() == Some(want.as_str()));
         }
         !ext.is_some_and(|actual| self.exclude.contains(&actual))
     }
@@ -179,14 +183,12 @@ impl Matcher {
 /// 编译正则。失败时返回模型可自行修正的错误：原模式与 regex 库的
 /// 定位说明。
 fn compile_regex(pattern: &str) -> Result<Matcher, String> {
-    Regex::new(pattern)
-        .map(Matcher::Regex)
-        .map_err(|error| {
-            format!(
-                "正则编译失败: pattern `{pattern}` 不是合法的正则表达式（{error}）；\
+    Regex::new(pattern).map(Matcher::Regex).map_err(|error| {
+        format!(
+            "正则编译失败: pattern `{pattern}` 不是合法的正则表达式（{error}）；\
                  若只想搜普通文本，请去掉 regex 参数按子串匹配"
-            )
-        })
+        )
+    })
 }
 
 impl ToolInvoker for SearchText {
@@ -208,8 +210,18 @@ impl ToolInvoker for SearchText {
                 Matcher::Substring(args.pattern.clone())
             };
             let filter = ExtFilter {
-                include: args.include.iter().map(String::as_str).map(normalize_ext).collect(),
-                exclude: args.exclude.iter().map(String::as_str).map(normalize_ext).collect(),
+                include: args
+                    .include
+                    .iter()
+                    .map(String::as_str)
+                    .map(normalize_ext)
+                    .collect(),
+                exclude: args
+                    .exclude
+                    .iter()
+                    .map(String::as_str)
+                    .map(normalize_ext)
+                    .collect(),
             };
             let start = match resolve_in(&self.root, args.path.as_deref().unwrap_or(".")) {
                 Ok(path) => path,
@@ -322,7 +334,13 @@ fn walk(
 }
 
 /// 扫描单个文件的每一行。
-fn scan_file(content: &str, relative: &str, matcher: &Matcher, cap: usize, result: &mut WalkResult) {
+fn scan_file(
+    content: &str,
+    relative: &str,
+    matcher: &Matcher,
+    cap: usize,
+    result: &mut WalkResult,
+) {
     for (index, line) in content.lines().enumerate() {
         if matcher.matches_line(line) {
             result.total += 1;
@@ -394,7 +412,12 @@ mod tests {
 
         let outcome = tool.invoke(&call(json!({"pattern": "KEY"}))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(
             outcome.content.contains("src/main.rs:1"),
             "workspace 内的正常文件仍要能搜到: {}",
@@ -420,14 +443,27 @@ mod tests {
         let root = temp_workspace("env-deep");
         fs::create_dir_all(root.join("src/nested")).unwrap();
         fs::write(root.join(".env"), "API_KEY={{SECRET_aa11bb22}}\n").unwrap();
-        fs::write(root.join("src/nested/.env"), "DB_PASSWORD={{SECRET_cc33dd44}}\n").unwrap();
+        fs::write(
+            root.join("src/nested/.env"),
+            "DB_PASSWORD={{SECRET_cc33dd44}}\n",
+        )
+        .unwrap();
         fs::write(root.join("src/main.rs"), "const X = 1;\n").unwrap();
         let tool = SearchText::new(WorkspaceRoot::new(&root));
 
         let outcome = tool.invoke(&call(json!({"pattern": "SECRET"}))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        assert_eq!(outcome.content, "未找到匹配", "凭据行任何深度都搜不出来: {}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+        assert_eq!(
+            outcome.content, "未找到匹配",
+            "凭据行任何深度都搜不出来: {}",
+            outcome.content
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -439,11 +475,28 @@ mod tests {
 
         let outcome = tool.invoke(&call(json!({"pattern": "TODO"}))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         // 相对路径用 / 分隔，行号从 1 开始。
-        assert!(outcome.content.contains("src/main.rs:2:// TODO fix this"), "{}", outcome.content);
-        assert!(outcome.content.contains("src/lib.rs:1:TODO fix"), "{}", outcome.content);
-        assert!(outcome.content.contains("src/lib.rs:3:TODO again"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("src/main.rs:2:// TODO fix this"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("src/lib.rs:1:TODO fix"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("src/lib.rs:3:TODO again"),
+            "{}",
+            outcome.content
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -472,8 +525,16 @@ mod tests {
 
         assert_eq!(outcome.status, OutcomeStatus::Success);
         // 共 3 处匹配（target 与 .git 已跳过），只显示 2 条，截断说明含总数。
-        assert!(outcome.content.contains("已截断，共匹配 3 处"), "{}", outcome.content);
-        assert!(outcome.content.contains("显示前 2 处"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("已截断，共匹配 3 处"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("显示前 2 处"),
+            "{}",
+            outcome.content
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -483,7 +544,9 @@ mod tests {
         plant(&root);
         let tool = SearchText::new(WorkspaceRoot::new(&root));
 
-        let outcome = tool.invoke(&call(json!({"pattern": "XYZZY_NOT_THERE"}))).await;
+        let outcome = tool
+            .invoke(&call(json!({"pattern": "XYZZY_NOT_THERE"})))
+            .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Success);
         assert_eq!(outcome.content, "未找到匹配");
@@ -527,7 +590,11 @@ mod tests {
             .invoke(&call(json!({"pattern": "TODO", "path": "src"})))
             .await;
 
-        assert!(outcome.content.contains("src/lib.rs"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("src/lib.rs"),
+            "{}",
+            outcome.content
+        );
         assert!(!outcome.content.contains("README"), "{}", outcome.content);
         let _ = fs::remove_dir_all(&root);
     }
@@ -536,7 +603,13 @@ mod tests {
     fn walk_counts_matches_without_emitting_past_the_cap() {
         // 按行匹配：每行计一处，行内多次出现不重复计数。
         let mut result = WalkResult::default();
-        scan_file("x1\nplain\nx2\nx3\n", "f.txt", &Matcher::Substring("x".to_owned()), 2, &mut result);
+        scan_file(
+            "x1\nplain\nx2\nx3\n",
+            "f.txt",
+            &Matcher::Substring("x".to_owned()),
+            2,
+            &mut result,
+        );
 
         assert_eq!(result.total, 3, "总数不受上限影响");
         assert_eq!(result.lines.len(), 2, "收集数受上限约束");
@@ -560,8 +633,17 @@ mod tests {
 
         let outcome = tool.invoke(&call(json!({"pattern": "TODO"}))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        assert!(outcome.content.contains("src/main.rs"), "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("src/main.rs"),
+            "{}",
+            outcome.content
+        );
         assert!(
             !outcome.content.contains("TODO hidden"),
             "gitignore 里的文件与被 ignore 的目录都不该被搜到: {}",
@@ -583,8 +665,17 @@ mod tests {
 
         let outcome = tool.invoke(&call(json!({"pattern": "TODO"}))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        assert!(outcome.content.contains("src/main.rs"), "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("src/main.rs"),
+            "{}",
+            outcome.content
+        );
         assert!(
             !outcome.content.contains("auto.rs"),
             "嵌套 .gitignore 应作用于自己的子目录: {}",
@@ -601,12 +692,31 @@ mod tests {
         plant(&root);
         let tool = SearchText::new(WorkspaceRoot::new(&root));
 
-        let outcome = tool.invoke(&call(json!({"pattern": "TODO", "max_results": 200}))).await;
+        let outcome = tool
+            .invoke(&call(json!({"pattern": "TODO", "max_results": 200})))
+            .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        assert!(outcome.content.contains("src/main.rs:2"), "{}", outcome.content);
-        assert!(outcome.content.contains("src/lib.rs:1"), "{}", outcome.content);
-        assert!(outcome.content.contains("src/lib.rs:3"), "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("src/main.rs:2"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("src/lib.rs:1"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("src/lib.rs:3"),
+            "{}",
+            outcome.content
+        );
         assert!(!outcome.content.contains("target/"), "{}", outcome.content);
         assert!(!outcome.content.contains(".git/"), "{}", outcome.content);
         let _ = fs::remove_dir_all(&root);
@@ -639,17 +749,39 @@ mod tests {
     async fn regex_mode_matches_pattern_syntax() {
         let root = temp_workspace("regex");
         fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/main.rs"), "TODO fix\nfn main() {}\ntodo later\n").unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "TODO fix\nfn main() {}\ntodo later\n",
+        )
+        .unwrap();
         let tool = SearchText::new(WorkspaceRoot::new(&root));
 
         // 子串语义下 `TODO|todo` 是字面量，且大小写敏感，搜不到。
         let substring = tool.invoke(&call(json!({"pattern": "TODO|todo"}))).await;
-        assert_eq!(substring.content, "未找到匹配", "不带 regex 时应按子串字面匹配");
+        assert_eq!(
+            substring.content, "未找到匹配",
+            "不带 regex 时应按子串字面匹配"
+        );
 
-        let regex_outcome = tool.invoke(&call(json!({"pattern": "TODO|todo", "regex": true}))).await;
-        assert_eq!(regex_outcome.status, OutcomeStatus::Success, "{}", regex_outcome.content);
-        assert!(regex_outcome.content.contains("src/main.rs:1:TODO fix"), "{}", regex_outcome.content);
-        assert!(regex_outcome.content.contains("src/main.rs:3:todo later"), "{}", regex_outcome.content);
+        let regex_outcome = tool
+            .invoke(&call(json!({"pattern": "TODO|todo", "regex": true})))
+            .await;
+        assert_eq!(
+            regex_outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            regex_outcome.content
+        );
+        assert!(
+            regex_outcome.content.contains("src/main.rs:1:TODO fix"),
+            "{}",
+            regex_outcome.content
+        );
+        assert!(
+            regex_outcome.content.contains("src/main.rs:3:todo later"),
+            "{}",
+            regex_outcome.content
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -659,12 +791,26 @@ mod tests {
         let root = temp_workspace("badregex");
         let tool = SearchText::new(WorkspaceRoot::new(&root));
 
-        let outcome = tool.invoke(&call(json!({"pattern": "TODO(", "regex": true}))).await;
+        let outcome = tool
+            .invoke(&call(json!({"pattern": "TODO(", "regex": true})))
+            .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
-        assert!(outcome.content.contains("TODO("), "错误信息应带原模式: {}", outcome.content);
-        assert!(outcome.content.contains("正则编译失败"), "{}", outcome.content);
-        assert!(outcome.content.contains("regex"), "应提示可去掉 regex 参数: {}", outcome.content);
+        assert!(
+            outcome.content.contains("TODO("),
+            "错误信息应带原模式: {}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("正则编译失败"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("regex"),
+            "应提示可去掉 regex 参数: {}",
+            outcome.content
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -680,23 +826,60 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "MARK cfg\n").unwrap();
         let tool = SearchText::new(WorkspaceRoot::new(&root));
 
-        let only_rs = tool.invoke(&call(json!({"pattern": "MARK", "include": ["rs"]}))).await;
-        assert_eq!(only_rs.status, OutcomeStatus::Success, "{}", only_rs.content);
-        assert!(only_rs.content.contains("src/main.rs"), "{}", only_rs.content);
-        assert!(!only_rs.content.contains("notes.md"), "include 应排除非 rs 文件: {}", only_rs.content);
-        assert!(!only_rs.content.contains("Cargo.toml"), "{}", only_rs.content);
+        let only_rs = tool
+            .invoke(&call(json!({"pattern": "MARK", "include": ["rs"]})))
+            .await;
+        assert_eq!(
+            only_rs.status,
+            OutcomeStatus::Success,
+            "{}",
+            only_rs.content
+        );
+        assert!(
+            only_rs.content.contains("src/main.rs"),
+            "{}",
+            only_rs.content
+        );
+        assert!(
+            !only_rs.content.contains("notes.md"),
+            "include 应排除非 rs 文件: {}",
+            only_rs.content
+        );
+        assert!(
+            !only_rs.content.contains("Cargo.toml"),
+            "{}",
+            only_rs.content
+        );
 
         // 大小写不敏感：`.RS` 与 `rs` 匹配同一批文件。
-        let upper = tool.invoke(&call(json!({"pattern": "MARK", "include": [".RS"]}))).await;
-        assert!(upper.content.contains("src/main.rs"), "扩展名匹配应大小写不敏感: {}", upper.content);
+        let upper = tool
+            .invoke(&call(json!({"pattern": "MARK", "include": [".RS"]})))
+            .await;
+        assert!(
+            upper.content.contains("src/main.rs"),
+            "扩展名匹配应大小写不敏感: {}",
+            upper.content
+        );
 
-        let no_md = tool.invoke(&call(json!({"pattern": "MARK", "exclude": ["md"]}))).await;
+        let no_md = tool
+            .invoke(&call(json!({"pattern": "MARK", "exclude": ["md"]})))
+            .await;
         assert!(no_md.content.contains("src/main.rs"), "{}", no_md.content);
-        assert!(no_md.content.contains("Cargo.toml"), "exclude 只应排除 md: {}", no_md.content);
-        assert!(!no_md.content.contains("notes.md"), "exclude 应排除 md 文件: {}", no_md.content);
+        assert!(
+            no_md.content.contains("Cargo.toml"),
+            "exclude 只应排除 md: {}",
+            no_md.content
+        );
+        assert!(
+            !no_md.content.contains("notes.md"),
+            "exclude 应排除 md 文件: {}",
+            no_md.content
+        );
 
         // 带点写法（`.md`）与不带点写法（`md`）等价。
-        let dotted = tool.invoke(&call(json!({"pattern": "MARK", "exclude": [".md"]}))).await;
+        let dotted = tool
+            .invoke(&call(json!({"pattern": "MARK", "exclude": [".md"]})))
+            .await;
         assert!(!dotted.content.contains("notes.md"), "{}", dotted.content);
         let _ = fs::remove_dir_all(&root);
     }
@@ -712,10 +895,17 @@ mod tests {
         let tool = SearchText::new(WorkspaceRoot::new(&root));
 
         let outcome = tool
-            .invoke(&call(json!({"pattern": "MARK", "include": ["rs"], "exclude": ["rs"]})))
+            .invoke(&call(
+                json!({"pattern": "MARK", "include": ["rs"], "exclude": ["rs"]}),
+            ))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(
             outcome.content.contains("src/main.rs"),
             "冲突时 include 优先，rs 文件应仍被搜出: {}",
@@ -733,17 +923,26 @@ mod tests {
             include: vec!["rs".to_owned()],
             exclude: vec![],
         };
-        assert!(!only_ext.allows(Path::new("Makefile")), "include 收窄时应排除无扩展名文件");
+        assert!(
+            !only_ext.allows(Path::new("Makefile")),
+            "include 收窄时应排除无扩展名文件"
+        );
         assert!(only_ext.allows(Path::new("main.rs")));
 
         let skip_ext = ExtFilter {
             include: vec![],
             exclude: vec!["log".to_owned()],
         };
-        assert!(skip_ext.allows(Path::new("Makefile")), "只 exclude 时无扩展名文件应放行");
+        assert!(
+            skip_ext.allows(Path::new("Makefile")),
+            "只 exclude 时无扩展名文件应放行"
+        );
         assert!(!skip_ext.allows(Path::new("app.log")));
 
         let inactive = ExtFilter::default();
-        assert!(inactive.allows(Path::new("anything.bin")), "没给名单时放行一切");
+        assert!(
+            inactive.allows(Path::new("anything.bin")),
+            "没给名单时放行一切"
+        );
     }
 }

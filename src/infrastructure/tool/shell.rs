@@ -24,25 +24,27 @@
 use serde::Deserialize;
 use serde_json::json;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 
+use crate::application::background_jobs::{BackgroundJobRegistry, BackgroundJobSpec};
 use crate::application::port::{BoxFuture, ToolInvoker};
 use crate::domain::command::parse_command;
 use crate::domain::platform::Platform;
 use crate::domain::sandbox::{
-    write_escape_beyond, ALLOW_UNISOLATED_COMMANDS_ENV, ExecutionBoundary,
-    PlatformCapabilities, SandboxPolicy, SANDBOX_DOWNGRADE_NOTICE,
-    unisolated_decision, UnisolatedDecision,
+    ALLOW_UNISOLATED_COMMANDS_ENV, ExecutionBoundary, PlatformCapabilities,
+    SANDBOX_DOWNGRADE_NOTICE, SandboxPolicy, UnisolatedDecision, unisolated_decision,
+    write_escape_beyond,
 };
 use crate::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSpec};
 use crate::domain::workspace::WorkspaceRoot;
-use crate::infrastructure::sandbox::{assign_child, JobGuard};
+use crate::infrastructure::sandbox::{JobGuard, assign_child};
 
 use super::parse_args;
 
-const RUN_COMMAND: &str = "run_command";
+pub(crate) const RUN_COMMAND: &str = "run_command";
 
 /// 未指定时的超时秒数。
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -60,6 +62,9 @@ pub struct RunCommand {
     // 构造时读一次环境并缓存：同一次执行内所有命令用同一口径，测试
     // 直接改字段而不动全局环境。
     host_allows_unisolated: bool,
+    // 后台作业注册表：有值时 background=true 的调用把命令交给注册表，
+    // 不阻塞当前轮；job_list 从同一注册表读状态。
+    jobs: Option<Arc<dyn BackgroundJobRegistry>>,
 }
 
 impl RunCommand {
@@ -74,7 +79,14 @@ impl RunCommand {
             root,
             policy: SandboxPolicy::default(),
             host_allows_unisolated: host_allows_unisolated_commands(),
+            jobs: None,
         }
+    }
+
+    /// 挂上后台作业注册表；与 job_list 工具共享同一份状态。
+    pub fn with_jobs(mut self, jobs: Arc<dyn BackgroundJobRegistry>) -> Self {
+        self.jobs = Some(jobs);
+        self
     }
 
     /// 工具规格。
@@ -98,7 +110,8 @@ impl RunCommand {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "要执行的命令，例如 cargo test" },
-                    "timeout_seconds": { "type": "integer", "description": "超时秒数，默认 30，上限 300" }
+                    "timeout_seconds": { "type": "integer", "description": "超时秒数，默认 30，上限 300" },
+                    "background": { "type": "boolean", "description": "true 时命令转入后台执行，立即返回作业 ID；用 job_list 查询状态" }
                 },
                 "required": ["command"]
             }),
@@ -137,6 +150,8 @@ pub(crate) fn unisolated_open_command_refusal(command: &str) -> Option<String> {
 struct RunArgs {
     command: String,
     timeout_seconds: Option<u64>,
+    /// 后台化标记：true 时命令交给作业注册表，立即返回作业 ID。
+    background: Option<bool>,
 }
 
 /// 一次命令执行的原始输出。
@@ -216,8 +231,13 @@ impl RunError {
         match self {
             Self::Refused(message) => ToolOutcome::refused(message),
             Self::NotStarted(message) => ToolOutcome::failed(message),
-            Self::Failed { message, sandbox_active } => with_process_boundary(
-                ToolOutcome::failed(message), sandbox_active, boundary_checked,
+            Self::Failed {
+                message,
+                sandbox_active,
+            } => with_process_boundary(
+                ToolOutcome::failed(message),
+                sandbox_active,
+                boundary_checked,
             ),
         }
     }
@@ -327,13 +347,15 @@ pub(crate) async fn run_with_policy(
             eprintln!("警告：{error}");
             None
         }
-        Err(error) => return Err(RunError::Refused(format!(
-            "沙箱创建失败: {error}（fail-closed：拒绝执行）"
-        ))),
+        Err(error) => {
+            return Err(RunError::Refused(format!(
+                "沙箱创建失败: {error}（fail-closed：拒绝执行）"
+            )));
+        }
     };
-    let mut child = cmd.spawn().map_err(|error| {
-        RunError::NotStarted(format!("启动 `{program}` 失败: {error}"))
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| RunError::NotStarted(format!("启动 `{program}` 失败: {error}")))?;
 
     // 纳沙箱失败时按降级策略执行，所有退出路径都返回该事实。
     // spawn 与 assign 之间存在窗口，这里不承诺 OS 级隔离。
@@ -464,6 +486,29 @@ impl ToolInvoker for RunCommand {
                     .clamp(1, HARD_MAX_TIMEOUT_SECS),
             );
 
+            // 后台化：命令交给作业注册表异步执行，当前轮立即拿到作业 ID。
+            // 与同步路径共用越界与开放命令收口，后台不放行更多命令；
+            // timeout 是作业自己的生命周期上限。
+            if args.background == Some(true) {
+                let Some(jobs) = &self.jobs else {
+                    return ToolOutcome::failed(
+                        "background=true 但宿主未挂接后台作业注册表，命令未执行",
+                    );
+                };
+                let spec = BackgroundJobSpec {
+                    command: args.command.clone(),
+                    root: self.root.as_path().to_path_buf(),
+                    timeout,
+                };
+                return match jobs.spawn(spec).await {
+                    Ok(id) => ToolOutcome::success(format!(
+                        "后台作业 {} 已启动：{}\n用 job_list 查询状态。",
+                        id.0, args.command
+                    )),
+                    Err(reason) => ToolOutcome::failed(format!("后台作业启动失败: {reason}")),
+                };
+            }
+
             match run_with_policy(&self.root, &args.command, timeout, &self.policy).await {
                 Err(error) => error.into_outcome(true),
                 Ok(output) => {
@@ -539,13 +584,21 @@ mod tests {
 
         let outcome = cmd.invoke(&call(run_args("echo ok"))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        let raw = run_in_workspace(&WorkspaceRoot::new(root.clone()), "echo ok", Duration::from_secs(30))
-            .await
-            .expect("执行成功");
         assert_eq!(
-            raw.sandbox_active,
-            capabilities.has_process_sandbox,
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+        let raw = run_in_workspace(
+            &WorkspaceRoot::new(root.clone()),
+            "echo ok",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("执行成功");
+        assert_eq!(
+            raw.sandbox_active, capabilities.has_process_sandbox,
             "沙箱状态必须与平台能力一致"
         );
         if capabilities.has_process_sandbox {
@@ -668,7 +721,11 @@ mod tests {
                     .join(format!("sandbox-victim{}", std::env::consts::EXE_SUFFIX))
             })
             .expect("定位探针");
-        assert!(path.exists(), "探针未编译（cargo test 会编 examples）: {}", path.display());
+        assert!(
+            path.exists(),
+            "探针未编译（cargo test 会编 examples）: {}",
+            path.display()
+        );
         path
     }
 
@@ -710,9 +767,22 @@ mod tests {
 
             // 拒绝与失败是两种结局：命令没有运行，失败表示跑过但未成功。
             // 证据必须能分辨；`SandboxApplied` 只为实际执行的命令记录。
-            assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
-            assert!(outcome.content.contains("沙箱创建失败"), "{}", outcome.content);
-            assert!(outcome.content.contains("fail-closed"), "{}", outcome.content);
+            assert_eq!(
+                outcome.status,
+                OutcomeStatus::Refused,
+                "{}",
+                outcome.content
+            );
+            assert!(
+                outcome.content.contains("沙箱创建失败"),
+                "{}",
+                outcome.content
+            );
+            assert!(
+                outcome.content.contains("fail-closed"),
+                "{}",
+                outcome.content
+            );
             assert!(outcome.execution.is_none(), "没启动进程就不能发边界证据");
             assert!(!root.join("ran.txt").exists(), "创建失败时命令不得执行");
             // 拒绝执行与降级执行不能同时出现：前者表示没跑，后者表示跑过但无保护。
@@ -722,27 +792,35 @@ mod tests {
                 outcome.content
             );
 
-            let error = match run_with_policy(&cmd.root, "echo ok", Duration::from_secs(30), &cmd.policy)
-                .await
-            {
-                Ok(_) => panic!("沙箱创建失败必须向上传播错误而不是降级"),
-                Err(RunError::Refused(message)) => message,
-                Err(other) => panic!("创建失败必须是拒绝: {other}"),
-            };
+            let error =
+                match run_with_policy(&cmd.root, "echo ok", Duration::from_secs(30), &cmd.policy)
+                    .await
+                {
+                    Ok(_) => panic!("沙箱创建失败必须向上传播错误而不是降级"),
+                    Err(RunError::Refused(message)) => message,
+                    Err(other) => panic!("创建失败必须是拒绝: {other}"),
+                };
             assert!(error.contains("沙箱创建失败"), "{error}");
         } else {
             let outcome = cmd
                 .invoke(&call(run_args("echo downgrade_ok > ran.txt")))
                 .await;
 
-            assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+            assert_eq!(
+                outcome.status,
+                OutcomeStatus::Success,
+                "{}",
+                outcome.content
+            );
             assert!(
                 outcome.content.starts_with("⚠️ 进程沙箱未生效"),
                 "{}",
                 outcome.content
             );
             assert_eq!(
-                std::fs::read_to_string(root.join("ran.txt")).unwrap().trim(),
+                std::fs::read_to_string(root.join("ran.txt"))
+                    .unwrap()
+                    .trim(),
                 "downgrade_ok"
             );
 
@@ -796,7 +874,12 @@ mod tests {
             "cat inside.txt"
         };
         let outcome = cmd.invoke(&call(run_args(read_file))).await;
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(outcome.execution.is_some(), "真启动的命令要带边界事实");
 
         // 根内绝对路径同样放行。模型常写 `type D:\repo\src\main.rs`，
@@ -870,10 +953,8 @@ mod tests {
     #[tokio::test]
     async fn refused_command_leaves_no_side_effect() {
         let root = temp_workspace("boundary-noop");
-        let outside = std::env::temp_dir().join(format!(
-            "qch-boundary-outside-{}.txt",
-            std::process::id()
-        ));
+        let outside =
+            std::env::temp_dir().join(format!("qch-boundary-outside-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&outside);
         let cmd = tool(&root);
 
@@ -884,7 +965,12 @@ mod tests {
             ))))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Refused,
+            "{}",
+            outcome.content
+        );
         assert!(!outside.exists(), "被拒的命令不该在 workspace 外留下文件");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -897,7 +983,12 @@ mod tests {
         // echo 在 cmd 与 sh 下都是同一条命令，无需分平台。
         let outcome = cmd.invoke(&call(run_args("echo hello_from_shell"))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("退出码: 0"), "{}", outcome.content);
         assert!(
             outcome.content.to_lowercase().contains("hello_from_shell"),
@@ -960,7 +1051,12 @@ mod tests {
         };
         let outcome = cmd.invoke(&call(run_args(command))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         // 比的是"两条路径指向同一个目录"，不是两串文本：Windows 上 `cd`
         // 可能打印 8.3 短名（RUNNER~1），macOS 上 /tmp 是 /private/tmp 的
         // 软链。两侧都 canonicalize 之后才是同一串可比的路径。
@@ -1052,7 +1148,10 @@ mod tests {
             "{}",
             outcome.content
         );
-        assert!(!outcome.content.trim().ends_with("── stderr ──"), "stderr 应有报错文本");
+        assert!(
+            !outcome.content.trim().ends_with("── stderr ──"),
+            "stderr 应有报错文本"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1075,7 +1174,9 @@ mod tests {
         assert_eq!(outcome.status, OutcomeStatus::Failed);
         assert!(outcome.content.contains("超时"), "{}", outcome.content);
         assert!(
-            outcome.execution.is_some_and(|boundary| boundary.boundary_checked),
+            outcome
+                .execution
+                .is_some_and(|boundary| boundary.boundary_checked),
             "超时前已启动进程，必须留下真实执行边界"
         );
 
@@ -1104,8 +1205,16 @@ mod tests {
             .invoke(&call(json!({"command": command, "timeout_seconds": 30})))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        assert!(root.join("alive_marker.txt").exists(), "正常完成的命令应写出标记");
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+        assert!(
+            root.join("alive_marker.txt").exists(),
+            "正常完成的命令应写出标记"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1129,7 +1238,12 @@ mod tests {
         };
         let outcome = cmd.invoke(&call(run_args(command))).await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(
             !outcome.content.contains("super-secret-value-123"),
             "密钥必须被脱敏: {}",
@@ -1194,7 +1308,9 @@ mod tests {
         let mut cmd = RunCommand::new(WorkspaceRoot::new(root.clone()));
         cmd.host_allows_unisolated = false;
 
-        let outcome = cmd.invoke(&call(run_args("echo x > open_default.txt"))).await;
+        let outcome = cmd
+            .invoke(&call(run_args("echo x > open_default.txt")))
+            .await;
 
         assert_eq!(
             outcome.status,
@@ -1203,7 +1319,9 @@ mod tests {
             outcome.content
         );
         assert!(
-            outcome.content.contains(crate::domain::sandbox::REFUSAL_CODE_UNISOLATED),
+            outcome
+                .content
+                .contains(crate::domain::sandbox::REFUSAL_CODE_UNISOLATED),
             "拒绝理由带稳定码: {}",
             outcome.content
         );
@@ -1253,9 +1371,7 @@ mod tests {
         let mut cmd = RunCommand::new(WorkspaceRoot::new(root.clone()));
         cmd.host_allows_unisolated = false;
 
-        let outcome = cmd
-            .invoke(&call(run_args("git status 2>&1 | more")))
-            .await;
+        let outcome = cmd.invoke(&call(run_args("git status 2>&1 | more"))).await;
 
         assert!(
             outcome.status != OutcomeStatus::Refused,
@@ -1286,7 +1402,10 @@ mod tests {
             outcome.content
         );
         // 未生效声明按平台能力生成：缺文件与网络隔离时必然附带。
-        if PlatformCapabilities::detect().unisolation_statement().is_some() {
+        if PlatformCapabilities::detect()
+            .unisolation_statement()
+            .is_some()
+        {
             assert!(
                 outcome.content.contains("未生效"),
                 "放行执行仍要声明隔离未生效: {}",

@@ -249,15 +249,16 @@ impl ToolInvoker for ApplyPatch {
                 // 目录创建失败在这里报错：临时文件尚未写入，工作区仍未
                 // 发生变化。
                 if let Some(parent) = temp.parent()
-                    && let Err(error) = tokio::fs::create_dir_all(parent).await {
-                        for (written, _) in &temps {
-                            let _ = tokio::fs::remove_file(written).await;
-                        }
-                        return ToolOutcome::failed(format!(
-                            "创建 `{}` 的目录失败: {error}（未改动任何文件）",
-                            file.display
-                        ));
+                    && let Err(error) = tokio::fs::create_dir_all(parent).await
+                {
+                    for (written, _) in &temps {
+                        let _ = tokio::fs::remove_file(written).await;
                     }
+                    return ToolOutcome::failed(format!(
+                        "创建 `{}` 的目录失败: {error}（未改动任何文件）",
+                        file.display
+                    ));
+                }
                 if let Err(error) = write_temp(&temp, content).await {
                     // 清掉已写好的临时文件，避免污染工作区。
                     for (temp, _) in &temps {
@@ -337,10 +338,7 @@ impl ToolInvoker for ApplyPatch {
                 ));
             }
             if !delete_failed.is_empty() {
-                summary.push_str(&format!(
-                    "以下文件删除失败：{}",
-                    delete_failed.join("、")
-                ));
+                summary.push_str(&format!("以下文件删除失败：{}", delete_failed.join("、")));
             }
             if summary.is_empty() {
                 summary.push_str("补丁没有产生任何改动");
@@ -442,7 +440,12 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert_eq!(
             fs::read_to_string(root.join("lib.rs")).unwrap(),
             "fn main() {\n    let x = 2;\n}\n"
@@ -458,7 +461,11 @@ mod tests {
     #[tokio::test]
     async fn updates_a_crlf_file_and_keeps_its_line_endings() {
         let root = temp_workspace("crlf-update");
-        fs::write(root.join("lib.rs"), "fn main() {\r\n    let x = 1;\r\n}\r\n").unwrap();
+        fs::write(
+            root.join("lib.rs"),
+            "fn main() {\r\n    let x = 1;\r\n}\r\n",
+        )
+        .unwrap();
         let file = tool(&root);
 
         let outcome = file
@@ -474,7 +481,12 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert_eq!(
             fs::read_to_string(root.join("lib.rs")).unwrap(),
             "fn main() {\r\n    let x = 2;\r\n}\r\n"
@@ -498,7 +510,12 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert_eq!(
             fs::read_to_string(root.join("src/new.rs")).unwrap(),
             "fn new() {}\n// 第二行\n"
@@ -526,7 +543,12 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(!root.join("temp.rs").exists());
         let _ = fs::remove_dir_all(&root);
     }
@@ -546,7 +568,12 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(!root.join("old.rs").exists(), "文件应被删除");
         let _ = fs::remove_dir_all(&root);
     }
@@ -601,7 +628,11 @@ mod tests {
             .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Failed);
-        assert!(outcome.content.contains("匹配到 2 处"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("匹配到 2 处"),
+            "{}",
+            outcome.content
+        );
         assert_eq!(
             fs::read_to_string(root.join("lib.rs")).unwrap(),
             "let x = 1;\nlet x = 1;\n"
@@ -807,7 +838,10 @@ mod tests {
             "应说清格式要求: {}",
             outcome.content
         );
-        assert_eq!(fs::read_to_string(root.join("a.rs")).unwrap(), "fn a() {}\n");
+        assert_eq!(
+            fs::read_to_string(root.join("a.rs")).unwrap(),
+            "fn a() {}\n"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -832,10 +866,23 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("2 个文件"), "{}", outcome.content);
-        assert!(fs::read_to_string(root.join("a.rs")).unwrap().contains("let x = 2;"));
-        assert!(fs::read_to_string(root.join("b.rs")).unwrap().contains("let y = 3;"));
+        assert!(
+            fs::read_to_string(root.join("a.rs"))
+                .unwrap()
+                .contains("let x = 2;")
+        );
+        assert!(
+            fs::read_to_string(root.join("b.rs"))
+                .unwrap()
+                .contains("let y = 3;")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -888,8 +935,16 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        assert_eq!(fs::read_to_string(root.join("a.rs")).unwrap(), "value = 3\n");
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("a.rs")).unwrap(),
+            "value = 3\n"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -913,7 +968,12 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert_eq!(
             fs::read_to_string(root.join("a.rs")).unwrap(),
             "新内容\n",

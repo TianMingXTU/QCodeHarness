@@ -8,7 +8,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 
 use crate::application::port::BoxFuture;
 use crate::application::service::TaskService;
-use crate::domain::service::{PROTOCOL_VERSION, ServiceCommand, ServiceError, ServiceEvent, ServiceReply};
+use crate::domain::service::{
+    PROTOCOL_VERSION, ServiceCommand, ServiceError, ServiceEvent, ServiceReply,
+};
 
 /// 封套计入上限；比单条服务事件多留空间，容纳事件外层的协议字段。
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -27,18 +29,37 @@ pub struct StdioRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StdioResponse {
-    Hello { version: u32 },
-    Reply { version: u32, id: String, result: ServiceReply },
-    Event { version: u32, event: Box<ServiceEvent> },
-    Error { version: u32, id: String, error: ServiceError },
-    Subscribed { version: u32, id: String, after: u64 },
+    Hello {
+        version: u32,
+    },
+    Reply {
+        version: u32,
+        id: String,
+        result: ServiceReply,
+    },
+    Event {
+        version: u32,
+        event: Box<ServiceEvent>,
+    },
+    Error {
+        version: u32,
+        id: String,
+        error: ServiceError,
+    },
+    Subscribed {
+        version: u32,
+        id: String,
+        after: u64,
+    },
 }
 
 impl StdioResponse {
     pub(crate) fn version(&self) -> u32 {
         match self {
-            Self::Hello { version } | Self::Reply { version, .. }
-            | Self::Event { version, .. } | Self::Error { version, .. }
+            Self::Hello { version }
+            | Self::Reply { version, .. }
+            | Self::Event { version, .. }
+            | Self::Error { version, .. }
             | Self::Subscribed { version, .. } => *version,
         }
     }
@@ -88,7 +109,13 @@ impl StdioServer {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        write_response(&mut writer, &StdioResponse::Hello { version: PROTOCOL_VERSION }).await?;
+        write_response(
+            &mut writer,
+            &StdioResponse::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await?;
         let mut subscription = Some(self.service.subscribe(0)?);
         let mut frames = FrameReader::new(reader);
         let mut queue = VecDeque::new();
@@ -204,14 +231,32 @@ impl StdioServer {
     }
 }
 
-async fn write_error<W: AsyncWrite + Unpin>(writer: &mut W, id: &str, error: ServiceError) -> Result<(), ServiceError> {
-    write_response(writer, &StdioResponse::Error { version: PROTOCOL_VERSION, id: id.to_owned(), error }).await
+async fn write_error<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    id: &str,
+    error: ServiceError,
+) -> Result<(), ServiceError> {
+    write_response(
+        writer,
+        &StdioResponse::Error {
+            version: PROTOCOL_VERSION,
+            id: id.to_owned(),
+            error,
+        },
+    )
+    .await
 }
 
-async fn write_response<W: AsyncWrite + Unpin>(writer: &mut W, response: &StdioResponse) -> Result<(), ServiceError> {
-    let mut bytes = serde_json::to_vec(response).map_err(|error| ServiceError::new("protocol_encoding", error.to_string()))?;
+async fn write_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &StdioResponse,
+) -> Result<(), ServiceError> {
+    let mut bytes = serde_json::to_vec(response)
+        .map_err(|error| ServiceError::new("protocol_encoding", error.to_string()))?;
     bytes.push(b'\n');
-    if bytes.len() > MAX_FRAME_BYTES { return Err(frame_too_large()); }
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(frame_too_large());
+    }
     writer.write_all(&bytes).await.map_err(transport_error)?;
     writer.flush().await.map_err(transport_error)
 }
@@ -221,11 +266,17 @@ pub(crate) fn transport_error(cause: std::io::Error) -> ServiceError {
 }
 
 pub(crate) fn unsupported_version(version: u32) -> ServiceError {
-    ServiceError::new("unsupported_version", format!("不支持协议版本 {version}，当前版本为 {PROTOCOL_VERSION}"))
+    ServiceError::new(
+        "unsupported_version",
+        format!("不支持协议版本 {version}，当前版本为 {PROTOCOL_VERSION}"),
+    )
 }
 
 pub(crate) fn frame_too_large() -> ServiceError {
-    ServiceError::new("frame_too_large", format!("单帧超过 {MAX_FRAME_BYTES} 字节上限"))
+    ServiceError::new(
+        "frame_too_large",
+        format!("单帧超过 {MAX_FRAME_BYTES} 字节上限"),
+    )
 }
 
 pub(crate) enum Frame {
@@ -243,15 +294,25 @@ pub(crate) struct FrameReader<R> {
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub(crate) fn new(reader: R) -> Self {
-        Self { reader: BufReader::new(reader), bytes: Vec::new(), oversized: false }
+        Self {
+            reader: BufReader::new(reader),
+            bytes: Vec::new(),
+            oversized: false,
+        }
     }
 
     pub(crate) async fn next(&mut self) -> Result<Frame, ServiceError> {
         loop {
             let available = self.reader.fill_buf().await.map_err(transport_error)?;
             if available.is_empty() {
-                if self.oversized { return Ok(self.finish()); }
-                return if self.bytes.is_empty() { Ok(Frame::End) } else { Ok(self.finish()) };
+                if self.oversized {
+                    return Ok(self.finish());
+                }
+                return if self.bytes.is_empty() {
+                    Ok(Frame::End)
+                } else {
+                    Ok(self.finish())
+                };
             }
             let newline = available.iter().position(|byte| *byte == b'\n');
             let count = newline.map_or(available.len(), |index| index + 1);
@@ -264,7 +325,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 }
             }
             self.reader.consume(count);
-            if newline.is_some() { return Ok(self.finish()); }
+            if newline.is_some() {
+                return Ok(self.finish());
+            }
         }
     }
 

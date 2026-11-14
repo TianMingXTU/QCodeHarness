@@ -9,16 +9,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::agent_run::{
     AgentDependencies, AgentRunner, PendingRound, RunState,
 };
-use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::error::ApplicationError;
+use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::application::port::{
     ApprovalGate, ApprovalRequest, BoxFuture, Decision, NoopHooks, ToolInvoker,
 };
-use qcode_harness::application::snapshot::{RunSnapshot, RUN_FORMAT, SessionStore, StoreError};
+use qcode_harness::application::snapshot::{RUN_FORMAT, RunSnapshot, SessionStore, StoreError};
 use qcode_harness::application::tool_registry::{ToolEntry, ToolRegistry};
 use qcode_harness::domain::agent::{AgentRole, AgentSpec, AgentTurn};
 use qcode_harness::domain::budget::{Budget, Consumption};
@@ -29,7 +30,6 @@ use qcode_harness::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSp
 use qcode_harness::domain::workspace::WorkspaceRoot;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::clock::SystemClock;
-use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::tool::all_tools;
@@ -125,7 +125,10 @@ struct RecordingInvoker {
 
 impl ToolInvoker for RecordingInvoker {
     fn invoke<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolOutcome> {
-        self.executed.lock().unwrap().push(call.arguments.to_string());
+        self.executed
+            .lock()
+            .unwrap()
+            .push(call.arguments.to_string());
         Box::pin(async { ToolOutcome::success("文件内容") })
     }
 }
@@ -177,12 +180,21 @@ async fn budget_stop_then_resume_finishes_the_remaining_rounds() {
         spec(),
         SessionId::new("resume-budget"),
         "读完两个文件再总结",
-        deps_with(&mock1, registry(), Arc::new(AutoApproveGate), PolicyEngine::new(), None),
+        deps_with(
+            &mock1,
+            registry(),
+            Arc::new(AutoApproveGate),
+            PolicyEngine::new(),
+            None,
+        ),
     );
 
     // 只给 2 轮预算：两轮工具调用完成后，第 3 次调用模型前被预算拦下。
     let error = runner.run(&Budget::new(2)).await.unwrap_err();
-    assert!(matches!(error, ApplicationError::BudgetExhausted { max_turns: 2 }), "{error}");
+    assert!(
+        matches!(error, ApplicationError::BudgetExhausted { max_turns: 2 }),
+        "{error}"
+    );
     assert_eq!(runner.session().rounds(), 2);
     let snapshot = runner.snapshot();
 
@@ -194,7 +206,13 @@ async fn budget_stop_then_resume_finishes_the_remaining_rounds() {
     ]);
     let mut runner2 = AgentRunner::resume(
         snapshot,
-        deps_with(&mock2, registry(), Arc::new(AutoApproveGate), PolicyEngine::new(), None),
+        deps_with(
+            &mock2,
+            registry(),
+            Arc::new(AutoApproveGate),
+            PolicyEngine::new(),
+            None,
+        ),
     )
     .unwrap();
     let outcome = runner2.run(&Budget::new(10)).await.unwrap();
@@ -206,14 +224,22 @@ async fn budget_stop_then_resume_finishes_the_remaining_rounds() {
 
 #[tokio::test]
 async fn awaiting_approval_snapshot_reasks_the_gate_on_resume() {
-    let mock1 = MockCompletionModel::from_turns(vec![
-        MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
-    ]);
+    let mock1 = MockCompletionModel::from_turns(vec![MockTurn::tool_call(
+        "call_1",
+        "read_file",
+        json!({"path": "a"}),
+    )]);
     let mut runner = AgentRunner::new(
         spec(),
         SessionId::new("resume-gate"),
         "要审批的任务",
-        deps_with(&mock1, registry(), Arc::new(AutoApproveGate), approval_policy(), None),
+        deps_with(
+            &mock1,
+            registry(),
+            Arc::new(AutoApproveGate),
+            approval_policy(),
+            None,
+        ),
     );
 
     // 手动推进：第 1 步产生调用（Evaluating），第 2 步停在审批闸门前。
@@ -238,7 +264,11 @@ async fn awaiting_approval_snapshot_reasks_the_gate_on_resume() {
     let outcome = runner2.run(&Budget::new(5)).await.unwrap();
 
     assert_eq!(outcome.answer, "审批后完成");
-    assert_eq!(*gate.asked.lock().unwrap(), 1, "恢复后应把同一请求重新递给闸门恰好一次");
+    assert_eq!(
+        *gate.asked.lock().unwrap(),
+        1,
+        "恢复后应把同一请求重新递给闸门恰好一次"
+    );
     assert_eq!(runner2.session().rounds(), 1);
     // 闸门放行后模型才被再次调用，且只有这一次（最终答案）。
     assert_eq!(mock2.requests().len(), 1);
@@ -276,7 +306,13 @@ async fn half_dispatched_snapshot_does_not_rerun_the_call_that_was_in_flight() {
     let mock = MockCompletionModel::from_turns(vec![MockTurn::text("半轮续跑完成")]);
     let mut runner = AgentRunner::resume(
         snapshot,
-        deps_with(&mock, registry, Arc::new(AutoApproveGate), PolicyEngine::new(), None),
+        deps_with(
+            &mock,
+            registry,
+            Arc::new(AutoApproveGate),
+            PolicyEngine::new(),
+            None,
+        ),
     )
     .unwrap();
     let outcome = runner.run(&Budget::new(5)).await.unwrap();
@@ -358,7 +394,13 @@ async fn dispatching_snapshot_of_a_restricted_role_still_refuses_the_write() {
     let mock = MockCompletionModel::from_turns(vec![MockTurn::text("改用文字给出结论")]);
     let mut runner = AgentRunner::resume(
         snapshot,
-        deps_with(&mock, registry, Arc::new(AutoApproveGate), PolicyEngine::new(), None),
+        deps_with(
+            &mock,
+            registry,
+            Arc::new(AutoApproveGate),
+            PolicyEngine::new(),
+            None,
+        ),
     )
     .unwrap();
     let outcome = runner.run(&Budget::new(5)).await.unwrap();
@@ -377,7 +419,9 @@ async fn dispatching_snapshot_of_a_restricted_role_still_refuses_the_write() {
     };
     assert_eq!(outcomes.len(), 1);
     assert!(
-        outcomes[0].content.contains("角色 `reviewer` 无权调用工具 `write_file`"),
+        outcomes[0]
+            .content
+            .contains("角色 `reviewer` 无权调用工具 `write_file`"),
         "{}",
         outcomes[0].content
     );
@@ -497,7 +541,13 @@ async fn cancelled_state_does_not_survive_resume() {
         spec(),
         SessionId::new("resume-cancel"),
         "会被取消的任务",
-        deps_with(&mock1, registry(), Arc::new(AutoApproveGate), PolicyEngine::new(), None),
+        deps_with(
+            &mock1,
+            registry(),
+            Arc::new(AutoApproveGate),
+            PolicyEngine::new(),
+            None,
+        ),
     );
     runner.cancel_handle().cancel();
     let error = runner.run(&Budget::new(5)).await.unwrap_err();
@@ -507,7 +557,13 @@ async fn cancelled_state_does_not_survive_resume() {
     let mock2 = MockCompletionModel::from_turns(vec![MockTurn::text("恢复后完成")]);
     let mut runner2 = AgentRunner::resume(
         runner.snapshot(),
-        deps_with(&mock2, registry(), Arc::new(AutoApproveGate), PolicyEngine::new(), None),
+        deps_with(
+            &mock2,
+            registry(),
+            Arc::new(AutoApproveGate),
+            PolicyEngine::new(),
+            None,
+        ),
     )
     .unwrap();
     let outcome = runner2.run(&Budget::new(5)).await.unwrap();
@@ -518,14 +574,22 @@ async fn cancelled_state_does_not_survive_resume() {
 async fn awaiting_approval_autosaves_and_resumes_from_disk() {
     let workspace = temp_workspace("autosave");
     let store: Arc<dyn SessionStore> = Arc::new(JsonSessionStore::new(&workspace));
-    let mock1 = MockCompletionModel::from_turns(vec![
-        MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
-    ]);
+    let mock1 = MockCompletionModel::from_turns(vec![MockTurn::tool_call(
+        "call_1",
+        "read_file",
+        json!({"path": "a"}),
+    )]);
     let mut runner = AgentRunner::new(
         spec(),
         SessionId::new("resume-disk"),
         "落盘审批",
-        deps_with(&mock1, registry(), Arc::new(AutoApproveGate), approval_policy(), Some(store.clone())),
+        deps_with(
+            &mock1,
+            registry(),
+            Arc::new(AutoApproveGate),
+            approval_policy(),
+            Some(store.clone()),
+        ),
     );
 
     // 走到审批前，这是自动保存点之一。
@@ -544,7 +608,13 @@ async fn awaiting_approval_autosaves_and_resumes_from_disk() {
     let mock2 = MockCompletionModel::from_turns(vec![MockTurn::text("从磁盘恢复后完成")]);
     let mut runner2 = AgentRunner::resume(
         snapshot,
-        deps_with(&mock2, registry(), Arc::new(AutoApproveGate), approval_policy(), Some(store)),
+        deps_with(
+            &mock2,
+            registry(),
+            Arc::new(AutoApproveGate),
+            approval_policy(),
+            Some(store),
+        ),
     )
     .unwrap();
     let outcome = runner2.run(&Budget::new(5)).await.unwrap();

@@ -71,12 +71,7 @@ impl AgentRole {
     ///
     /// 配置装配要遍历所有角色，遗漏会让该角色的专属配置静默失效。
     pub fn all() -> [AgentRole; 4] {
-        [
-            Self::Planner,
-            Self::Coder,
-            Self::Tester,
-            Self::Reviewer,
-        ]
+        [Self::Planner, Self::Coder, Self::Tester, Self::Reviewer]
     }
 }
 

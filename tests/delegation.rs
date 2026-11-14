@@ -108,13 +108,19 @@ impl WorkspaceIsolation for FakeIsolation {
         })
     }
 
-    fn create<'a>(&'a self, id: &'a str, base: &'a str) -> BoxFuture<'a, Result<IsolationWorkspace, String>> {
+    fn create<'a>(
+        &'a self,
+        id: &'a str,
+        base: &'a str,
+    ) -> BoxFuture<'a, Result<IsolationWorkspace, String>> {
         Box::pin(async move {
             if self.fail_create.load(Ordering::SeqCst) {
                 return Err("create failed".to_owned());
             }
             let workspace = IsolationWorkspace {
-                id: id.to_owned(), root: self.root.0.join(id), base_revision: base.to_owned(),
+                id: id.to_owned(),
+                root: self.root.0.join(id),
+                base_revision: base.to_owned(),
             };
             fs::create_dir(&workspace.root).unwrap();
             fs::create_dir(workspace.root.join("src")).unwrap();
@@ -123,7 +129,10 @@ impl WorkspaceIsolation for FakeIsolation {
         })
     }
 
-    fn capture<'a>(&'a self, workspace: &'a IsolationWorkspace) -> BoxFuture<'a, Result<ChangeSet, String>> {
+    fn capture<'a>(
+        &'a self,
+        workspace: &'a IsolationWorkspace,
+    ) -> BoxFuture<'a, Result<ChangeSet, String>> {
         Box::pin(async move {
             if self.fail_capture.load(Ordering::SeqCst) {
                 return Err("capture failed".to_owned());
@@ -132,10 +141,16 @@ impl WorkspaceIsolation for FakeIsolation {
             for entry in fs::read_dir(&workspace.root).unwrap() {
                 let entry = entry.unwrap();
                 if entry.file_name().to_string_lossy().starts_with("output-") {
-                    files.insert(entry.file_name().to_string_lossy().into_owned(), fs::read(entry.path()).unwrap());
+                    files.insert(
+                        entry.file_name().to_string_lossy().into_owned(),
+                        fs::read(entry.path()).unwrap(),
+                    );
                 }
             }
-            Ok(ChangeSet { id: workspace.id.clone(), patch: serde_json::to_vec(&files).unwrap() })
+            Ok(ChangeSet {
+                id: workspace.id.clone(),
+                patch: serde_json::to_vec(&files).unwrap(),
+            })
         })
     }
 
@@ -153,7 +168,8 @@ impl WorkspaceIsolation for FakeIsolation {
             let integration = self.root.0.join("integration");
             fs::create_dir(&integration).unwrap();
             for change in changes {
-                let files: BTreeMap<String, Vec<u8>> = serde_json::from_slice(&change.patch).unwrap();
+                let files: BTreeMap<String, Vec<u8>> =
+                    serde_json::from_slice(&change.patch).unwrap();
                 for (name, contents) in files {
                     fs::write(integration.join(name), contents).unwrap();
                 }
@@ -162,7 +178,11 @@ impl WorkspaceIsolation for FakeIsolation {
             if verdict.is_ok() {
                 for entry in fs::read_dir(&integration).unwrap() {
                     let entry = entry.unwrap();
-                    fs::copy(entry.path(), self.root.0.join("parent").join(entry.file_name())).unwrap();
+                    fs::copy(
+                        entry.path(),
+                        self.root.0.join("parent").join(entry.file_name()),
+                    )
+                    .unwrap();
                 }
             }
             fs::remove_dir_all(&integration).unwrap();
@@ -170,7 +190,10 @@ impl WorkspaceIsolation for FakeIsolation {
         })
     }
 
-    fn remove<'a>(&'a self, workspace: &'a IsolationWorkspace) -> BoxFuture<'a, Result<(), String>> {
+    fn remove<'a>(
+        &'a self,
+        workspace: &'a IsolationWorkspace,
+    ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             if self.fail_remove.load(Ordering::SeqCst) {
                 return Err("remove failed".to_owned());
@@ -222,10 +245,21 @@ impl SessionStore for Store {
         Ok(())
     }
     fn load(&self, id: &SessionId) -> Result<Option<RunSnapshot>, StoreError> {
-        Ok(self.0.lock().unwrap().clone().filter(|snapshot| &snapshot.session_id == id))
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|snapshot| &snapshot.session_id == id))
     }
     fn list(&self) -> Result<Vec<SessionId>, StoreError> {
-        Ok(self.0.lock().unwrap().iter().map(|snapshot| snapshot.session_id.clone()).collect())
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|snapshot| snapshot.session_id.clone())
+            .collect())
     }
 }
 
@@ -237,7 +271,13 @@ struct Gate {
 
 impl ApprovalGate for Gate {
     fn request<'a>(&'a self, _request: &'a ApprovalRequest) -> BoxFuture<'a, Decision> {
-        Box::pin(async move { if self.deny { Err("child write denied".to_owned()) } else { Ok(()) } })
+        Box::pin(async move {
+            if self.deny {
+                Err("child write denied".to_owned())
+            } else {
+                Ok(())
+            }
+        })
     }
     fn bind_cancel(&self, cancel: CancelHandle) {
         *self.cancel.lock().unwrap() = Some(cancel);
@@ -256,7 +296,9 @@ struct Probe {
 struct Active<'a>(&'a Probe);
 
 impl Drop for Active<'_> {
-    fn drop(&mut self) { self.0.active.fetch_sub(1, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct Model {
@@ -268,10 +310,18 @@ struct Model {
 }
 
 impl ModelGateway for Model {
-    fn complete<'a>(&'a self, request: ModelRequest<'a>) -> BoxFuture<'a, Result<ModelReply, ApplicationError>> {
+    fn complete<'a>(
+        &'a self,
+        request: ModelRequest<'a>,
+    ) -> BoxFuture<'a, Result<ModelReply, ApplicationError>> {
         Box::pin(async move {
             assert!(request.cache_key.is_some());
-            assert!(!request.tools.iter().any(|tool| tool.name == "delegate_subtasks"));
+            assert!(
+                !request
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "delegate_subtasks")
+            );
             self.probe.model_calls.fetch_add(1, Ordering::SeqCst);
             let first = self.first.swap(false, Ordering::SeqCst);
             let turn = if first {
@@ -279,9 +329,15 @@ impl ModelGateway for Model {
                 self.probe.peak.fetch_max(active, Ordering::SeqCst);
                 let _active = Active(&self.probe);
                 self.probe.first_arrived.notify_one();
-                if let Some(barrier) = &self.probe.barrier { barrier.wait().await; }
-                if self.hang { std::future::pending::<()>().await; }
-                if self.fail { return Err(ApplicationError::Model("scripted model failure".to_owned())); }
+                if let Some(barrier) = &self.probe.barrier {
+                    barrier.wait().await;
+                }
+                if self.hang {
+                    std::future::pending::<()>().await;
+                }
+                if self.fail {
+                    return Err(ApplicationError::Model("scripted model failure".to_owned()));
+                }
                 AgentTurn {
                     text: "写入独立子工作区".to_owned(),
                     calls: vec![ToolCall {
@@ -294,9 +350,15 @@ impl ModelGateway for Model {
                     }],
                 }
             } else {
-                AgentTurn { text: format!("child {} finished", self.ordinal), calls: Vec::new() }
+                AgentTurn {
+                    text: format!("child {} finished", self.ordinal),
+                    calls: Vec::new(),
+                }
             };
-            Ok(ModelReply { turn, usage: TokenUsage::default() })
+            Ok(ModelReply {
+                turn,
+                usage: TokenUsage::default(),
+            })
         })
     }
 }
@@ -395,7 +457,9 @@ fn call(tasks: Value) -> ToolCall {
 fn tasks(count: usize) -> Value {
     Value::Array(
         (0..count)
-            .map(|index| json!({"id": format!("task-{index}"), "goal": "write an independent file"}))
+            .map(
+                |index| json!({"id": format!("task-{index}"), "goal": "write an independent file"}),
+            )
             .collect(),
     )
 }
@@ -440,7 +504,12 @@ async fn two_children_overlap_and_config_bounds_concurrency() {
         .await
         .expect("并发屏障必须由两个独立子运行同时抵达");
 
-    assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+    assert_eq!(
+        outcome.status,
+        OutcomeStatus::Success,
+        "{}",
+        outcome.content
+    );
     let batch = result(&outcome);
     assert!(batch.merged);
     assert_eq!(factory.probe.peak.load(Ordering::SeqCst), 2);
@@ -460,14 +529,24 @@ async fn two_children_overlap_and_config_bounds_concurrency() {
     assert!(batch.tasks.iter().all(|task| {
         task.status == SubtaskStatus::Completed && task.verified && task.workspace_removed
     }));
-    assert_eq!(fs::read_dir(isolation.root.0.join("parent")).unwrap().count(), 4);
+    assert_eq!(
+        fs::read_dir(isolation.root.0.join("parent"))
+            .unwrap()
+            .count(),
+        4
+    );
     isolation.assert_cleaned();
 }
 
 #[tokio::test]
 async fn invalid_inputs_are_rejected_before_prepare_or_workspace_creation() {
     let isolation = Arc::new(FakeIsolation::new());
-    let invoker = tool(isolation.clone(), Arc::new(Factory::default()), Arc::new(Verifier::default()), 2);
+    let invoker = tool(
+        isolation.clone(),
+        Arc::new(Factory::default()),
+        Arc::new(Verifier::default()),
+        2,
+    );
     let mut invalid = vec![
         json!({"tasks": []}),
         json!({"tasks": [{"id": "same", "goal": "one"}, {"id": "same", "goal": "two"}]}),
@@ -488,7 +567,12 @@ async fn invalid_inputs_are_rejected_before_prepare_or_workspace_creation() {
         let mut request = call(Value::Null);
         request.arguments = arguments.clone();
         let outcome = invoker.invoke(&request).await;
-        assert_eq!(outcome.status, OutcomeStatus::Refused, "{arguments}: {}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Refused,
+            "{arguments}: {}",
+            outcome.content
+        );
     }
     assert_eq!(isolation.prepared.load(Ordering::SeqCst), 0);
     assert!(isolation.created.lock().unwrap().is_empty());
@@ -498,8 +582,16 @@ async fn invalid_inputs_are_rejected_before_prepare_or_workspace_creation() {
 async fn disabled_or_invalid_parallelism_never_prepares_a_workspace() {
     let isolation = Arc::new(FakeIsolation::new());
     for max in [0, 17, usize::MAX] {
-        let invoker = tool(isolation.clone(), Arc::new(Factory::default()), Arc::new(Verifier::default()), max);
-        assert_eq!(invoker.invoke(&call(tasks(1))).await.status, OutcomeStatus::Refused);
+        let invoker = tool(
+            isolation.clone(),
+            Arc::new(Factory::default()),
+            Arc::new(Verifier::default()),
+            max,
+        );
+        assert_eq!(
+            invoker.invoke(&call(tasks(1))).await.status,
+            OutcomeStatus::Refused
+        );
     }
     assert_eq!(isolation.prepared.load(Ordering::SeqCst), 0);
 }
@@ -508,12 +600,24 @@ async fn disabled_or_invalid_parallelism_never_prepares_a_workspace() {
 async fn child_sessions_roots_audits_stores_and_cancel_gates_are_independent() {
     let isolation = Arc::new(FakeIsolation::new());
     let factory = Arc::new(Factory::default());
-    let invoker = tool(isolation.clone(), factory.clone(), Arc::new(Verifier::default()), 1);
-    let outcome = invoker.invoke(&call(json!([
-        {"id": "one", "goal": "one", "role": "coder", "scope": "src"},
-        {"id": "two", "goal": "two"}
-    ]))).await;
-    assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+    let invoker = tool(
+        isolation.clone(),
+        factory.clone(),
+        Arc::new(Verifier::default()),
+        1,
+    );
+    let outcome = invoker
+        .invoke(&call(json!([
+            {"id": "one", "goal": "one", "role": "coder", "scope": "src"},
+            {"id": "two", "goal": "two"}
+        ])))
+        .await;
+    assert_eq!(
+        outcome.status,
+        OutcomeStatus::Success,
+        "{}",
+        outcome.content
+    );
     let batch = result(&outcome);
     let children = factory.children.lock().unwrap();
     assert_eq!(children.len(), 2);
@@ -525,9 +629,20 @@ async fn child_sessions_roots_audits_stores_and_cancel_gates_are_independent() {
         assert_eq!(task.evidence_id.as_ref(), Some(&child.session_id));
         assert_eq!(task.session_id, child.session_id);
         assert_eq!(child.role, AgentRole::Coder);
-        let snapshot = child.store.0.lock().unwrap().clone().expect("子快照必须由真实 runner 落盘");
+        let snapshot = child
+            .store
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("子快照必须由真实 runner 落盘");
         assert_eq!(snapshot.session_id, child.session_id);
-        assert!(snapshot.spec.system_prompt.contains(&child.root.display().to_string()));
+        assert!(
+            snapshot
+                .spec
+                .system_prompt
+                .contains(&child.root.display().to_string())
+        );
         let events = child.events.0.lock().unwrap();
         assert!(events.iter().any(|event| matches!(
             event,
@@ -536,12 +651,16 @@ async fn child_sessions_roots_audits_stores_and_cancel_gates_are_independent() {
                 ..
             }
         )));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, AuditEvent::Thought { .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, AuditEvent::ToolRequested { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AuditEvent::Thought { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AuditEvent::ToolRequested { .. }))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AuditEvent::PolicyEvaluated {
@@ -549,17 +668,34 @@ async fn child_sessions_roots_audits_stores_and_cancel_gates_are_independent() {
                 ..
             }
         )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AuditEvent::ApprovalDecided { allowed: true, .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AuditEvent::ApprovalDecided { allowed: true, .. }))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AuditEvent::ToolObserved { outcome, .. } if outcome.status == OutcomeStatus::Success
         )));
     }
-    children[0].gate.cancel.lock().unwrap().as_ref().unwrap().cancel();
-    assert!(!children[1].gate.cancel.lock().unwrap().as_ref().unwrap().is_cancelled());
+    children[0]
+        .gate
+        .cancel
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .cancel();
+    assert!(
+        !children[1]
+            .gate
+            .cancel
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_cancelled()
+    );
     isolation.assert_cleaned();
 }
 
@@ -574,7 +710,12 @@ async fn model_failure_settles_other_running_children_prevents_merge_and_cleans_
         }),
         ..Factory::default()
     });
-    let invoker = tool(isolation.clone(), factory.clone(), Arc::new(Verifier::default()), 2);
+    let invoker = tool(
+        isolation.clone(),
+        factory.clone(),
+        Arc::new(Verifier::default()),
+        2,
+    );
     let outcome = tokio::time::timeout(Duration::from_secs(5), invoker.invoke(&call(tasks(3))))
         .await
         .unwrap();
@@ -582,26 +723,41 @@ async fn model_failure_settles_other_running_children_prevents_merge_and_cleans_
     let batch = result(&outcome);
     assert!(!batch.merged);
     assert_eq!(batch.tasks.len(), 3);
-    assert!(batch.tasks[0].error.as_ref().unwrap().contains("scripted model failure"));
+    assert!(
+        batch.tasks[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("scripted model failure")
+    );
     assert_eq!(factory.probe.active.load(Ordering::SeqCst), 0);
     assert_eq!(isolation.merged.load(Ordering::SeqCst), 0);
-    assert_eq!(fs::read_dir(isolation.root.0.join("parent")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(isolation.root.0.join("parent"))
+            .unwrap()
+            .count(),
+        0
+    );
     isolation.assert_cleaned();
 }
 
 #[tokio::test]
 async fn child_verifier_failure_is_reported_without_any_merge() {
     let isolation = Arc::new(FakeIsolation::new());
-    let verifier = Arc::new(Verifier { reject_children: true, ..Verifier::default() });
+    let verifier = Arc::new(Verifier {
+        reject_children: true,
+        ..Verifier::default()
+    });
     let invoker = tool(isolation.clone(), Arc::new(Factory::default()), verifier, 2);
     let outcome = invoker.invoke(&call(tasks(2))).await;
     assert_eq!(outcome.status, OutcomeStatus::Failed);
     let batch = result(&outcome);
     assert!(!batch.merged);
-    assert!(batch.tasks.iter().any(|task| task
-        .error
-        .as_deref()
-        .is_some_and(|reason| reason.contains("external validation failed"))));
+    assert!(batch.tasks.iter().any(|task| {
+        task.error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("external validation failed"))
+    }));
     assert_eq!(isolation.merged.load(Ordering::SeqCst), 0);
     isolation.assert_cleaned();
 }
@@ -609,13 +765,21 @@ async fn child_verifier_failure_is_reported_without_any_merge() {
 #[tokio::test]
 async fn combined_verifier_failure_keeps_parent_files_unchanged() {
     let isolation = Arc::new(FakeIsolation::new());
-    let verifier = Arc::new(Verifier { reject_integration: true, ..Verifier::default() });
+    let verifier = Arc::new(Verifier {
+        reject_integration: true,
+        ..Verifier::default()
+    });
     let invoker = tool(isolation.clone(), Arc::new(Factory::default()), verifier, 2);
     let outcome = invoker.invoke(&call(tasks(2))).await;
     assert_eq!(outcome.status, OutcomeStatus::Failed);
     assert!(!result(&outcome).merged);
     assert!(outcome.content.contains("external validation failed"));
-    assert_eq!(fs::read_dir(isolation.root.0.join("parent")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(isolation.root.0.join("parent"))
+            .unwrap()
+            .count(),
+        0
+    );
     isolation.assert_cleaned();
 }
 
@@ -623,8 +787,12 @@ async fn combined_verifier_failure_keeps_parent_files_unchanged() {
 async fn factory_capture_and_merge_failures_clean_every_created_workspace() {
     for failure in ["factory", "capture", "merge"] {
         let isolation = Arc::new(FakeIsolation::new());
-        isolation.fail_capture.store(failure == "capture", Ordering::SeqCst);
-        isolation.fail_merge.store(failure == "merge", Ordering::SeqCst);
+        isolation
+            .fail_capture
+            .store(failure == "capture", Ordering::SeqCst);
+        isolation
+            .fail_merge
+            .store(failure == "merge", Ordering::SeqCst);
         let factory = Arc::new(Factory {
             fail_factory: (failure == "factory").then_some(2),
             ..Factory::default()
@@ -655,11 +823,20 @@ async fn prepare_and_create_failures_return_batch_reasons_without_starting_model
         isolation.fail_prepare.store(prepare, Ordering::SeqCst);
         isolation.fail_create.store(!prepare, Ordering::SeqCst);
         let factory = Arc::new(Factory::default());
-        let invoker = tool(isolation.clone(), factory.clone(), Arc::new(Verifier::default()), 2);
+        let invoker = tool(
+            isolation.clone(),
+            factory.clone(),
+            Arc::new(Verifier::default()),
+            2,
+        );
         let outcome = invoker.invoke(&call(tasks(2))).await;
         assert_eq!(outcome.status, OutcomeStatus::Failed);
         assert!(!result(&outcome).merged);
-        assert!(outcome.content.contains(if prepare { "dirty parent" } else { "create failed" }));
+        assert!(outcome.content.contains(if prepare {
+            "dirty parent"
+        } else {
+            "create failed"
+        }));
         assert_eq!(factory.probe.model_calls.load(Ordering::SeqCst), 0);
     }
 }
@@ -668,7 +845,12 @@ async fn prepare_and_create_failures_return_batch_reasons_without_starting_model
 async fn cleanup_failure_preserves_recovery_paths_and_does_not_claim_removal() {
     let isolation = Arc::new(FakeIsolation::new());
     isolation.fail_remove.store(true, Ordering::SeqCst);
-    let invoker = tool(isolation.clone(), Arc::new(Factory::default()), Arc::new(Verifier::default()), 2);
+    let invoker = tool(
+        isolation.clone(),
+        Arc::new(Factory::default()),
+        Arc::new(Verifier::default()),
+        2,
+    );
     let outcome = invoker.invoke(&call(tasks(2))).await;
     assert_eq!(outcome.status, OutcomeStatus::Failed);
     let batch = result(&outcome);
@@ -683,17 +865,36 @@ async fn cleanup_failure_preserves_recovery_paths_and_does_not_claim_removal() {
 #[tokio::test]
 async fn denied_child_writes_do_not_run_and_keep_the_approval_audit() {
     let isolation = Arc::new(FakeIsolation::new());
-    let factory = Arc::new(Factory { deny_write: true, ..Factory::default() });
-    let invoker = tool(isolation.clone(), factory.clone(), Arc::new(Verifier::default()), 2);
+    let factory = Arc::new(Factory {
+        deny_write: true,
+        ..Factory::default()
+    });
+    let invoker = tool(
+        isolation.clone(),
+        factory.clone(),
+        Arc::new(Verifier::default()),
+        2,
+    );
     let outcome = invoker.invoke(&call(tasks(2))).await;
-    assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-    assert_eq!(fs::read_dir(isolation.root.0.join("parent")).unwrap().count(), 0);
+    assert_eq!(
+        outcome.status,
+        OutcomeStatus::Success,
+        "{}",
+        outcome.content
+    );
+    assert_eq!(
+        fs::read_dir(isolation.root.0.join("parent"))
+            .unwrap()
+            .count(),
+        0
+    );
     for child in factory.children.lock().unwrap().iter() {
         let events = child.events.0.lock().unwrap();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AuditEvent::ApprovalDecided { allowed: false, .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AuditEvent::ApprovalDecided { allowed: false, .. }))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AuditEvent::ToolObserved { outcome, .. } if outcome.status == OutcomeStatus::Refused
@@ -706,18 +907,39 @@ async fn denied_child_writes_do_not_run_and_keep_the_approval_audit() {
 async fn all_stable_role_names_are_accepted_and_reviewer_cannot_write() {
     let isolation = Arc::new(FakeIsolation::new());
     let factory = Arc::new(Factory::default());
-    let invoker = tool(isolation.clone(), factory.clone(), Arc::new(Verifier::default()), 4);
+    let invoker = tool(
+        isolation.clone(),
+        factory.clone(),
+        Arc::new(Verifier::default()),
+        4,
+    );
     let request = call(Value::Array(
         AgentRole::all()
             .iter()
-            .map(|role| json!({"id": role.name(), "goal": "inspect or change", "role": role.name()}))
+            .map(
+                |role| json!({"id": role.name(), "goal": "inspect or change", "role": role.name()}),
+            )
             .collect(),
     ));
     let outcome = invoker.invoke(&request).await;
-    assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-    for (child, role) in factory.children.lock().unwrap().iter().zip(AgentRole::all()) {
+    assert_eq!(
+        outcome.status,
+        OutcomeStatus::Success,
+        "{}",
+        outcome.content
+    );
+    for (child, role) in factory
+        .children
+        .lock()
+        .unwrap()
+        .iter()
+        .zip(AgentRole::all())
+    {
         assert_eq!(child.role, role);
-        if matches!(role, AgentRole::Planner | AgentRole::Reviewer | AgentRole::Tester) {
+        if matches!(
+            role,
+            AgentRole::Planner | AgentRole::Reviewer | AgentRole::Tester
+        ) {
             let events = child.events.0.lock().unwrap();
             assert!(events.iter().any(|event| matches!(
                 event,
@@ -726,7 +948,12 @@ async fn all_stable_role_names_are_accepted_and_reviewer_cannot_write() {
             )));
         }
     }
-    assert_eq!(fs::read_dir(isolation.root.0.join("parent")).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(isolation.root.0.join("parent"))
+            .unwrap()
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -739,14 +966,20 @@ async fn repeated_calls_generate_distinct_worktree_and_session_ids() {
     assert!(first.merged && second.merged);
     assert_ne!(first.invocation_id, second.invocation_id);
     assert_ne!(first.tasks[0].session_id, second.tasks[0].session_id);
-    assert_ne!(first.tasks[0].workspace_path, second.tasks[0].workspace_path);
+    assert_ne!(
+        first.tasks[0].workspace_path,
+        second.tasks[0].workspace_path
+    );
     isolation.assert_cleaned();
 }
 
 #[tokio::test]
 async fn hanging_model_is_bounded_without_dropping_an_inflight_command() {
     let isolation = Arc::new(FakeIsolation::new());
-    let factory = Arc::new(Factory { hang_model: true, ..Factory::default() });
+    let factory = Arc::new(Factory {
+        hang_model: true,
+        ..Factory::default()
+    });
     let source = SubAgentToolSource::new(
         isolation.clone(),
         factory,

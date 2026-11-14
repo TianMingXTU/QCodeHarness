@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::application::snapshot::{RunSnapshot, SessionStore, StoreError};
-use crate::domain::ids::{sanitize_file_id, SessionId};
+use crate::domain::ids::{SessionId, sanitize_file_id};
 
 /// 把快照存成 workspace 下的单文件 JSON。
 #[derive(Debug, Clone)]
@@ -156,7 +156,12 @@ mod tests {
         let workspace = temp_workspace("missing");
         let store = JsonSessionStore::new(&workspace);
 
-        assert!(store.load(&SessionId::new("never-saved")).unwrap().is_none());
+        assert!(
+            store
+                .load(&SessionId::new("never-saved"))
+                .unwrap()
+                .is_none()
+        );
         // list 同理：目录都不存在也不算错误。
         assert!(store.list().unwrap().is_empty());
     }
@@ -172,7 +177,12 @@ mod tests {
         let loaded = store.load(&SessionId::new("s1")).unwrap().unwrap();
         assert_eq!(loaded.consumption.turns, 3, "后一次保存应覆盖前一次");
         // 临时文件不应残留。
-        assert!(!store.path_for(&SessionId::new("s1")).with_extension("json.tmp").exists());
+        assert!(
+            !store
+                .path_for(&SessionId::new("s1"))
+                .with_extension("json.tmp")
+                .exists()
+        );
     }
 
     #[test]
@@ -184,10 +194,10 @@ mod tests {
         store.save(&snapshot).unwrap();
 
         let error = store.load(&SessionId::new("s1")).unwrap_err();
-        assert!(matches!(
-            error,
-            StoreError::VersionMismatch { found: 999, .. }
-        ), "{error}");
+        assert!(
+            matches!(error, StoreError::VersionMismatch { found: 999, .. }),
+            "{error}"
+        );
     }
 
     #[test]

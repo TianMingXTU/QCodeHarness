@@ -123,13 +123,13 @@ pub fn load_long_tasks(benchmarks_root: &Path) -> Result<Vec<BenchmarkTask>, Ben
 
 /// 读取指定套件的任务。
 ///
-/// 先全部装载校验，再按套件筛选。反过来做（边装载边筛）会把不合法
-/// 任务的装载错误筛掉，坏任务静默消失。
+/// `task.toml` 是任务目录的契约；公开基准清单、结果等纯元数据目录没有
+/// 这个文件，按非任务目录跳过。其余目录先全部装载校验再按套件筛选：
+/// 反过来做会把不合法任务的装载错误筛掉，坏任务静默消失。
 ///
 /// # Errors
 ///
-/// 根目录不可读，或任一任务（无论属于哪个套件）配置不合法时返回
-/// [`BenchmarkLoadError`]。
+/// 根目录不可读，或任一任务目录配置不合法时返回 [`BenchmarkLoadError`]。
 pub fn load_suite(
     benchmarks_root: &Path,
     suite: &str,
@@ -137,7 +137,10 @@ pub fn load_suite(
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(benchmarks_root)?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|entry| {
+            entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && entry.path().join("task.toml").is_file()
+        })
         .map(|entry| entry.path())
         .collect();
     dirs.sort();
@@ -152,10 +155,7 @@ pub fn load_suite(
             load_one(dir, &name)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(all
-        .into_iter()
-        .filter(|task| task.suite == suite)
-        .collect())
+    Ok(all.into_iter().filter(|task| task.suite == suite).collect())
 }
 
 /// 装载单个任务目录。
@@ -289,7 +289,10 @@ answer_must_mention = []
         // 语言随 fixture 装载：非 Rust fixture 带语言，Rust 缺省。
         // 这个字段只服务报告分组，不改变运行。
         assert_eq!(
-            tasks.iter().map(|t| t.language.as_deref()).collect::<Vec<_>>(),
+            tasks
+                .iter()
+                .map(|t| t.language.as_deref())
+                .collect::<Vec<_>>(),
             [
                 Some("go"),
                 Some("go"),
@@ -339,6 +342,22 @@ answer_must_mention = []
     }
 
     #[test]
+    fn metadata_directories_without_task_toml_are_skipped() {
+        // 公开基准清单是机器可读元数据，不是旧装载器的任务目录；把它放进
+        // benchmarks/ 不应让默认套件在装载期失败。真正的任务目录仍逐个校验。
+        let root = temp_root("skip-metadata");
+        std::fs::create_dir_all(root.join("public")).expect("建元数据目录");
+        std::fs::write(root.join("public/manifest.json"), "{}").expect("写清单");
+        write_task(&root, "demo", VALID_TASK);
+
+        let tasks = load_tasks(&root).expect("装载");
+
+        assert_eq!(tasks.len(), 1, "元数据目录不该被当成任务");
+        assert_eq!(tasks[0].id, "demo");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn id_must_match_the_directory_name() {
         let root = temp_root("id-mismatch");
         write_task(&root, "demo", &VALID_TASK.replace("demo", "other"));
@@ -359,7 +378,10 @@ answer_must_mention = []
 
         let error = load_tasks(&root).unwrap_err();
 
-        assert!(matches!(&error, BenchmarkLoadError::Invalid { task, .. } if task == "demo"), "{error}");
+        assert!(
+            matches!(&error, BenchmarkLoadError::Invalid { task, .. } if task == "demo"),
+            "{error}"
+        );
         assert!(error.to_string().contains("任务类型"), "{error}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -373,7 +395,10 @@ answer_must_mention = []
 
         let error = load_tasks(&root).unwrap_err();
 
-        assert!(matches!(&error, BenchmarkLoadError::MissingRepo(task) if task == "demo"), "{error}");
+        assert!(
+            matches!(&error, BenchmarkLoadError::MissingRepo(task) if task == "demo"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -382,11 +407,18 @@ answer_must_mention = []
         // 拼错的字段（如 criteria 写成 criterias）必须报错，不能静默忽略。
         // 被忽略的判据会放宽验收。
         let root = temp_root("unknown-field");
-        write_task(&root, "demo", &VALID_TASK.replace("description", "descripton"));
+        write_task(
+            &root,
+            "demo",
+            &VALID_TASK.replace("description", "descripton"),
+        );
 
         let error = load_tasks(&root).unwrap_err();
 
-        assert!(matches!(&error, BenchmarkLoadError::Invalid { .. }), "{error}");
+        assert!(
+            matches!(&error, BenchmarkLoadError::Invalid { .. }),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -410,7 +442,10 @@ answer_must_mention = []
         let long_tasks = load_long_tasks(&root).expect("装载");
 
         assert_eq!(
-            default_tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            default_tasks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
             ["demo"]
         );
         assert_eq!(
@@ -425,10 +460,7 @@ answer_must_mention = []
             long.criteria.no_repeated_commands,
             Some(vec!["cargo test".to_owned()])
         );
-        assert_eq!(
-            long.criteria.must_mention_after_compaction,
-            ["parser.rs"]
-        );
+        assert_eq!(long.criteria.must_mention_after_compaction, ["parser.rs"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -436,7 +468,14 @@ answer_must_mention = []
     #[test]
     fn a_long_task_without_a_long_run_table_loads_with_defaults() {
         let root = temp_root("no-long-run");
-        write_task(&root, "demo-long", &LONG_TASK.replace("\n[long_run]\nexhaust_turns = 3\ncontext_max_tokens = 2000\n", "\n"));
+        write_task(
+            &root,
+            "demo-long",
+            &LONG_TASK.replace(
+                "\n[long_run]\nexhaust_turns = 3\ncontext_max_tokens = 2000\n",
+                "\n",
+            ),
+        );
 
         let tasks = load_long_tasks(&root).expect("装载");
         assert_eq!(tasks.len(), 1);
@@ -451,10 +490,17 @@ answer_must_mention = []
         let root = temp_root("bad-suite");
         write_task(&root, "demo", VALID_TASK);
         // 长任务类型写错：装载 long 套件时必须报错，不能被筛掉。
-        write_task(&root, "demo-long", &LONG_TASK.replace("bug-fix", "nonsense"));
+        write_task(
+            &root,
+            "demo-long",
+            &LONG_TASK.replace("bug-fix", "nonsense"),
+        );
 
         let error = load_long_tasks(&root).unwrap_err();
-        assert!(matches!(&error, BenchmarkLoadError::Invalid { task, .. } if task == "demo-long"), "{error}");
+        assert!(
+            matches!(&error, BenchmarkLoadError::Invalid { task, .. } if task == "demo-long"),
+            "{error}"
+        );
         // 短任务装载同样要被拦住：坏的是任务本身，与套件归属无关。
         assert!(load_tasks(&root).is_err());
         let _ = std::fs::remove_dir_all(&root);

@@ -268,8 +268,16 @@ impl FileConfig {
                 .map(Some),
             "mcp_config_path"
         );
-        overlay!(config.skills.enabled, self.skills.enabled.map(Some), "skills.enabled");
-        overlay!(config.hooks.enabled, self.hooks.enabled.map(Some), "hooks.enabled");
+        overlay!(
+            config.skills.enabled,
+            self.skills.enabled.map(Some),
+            "skills.enabled"
+        );
+        overlay!(
+            config.hooks.enabled,
+            self.hooks.enabled.map(Some),
+            "hooks.enabled"
+        );
         overlay!(
             config.parallel.max_subtasks,
             self.parallel.max_subtasks,
@@ -491,8 +499,14 @@ mod tests {
         fixture.user("[skills]\nenabled = ['user-skill']\n[hooks]\nenabled = ['user-hook']");
         fixture.project("[skills]\nenabled = ['project-skill']");
         let config = load_from_paths(&fixture.paths).unwrap();
-        assert_eq!(config.skills.enabled.as_deref(), Some(&["project-skill".to_owned()][..]));
-        assert_eq!(config.hooks.enabled.as_deref(), Some(&["user-hook".to_owned()][..]));
+        assert_eq!(
+            config.skills.enabled.as_deref(),
+            Some(&["project-skill".to_owned()][..])
+        );
+        assert_eq!(
+            config.hooks.enabled.as_deref(),
+            Some(&["user-hook".to_owned()][..])
+        );
     }
 
     #[test]
@@ -525,7 +539,10 @@ mod tests {
         fixture.user("[skills]\nenabled = ['user-skill']\n[parallel]\nmax_subtasks = 12");
         fixture.project("[skills]\n[parallel]");
         let config = load_from_paths(&fixture.paths).unwrap();
-        assert_eq!(config.skills.enabled.as_deref(), Some(&["user-skill".to_owned()][..]));
+        assert_eq!(
+            config.skills.enabled.as_deref(),
+            Some(&["user-skill".to_owned()][..])
+        );
         assert_eq!(config.parallel.max_subtasks, 12);
     }
 
@@ -536,8 +553,14 @@ mod tests {
         fixture.project("[hooks]\nenabled = ['project-hook']");
         fixture.explicit("[parallel]\nmax_subtasks = 8");
         let config = load_from_paths(&fixture.paths).unwrap();
-        assert_eq!(config.skills.enabled.as_deref(), Some(&["user-skill".to_owned()][..]));
-        assert_eq!(config.hooks.enabled.as_deref(), Some(&["project-hook".to_owned()][..]));
+        assert_eq!(
+            config.skills.enabled.as_deref(),
+            Some(&["user-skill".to_owned()][..])
+        );
+        assert_eq!(
+            config.hooks.enabled.as_deref(),
+            Some(&["project-hook".to_owned()][..])
+        );
         assert_eq!(config.parallel.max_subtasks, 8);
     }
 
@@ -626,7 +649,10 @@ mod tests {
         );
         let config = load_from_paths(&fixture.paths).unwrap();
         assert_eq!(config.skills.enabled.as_deref(), Some(&[][..]));
-        assert_eq!(config.hooks.enabled.as_deref(), Some(&["explicit-hook".to_owned()][..]));
+        assert_eq!(
+            config.hooks.enabled.as_deref(),
+            Some(&["explicit-hook".to_owned()][..])
+        );
         assert_eq!(config.run.max_turns, 20);
         assert_eq!(config.parallel.max_subtasks, 4);
     }
@@ -645,7 +671,9 @@ mod tests {
             Some(fixture.root.join("user/user-mcp.json"))
         );
 
-        fixture.explicit("policy_path = 'explicit-policy.toml'\nmcp_config_path = '../explicit-mcp.json'");
+        fixture.explicit(
+            "policy_path = 'explicit-policy.toml'\nmcp_config_path = '../explicit-mcp.json'",
+        );
         let config = load_from_paths(&fixture.paths).unwrap();
         assert_eq!(
             config.policy_path,
@@ -837,8 +865,13 @@ mod tests {
         ] {
             let fixture = Fixture::new();
             fixture.project(text);
-            assert!(matches!(load_from_paths(&fixture.paths),
-                Err(ConfigError::Invalid { field: "parallel.verify_command", .. })));
+            assert!(matches!(
+                load_from_paths(&fixture.paths),
+                Err(ConfigError::Invalid {
+                    field: "parallel.verify_command",
+                    ..
+                })
+            ));
         }
     }
 
@@ -914,7 +947,10 @@ mod tests {
     #[test]
     fn project_config_cannot_redirect_the_model_policy_or_mcp_servers() {
         for (text, field) in [
-            ("[llm]\nbase_url = 'https://evil.invalid/v1'", "llm.base_url"),
+            (
+                "[llm]\nbase_url = 'https://evil.invalid/v1'",
+                "llm.base_url",
+            ),
             ("policy_path = 'allow-all.toml'", "policy_path"),
             ("mcp_config_path = 'mcp.json'", "mcp_config_path"),
         ] {
@@ -931,7 +967,11 @@ mod tests {
         let fixture = Fixture::new();
         fixture.user("policy_path = 'p.toml'\n[llm]\nbase_url = 'https://mine.invalid/v1'");
         assert_eq!(
-            load_from_paths(&fixture.paths).unwrap().llm.base_url.as_deref(),
+            load_from_paths(&fixture.paths)
+                .unwrap()
+                .llm
+                .base_url
+                .as_deref(),
             Some("https://mine.invalid/v1")
         );
     }

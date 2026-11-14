@@ -19,7 +19,7 @@ use crate::domain::evidence::AuditEvent;
 // 常量出现两个来源。
 pub use crate::domain::service::MAX_JOURNAL_BYTES;
 use crate::domain::service::{
-    EventContext, ServiceError, ServiceEvent, ServiceEventPayload, PROTOCOL_VERSION,
+    EventContext, PROTOCOL_VERSION, ServiceError, ServiceEvent, ServiceEventPayload,
 };
 use crate::domain::tool::ToolCall;
 
@@ -76,9 +76,10 @@ pub fn rotate_events(workspace: &Path) -> Result<RotateReport, ServiceError> {
     if metadata.len() == 0 {
         return Ok(empty);
     }
-    let mut millis = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| {
-        ServiceError::new("invalid_clock", error.to_string())
-    })?.as_millis();
+    let mut millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ServiceError::new("invalid_clock", error.to_string()))?
+        .as_millis();
     // 同毫秒内再次归档或时钟回拨时也不能覆盖已有归档。
     let archive_path = loop {
         let candidate = service.join(format!("events.jsonl.{millis}.archive"));
@@ -133,22 +134,37 @@ impl JsonEventJournal {
     /// 写入期间发生 IO 错误后本实例停止追加，避免在半行后继续产生记录。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ServiceError> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(io_error)?;
         }
         // 先取得租约再读数据：两个实例同时打开时，第二个不会读到正在追加的半行。
         // 锁与数据分开，读者仍能按普通文件打开日志。
         let lease = open_lease(path)?;
-        let mut file = OpenOptions::new().create(true).read(true).append(true).open(path).map_err(io_error)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)
+            .map_err(io_error)?;
         let bytes = file.metadata().map_err(io_error)?.len();
         if bytes > MAX_JOURNAL_BYTES {
             return Err(journal_too_large());
         }
         let events = load_events(&mut file)?;
         let (publisher, _) = broadcast::channel(EVENT_QUEUE_CAPACITY);
-        Ok(Self { state: Mutex::new(JournalState {
-            file, lease: Some(lease), events, bytes, failure: None, publisher: Some(publisher),
-        }) })
+        Ok(Self {
+            state: Mutex::new(JournalState {
+                file,
+                lease: Some(lease),
+                events,
+                bytes,
+                failure: None,
+                publisher: Some(publisher),
+            }),
+        })
     }
 
     /// 停止发布并释放独占租约，供服务关闭时移交日志给新实例。
@@ -205,21 +221,25 @@ impl EventJournal for JsonEventJournal {
         }
         // 启动事件属于一次原子提交：先在内存里取号、编码并检查全部上限，
         // 再把整批字节一次写入磁盘。任何前置检查失败都不能留下半组事件。
-        let millis = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| {
-            ServiceError::new("invalid_clock", error.to_string())
-        })?.as_millis();
-        let time_unix_ms = u64::try_from(millis).map_err(|_| ServiceError::new("invalid_clock", "毫秒时间戳越界"))?;
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| ServiceError::new("invalid_clock", error.to_string()))?
+            .as_millis();
+        let time_unix_ms = u64::try_from(millis)
+            .map_err(|_| ServiceError::new("invalid_clock", "毫秒时间戳越界"))?;
         let task_id = context.map(|context| context.task_id.clone());
         let session_id = context.map(|context| context.session_id.clone());
         let execution_id = context.map(|context| context.execution_id.clone());
-        let origin = context.map(|context| context.origin.clone()).unwrap_or_default();
+        let origin = context
+            .map(|context| context.origin.clone())
+            .unwrap_or_default();
         let mut sequence = latest_sequence(&state.events);
         let mut events = Vec::with_capacity(payloads.len());
         let mut chunk = Vec::new();
         for payload in payloads {
-            sequence = sequence.checked_add(1).ok_or_else(|| {
-                ServiceError::new("sequence_exhausted", "服务事件序号已耗尽")
-            })?;
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| ServiceError::new("sequence_exhausted", "服务事件序号已耗尽"))?;
             let event = ServiceEvent {
                 version: PROTOCOL_VERSION,
                 sequence,
@@ -230,9 +250,8 @@ impl EventJournal for JsonEventJournal {
                 origin: origin.clone(),
                 payload,
             };
-            let mut line = serde_json::to_vec(&event).map_err(|error| {
-                ServiceError::new("event_encoding", error.to_string())
-            })?;
+            let mut line = serde_json::to_vec(&event)
+                .map_err(|error| ServiceError::new("event_encoding", error.to_string()))?;
             line.push(b'\n');
             if line.len() > MAX_EVENT_BYTES {
                 return Err(event_too_large());
@@ -266,8 +285,16 @@ impl EventJournal for JsonEventJournal {
     fn read(&self, after: u64, limit: usize) -> Result<Vec<ServiceEvent>, ServiceError> {
         let state = self.lock()?;
         validate_cursor(after, &state.events)?;
-        let start = state.events.partition_point(|event| event.sequence <= after);
-        Ok(state.events.iter().skip(start).take(limit).cloned().collect())
+        let start = state
+            .events
+            .partition_point(|event| event.sequence <= after);
+        Ok(state
+            .events
+            .iter()
+            .skip(start)
+            .take(limit)
+            .cloned()
+            .collect())
     }
 
     fn subscribe(&self, after: u64) -> Result<Box<dyn EventSubscription>, ServiceError> {
@@ -276,14 +303,22 @@ impl EventJournal for JsonEventJournal {
         if let Some(error) = &state.failure {
             return Err(error.clone());
         }
-        let publisher = state.publisher.as_ref().ok_or_else(|| {
-            ServiceError::new("journal_closed", "事件日志已停止发布")
-        })?;
+        let publisher = state
+            .publisher
+            .as_ref()
+            .ok_or_else(|| ServiceError::new("journal_closed", "事件日志已停止发布"))?;
         // 追加也需要此锁，因此快照与接上实时流之间没有提交窗口。
         let live = publisher.subscribe();
-        let start = state.events.partition_point(|event| event.sequence <= after);
+        let start = state
+            .events
+            .partition_point(|event| event.sequence <= after);
         let replay = state.events.iter().skip(start).cloned().collect();
-        Ok(Box::new(JournalSubscription { replay, live, cursor: after, lagged: false }))
+        Ok(Box::new(JournalSubscription {
+            replay,
+            live,
+            cursor: after,
+            lagged: false,
+        }))
     }
 
     fn latest(&self) -> Result<u64, ServiceError> {
@@ -299,10 +334,12 @@ fn open_lease(path: &Path) -> Result<File, ServiceError> {
         .append(true)
         .open(&lease_path)
         .map_err(io_error)?;
-    lease.try_lock().map_err(|error| ServiceError::new(
-        "journal_locked",
-        format!("无法独占事件日志 {}: {error}", path.display()),
-    ))?;
+    lease.try_lock().map_err(|error| {
+        ServiceError::new(
+            "journal_locked",
+            format!("无法独占事件日志 {}: {error}", path.display()),
+        )
+    })?;
     Ok(lease)
 }
 
@@ -315,7 +352,10 @@ fn lease_path(path: &Path) -> PathBuf {
 fn write_committed(state: &mut JournalState, line: &[u8]) -> Result<(), ServiceError> {
     let size = state.file.metadata().map_err(io_error)?.len();
     if size != state.bytes {
-        return Err(ServiceError::new("journal_changed", "事件日志在实例外被修改，拒绝继续追加"));
+        return Err(ServiceError::new(
+            "journal_changed",
+            "事件日志在实例外被修改，拒绝继续追加",
+        ));
     }
     state.file.write_all(line).map_err(io_error)?;
     state.file.flush().map_err(io_error)?;
@@ -328,7 +368,11 @@ fn load_events(file: &mut File) -> Result<Vec<ServiceEvent>, ServiceError> {
     let mut line = Vec::new();
     loop {
         line.clear();
-        let read = reader.by_ref().take(MAX_EVENT_BYTES as u64 + 1).read_until(b'\n', &mut line).map_err(io_error)?;
+        let read = reader
+            .by_ref()
+            .take(MAX_EVENT_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(io_error)?;
         if read == 0 {
             break;
         }
@@ -336,23 +380,37 @@ fn load_events(file: &mut File) -> Result<Vec<ServiceEvent>, ServiceError> {
             return Err(event_too_large());
         }
         if line.last() != Some(&b'\n') {
-            return Err(ServiceError::new("journal_corrupt", "事件日志末行不完整，拒绝追加"));
+            return Err(ServiceError::new(
+                "journal_corrupt",
+                "事件日志末行不完整，拒绝追加",
+            ));
         }
         let value: serde_json::Value = serde_json::from_slice(&line).map_err(|error| {
-            ServiceError::new("journal_corrupt", format!("事件日志第 {} 行损坏: {error}", events.len() + 1))
+            ServiceError::new(
+                "journal_corrupt",
+                format!("事件日志第 {} 行损坏: {error}", events.len() + 1),
+            )
         })?;
-        if value.get("version").and_then(serde_json::Value::as_u64) != Some(PROTOCOL_VERSION as u64) {
-            return Err(ServiceError::new("unsupported_version", "事件日志版本未知或缺失"));
+        if value.get("version").and_then(serde_json::Value::as_u64) != Some(PROTOCOL_VERSION as u64)
+        {
+            return Err(ServiceError::new(
+                "unsupported_version",
+                "事件日志版本未知或缺失",
+            ));
         }
         let event: ServiceEvent = serde_json::from_value(value).map_err(|error| {
-            ServiceError::new("journal_corrupt", format!("事件日志第 {} 行不符合协议: {error}", events.len() + 1))
+            ServiceError::new(
+                "journal_corrupt",
+                format!("事件日志第 {} 行不符合协议: {error}", events.len() + 1),
+            )
         })?;
-        let expected = latest_sequence(&events).checked_add(1).ok_or_else(|| {
-            ServiceError::new("sequence_exhausted", "服务事件序号已耗尽")
-        })?;
+        let expected = latest_sequence(&events)
+            .checked_add(1)
+            .ok_or_else(|| ServiceError::new("sequence_exhausted", "服务事件序号已耗尽"))?;
         if event.sequence != expected {
             return Err(ServiceError::new(
-                "journal_sequence", format!("服务事件序号应为 {expected}，实际为 {}", event.sequence),
+                "journal_sequence",
+                format!("服务事件序号应为 {expected}，实际为 {}", event.sequence),
             ));
         }
         events.push(event);
@@ -367,7 +425,10 @@ fn latest_sequence(events: &[ServiceEvent]) -> u64 {
 fn validate_cursor(after: u64, events: &[ServiceEvent]) -> Result<(), ServiceError> {
     let latest = latest_sequence(events);
     if after > latest {
-        return Err(ServiceError::new("invalid_cursor", format!("游标 {after} 超过日志末尾 {latest}")));
+        return Err(ServiceError::new(
+            "invalid_cursor",
+            format!("游标 {after} 超过日志末尾 {latest}"),
+        ));
     }
     Ok(())
 }
@@ -377,7 +438,10 @@ fn io_error(error: std::io::Error) -> ServiceError {
 }
 
 fn event_too_large() -> ServiceError {
-    ServiceError::new("event_too_large", format!("单条事件超过 {MAX_EVENT_BYTES} 字节上限"))
+    ServiceError::new(
+        "event_too_large",
+        format!("单条事件超过 {MAX_EVENT_BYTES} 字节上限"),
+    )
 }
 
 fn journal_too_large() -> ServiceError {
@@ -424,7 +488,10 @@ impl EventSubscription for JournalSubscription {
 }
 
 fn lagged(cursor: u64) -> ServiceError {
-    ServiceError::new("lagged", format!("订阅缓冲已溢出，请从游标 {cursor} 补读并重新订阅"))
+    ServiceError::new(
+        "lagged",
+        format!("订阅缓冲已溢出，请从游标 {cursor} 补读并重新订阅"),
+    )
 }
 
 /// 从扩展调用 ID 补充来源关联。前缀只提供审计线索，不授予任何权限。
@@ -434,10 +501,13 @@ pub fn context_for_call(context: &EventContext, call: &ToolCall) -> EventContext
 
 fn context_for_call_id(context: &EventContext, id: &str) -> EventContext {
     let mut context = context.clone();
-    if let Some((extension, _)) = id.strip_prefix("extension__").and_then(|rest| rest.split_once("__"))
-        && !extension.is_empty() {
-            context.origin.extension_id = Some(extension.to_owned());
-        }
+    if let Some((extension, _)) = id
+        .strip_prefix("extension__")
+        .and_then(|rest| rest.split_once("__"))
+        && !extension.is_empty()
+    {
+        context.origin.extension_id = Some(extension.to_owned());
+    }
     context
 }
 
@@ -465,15 +535,27 @@ pub struct ServiceEvidence {
 
 impl ServiceEvidence {
     /// 为一次执行绑定日志、来源和独立的取消通道。
-    pub fn new(journal: Arc<dyn EventJournal>, context: EventContext, cancel: CancelHandle) -> Self {
-        Self { journal, context, cancel, failure: Mutex::new(None) }
+    pub fn new(
+        journal: Arc<dyn EventJournal>,
+        context: EventContext,
+        cancel: CancelHandle,
+    ) -> Self {
+        Self {
+            journal,
+            context,
+            cancel,
+            failure: Mutex::new(None),
+        }
     }
 
     /// 返回首个持久化错误；失败标记在本实例生命周期内不会自动清除。
     pub fn health(&self) -> Result<(), ServiceError> {
         match self.failure.lock() {
             Ok(failure) => failure.clone().map_or(Ok(()), Err),
-            Err(_) => Err(ServiceError::new("evidence_unhealthy", "服务证据健康状态锁已损坏")),
+            Err(_) => Err(ServiceError::new(
+                "evidence_unhealthy",
+                "服务证据健康状态锁已损坏",
+            )),
         }
     }
 
@@ -503,15 +585,25 @@ impl EvidenceSink for ServiceEvidence {
 impl RunHooks for ServiceEvidence {
     fn before_model_call<'a>(&'a self, request: &'a ModelRequest<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            self.emit(&self.context, ServiceEventPayload::ModelCallStarted { role: request.spec.role });
+            self.emit(
+                &self.context,
+                ServiceEventPayload::ModelCallStarted {
+                    role: request.spec.role,
+                },
+            );
         })
     }
 
     fn after_model_reply<'a>(&'a self, reply: &'a ModelReply, retried: bool) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            self.emit(&self.context, ServiceEventPayload::ModelCallFinished {
-                text: reply.turn.text.clone(), calls: reply.turn.calls.clone(), retried,
-            });
+            self.emit(
+                &self.context,
+                ServiceEventPayload::ModelCallFinished {
+                    text: reply.turn.text.clone(),
+                    calls: reply.turn.calls.clone(),
+                    retried,
+                },
+            );
         })
     }
 }
@@ -522,14 +614,21 @@ mod rotate_tests {
 
     #[test]
     fn an_empty_journal_still_requires_the_writers_lease() {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let workspace = std::env::temp_dir().join(format!(
-            "qch-rotate-empty-lease-{}-{stamp}", std::process::id()
+            "qch-rotate-empty-lease-{}-{stamp}",
+            std::process::id()
         ));
         let path = workspace.join(".qcodeharness/service/events.jsonl");
         let journal = JsonEventJournal::open(&path).unwrap();
 
-        assert_eq!(rotate_events(&workspace).unwrap_err().code, "journal_locked");
+        assert_eq!(
+            rotate_events(&workspace).unwrap_err().code,
+            "journal_locked"
+        );
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         drop(journal);
         assert!(rotate_events(&workspace).unwrap().empty_run);
@@ -548,7 +647,10 @@ mod close_tests {
     /// 断言关闭成功且租约可移交，不依赖不同平台的锁实现差异。
     #[test]
     fn a_poisoned_state_lock_still_releases_the_writer_lease_on_close() {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let workspace = std::env::temp_dir().join(format!(
             "qch-close-poisoned-lease-{}-{stamp}",
             std::process::id()

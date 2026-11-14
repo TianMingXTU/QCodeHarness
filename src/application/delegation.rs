@@ -213,9 +213,8 @@ pub fn parse_request(arguments: &Value, max_subtasks: usize) -> Result<Vec<Subta
                     )
                 })?,
         };
-        let scope = validate_scope(task.scope.as_deref().unwrap_or(".")).map_err(|error| {
-            format!("子任务 {} 的 scope 无效: {error}", task.id)
-        })?;
+        let scope = validate_scope(task.scope.as_deref().unwrap_or("."))
+            .map_err(|error| format!("子任务 {} 的 scope 无效: {error}", task.id))?;
         subtasks.push(Subtask {
             id: task.id,
             goal: goal.to_owned(),
@@ -250,7 +249,8 @@ fn validate_scope(raw: &str) -> Result<PathBuf, String> {
                 let text = part
                     .to_str()
                     .ok_or_else(|| format!("`{raw}` 含非 UTF-8 路径"))?;
-                if text.trim_end_matches([' ', '.']).is_empty() || text != text.trim_end_matches([' ', '.'])
+                if text.trim_end_matches([' ', '.']).is_empty()
+                    || text != text.trim_end_matches([' ', '.'])
                 {
                     return Err(format!("`{raw}` 含以空格或点结尾的路径段"));
                 }
@@ -282,11 +282,8 @@ mod tests {
 
     #[test]
     fn valid_request_defaults_role_and_scope() {
-        let parsed = parse_request(
-            &tasks(json!([{ "id": "one", "goal": "  do it  " }])),
-            2,
-        )
-        .unwrap();
+        let parsed =
+            parse_request(&tasks(json!([{ "id": "one", "goal": "  do it  " }])), 2).unwrap();
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].goal, "do it");
@@ -314,14 +311,38 @@ mod tests {
             (tasks(json!([{ "id": "one", "goal": "work" }])), 0),
             (tasks(json!([{ "id": "one", "goal": "work" }])), 17),
             (tasks(json!([{ "id": "one", "goal": "  " }])), 2),
-            (tasks(json!([{ "id": "one", "goal": "work" }, { "id": "one", "goal": "again" }])), 2),
-            (tasks(json!([{ "id": "one", "goal": "work", "role": "manager" }])), 2),
-            (tasks(json!([{ "id": "one", "goal": "work", "scope": "../escape" }])), 2),
-            (tasks(json!([{ "id": "one", "goal": "work", "scope": "/escape" }])), 2),
-            (tasks(json!([{ "id": "one", "goal": "work", "scope": ".git" }])), 2),
-            (tasks(json!([{ "id": "one", "goal": "work", "scope": "" }])), 2),
-            (tasks(json!([{ "id": "one", "goal": "work", "verify_command": "skip" }])), 2),
-            (json!({ "tasks": [{ "id": "one", "goal": "work" }], "verify_command": "skip" }), 2),
+            (
+                tasks(json!([{ "id": "one", "goal": "work" }, { "id": "one", "goal": "again" }])),
+                2,
+            ),
+            (
+                tasks(json!([{ "id": "one", "goal": "work", "role": "manager" }])),
+                2,
+            ),
+            (
+                tasks(json!([{ "id": "one", "goal": "work", "scope": "../escape" }])),
+                2,
+            ),
+            (
+                tasks(json!([{ "id": "one", "goal": "work", "scope": "/escape" }])),
+                2,
+            ),
+            (
+                tasks(json!([{ "id": "one", "goal": "work", "scope": ".git" }])),
+                2,
+            ),
+            (
+                tasks(json!([{ "id": "one", "goal": "work", "scope": "" }])),
+                2,
+            ),
+            (
+                tasks(json!([{ "id": "one", "goal": "work", "verify_command": "skip" }])),
+                2,
+            ),
+            (
+                json!({ "tasks": [{ "id": "one", "goal": "work" }], "verify_command": "skip" }),
+                2,
+            ),
             (tasks(json!([{ "id": "CON", "goal": "work" }])), 2),
             (tasks(json!([{ "id": "a/b", "goal": "work" }])), 2),
         ] {
@@ -342,9 +363,11 @@ mod tests {
         assert_eq!(parse_request(&request, 1).unwrap().len(), 2);
         assert_eq!(parse_request(&request, 2).unwrap().len(), 2);
 
-        let full = tasks(json!((0..MAX_SUBTASKS)
-            .map(|index| json!({ "id": format!("task-{index}"), "goal": "work" }))
-            .collect::<Vec<_>>()));
+        let full = tasks(json!(
+            (0..MAX_SUBTASKS)
+                .map(|index| json!({ "id": format!("task-{index}"), "goal": "work" }))
+                .collect::<Vec<_>>()
+        ));
         assert_eq!(parse_request(&full, 1).unwrap().len(), MAX_SUBTASKS);
     }
 }

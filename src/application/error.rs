@@ -90,7 +90,10 @@ pub enum ApplicationError {
     /// 拿着过期计划继续修改，覆盖用户刚做的改动。
     ///
     /// `changes` 列出差异，用户确认前能看到具体改动。
-    #[error("工作区在任务中断后被改动过，恢复前需要确认：\n{}", format_changes(changes))]
+    #[error(
+        "工作区在任务中断后被改动过，恢复前需要确认：\n{}",
+        format_changes(changes)
+    )]
     WorktreeChanged {
         /// 差异清单，每条一行。
         changes: Vec<String>,

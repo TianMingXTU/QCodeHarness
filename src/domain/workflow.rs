@@ -259,10 +259,7 @@ mod tests {
                 AgentRole::Tester,
             ]
         );
-        assert_eq!(
-            roles_of(TaskKind::Review),
-            vec![AgentRole::Reviewer; 4]
-        );
+        assert_eq!(roles_of(TaskKind::Review), vec![AgentRole::Reviewer; 4]);
         assert_eq!(
             roles_of(TaskKind::Refactor),
             vec![

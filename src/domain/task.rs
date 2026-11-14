@@ -173,12 +173,13 @@ impl<'de> Deserialize<'de> for Task {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = TaskWire::deserialize(deserializer)?;
         if let TaskState::Running { step } = wire.state
-            && step >= wire.steps.len() {
-                return Err(serde::de::Error::custom(format!(
-                    "任务状态是 Running {{ step: {step} }}，但只有 {} 个步骤——进度下标越界",
-                    wire.steps.len()
-                )));
-            }
+            && step >= wire.steps.len()
+        {
+            return Err(serde::de::Error::custom(format!(
+                "任务状态是 Running {{ step: {step} }}，但只有 {} 个步骤——进度下标越界",
+                wire.steps.len()
+            )));
+        }
         if wire.state == TaskState::Completed && wire.steps.is_empty() {
             return Err(serde::de::Error::custom(
                 "任务状态是 Completed，但它没有任何步骤——空任务不可能走到完成",
@@ -190,13 +191,14 @@ impl<'de> Deserialize<'de> for Task {
             ));
         }
         if let Some(failure) = &wire.failure
-            && failure.step >= wire.steps.len() {
-                return Err(serde::de::Error::custom(format!(
-                    "失败步号 {} 超出 {} 个步骤——恢复会从不存在的一步开始",
-                    failure.step,
-                    wire.steps.len()
-                )));
-            }
+            && failure.step >= wire.steps.len()
+        {
+            return Err(serde::de::Error::custom(format!(
+                "失败步号 {} 超出 {} 个步骤——恢复会从不存在的一步开始",
+                failure.step,
+                wire.steps.len()
+            )));
+        }
         Ok(Self {
             id: wire.id,
             kind: wire.kind,
@@ -232,12 +234,7 @@ pub enum TaskError {
 impl Task {
     /// 创建任务，初始 [`TaskState::Pending`]。步骤来自模板展开（见
     /// [`crate::domain::workflow`]），也可以手工构造。
-    pub fn new(
-        id: TaskId,
-        kind: TaskKind,
-        goal: impl Into<String>,
-        steps: Vec<TaskStep>,
-    ) -> Self {
+    pub fn new(id: TaskId, kind: TaskKind, goal: impl Into<String>, steps: Vec<TaskStep>) -> Self {
         Self {
             id,
             kind,
@@ -250,7 +247,10 @@ impl Task {
 
     /// 复制任务进度，给分支任务分配独立 ID。
     pub fn fork_with_id(&self, new_id: TaskId) -> Self {
-        Self { id: new_id, ..self.clone() }
+        Self {
+            id: new_id,
+            ..self.clone()
+        }
     }
 
     /// 开始执行：`Pending → Running { step: 0 }`。
@@ -483,7 +483,10 @@ mod tests {
             ("refactor", TaskKind::Refactor),
         ] {
             assert_eq!(TaskKind::parse_name(text), Some(kind));
-            assert_eq!(kind.name(), TaskKind::parse_name(kind.name()).unwrap().name());
+            assert_eq!(
+                kind.name(),
+                TaskKind::parse_name(kind.name()).unwrap().name()
+            );
         }
         assert_eq!(TaskKind::parse_name("deploy"), None, "未知类型必须拒绝");
     }

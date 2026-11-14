@@ -676,9 +676,10 @@ pub(crate) fn compact_slices<'a>(
 
     let mut kept = Vec::with_capacity(slices.len() + 2);
     if budget.keep_task
-        && let Some(ContextSlice::User(task)) = slices.first() {
-            kept.push(ContextSlice::User(task.clone()));
-        }
+        && let Some(ContextSlice::User(task)) = slices.first()
+    {
+        kept.push(ContextSlice::User(task.clone()));
+    }
     if keep_from > 0 {
         let notice = budgeted_omission(summary, &round_numbers[..keep_from], notice_room);
         if !notice.is_empty() {

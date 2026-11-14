@@ -8,9 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::application::report::{
-    ServiceSummary, ServiceSummaryStatus, summarize_service_events,
-};
+use crate::application::report::{ServiceSummary, ServiceSummaryStatus, summarize_service_events};
 
 /// 读取工作区下的服务状态、事件日志及两类快照，不创建目录或修改文件。
 ///
@@ -44,7 +42,9 @@ pub fn summarize_service(root: &Path) -> ServiceSummary {
     }
     match fs::read(&events_path) {
         Ok(contents) => summary = summarize_service_events(&contents, &events_path),
-        Err(error) => summary.record_corrupt(&events_path, None, format!("无法读取事件日志: {error}")),
+        Err(error) => {
+            summary.record_corrupt(&events_path, None, format!("无法读取事件日志: {error}"))
+        }
     }
     summary.state_path = Some(state_path.clone());
     match service_json_version(&state_path, "schema_version", Some(0)) {
@@ -61,11 +61,15 @@ pub fn summarize_service(root: &Path) -> ServiceSummary {
 
 fn service_json_version(path: &Path, field: &str, missing: Option<u64>) -> Result<u64, String> {
     let contents = fs::read(path).map_err(|error| format!("无法读取 JSON 文件: {error}"))?;
-    let value: serde_json::Value = serde_json::from_slice(&contents)
-        .map_err(|error| format!("JSON 解析失败: {error}"))?;
-    let object = value.as_object().ok_or_else(|| "JSON 顶层必须是对象".to_owned())?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&contents).map_err(|error| format!("JSON 解析失败: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "JSON 顶层必须是对象".to_owned())?;
     match object.get(field) {
-        Some(value) => value.as_u64().ok_or_else(|| format!("{field} 必须是非负整数")),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("{field} 必须是非负整数")),
         None => missing.ok_or_else(|| format!("缺少 {field}")),
     }
 }
@@ -88,7 +92,10 @@ fn service_snapshot_versions(
         match entry {
             Ok(entry) => {
                 let path = entry.path();
-                if path.extension().is_some_and(|extension| extension == "json") {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
                     paths.push(path);
                 }
             }

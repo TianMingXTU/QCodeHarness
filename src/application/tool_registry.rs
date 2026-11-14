@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use crate::domain::tool::{ToolCall, ToolOutcome, ToolSpec};
 use crate::application::port::{BoxFuture, ToolInvoker};
+use crate::domain::tool::{ToolCall, ToolOutcome, ToolSpec};
 
 /// 一个工具的完整登记：模型可见的规格与执行入口。
 ///
@@ -78,10 +78,7 @@ impl ToolRegistry {
     /// 按来源顺序合并；同名工具沿用 [`new`](Self::new) 的覆盖语义，
     /// 后到的来源胜出。顺序由装配方决定。
     pub fn from_sources(sources: &[Arc<dyn ToolSource>]) -> Self {
-        let entries: Vec<ToolEntry> = sources
-            .iter()
-            .flat_map(|source| source.tools())
-            .collect();
+        let entries: Vec<ToolEntry> = sources.iter().flat_map(|source| source.tools()).collect();
         Self::new(entries)
     }
 
@@ -100,7 +97,10 @@ impl ToolRegistry {
     /// 直接返回克隆：调用方（rig 防腐层）需要把它们序列化进请求，
     /// 给出所有权可省去借用传递。
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.entries.iter().map(|entry| entry.spec.clone()).collect()
+        self.entries
+            .iter()
+            .map(|entry| entry.spec.clone())
+            .collect()
     }
 
     /// 按名字查登记项。查不到说明模型指名了不存在的工具。
@@ -179,11 +179,7 @@ mod tests {
             },
         ]);
 
-        let names: Vec<String> = registry
-            .specs()
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
+        let names: Vec<String> = registry.specs().iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, vec!["read_file", "write_file"]);
     }
 
@@ -313,7 +309,10 @@ mod tests {
             // 台账的 subject() 取不到对象，只能退化成工具名。把
             // "apply_patch" 当文件名记进"写过的文件"是错的。解析补丁文本
             // 属于基础设施层；台账宁可少记一类，也不记错。
-            ("apply_patch", "参数是补丁文本，没有路径字段，台账取不到对象"),
+            (
+                "apply_patch",
+                "参数是补丁文本，没有路径字段，台账取不到对象",
+            ),
         ];
         for (name, reason) in deliberately_untracked {
             assert!(
@@ -328,7 +327,10 @@ mod tests {
 
         for name in &registered {
             assert!(
-                known.contains(name) || deliberately_untracked.iter().any(|(untracked, _)| untracked == name),
+                known.contains(name)
+                    || deliberately_untracked
+                        .iter()
+                        .any(|(untracked, _)| untracked == name),
                 "新工具 `{name}` 没进台账分类表：要么加进分类表，要么在明确不记的名单里写清理由"
             );
         }

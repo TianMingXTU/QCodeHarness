@@ -28,7 +28,10 @@ pub struct TaskBuild {
 
 /// 执行依赖的生命周期。`close` 必须等待该执行持有的外部资源完成关闭。
 pub trait TaskFactory: Send + Sync {
-    fn build<'a>(&'a self, build: TaskBuild) -> BoxFuture<'a, Result<AgentDependencies, ServiceError>>;
+    fn build<'a>(
+        &'a self,
+        build: TaskBuild,
+    ) -> BoxFuture<'a, Result<AgentDependencies, ServiceError>>;
 
     fn close<'a>(&'a self, _execution_id: &'a str) -> BoxFuture<'a, Result<(), ServiceError>> {
         Box::pin(async { Ok(()) })

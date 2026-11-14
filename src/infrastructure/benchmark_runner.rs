@@ -24,15 +24,18 @@ use crate::application::port::EvidenceSink;
 use crate::application::report::{cost_label, hit_ratio_label, summarize};
 use crate::application::snapshot::TaskStore;
 use crate::application::tool_registry::ToolRegistry;
-use crate::domain::benchmark::{BenchmarkMetrics, BenchmarkResult, BenchmarkTask, CriteriaObservation, LongBenchmarkResult, SecurityCaseResult};
+use crate::domain::benchmark::{
+    BenchmarkMetrics, BenchmarkResult, BenchmarkTask, CriteriaObservation, LongBenchmarkResult,
+    SecurityCaseResult,
+};
 use crate::domain::budget::Budget;
 use crate::domain::ids::{SessionId, TaskId};
 use crate::domain::workspace::WorkspaceRoot;
-use crate::infrastructure::benchmark::{load_long_tasks, load_tasks, BenchmarkLoadError};
-use crate::infrastructure::evidence::jsonl::{session_path, JsonlEvidenceSink};
+use crate::infrastructure::benchmark::{BenchmarkLoadError, load_long_tasks, load_tasks};
+use crate::infrastructure::evidence::jsonl::{JsonlEvidenceSink, session_path};
 use crate::infrastructure::evidence::reader::read_session;
-use crate::infrastructure::tool::shell::run_in_workspace;
 use crate::infrastructure::tool::all_tools;
+use crate::infrastructure::tool::shell::run_in_workspace;
 
 /// 判据测试命令的超时。fixture 都是小 crate，几分钟足够；卡死的命令
 /// 不应拖垮整个基准。
@@ -95,7 +98,9 @@ fn error_metrics(failure: &str) -> BenchmarkMetrics {
 /// 返回一条 `passed = None` 的未知用例；诊断只走 stderr，不进入 `--json`。
 fn security_case_results() -> Vec<SecurityCaseResult> {
     let Some(raw) = std::env::var_os("QCH_SECURITY_CASES") else {
-        return vec![unknown_security_case("未配置 QCH_SECURITY_CASES，安全用例未运行")];
+        return vec![unknown_security_case(
+            "未配置 QCH_SECURITY_CASES，安全用例未运行",
+        )];
     };
     let path = PathBuf::from(&raw);
     let text = match fs::read_to_string(&path) {
@@ -168,7 +173,11 @@ pub async fn run_benchmark(
                 }
             }
         };
-        let verdict = if result.passed { "✓ 通过" } else { "✗ 未通过" };
+        let verdict = if result.passed {
+            "✓ 通过"
+        } else {
+            "✗ 未通过"
+        };
         eprintln!(
             "{} {}：{} 步 / {} 轮 / 墙钟 {} / 审批 {} 次 / 缓存 {} / 成本 {}",
             verdict,
@@ -234,7 +243,11 @@ pub async fn run_long_benchmark(
                 }
             }
         };
-        let verdict = if result.passed { "✓ 通过" } else { "✗ 未通过" };
+        let verdict = if result.passed {
+            "✓ 通过"
+        } else {
+            "✗ 未通过"
+        };
         if result.first_run_failure.is_empty() {
             eprintln!("  第一次运行：没有失败——任务一遍跑完了，这次没有测到中断恢复");
         } else {
@@ -259,7 +272,9 @@ pub async fn run_long_benchmark(
             // 与判据共用同一份统计：这里数的是 no_repeated_commands 中
             // 真正违规的命令。所有重复命令中还包含修完缺陷后重跑全量测试
             // 这类正常迭代。
-            task.criteria.forbidden_repeats(&result.repeated_commands).len(),
+            task.criteria
+                .forbidden_repeats(&result.repeated_commands)
+                .len(),
             wall_clock_label(result.wall_clock_ms),
             cost_label(result.cost_usd),
         );
@@ -376,8 +391,11 @@ async fn run_one(
         })
     };
     let mut orchestrator = Orchestrator::new(task_deps, *budget, evidence_factory);
-    let mut orchestrated =
-        orchestrator.create_task(TaskId::new(format!("bench-{}", task.id)), task.kind, &task.description);
+    let mut orchestrated = orchestrator.create_task(
+        TaskId::new(format!("bench-{}", task.id)),
+        task.kind,
+        &task.description,
+    );
 
     let (answer, steps_completed, session_id, mut failures) =
         match orchestrator.run(&mut orchestrated).await {
@@ -392,7 +410,12 @@ async fn run_one(
                 steps_completed,
                 message,
                 ..
-            }) => (String::new(), steps_completed, Some(session_id), vec![message]),
+            }) => (
+                String::new(),
+                steps_completed,
+                Some(session_id),
+                vec![message],
+            ),
             Err(error) => (String::new(), 0, None, vec![error.to_string()]),
         };
 
@@ -420,7 +443,12 @@ async fn run_one(
     if failures.is_empty() {
         let has_changes = snapshot_files(&repo) != before;
         let observation = CriteriaObservation {
-            test_exit_success: run_criterion_command(&repo, &task.criteria.test_command, &mut failures).await,
+            test_exit_success: run_criterion_command(
+                &repo,
+                &task.criteria.test_command,
+                &mut failures,
+            )
+            .await,
             has_changes,
             answer: &answer,
             turns_used: 0,
@@ -476,10 +504,7 @@ async fn run_long_one(
     let before = snapshot_files(&repo);
     let task_id = TaskId::new(format!("bench-long-{}", task.id));
 
-    let turn_limit = task
-        .long_run
-        .exhaust_turns
-        .unwrap_or(DEFAULT_EXHAUST_TURNS);
+    let turn_limit = task.long_run.exhaust_turns.unwrap_or(DEFAULT_EXHAUST_TURNS);
 
     // ── 第一段：故意耗尽预算 ─────────────────────────────────────
     let mut first_deps = deps.clone();
@@ -501,7 +526,9 @@ async fn run_long_one(
     let mut orchestrated = orchestrator.create_task(task_id.clone(), task.kind, &task.description);
 
     let first_budget = Budget::new(turn_limit);
-    let first = orchestrator.run_with_budget(&mut orchestrated, &first_budget).await;
+    let first = orchestrator
+        .run_with_budget(&mut orchestrated, &first_budget)
+        .await;
     let (first_failure, first_steps, session_id) = match &first {
         Err(ApplicationError::StepFailed {
             session_id,
@@ -513,7 +540,11 @@ async fn run_long_one(
         // 一遍跑完，没有测到中断。仍带出会话 ID 与完成步数，但结果中
         // 必须明确记录没有发生中断，否则这次基准会在未测到恢复链路时
         // 显示为通过。
-        Ok(outcome) => (String::new(), outcome.steps_completed, Some(outcome.session_id.clone())),
+        Ok(outcome) => (
+            String::new(),
+            outcome.steps_completed,
+            Some(outcome.session_id.clone()),
+        ),
     };
     let Some(session_id) = session_id else {
         let _ = fs::remove_dir_all(&repo);
@@ -522,8 +553,8 @@ async fn run_long_one(
     // 恢复段追加在同一个证据文件里，无法按文件分段得到第一段轮数；
     // 用完成步数乘以每步轮数同样不可靠。轮数以任务快照为准：恢复从
     // 快照接账，`consumption.turns` 就是第一段跑完时的轮数。
-    let first_turns = turns_at_snapshot(workspace, &task_id)
-        .unwrap_or_else(|| turns_of(workspace, &session_id));
+    let first_turns =
+        turns_at_snapshot(workspace, &task_id).unwrap_or_else(|| turns_of(workspace, &session_id));
 
     // ── 第二段：恢复 ─────────────────────────────────────────────
     // 第一次运行未失败时不存在恢复，恢复段记为"没测到"，不能当作恢复成功。
@@ -550,14 +581,18 @@ async fn run_long_one(
     // 这种运行判为不通过，并在失败原因中说明。
     let mut failures = Vec::new();
     if first_failure.is_empty() {
-        failures.push(
-            "第一次运行没有失败：exhaust_turns 配置过大，中断恢复链路没有被测到".to_owned(),
-        );
+        failures
+            .push("第一次运行没有失败：exhaust_turns 配置过大，中断恢复链路没有被测到".to_owned());
     } else if resume_failure.is_none() {
         let has_changes = snapshot_files(&repo) != before;
         let text_after_compaction = text_after_first_compaction(workspace, &session_id);
         let observation = CriteriaObservation {
-            test_exit_success: run_criterion_command(&repo, &task.criteria.test_command, &mut failures).await,
+            test_exit_success: run_criterion_command(
+                &repo,
+                &task.criteria.test_command,
+                &mut failures,
+            )
+            .await,
             has_changes,
             answer: &answer,
             turns_used: total_turns,
@@ -608,7 +643,10 @@ async fn run_long_resume(
     task: &BenchmarkTask,
 ) -> Result<(usize, String), String> {
     let task_store = crate::infrastructure::task_store::JsonTaskStore::new(workspace);
-    let Some(snapshot) = task_store.load(task_id).map_err(|error| format!("读取任务快照失败: {error}"))? else {
+    let Some(snapshot) = task_store
+        .load(task_id)
+        .map_err(|error| format!("读取任务快照失败: {error}"))?
+    else {
         return Err(format!("任务 {task_id} 的快照不存在，无法恢复"));
     };
 
@@ -681,15 +719,19 @@ fn turns_of(workspace: &Path, session: &SessionId) -> u32 {
 fn text_after_first_compaction(workspace: &Path, session: &SessionId) -> Option<String> {
     let path = session_path(workspace, session.as_str());
     let log = read_session(&path).ok()??;
-    let first_compaction = log
-        .events
-        .iter()
-        .position(|evidence| matches!(evidence.event, crate::domain::evidence::AuditEvent::ContextCompacted { .. }))?;
+    let first_compaction = log.events.iter().position(|evidence| {
+        matches!(
+            evidence.event,
+            crate::domain::evidence::AuditEvent::ContextCompacted { .. }
+        )
+    })?;
     log.events[first_compaction..]
         .iter()
         .rev()
         .find_map(|evidence| match &evidence.event {
-            crate::domain::evidence::AuditEvent::Thought { text, .. } if !text.trim().is_empty() => {
+            crate::domain::evidence::AuditEvent::Thought { text, .. }
+                if !text.trim().is_empty() =>
+            {
                 Some(text.clone())
             }
             _ => None,
@@ -701,10 +743,7 @@ fn text_after_first_compaction(workspace: &Path, session: &SessionId) -> Option<
 /// 重复命令按 `ToolObserved` 统计，只计算真正执行过的调用。恢复路径上
 /// 仅有 `ToolCallReplayed` 记录而未重跑的调用，以及被拒绝的调用，都不
 /// 构成副作用重复。
-async fn usage_of_long(
-    workspace: &Path,
-    session: &SessionId,
-) -> (Option<f64>, u64, Vec<String>) {
+async fn usage_of_long(workspace: &Path, session: &SessionId) -> (Option<f64>, u64, Vec<String>) {
     let path = session_path(workspace, session.as_str());
     let mut cost = None;
     let mut wall_clock = 0u64;
@@ -716,16 +755,17 @@ async fn usage_of_long(
         for evidence in &log.events {
             if let crate::domain::evidence::AuditEvent::ToolObserved { call, .. } = &evidence.event
                 && call.name == "run_command"
-                    && let Some(command) = call.arguments.get("command").and_then(|v| v.as_str()) {
-                        // 先 trim，首尾空白不影响判定。
-                        let command = command.trim().to_owned();
-                        if repeated.contains(&command) {
-                            continue;
-                        }
-                        if seen_twice(&log.events, &command) {
-                            repeated.push(command);
-                        }
-                    }
+                && let Some(command) = call.arguments.get("command").and_then(|v| v.as_str())
+            {
+                // 先 trim，首尾空白不影响判定。
+                let command = command.trim().to_owned();
+                if repeated.contains(&command) {
+                    continue;
+                }
+                if seen_twice(&log.events, &command) {
+                    repeated.push(command);
+                }
+            }
         }
     }
     (cost, wall_clock, repeated)
@@ -843,7 +883,10 @@ async fn usage_of(
         // 无证据（空文件）或读取失败：成本按未知处理，轮数记 0。
         Ok(None) => {}
         Err(error) => {
-            eprintln!("警告：证据 {} 读不出来，成本按未知处理: {error}", path.display());
+            eprintln!(
+                "警告：证据 {} 读不出来，成本按未知处理: {error}",
+                path.display()
+            );
         }
     }
     // 输入 token 为 0 时返回 None，表示无法计算，不能按 0% 命中处理。
@@ -872,7 +915,8 @@ fn copy_fixture(benchmarks_root: &Path, task: &BenchmarkTask) -> Result<PathBuf,
     ));
     COPIES_MADE.store(serial + 1, Ordering::Relaxed);
     let _ = fs::remove_dir_all(&dest);
-    copy_dir(&source, &dest).map_err(|error| format!("复制 fixture {} 失败: {error}", source.display()))?;
+    copy_dir(&source, &dest)
+        .map_err(|error| format!("复制 fixture {} 失败: {error}", source.display()))?;
     Ok(dest)
 }
 
@@ -948,13 +992,13 @@ mod tests {
     use super::*;
     use crate::application::agent_roster::AgentRoster;
     use crate::application::context_policy::DefaultContextPolicy;
+    use crate::application::memory_evidence::MemoryEvidenceSink;
     use crate::application::port::{ApprovalGate, NoopHooks};
     use crate::domain::evidence::AuditEvent;
     use crate::domain::policy::PolicyEngine;
     use crate::domain::tool::{OutcomeStatus, ToolOutcome};
     use crate::infrastructure::approval::auto::AutoApproveGate;
     use crate::infrastructure::clock::SystemClock;
-    use crate::application::memory_evidence::MemoryEvidenceSink;
     use crate::infrastructure::model::rig_chat::RigChatGateway;
 
     use std::time::SystemTime;
@@ -1045,9 +1089,14 @@ mod tests {
             MockTurn::text("已改好：notes.txt 已更新为第二版，验证通过。"),
         ]);
 
-        let results = run_benchmark(&bench_deps(&mock), &Budget::new(10), &benchmarks, &workspace)
-            .await
-            .expect("装载");
+        let results = run_benchmark(
+            &bench_deps(&mock),
+            &Budget::new(10),
+            &benchmarks,
+            &workspace,
+        )
+        .await
+        .expect("装载");
 
         assert_eq!(results.len(), 1);
         let result = &results[0];
@@ -1057,7 +1106,10 @@ mod tests {
         assert_eq!(result.steps_completed, 4, "bug-fix 模板四步全跑完");
         assert_eq!(result.turns_used, 5, "五次模型调用各记一轮思考");
         assert!(result.session_id.is_some(), "有动手过程就有会话");
-        assert_eq!(result.cost_usd, None, "mock 模型没有定价信息：成本是未知而非 0");
+        assert_eq!(
+            result.cost_usd, None,
+            "mock 模型没有定价信息：成本是未知而非 0"
+        );
         // 运行器跑完会清理临时仓库，文件改动已由判据在清理前确认。
         // 拷贝目录名带进程内原子自增序号，本次运行的拷贝是序号最大且
         // 最新的那个。只检查它，历史运行残留的目录不属于本测试范围。
@@ -1093,16 +1145,24 @@ mod tests {
         turns.extend(["b1", "b2", "b3", "b4"].map(MockTurn::text));
         let mock = MockCompletionModel::from_turns(turns);
 
-        let results = run_benchmark(&bench_deps(&mock), &Budget::new(10), &benchmarks, &workspace)
-            .await
-            .expect("装载");
+        let results = run_benchmark(
+            &bench_deps(&mock),
+            &Budget::new(10),
+            &benchmarks,
+            &workspace,
+        )
+        .await
+        .expect("装载");
 
         assert_eq!(results.len(), 2, "两个任务都要有结果");
         let failed = &results[0];
         assert_eq!(failed.task_id, "a-collapses");
         assert!(!failed.passed);
         assert!(
-            failed.failures.iter().any(|reason| reason.contains("第 1 步失败")),
+            failed
+                .failures
+                .iter()
+                .any(|reason| reason.contains("第 1 步失败")),
             "失败原因应说明步骤在哪断的: {:?}",
             failed.failures
         );
@@ -1115,7 +1175,11 @@ mod tests {
         );
         let passed = &results[1];
         assert_eq!(passed.task_id, "b-passes");
-        assert!(passed.passed, "后续任务不该被前一个的失败拖累: {:?}", passed.failures);
+        assert!(
+            passed.passed,
+            "后续任务不该被前一个的失败拖累: {:?}",
+            passed.failures
+        );
 
         let _ = fs::remove_dir_all(&benchmarks);
         let _ = fs::remove_dir_all(&workspace);
@@ -1130,14 +1194,22 @@ mod tests {
         write_task(&benchmarks, "red-test", "exit 1", false);
 
         let mock = MockCompletionModel::from_turns(["1", "2", "3", "4"].map(MockTurn::text));
-        let results = run_benchmark(&bench_deps(&mock), &Budget::new(10), &benchmarks, &workspace)
-            .await
-            .expect("装载");
+        let results = run_benchmark(
+            &bench_deps(&mock),
+            &Budget::new(10),
+            &benchmarks,
+            &workspace,
+        )
+        .await
+        .expect("装载");
 
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
         assert!(
-            results[0].failures.iter().any(|reason| reason.contains("测试命令 `exit 1` 未通过")),
+            results[0]
+                .failures
+                .iter()
+                .any(|reason| reason.contains("测试命令 `exit 1` 未通过")),
             "应指明是哪条判据没过: {:?}",
             results[0].failures
         );
@@ -1191,7 +1263,10 @@ mod tests {
 
     #[test]
     fn tail_keeps_the_last_lines_of_both_streams() {
-        let stdout = (1..=30).map(|i| format!("out{i}")).collect::<Vec<_>>().join("\n");
+        let stdout = (1..=30)
+            .map(|i| format!("out{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let stderr = "error[E0412]: cannot find type\nhelp: consider importing";
 
         let text = tail(&stdout, stderr);
@@ -1211,7 +1286,10 @@ mod tests {
         fs::write(root.join("lib.rs"), "v1").expect("写源文件");
 
         let before = snapshot_files(&root);
-        assert_eq!(before.get("lib.rs").map(Vec::as_slice), Some(b"v1".as_slice()));
+        assert_eq!(
+            before.get("lib.rs").map(Vec::as_slice),
+            Some(b"v1".as_slice())
+        );
 
         // agent 修改源文件并产生构建产物：只有源文件算改动。
         fs::write(root.join("lib.rs"), "v2").expect("改源文件");
@@ -1221,7 +1299,12 @@ mod tests {
 
         assert_ne!(snapshot_files(&root), before, "源文件改动必须被看见");
         let after = snapshot_files(&root);
-        assert_eq!(after.len(), 1, "target/ 与 Cargo.lock 不进快照: {:?}", after.keys());
+        assert_eq!(
+            after.len(),
+            1,
+            "target/ 与 Cargo.lock 不进快照: {:?}",
+            after.keys()
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1231,8 +1314,16 @@ mod tests {
         // 被拒绝的调用没有执行，也没有副作用。把两次拒绝算作重复副作用
         // 会误报一次未发生的执行。
         let events = vec![
-            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Refused),
-            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Refused),
+            observed(
+                "run_command",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Refused,
+            ),
+            observed(
+                "run_command",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Refused,
+            ),
         ];
         assert!(!seen_twice(&events, "cargo test"), "两次拒绝不构成重复执行");
     }
@@ -1241,24 +1332,54 @@ mod tests {
     fn executed_repeats_count_as_side_effect_repeats() {
         // 成功执行两次，副作用发生两遍，判定为重复。
         let events = vec![
-            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Success),
-            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Success),
+            observed(
+                "run_command",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Success,
+            ),
+            observed(
+                "run_command",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Success,
+            ),
         ];
-        assert!(seen_twice(&events, "cargo test"), "两次成功执行是重复副作用");
+        assert!(
+            seen_twice(&events, "cargo test"),
+            "两次成功执行是重复副作用"
+        );
 
         // 执行后失败：命令已运行，副作用可能已发生，仍然计入。
         let failed = vec![
-            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Failed),
-            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Failed),
+            observed(
+                "run_command",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Failed,
+            ),
+            observed(
+                "run_command",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Failed,
+            ),
         ];
         assert!(seen_twice(&failed, "cargo test"), "失败也算执行过");
 
         // 一次成功加一次拒绝：实际执行只有一次，不算重复。
         let mixed = vec![
-            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Success),
-            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Refused),
+            observed(
+                "run_command",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Success,
+            ),
+            observed(
+                "run_command",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Refused,
+            ),
         ];
-        assert!(!seen_twice(&mixed, "cargo test"), "一次执行一次拒绝不算重复");
+        assert!(
+            !seen_twice(&mixed, "cargo test"),
+            "一次执行一次拒绝不算重复"
+        );
     }
 
     #[test]
@@ -1349,24 +1470,57 @@ mod tests {
     fn seen_twice_only_looks_at_run_command_with_matching_command() {
         // 其他工具即使参数同名，也不计入命令重复。
         let other_tool = vec![
-            observed("write_file", json!({"command": "cargo test"}), OutcomeStatus::Success),
-            observed("write_file", json!({"command": "cargo test"}), OutcomeStatus::Success),
+            observed(
+                "write_file",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Success,
+            ),
+            observed(
+                "write_file",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Success,
+            ),
         ];
-        assert!(!seen_twice(&other_tool, "cargo test"), "非 run_command 不计");
+        assert!(
+            !seen_twice(&other_tool, "cargo test"),
+            "非 run_command 不计"
+        );
 
         // 不同命令分别计数，各执行一次不算重复。
         let different = vec![
-            observed("run_command", json!({"command": "cargo test"}), OutcomeStatus::Success),
-            observed("run_command", json!({"command": "cargo build"}), OutcomeStatus::Success),
+            observed(
+                "run_command",
+                json!({"command": "cargo test"}),
+                OutcomeStatus::Success,
+            ),
+            observed(
+                "run_command",
+                json!({"command": "cargo build"}),
+                OutcomeStatus::Success,
+            ),
         ];
-        assert!(!seen_twice(&different, "cargo test"), "cargo build 不该算进 cargo test");
+        assert!(
+            !seen_twice(&different, "cargo test"),
+            "cargo build 不该算进 cargo test"
+        );
         assert!(!seen_twice(&different, "cargo build"), "反向同理");
 
         // 参数先 trim，模型常带首尾空格。
         let spaced = vec![
-            observed("run_command", json!({"command": "cargo test "}), OutcomeStatus::Success),
-            observed("run_command", json!({"command": " cargo test"}), OutcomeStatus::Success),
+            observed(
+                "run_command",
+                json!({"command": "cargo test "}),
+                OutcomeStatus::Success,
+            ),
+            observed(
+                "run_command",
+                json!({"command": " cargo test"}),
+                OutcomeStatus::Success,
+            ),
         ];
-        assert!(seen_twice(&spaced, "cargo test"), "首尾空白不影响同一条命令的认定");
+        assert!(
+            seen_twice(&spaced, "cargo test"),
+            "首尾空白不影响同一条命令的认定"
+        );
     }
 }

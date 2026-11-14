@@ -337,14 +337,11 @@ impl RealMcpClient {
             )
             .with_detail(format!("MCP 握手失败: {error}"))
             .with_isolation(process_isolation)),
-            Err(_) => Err(McpError::new(
-                crate::domain::mcp::McpFaultKind::HandshakeTimeout,
-                false,
-            )
-            .with_detail(format!(
-                "MCP 握手超时（{handshake:?} 内未完成协议握手）"
-            ))
-            .with_isolation(process_isolation)),
+            Err(_) => Err(
+                McpError::new(crate::domain::mcp::McpFaultKind::HandshakeTimeout, false)
+                    .with_detail(format!("MCP 握手超时（{handshake:?} 内未完成协议握手）"))
+                    .with_isolation(process_isolation),
+            ),
         }
     }
 }
@@ -402,14 +399,20 @@ impl McpClientHandle for RealMcpClient {
             // 判据。这里再叠加固定超时会产生两种"调用超时"口径。外层取消
             // future 时 rmcp 会尽力发送 notifications/cancelled，这是协作式
             // 取消，远端可能继续执行，结果未知由调用点记录。
-            let result = self.service.call_tool(params).await.map_err(classify_service_error)?;
+            let result = self
+                .service
+                .call_tool(params)
+                .await
+                .map_err(classify_service_error)?;
 
             if result.is_error == Some(true) {
                 // Server 报告执行失败：业务错误，连接仍可用。正文照常返回，
                 // 模型需要看到原因。ServerError 分类让审计能区分"远端执行
                 // 但报错"与"请求未送达"。
-                return Err(McpError::new(crate::domain::mcp::McpFaultKind::ServerError, false)
-                    .with_detail(extract_text(&result)));
+                return Err(
+                    McpError::new(crate::domain::mcp::McpFaultKind::ServerError, false)
+                        .with_detail(extract_text(&result)),
+                );
             }
             Ok(extract_text(&result))
         })
@@ -599,7 +602,13 @@ impl McpToolSource {
             config: config.clone(),
             workspace: workspace.map(Path::to_path_buf),
         };
-        Self::connect_with(config, Arc::new(connector), recorder, McpTimeouts::production()).await
+        Self::connect_with(
+            config,
+            Arc::new(connector),
+            recorder,
+            McpTimeouts::production(),
+        )
+        .await
     }
 
     /// 连接骨架，连接源与超时预算可注入。
@@ -696,7 +705,10 @@ struct McpToolInvoker {
 
 impl ToolInvoker for McpToolInvoker {
     fn invoke<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(self.managed.invoke(&self.remote_name, &self.registered, call))
+        Box::pin(
+            self.managed
+                .invoke(&self.remote_name, &self.registered, call),
+        )
     }
 }
 
@@ -748,17 +760,17 @@ async fn connect_all_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::memory_evidence::MemoryEvidenceSink;
     use crate::domain::evidence::AuditEvent;
     use crate::domain::mcp::{McpFaultKind, McpLifecycleKind};
     use crate::domain::platform::Platform;
     use crate::domain::tool::OutcomeStatus;
     use crate::domain::workspace::WorkspaceRoot;
-    use crate::application::memory_evidence::MemoryEvidenceSink;
     use crate::infrastructure::tool::all_tools;
     use serde_json::json;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// 断言 MCP 边界的三个字段，不用 `ExecutionBoundary::mcp` 构造期望值。
     /// 该构造函数本身是被测语义的一部分，用它作基准会让测试与实现同错。
@@ -1157,7 +1169,11 @@ mod tests {
         // 直接返回短路结果。
         let second = entry.invoker.invoke(&call).await;
         assert!(second.content.contains("连接已断开"), "{second:?}");
-        assert_eq!(client.calls.lock().unwrap().len(), 1, "死连接上不得再发起调用");
+        assert_eq!(
+            client.calls.lock().unwrap().len(),
+            1,
+            "死连接上不得再发起调用"
+        );
     }
 
     /// 子进程纳入宿主沙箱后，MCP 边界记录 active=true，不再一律写死为
@@ -1342,11 +1358,18 @@ mod tests {
         assert_eq!(first.status, crate::domain::tool::OutcomeStatus::Failed);
         let failure = first.mcp_failure.expect("isError 也要留下故障事实");
         assert_eq!(failure.kind, McpFaultKind::ServerError);
-        assert!(!failure.result_unknown, "远端已经答了：结果是已知的（答案是错）");
+        assert!(
+            !failure.result_unknown,
+            "远端已经答了：结果是已知的（答案是错）"
+        );
 
         let second = entry.invoker.invoke(&call).await;
         assert_eq!(second.status, crate::domain::tool::OutcomeStatus::Success);
-        assert_eq!(client.calls.lock().unwrap().len(), 2, "故障与恢复都是真实往返");
+        assert_eq!(
+            client.calls.lock().unwrap().len(),
+            2,
+            "故障与恢复都是真实往返"
+        );
     }
 
     /// 调用超时：记录结果未知，不终止 Server，不自动重发。
@@ -1355,9 +1378,15 @@ mod tests {
     /// 再次超时，不会被短路成"连接已断开"。超时与连接死亡必须区分。
     #[tokio::test]
     async fn a_hanging_call_times_out_without_killing_the_connection() {
-        let managed = ManagedServer::discover("demo", Box::new(HangCallClient), None, None, test_timeouts())
-            .await
-            .expect("清单能给的替身应当连接成功");
+        let managed = ManagedServer::discover(
+            "demo",
+            Box::new(HangCallClient),
+            None,
+            None,
+            test_timeouts(),
+        )
+        .await
+        .expect("清单能给的替身应当连接成功");
         let source = McpToolSource::from_managed(managed);
         let entry = source.entries().remove(0);
         let call = call_to("mcp__demo__get_page");
@@ -1369,7 +1398,10 @@ mod tests {
         assert!(first.content.contains("结果未知"), "{first:?}");
 
         let second = entry.invoker.invoke(&call).await;
-        assert!(second.content.contains("调用超时"), "超时后连接仍应可用: {second:?}");
+        assert!(
+            second.content.contains("调用超时"),
+            "超时后连接仍应可用: {second:?}"
+        );
         assert!(!second.content.contains("连接已断开"));
     }
 
@@ -1397,7 +1429,10 @@ mod tests {
                 ))
                 .display()
                 .to_string(),
-            args: vec![mode.to_owned(), dir.join("counter.txt").display().to_string()],
+            args: vec![
+                mode.to_owned(),
+                dir.join("counter.txt").display().to_string(),
+            ],
         }
     }
 
@@ -1510,7 +1545,10 @@ mod tests {
         let config = fixture_config(&dir, "handshake-fail");
         let error = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
+            Arc::new(TokioConnector {
+                config: config.clone(),
+                workspace: None,
+            }),
             None,
             subprocess_timeouts(),
         )
@@ -1529,7 +1567,10 @@ mod tests {
         let started = std::time::Instant::now();
         let error = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
+            Arc::new(TokioConnector {
+                config: config.clone(),
+                workspace: None,
+            }),
             None,
             McpTimeouts {
                 connect: Duration::from_millis(400),
@@ -1550,7 +1591,10 @@ mod tests {
         // 是否真的退出用 PID 查证，各平台都能查，不做未经验证的假设。
         let pid = read_pid(&suffixed(&dir.join("counter.txt"), ".pid"));
         assert!(
-            wait_until("子进程退出", Duration::from_secs(10), || !process_alive(&pid)).await,
+            wait_until("子进程退出", Duration::from_secs(10), || {
+                !process_alive(&pid)
+            })
+            .await,
             "握手超时后子进程必须被清理，pid {pid} 仍存活"
         );
     }
@@ -1564,7 +1608,10 @@ mod tests {
         let config = fixture_config(&dir, "silent-after-1");
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
+            Arc::new(TokioConnector {
+                config: config.clone(),
+                workspace: None,
+            }),
             None,
             subprocess_timeouts(),
         )
@@ -1582,8 +1629,11 @@ mod tests {
 
         source.managed().close().await;
         assert!(
-            wait_until("EOF 标记", Duration::from_secs(5), || suffixed(&counter, ".eof").exists())
-                .await,
+            wait_until("EOF 标记", Duration::from_secs(5), || suffixed(
+                &counter, ".eof"
+            )
+            .exists())
+            .await,
             "优雅关闭链必须执行到子进程（stdin EOF），不留孤儿"
         );
         assert_eq!(counter_lines(&counter), 1, "关闭与超时都不重放原调用");
@@ -1599,7 +1649,10 @@ mod tests {
         let (recorder, sink) = test_recorder();
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
+            Arc::new(TokioConnector {
+                config: config.clone(),
+                workspace: None,
+            }),
             Some(recorder),
             subprocess_timeouts(),
         )
@@ -1636,7 +1689,10 @@ mod tests {
         let (recorder, sink) = test_recorder();
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
+            Arc::new(TokioConnector {
+                config: config.clone(),
+                workspace: None,
+            }),
             Some(recorder.clone()),
             subprocess_timeouts(),
         )
@@ -1692,7 +1748,10 @@ mod tests {
         let (recorder, sink) = test_recorder();
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
+            Arc::new(TokioConnector {
+                config: config.clone(),
+                workspace: None,
+            }),
             Some(recorder),
             subprocess_timeouts(),
         )
@@ -1705,8 +1764,11 @@ mod tests {
 
         source.managed().close().await;
         assert!(
-            wait_until("EOF 标记", Duration::from_secs(5), || suffixed(&counter, ".eof").exists())
-                .await,
+            wait_until("EOF 标记", Duration::from_secs(5), || suffixed(
+                &counter, ".eof"
+            )
+            .exists())
+            .await,
             "关闭必须走到子进程的优雅收尾"
         );
         source.managed().close().await;
@@ -1735,7 +1797,10 @@ mod tests {
         let config = fixture_config(&dir, "with-child");
         let source = McpToolSource::connect_with(
             &config,
-            Arc::new(TokioConnector { config: config.clone(), workspace: None }),
+            Arc::new(TokioConnector {
+                config: config.clone(),
+                workspace: None,
+            }),
             None,
             subprocess_timeouts(),
         )
@@ -1745,7 +1810,10 @@ mod tests {
         let isolated = source.managed().process_isolation().await;
         let child_path = suffixed(&dir.join("counter.txt"), ".child");
         assert!(
-            wait_until("孙进程 PID 文件", Duration::from_secs(5), || child_path.exists()).await
+            wait_until("孙进程 PID 文件", Duration::from_secs(5), || {
+                child_path.exists()
+            })
+            .await
         );
         let grandchild = read_pid(&child_path);
         assert!(process_alive(&grandchild), "关闭前孙进程应还活着");
@@ -1756,15 +1824,14 @@ mod tests {
             assert!(isolated, "夹具进程应已纳入沙箱");
             source.managed().close().await;
             assert!(
-                wait_until("孙进程退出", Duration::from_secs(10), || !process_alive(&grandchild))
-                    .await,
+                wait_until("孙进程退出", Duration::from_secs(10), || {
+                    !process_alive(&grandchild)
+                })
+                .await,
                 "沙箱关闭必须把孙进程一并收掉，pid {grandchild} 仍存活说明整树终止失败"
             );
         } else {
-            assert!(
-                !isolated,
-                "没有进程沙箱的平台必须报无保护"
-            );
+            assert!(!isolated, "没有进程沙箱的平台必须报无保护");
             source.managed().close().await;
         }
     }
@@ -1810,7 +1877,9 @@ mod tests {
                     tokio::time::sleep(pause).await;
                 }
                 match next {
-                    Some(Ok(client)) => Ok(Box::new(SharedHandle(client)) as Box<dyn McpClientHandle>),
+                    Some(Ok(client)) => {
+                        Ok(Box::new(SharedHandle(client)) as Box<dyn McpClientHandle>)
+                    }
                     Some(Err(error)) => Err(error),
                     None => Err(McpError::new(McpFaultKind::Spawn, false)
                         .with_detail("测试脚本没有预置更多连接")),
@@ -1875,13 +1944,14 @@ mod tests {
     /// 分支，与生产断连路径相同。
     async fn invoke_until_disconnected(managed: &ManagedServer) {
         let outcome = managed
-            .invoke("get_page", &managed.tools[0], &call_to("mcp__svc__get_page"))
+            .invoke(
+                "get_page",
+                &managed.tools[0],
+                &call_to("mcp__svc__get_page"),
+            )
             .await;
         assert_eq!(
-            outcome
-                .mcp_failure
-                .expect("断连调用必须留下故障事实")
-                .kind,
+            outcome.mcp_failure.expect("断连调用必须留下故障事实").kind,
             McpFaultKind::Disconnected
         );
     }
@@ -1913,11 +1983,19 @@ mod tests {
         .expect("替身发现不该失败");
         invoke_until_disconnected(&managed).await;
 
-        assert_eq!(managed.reconnect(None).await, Ok(true), "恢复要宣告重建了通信");
+        assert_eq!(
+            managed.reconnect(None).await,
+            Ok(true),
+            "恢复要宣告重建了通信"
+        );
         assert_eq!(connector.attempts(), 1, "一次请求恰好一次尝试");
 
         let outcome = managed
-            .invoke("get_page", &managed.tools[0], &call_to("mcp__svc__get_page"))
+            .invoke(
+                "get_page",
+                &managed.tools[0],
+                &call_to("mcp__svc__get_page"),
+            )
             .await;
         assert!(!outcome.is_error(), "恢复后的调用必须真的走通: {outcome:?}");
         assert_eq!(fresh.calls.lock().unwrap().len(), 1, "调用落在新实例上");
@@ -1935,7 +2013,8 @@ mod tests {
         let fresh = FakeClient::with_tools(page_tools());
         let (recorder, sink) = test_recorder();
         // 挂起 30ms，使 current_thread 运行时下的第二个请求必定在锁上排队。
-        let connector = ScriptConnector::paused(vec![Ok(Arc::clone(&fresh))], Duration::from_millis(30));
+        let connector =
+            ScriptConnector::paused(vec![Ok(Arc::clone(&fresh))], Duration::from_millis(30));
         let managed = ManagedServer::discover(
             "svc",
             Box::new(SharedHandle(old)),
@@ -1967,7 +2046,9 @@ mod tests {
         let old = FakeClient::flaky(page_tools(), disconnected_fault());
         let (recorder, sink) = test_recorder();
         let connector = ScriptConnector::paused(
-            vec![Err(McpError::new(McpFaultKind::Spawn, false).with_detail("起不来"))],
+            vec![Err(
+                McpError::new(McpFaultKind::Spawn, false).with_detail("起不来")
+            )],
             Duration::from_millis(30),
         );
         let managed = ManagedServer::discover(
@@ -1991,9 +2072,16 @@ mod tests {
         assert_eq!(count_lifecycle(&sink, McpLifecycleKind::RecoveryFailed), 1);
 
         let after = managed
-            .invoke("get_page", &managed.tools[0], &call_to("mcp__svc__get_page"))
+            .invoke(
+                "get_page",
+                &managed.tools[0],
+                &call_to("mcp__svc__get_page"),
+            )
             .await;
-        assert!(after.content.contains("连接已断开"), "失败的恢复把连接留在断开态");
+        assert!(
+            after.content.contains("连接已断开"),
+            "失败的恢复把连接留在断开态"
+        );
         let failure = after.mcp_failure.expect("短路失败也要留故障事实");
         assert!(!failure.result_unknown, "没有发出的请求没有未知可言");
         assert_eq!(connector.attempts(), 1, "短路调用不得顺手再发起恢复");
@@ -2044,7 +2132,10 @@ mod tests {
         .expect("替身发现不该失败");
         managed.close().await;
 
-        let error = managed.reconnect(None).await.expect_err("关闭是主动决定，恢复不许推翻");
+        let error = managed
+            .reconnect(None)
+            .await
+            .expect_err("关闭是主动决定，恢复不许推翻");
         assert_eq!(error.kind, McpFaultKind::Closed);
         assert_eq!(connector.attempts(), 0, "关闭后的连接一次都不该重连");
     }
@@ -2084,11 +2175,26 @@ mod tests {
         assert!(recovered.tools_changed, "清单变化必须落账，不许悄悄吞下");
 
         let outcome = managed
-            .invoke("get_page", &managed.tools[0], &call_to("mcp__svc__get_page"))
+            .invoke(
+                "get_page",
+                &managed.tools[0],
+                &call_to("mcp__svc__get_page"),
+            )
             .await;
-        assert_eq!(outcome.status, OutcomeStatus::Refused, "旧定义拒调是拒绝，不是失败");
-        assert!(!outcome.content.contains("结果未知"), "根本没发出请求，没有未知可言");
-        assert_eq!(fresh.calls.lock().unwrap().len(), 0, "不许按旧定义盲调新实例");
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Refused,
+            "旧定义拒调是拒绝，不是失败"
+        );
+        assert!(
+            !outcome.content.contains("结果未知"),
+            "根本没发出请求，没有未知可言"
+        );
+        assert_eq!(
+            fresh.calls.lock().unwrap().len(),
+            0,
+            "不许按旧定义盲调新实例"
+        );
     }
 
     /// 监视器路径：transport 死亡通知触发一条断开事实，之后的调用被短路，
@@ -2125,15 +2231,28 @@ mod tests {
         );
 
         let outcome = managed
-            .invoke("get_page", &managed.tools[0], &call_to("mcp__svc__get_page"))
+            .invoke(
+                "get_page",
+                &managed.tools[0],
+                &call_to("mcp__svc__get_page"),
+            )
             .await;
-        assert!(outcome.content.contains("--mcp-reconnect"), "短路失败要带恢复指引");
-        assert!(outcome.execution.is_none(), "没发出的请求没有执行边界可交代");
+        assert!(
+            outcome.content.contains("--mcp-reconnect"),
+            "短路失败要带恢复指引"
+        );
+        assert!(
+            outcome.execution.is_none(),
+            "没发出的请求没有执行边界可交代"
+        );
         assert_eq!(
             count_lifecycle(&sink, McpLifecycleKind::Disconnected),
             1,
             "断开按连接记账，新调用不复读"
         );
-        assert!(fake.calls.lock().unwrap().is_empty(), "短路调用不得触碰 Server");
+        assert!(
+            fake.calls.lock().unwrap().is_empty(),
+            "短路调用不得触碰 Server"
+        );
     }
 }

@@ -260,6 +260,20 @@ pub enum AuditEvent {
         /// 执行层提供的故障事实。
         failure: McpCallFailure,
     },
+    /// 沙箱能力降级：隔离未被证明生效时的显式落账。
+    ///
+    /// 与 `SandboxApplied` 分开：`SandboxApplied` 记录进程边界是否纳管，
+    /// 本条记录文件系统/网络等切片未能生效或未实测。缺能力时必须留证，
+    /// 否则报表会把"没试过"当成"没问题"。`fact` 携带稳定事件名与原因，
+    /// 供 `--report` 与审计按结构判断，不靠中文理由文本匹配。
+    SandboxDegraded {
+        /// 轮次号；连接级降级（MCP 子进程）为 0。
+        turn: u32,
+        /// 触发判定的调用，用于和 `ToolRequested` 关联。
+        call: ToolCall,
+        /// 降级事实：原因与各切片状态。
+        fact: crate::domain::sandbox_fact::SandboxDegradedFact,
+    },
 }
 
 impl AuditEvent {
@@ -281,7 +295,8 @@ impl AuditEvent {
             | Self::SummaryGenerated { turn, .. }
             | Self::SummaryFailed { turn, .. }
             | Self::McpLifecycle { turn, .. }
-            | Self::McpCallFailed { turn, .. } => *turn,
+            | Self::McpCallFailed { turn, .. }
+            | Self::SandboxDegraded { turn, .. } => *turn,
         }
     }
 }

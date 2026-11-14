@@ -119,7 +119,10 @@ pub enum UnisolatedDecision {
     Allowed,
     /// 拒绝执行。`reason` 含未生效声明与可执行建议；`stable_code` 固定为
     /// [`REFUSAL_CODE_UNISOLATED`]，执行层原样带回给模型与调用方。
-    Refused { reason: String, stable_code: &'static str },
+    Refused {
+        reason: String,
+        stable_code: &'static str,
+    },
 }
 
 /// 缺少文件与网络隔离时，判断一条开放命令是否允许执行。
@@ -237,8 +240,7 @@ impl UnisolatedCommand {
             return UnisolatedCommand::Open;
         }
         let rest_is_baseline = segments.all(|segment| {
-            segment_baseline(segment) == UnisolatedCommand::Baseline
-                || observer_baseline(segment)
+            segment_baseline(segment) == UnisolatedCommand::Baseline || observer_baseline(segment)
         });
         if rest_is_baseline {
             UnisolatedCommand::Baseline
@@ -368,7 +370,11 @@ fn python_unittest_baseline(segment: &CommandSegment) -> UnisolatedCommand {
     let words: Vec<&str> = segment.arguments().map(|word| word.text.as_str()).collect();
     // 两种基线形状：`-m unittest …` 与 `-I -m unittest …`。
     let is_unittest = matches!(
-        (words.first().copied(), words.get(1).copied(), words.get(2).copied()),
+        (
+            words.first().copied(),
+            words.get(1).copied(),
+            words.get(2).copied()
+        ),
         (Some("-m"), Some("unittest"), _) | (Some("-I"), Some("-m"), Some("unittest"))
     );
     if is_unittest {
@@ -406,10 +412,11 @@ fn git_readonly_baseline(segment: &CommandSegment) -> UnisolatedCommand {
         return UnisolatedCommand::Open;
     }
     // `git diff --output=...` 是写文件选项，必须按开放命令拒绝。
-    let writes_file = segment
-        .words
-        .iter()
-        .any(|word| word.flag_value.as_deref().is_some_and(|_| word.text.starts_with("--output")));
+    let writes_file = segment.words.iter().any(|word| {
+        word.flag_value
+            .as_deref()
+            .is_some_and(|_| word.text.starts_with("--output"))
+    });
     if writes_file {
         return UnisolatedCommand::Open;
     }
@@ -1094,7 +1101,10 @@ mod tests {
 
     /// 构造指定平台的能力：文件与网络隔离恒 false（任何平台都没实现），
     /// 进程沙箱只在 Windows 为 true。不依赖真实 Linux/macOS 机器。
-    fn constructed_capabilities(platform: Platform, has_process_sandbox: bool) -> PlatformCapabilities {
+    fn constructed_capabilities(
+        platform: Platform,
+        has_process_sandbox: bool,
+    ) -> PlatformCapabilities {
         PlatformCapabilities {
             platform,
             has_process_sandbox,
@@ -1243,9 +1253,7 @@ mod tests {
                             "拒绝理由写明隔离未生效: {reason}"
                         );
                     }
-                    other => panic!(
-                        "`{command}` 应被默认拒绝，实际: {other:?}"
-                    ),
+                    other => panic!("`{command}` 应被默认拒绝，实际: {other:?}"),
                 }
             }
         }
@@ -1256,7 +1264,11 @@ mod tests {
     #[test]
     fn explicit_host_opt_in_allows_open_commands_but_isolation_is_still_missing() {
         let capabilities = unix_like_capabilities();
-        let open = ["echo hello", "curl -o out.txt https://example.com", "git push"];
+        let open = [
+            "echo hello",
+            "curl -o out.txt https://example.com",
+            "git push",
+        ];
         for command in open {
             let decision = unisolated_decision(&capabilities, &parse(command), true);
             assert!(
@@ -1265,7 +1277,9 @@ mod tests {
             );
         }
         // 未生效声明与裁决无关：宿主放行后仍然必须附带，让证据如实反映。
-        let statement = capabilities.unisolation_statement().expect("缺隔离能力必有声明");
+        let statement = capabilities
+            .unisolation_statement()
+            .expect("缺隔离能力必有声明");
         assert!(statement.contains("未生效"), "{statement}");
     }
 
@@ -1274,7 +1288,9 @@ mod tests {
     #[test]
     fn windows_process_sandbox_does_not_silence_the_unisolation_statement() {
         let capabilities = windows_like_capabilities();
-        let statement = capabilities.unisolation_statement().expect("Windows 缺文件与网络隔离");
+        let statement = capabilities
+            .unisolation_statement()
+            .expect("Windows 缺文件与网络隔离");
         assert!(statement.contains("未生效"), "{statement}");
         // 开放命令默认拒，与 Linux/macOS 同口径。
         let decision = unisolated_decision(&capabilities, &parse("git push"), false);

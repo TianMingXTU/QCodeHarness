@@ -11,16 +11,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use rig::completion::{
-    AssistantContent, AssistantMessage, CompletionRequest, CompletionResponse, Message,
-    ToolAnnotations as RigToolAnnotations, ToolDefinition, Usage,
-};
 use rig::completion::options::{
     CacheRetention, Effort as RigEffort, GenerationOptions, OnUnsupported, Reasoning,
     Verbosity as RigVerbosity,
 };
+use rig::completion::{
+    AssistantContent, AssistantMessage, CompletionRequest, CompletionResponse, Message,
+    ToolAnnotations as RigToolAnnotations, ToolDefinition, Usage,
+};
 use rig::driver::DynModel;
-use rig::message::{CallId as RigCallId, ToolCall as RigToolCall, ToolFunction, ToolName, ToolResult, ToolResultContent};
+use rig::message::{
+    CallId as RigCallId, ToolCall as RigToolCall, ToolFunction, ToolName, ToolResult,
+    ToolResultContent,
+};
 use rig::operation::Completion;
 use tokio::time::timeout;
 
@@ -289,7 +292,8 @@ fn slices_to_messages(history: &[ContextSlice<'_>]) -> Vec<Message> {
                 messages.push(assistant_message(thought, calls));
                 if !observations.is_empty() {
                     messages.push(Message::tool_results(observations_to_results(
-                        calls, observations,
+                        calls,
+                        observations,
                     )));
                 }
             }
@@ -556,17 +560,28 @@ mod tests {
     async fn hung_model_call_is_cut_off_at_the_timeout() {
         // 永不完成的 future 模拟挂死的连接。时限到达时必须报错，不能让
         // 任务一直等待模型回复。
-        let error = with_call_timeout(std::future::pending::<CompletionResponse>(), Duration::from_millis(20))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ApplicationError::ModelTimeout { seconds: 0 }), "{error}");
+        let error = with_call_timeout(
+            std::future::pending::<CompletionResponse>(),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, ApplicationError::ModelTimeout { seconds: 0 }),
+            "{error}"
+        );
     }
 
     #[test]
     fn request_puts_system_prompt_first() {
         let session = Session::new(SessionId::new("s1"), "任务");
-        let request = build_request(&session.slices(), &spec_with(), &[read_file_spec()], Some("s1"))
-            .unwrap();
+        let request = build_request(
+            &session.slices(),
+            &spec_with(),
+            &[read_file_spec()],
+            Some("s1"),
+        )
+        .unwrap();
 
         assert_eq!(request.system_instructions(), Some("系统提示"));
         assert_eq!(request.chat_history.len(), 2);
@@ -618,7 +633,8 @@ mod tests {
     fn cache_key_follows_the_session() {
         let session = Session::new(SessionId::new("s1"), "任务");
         let first = build_request(&session.slices(), &spec_with(), &[], Some("session-a")).unwrap();
-        let second = build_request(&session.slices(), &spec_with(), &[], Some("session-b")).unwrap();
+        let second =
+            build_request(&session.slices(), &spec_with(), &[], Some("session-b")).unwrap();
 
         assert_eq!(first.options.cache_key.as_deref(), Some("session-a"));
         assert_eq!(second.options.cache_key.as_deref(), Some("session-b"));

@@ -5,6 +5,7 @@
 //! `auto` 始终放行，用于测试和非交互场景（CI、脚本化运行）。
 
 pub mod ai_review;
+pub mod async_gate;
 pub mod auto;
 pub mod cli;
-pub mod async_gate;
+pub mod profile_gate;

@@ -12,9 +12,13 @@ struct Workspace(PathBuf);
 
 impl Workspace {
     fn new(name: &str) -> Self {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "qch-events-rotate-{name}-{}-{stamp}", std::process::id()
+            "qch-events-rotate-{name}-{}-{stamp}",
+            std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -30,9 +34,13 @@ impl Workspace {
     }
 
     fn archives(&self) -> Vec<PathBuf> {
-        fs::read_dir(self.log().parent().unwrap()).unwrap()
+        fs::read_dir(self.log().parent().unwrap())
+            .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "archive"))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "archive")
+            })
             .collect()
     }
 }
@@ -47,7 +55,9 @@ impl Drop for Workspace {
 fn a_nonempty_journal_is_archived_and_replaced_by_an_empty_journal() {
     let workspace = Workspace::new("archive");
     let journal = JsonEventJournal::open(workspace.log()).unwrap();
-    journal.append(None, ServiceEventPayload::ExecutionStarted).unwrap();
+    journal
+        .append(None, ServiceEventPayload::ExecutionStarted)
+        .unwrap();
     drop(journal);
     let original = fs::read(workspace.log()).unwrap();
 
@@ -58,14 +68,24 @@ fn a_nonempty_journal_is_archived_and_replaced_by_an_empty_journal() {
     let archive = report.archive_path.unwrap();
     assert_eq!(archive.parent(), workspace.log().parent());
     let name = archive.file_name().unwrap().to_str().unwrap();
-    let stamp = name.strip_prefix("events.jsonl.").unwrap().strip_suffix(".archive").unwrap();
+    let stamp = name
+        .strip_prefix("events.jsonl.")
+        .unwrap()
+        .strip_suffix(".archive")
+        .unwrap();
     assert!(stamp.parse::<u128>().is_ok());
     assert_eq!(fs::read(&archive).unwrap(), original);
     assert_eq!(fs::metadata(workspace.log()).unwrap().len(), 0);
     assert!(!report.recommendation.is_empty());
     let fresh = JsonEventJournal::open(workspace.log()).unwrap();
     assert_eq!(fresh.latest().unwrap(), 0);
-    assert_eq!(fresh.append(None, ServiceEventPayload::ExecutionStarted).unwrap().sequence, 1);
+    assert_eq!(
+        fresh
+            .append(None, ServiceEventPayload::ExecutionStarted)
+            .unwrap()
+            .sequence,
+        1
+    );
 }
 
 #[test]
@@ -127,7 +147,9 @@ fn damaged_journals_are_archived_without_decoding_or_changing_their_bytes() {
 fn an_active_writer_prevents_rotation_and_keeps_the_original_journal() {
     let workspace = Workspace::new("locked");
     let journal = JsonEventJournal::open(workspace.log()).unwrap();
-    journal.append(None, ServiceEventPayload::ExecutionStarted).unwrap();
+    journal
+        .append(None, ServiceEventPayload::ExecutionStarted)
+        .unwrap();
     let original = fs::read(workspace.log()).unwrap();
 
     let error = rotate_events(&workspace.0).unwrap_err();

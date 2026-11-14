@@ -67,8 +67,8 @@ impl McpLifecycleRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::mcp::{McpFaultKind, McpLifecycleKind};
     use crate::application::memory_evidence::MemoryEvidenceSink;
+    use crate::domain::mcp::{McpFaultKind, McpLifecycleKind};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// 固定时钟：让连接事件的时刻可断言，不受测试执行速度影响。

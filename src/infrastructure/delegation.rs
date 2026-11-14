@@ -24,7 +24,9 @@ use crate::application::delegation::{
     ChildAgentFactory, CleanupFailure, DelegationResult, Subtask, SubtaskOutcome, SubtaskStatus,
     parse_request,
 };
-use crate::application::isolation::{ChangeSet, IsolationWorkspace, WorkspaceIsolation, WorkspaceVerifier};
+use crate::application::isolation::{
+    ChangeSet, IsolationWorkspace, WorkspaceIsolation, WorkspaceVerifier,
+};
 use crate::application::port::{BoxFuture, CancelHandle, ToolInvoker};
 use crate::application::tool_registry::{ToolEntry, ToolSource};
 use crate::domain::agent::AgentSpec;
@@ -166,25 +168,17 @@ impl ToolInvoker for DelegateInvoker {
                     }
                     Err(error) => {
                         result.tasks[index].status = SubtaskStatus::Failed;
-                        result.tasks[index].error =
-                            Some(format!("创建工作区失败: {error}"));
+                        result.tasks[index].error = Some(format!("创建工作区失败: {error}"));
                         result.error = Some(format!("创建工作区失败: {error}"));
                         // 已创建的工作区仍要清理；未创建的任务保持 Skipped。
-                        cleanup(
-                            &*self.isolation,
-                            &subtasks,
-                            &workspaces,
-                            &mut result,
-                        )
-                        .await;
+                        cleanup(&*self.isolation, &subtasks, &workspaces, &mut result).await;
                         return finish(result);
                     }
                 }
             }
 
             let control = Arc::new(BatchControl::default());
-            let mut changes: Vec<Option<ChangeSet>> =
-                (0..subtasks.len()).map(|_| None).collect();
+            let mut changes: Vec<Option<ChangeSet>> = (0..subtasks.len()).map(|_| None).collect();
             let mut next = 0;
             while next < subtasks.len() && !control.is_cancelled() {
                 let end = (next + self.max_subtasks).min(subtasks.len());
@@ -202,16 +196,8 @@ impl ToolInvoker for DelegateInvoker {
                     let isolation = self.isolation.clone();
                     set.spawn(async move {
                         run_child(
-                            index,
-                            subtask,
-                            workspace,
-                            session_id,
-                            isolation,
-                            factory,
-                            verifier,
-                            budget,
-                            deadline,
-                            control,
+                            index, subtask, workspace, session_id, isolation, factory, verifier,
+                            budget, deadline, control,
                         )
                         .await
                     });
@@ -251,9 +237,10 @@ impl ToolInvoker for DelegateInvoker {
                 }
             }
 
-            let all_ready = result.tasks.iter().all(|task| {
-                task.status == SubtaskStatus::Completed && task.verified
-            });
+            let all_ready = result
+                .tasks
+                .iter()
+                .all(|task| task.status == SubtaskStatus::Completed && task.verified);
             if all_ready && result.error.is_none() {
                 let batch: Vec<ChangeSet> = changes.into_iter().flatten().collect();
                 if batch.len() != subtasks.len() {
@@ -289,7 +276,10 @@ struct BatchControl {
 
 impl BatchControl {
     fn register(&self, handle: CancelHandle) {
-        let mut handles = self.handles.lock().unwrap_or_else(|error| error.into_inner());
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if self.cancelled.load(Ordering::SeqCst) {
             handle.cancel();
         }
@@ -298,7 +288,10 @@ impl BatchControl {
 
     fn cancel_all(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        let handles = self.handles.lock().unwrap_or_else(|error| error.into_inner());
+        let handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for handle in handles.iter() {
             handle.cancel();
         }
@@ -348,7 +341,11 @@ async fn run_child(
     };
 
     if control.is_cancelled() {
-        return fail(outcome, "同批其他子任务失败，本任务未运行".to_owned(), &control);
+        return fail(
+            outcome,
+            "同批其他子任务失败，本任务未运行".to_owned(),
+            &control,
+        );
     }
     // scope 必须在子工作区内真实存在，否则项目指令与文件工具会落在
     // 两个不同的根上。物理路径再校验一次，防止链接逃逸。
@@ -473,9 +470,10 @@ async fn cleanup(
 fn finish(result: DelegationResult) -> ToolOutcome {
     let success = result.merged
         && result.cleanup_failures.is_empty()
-        && result.tasks.iter().all(|task| {
-            task.status == SubtaskStatus::Completed && task.verified
-        });
+        && result
+            .tasks
+            .iter()
+            .all(|task| task.status == SubtaskStatus::Completed && task.verified);
     let content = serde_json::to_string(&result).unwrap_or_else(|error| {
         format!(
             "{{\"invocation_id\":{},\"merged\":false,\"tasks\":[],\"cleanup_failures\":[],\"error\":\"结果序列化失败: {error}\"}}",

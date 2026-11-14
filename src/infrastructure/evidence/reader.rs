@@ -348,7 +348,10 @@ mod tests {
         assert!(log.is_sequential());
         // 深度相等：事件类型、字段、轮次号全部还原。
         assert_eq!(log.events, events);
-        assert_eq!(log.started_at(), Some(UNIX_EPOCH + Duration::from_secs(100)));
+        assert_eq!(
+            log.started_at(),
+            Some(UNIX_EPOCH + Duration::from_secs(100))
+        );
         assert_eq!(log.ended_at(), Some(UNIX_EPOCH + Duration::from_secs(108)));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -552,10 +555,7 @@ mod tests {
     fn a_file_with_no_readable_lines_is_an_error() {
         let dir = temp_dir("all-bad");
         let path = dir.join("not-evidence.jsonl");
-        write_lines(
-            &path,
-            &["这不是证据".to_owned(), "{\"a\":1}".to_owned()],
-        );
+        write_lines(&path, &["这不是证据".to_owned(), "{\"a\":1}".to_owned()]);
 
         let error = read_session(&path).unwrap_err();
         assert!(matches!(error, ReadError::NoReadableLines { lines: 2, .. }));
@@ -583,7 +583,11 @@ mod tests {
             .iter()
             .map(|log| log.session_id.as_str().to_owned())
             .collect();
-        assert_eq!(ids, vec!["session-a", "session-b"], "按文件名排序且跳过坏文件");
+        assert_eq!(
+            ids,
+            vec!["session-a", "session-b"],
+            "按文件名排序且跳过坏文件"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -21,9 +21,10 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::application::background_jobs::BackgroundJobRegistry;
 use crate::application::tool_registry::{ToolEntry, ToolSource};
 use crate::domain::tool::ToolOutcome;
-use crate::domain::workspace::{is_protected_path, PathRejected, WorkspacePath, WorkspaceRoot};
+use crate::domain::workspace::{PathRejected, WorkspacePath, WorkspaceRoot, is_protected_path};
 
 /// 内置工具来源：把 [`all_tools`] 包成具名来源。
 ///
@@ -32,12 +33,25 @@ use crate::domain::workspace::{is_protected_path, PathRejected, WorkspacePath, W
 /// 工具来源在装配层可见，注册表不需要知道。
 pub struct BuiltinToolSource {
     root: WorkspaceRoot,
+    /// 后台作业注册表：有值时 run_command 支持 background 参数，把命令
+    /// 交给注册表异步执行；`None` 保持既有同步语义。
+    jobs: Option<std::sync::Arc<dyn BackgroundJobRegistry>>,
 }
 
 impl BuiltinToolSource {
     /// 用 workspace 根构造：内置工具全部限定在这个根内。
     pub fn new(root: WorkspaceRoot) -> Self {
-        Self { root }
+        Self { root, jobs: None }
+    }
+
+    /// 挂上后台作业注册表：run_command 的 background 参数把命令交给它，
+    /// 作业清单工具从同一注册表读，两处看到同一份状态。
+    pub fn with_jobs(
+        mut self,
+        jobs: std::sync::Arc<dyn BackgroundJobRegistry>,
+    ) -> Self {
+        self.jobs = Some(jobs);
+        self
     }
 }
 
@@ -47,7 +61,20 @@ impl ToolSource for BuiltinToolSource {
     }
 
     fn tools(&self) -> Vec<ToolEntry> {
-        all_tools(self.root.clone())
+        let mut tools = all_tools(self.root.clone());
+        if let Some(jobs) = &self.jobs {
+            // 用带注册表的 run_command 覆盖默认条目：同名工具后到者胜，
+            // 语义与 MCP 前缀覆盖一致。
+            if let Some(entry) = tools
+                .iter_mut()
+                .find(|entry| entry.spec.name == shell::RUN_COMMAND)
+            {
+                entry.invoker = std::sync::Arc::new(
+                    shell::RunCommand::new(self.root.clone()).with_jobs(std::sync::Arc::clone(jobs)),
+                );
+            }
+        }
+        tools
     }
 }
 
@@ -118,8 +145,8 @@ pub(crate) fn parse_args<A: DeserializeOwned>(arguments: &Value) -> Result<A, St
 /// 所有操作文件的工具共用这条校验路径，"越界即拒绝、受保护即拒绝"只有
 /// 一种实现。
 pub(crate) fn resolve_in(root: &WorkspaceRoot, raw: &str) -> Result<WorkspacePath, ToolOutcome> {
-    let resolved =
-        WorkspacePath::resolve(root, raw).map_err(|rejected| ToolOutcome::refused(rejected.to_string()))?;
+    let resolved = WorkspacePath::resolve(root, raw)
+        .map_err(|rejected| ToolOutcome::refused(rejected.to_string()))?;
     reject_links_out_of_scope(resolved.as_path(), root.as_path(), raw)
         .map_err(|rejected| ToolOutcome::refused(rejected.to_string()))?;
     Ok(resolved)
@@ -136,7 +163,11 @@ fn physical_path(resolved: &Path) -> Option<PathBuf> {
     let mut current = resolved.to_path_buf();
     loop {
         if let Ok(canonical) = std::fs::canonicalize(&current) {
-            return Some(tail.iter().rev().fold(canonical, |path, part| path.join(part)));
+            return Some(
+                tail.iter()
+                    .rev()
+                    .fold(canonical, |path, part| path.join(part)),
+            );
         }
         tail.push(current.file_name()?.to_os_string());
         if !current.pop() {
@@ -167,12 +198,16 @@ fn reject_links_out_of_scope(resolved: &Path, root: &Path, raw: &str) -> Result<
         return Ok(());
     };
     let Ok(relative) = physical.strip_prefix(&canonical_root) else {
-        return Err(PathRejected::Escape { raw: raw.to_owned() });
+        return Err(PathRejected::Escape {
+            raw: raw.to_owned(),
+        });
     };
     // 规范化后重新判断受保护：链接指向 .git 时，物理路径的首组件是
     // .git，词法一侧看到的却是 junction 的名字。
     if is_protected_path(relative) {
-        return Err(PathRejected::Protected { raw: raw.to_owned() });
+        return Err(PathRejected::Protected {
+            raw: raw.to_owned(),
+        });
     }
     Ok(())
 }
@@ -253,7 +288,8 @@ mod tests {
             // 多套一层目录也一样：链接在中间那段。
             "jgit/refs/heads/main",
         ] {
-            let refused = resolve_in(&root, path).expect_err("经 junction 落到受保护路径，应被拒绝");
+            let refused =
+                resolve_in(&root, path).expect_err("经 junction 落到受保护路径，应被拒绝");
             assert!(
                 refused.content.contains("受保护"),
                 "`{path}` 应按受保护拒绝，实际: {}",
@@ -277,7 +313,8 @@ mod tests {
         fs::write(outside.join("secret.txt"), "OUTSIDE\n").unwrap();
         link_dir(&dir, "jout", &outside);
 
-        let refused = resolve_in(&root, "jout/secret.txt").expect_err("经 junction 逃出 workspace 应被拒绝");
+        let refused =
+            resolve_in(&root, "jout/secret.txt").expect_err("经 junction 逃出 workspace 应被拒绝");
         assert!(
             refused.content.contains("只允许"),
             "应按越界拒绝，实际: {}",
@@ -293,8 +330,14 @@ mod tests {
     fn a_path_that_does_not_exist_yet_is_still_allowed() {
         let (dir, root) = real_workspace("newfile");
 
-        assert!(resolve_in(&root, "src/brand_new.rs").is_ok(), "新文件应放行");
-        assert!(resolve_in(&root, "new_dir/x.txt").is_ok(), "新目录下的新文件应放行");
+        assert!(
+            resolve_in(&root, "src/brand_new.rs").is_ok(),
+            "新文件应放行"
+        );
+        assert!(
+            resolve_in(&root, "new_dir/x.txt").is_ok(),
+            "新目录下的新文件应放行"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -305,8 +348,8 @@ mod tests {
         let (dir, root) = real_workspace("newfile-junction");
         link_dir(&dir, "jgit", &dir.join(".git"));
 
-        let refused =
-            resolve_in(&root, "jgit/hooks/pre-commit").expect_err("经 junction 往 .git 里写新文件应被拒绝");
+        let refused = resolve_in(&root, "jgit/hooks/pre-commit")
+            .expect_err("经 junction 往 .git 里写新文件应被拒绝");
         assert!(
             refused.content.contains("受保护"),
             "应按受保护拒绝，实际: {}",

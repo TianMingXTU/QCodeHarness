@@ -60,8 +60,8 @@ pub struct LocalExtensionStore {
 impl LocalExtensionStore {
     /// 授权状态写入平台用户配置目录；清单仍从工作区读取。
     pub fn new(workspace: &Path) -> Self {
-        let directory = crate::infrastructure::config::user_directory()
-            .map(|dir| dir.join("extension-state"));
+        let directory =
+            crate::infrastructure::config::user_directory().map(|dir| dir.join("extension-state"));
         Self::with_state_directory(workspace, directory)
     }
 
@@ -304,8 +304,7 @@ impl LocalExtensionStore {
         let result = result
             .map_err(|source| io_error(&temp, source))
             .and_then(|_| {
-                fs::rename(&temp, destination)
-                    .map_err(|source| io_error(destination, source))
+                fs::rename(&temp, destination).map_err(|source| io_error(destination, source))
             });
         if let Err(error) = result {
             if let Err(cleanup) = fs::remove_file(&temp) {
@@ -459,9 +458,7 @@ fn read_manifest(path: &Path) -> Result<Manifest, ExtensionStoreError> {
 
 fn reject_link_itself(path: &Path) -> Result<(), ExtensionStoreError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if is_link(&metadata) => {
-            Err(invalid(path, "拒绝符号链接或 reparse point"))
-        }
+        Ok(metadata) if is_link(&metadata) => Err(invalid(path, "拒绝符号链接或 reparse point")),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(io_error(path, source)),

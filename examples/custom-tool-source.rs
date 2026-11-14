@@ -68,11 +68,7 @@ async fn main() {
     ];
     let registry = ToolRegistry::from_sources(&sources);
 
-    let names: Vec<String> = registry
-        .specs()
-        .into_iter()
-        .map(|spec| spec.name)
-        .collect();
+    let names: Vec<String> = registry.specs().into_iter().map(|spec| spec.name).collect();
     println!("注册表里有 {} 个工具: {names:?}", names.len());
 
     let call = ToolCall {

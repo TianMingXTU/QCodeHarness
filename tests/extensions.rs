@@ -124,7 +124,9 @@ fn a_workspace_under_a_linked_parent_still_loads() {
     // 工作区自身走链接（macOS 的 /var 就是这样）：祖先链接不能拦，
     // 工作区内部的链接仍然要拦。
     let store = LocalExtensionStore::with_state_directory(&link, Some(workspace.0.join("cfg")));
-    let registry = store.load(&fake_tools(Arc::new(Recorder::default()))).unwrap();
+    let registry = store
+        .load(&fake_tools(Arc::new(Recorder::default())))
+        .unwrap();
     assert!(registry.list().unwrap().is_empty());
 
     // 工作区内部的链接仍要拒绝：把扩展目录所在的那一级做成链接。
@@ -607,10 +609,20 @@ async fn role_change_during_approval_invalidates_the_previous_roles_request() {
     let gate = Arc::new(ChangeRoleDuringApproval(Mutex::new(None)));
     deps.policy = policy(PolicyVerdict::RequireApproval);
     deps.approvals = gate.clone();
-    let adapters = registry.adapters(&deps, AgentRole::Coder, ExtensionSelection::all(), limiter()).unwrap();
+    let adapters = registry
+        .adapters(
+            &deps,
+            AgentRole::Coder,
+            ExtensionSelection::all(),
+            limiter(),
+        )
+        .unwrap();
     *gate.0.lock().unwrap() = Some(adapters.hooks.clone());
     let tools = ToolRegistry::from_sources(&[adapters.source]);
-    assert_eq!(tools.invoke(&action("write_file")).await.status, OutcomeStatus::Refused);
+    assert_eq!(
+        tools.invoke(&action("write_file")).await.status,
+        OutcomeStatus::Refused
+    );
     assert!(recorder.0.lock().unwrap().is_empty());
     gate.0.lock().unwrap().take();
 }

@@ -118,7 +118,10 @@ impl GitWorktreeManager {
             }
             Ok(_) => return Err("隔离实例的 Git 配置文件不是普通文件".to_owned()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                File::create(&disabled).map_err(io_error)?.sync_all().map_err(io_error)?;
+                File::create(&disabled)
+                    .map_err(io_error)?
+                    .sync_all()
+                    .map_err(io_error)?;
             }
             Err(error) => return Err(io_error(error)),
         }
@@ -274,7 +277,11 @@ impl GitWorktreeManager {
             .join(format!(".{}.workspace.json", workspace.id)))
     }
 
-    async fn check_repository(&self, workspace: &IsolationWorkspace, marker: &[u8]) -> Result<(), String> {
+    async fn check_repository(
+        &self,
+        workspace: &IsolationWorkspace,
+        marker: &[u8],
+    ) -> Result<(), String> {
         let main_git = self.main_git_dir()?;
         let gitdir = self.child_git_dir(marker)?;
         let worktrees = main_git.join("worktrees");
@@ -289,8 +296,7 @@ impl GitWorktreeManager {
         let common_file = gitdir.join("commondir");
         let target = if fs::symlink_metadata(&common_file).is_ok() {
             let bytes = fs::read(&common_file).map_err(io_error)?;
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|_| "commondir 记录不是文本")?;
+            let text = std::str::from_utf8(&bytes).map_err(|_| "commondir 记录不是文本")?;
             PathBuf::from(text.trim())
         } else {
             gitdir.clone()
@@ -328,7 +334,8 @@ impl GitWorktreeManager {
             return fs::canonicalize(self.root.join(".git")).map_err(io_error);
         }
         // 父仓库的 .git 是文件时，marker 保存其 gitdir: 内容。
-        let text = std::str::from_utf8(&self.root_marker).map_err(|_| "父工作区的 .git 入口无效")?;
+        let text =
+            std::str::from_utf8(&self.root_marker).map_err(|_| "父工作区的 .git 入口无效")?;
         let target = text
             .trim()
             .strip_prefix("gitdir:")
@@ -1201,7 +1208,10 @@ fn check_nested_repositories(root: &Path, directory: &Path) -> Result<(), String
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.trim_end_matches([' ', '.']).eq_ignore_ascii_case(".git") {
+        if name
+            .trim_end_matches([' ', '.'])
+            .eq_ignore_ascii_case(".git")
+        {
             if directory != root {
                 return Err(format!("隔离变更含嵌套仓库: {}", path.display()));
             }

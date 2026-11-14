@@ -131,12 +131,13 @@ impl SuccessCriteria {
             }
         }
         if let Some(minimum) = self.min_turns
-            && observed.turns_used < minimum {
-                failures.push(format!(
-                    "只跑了 {} 轮，长任务要求至少 {minimum} 轮",
-                    observed.turns_used
-                ));
-            }
+            && observed.turns_used < minimum
+        {
+            failures.push(format!(
+                "只跑了 {} 轮，长任务要求至少 {minimum} 轮",
+                observed.turns_used
+            ));
+        }
         // 判定与展示使用同一份违规清单：runner 打印"重复副作用 N 次"时也数
         // 这份清单，不统计所有重复过的命令。模型修完缺陷后重跑全量测试属于
         // 正常迭代，不算副作用重复。
@@ -363,11 +364,7 @@ mod tests {
 
     #[test]
     fn each_unmet_criterion_is_reported_individually() {
-        let failures = criteria().evaluate(observation(
-            false,
-            false,
-            "修好了，测试应该能过",
-        ));
+        let failures = criteria().evaluate(observation(false, false, "修好了，测试应该能过"));
         assert_eq!(failures.len(), 3, "三条判据各自未满足：{failures:?}");
         assert!(failures[0].contains("cargo test"));
         assert!(failures[1].contains("改动"));
@@ -431,7 +428,10 @@ mod tests {
             },
         };
         let text = serde_json::to_string(&result).unwrap();
-        assert_eq!(serde_json::from_str::<BenchmarkResult>(&text).unwrap(), result);
+        assert_eq!(
+            serde_json::from_str::<BenchmarkResult>(&text).unwrap(),
+            result
+        );
     }
 
     #[test]
@@ -443,7 +443,10 @@ mod tests {
         let result: BenchmarkResult = serde_json::from_str(text).unwrap();
 
         assert_eq!(result.metrics, BenchmarkMetrics::default());
-        assert_eq!(result.metrics.input_tokens, None, "旧文件没报用量，不能补 0");
+        assert_eq!(
+            result.metrics.input_tokens, None,
+            "旧文件没报用量，不能补 0"
+        );
     }
 
     // ── 长任务判据 ───────────────────────────────────────────────────

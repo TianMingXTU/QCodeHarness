@@ -7,6 +7,7 @@
 //! 不重写传输与协议。签名使用领域类型，不用 rig 的 `CompletionRequest`，
 //! 否则"怎么拼 chat_history、怎么读 choice"会渗进应用层，防腐层失效。
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -115,7 +116,7 @@ pub trait ModelGateway: Send + Sync {
 /// [`id`](LlmProvider::id) 从
 /// [`ProviderRegistry`](crate::application::provider_registry::ProviderRegistry)
 /// 选择，核心循环与网关签名不感知具体供应商。
-pub trait LlmProvider: Send + Sync {
+pub trait LlmProvider: Any + Send + Sync {
     /// 提供方标识，注册表的查找键与查重键；重复 `id` 的登记会被忽略。
     fn id(&self) -> &str;
 
@@ -124,6 +125,11 @@ pub trait LlmProvider: Send + Sync {
     /// 网关承载连接与凭据，构造一次后长期复用。按角色覆盖模型名走请求上
     /// 的 `model` 字段，不需要为每个角色另建网关。
     fn gateway(&self) -> Arc<dyn ModelGateway>;
+
+    /// 装配层按具体提供方读取配置诊断信息时使用；未实现时返回 `None`。
+    fn as_any(&self) -> Option<&dyn Any> {
+        None
+    }
 }
 
 /// 工具执行器：按调用意图执行。
@@ -197,15 +203,20 @@ pub trait ApprovalGate: Send + Sync {
     fn bind_cancel(&self, _cancel: CancelHandle) {}
 }
 
-/// 运行挂点：模型调用与工具执行前后的观察者。
+/// 工具执行前的裁决。拒绝原因会写入证据账本并回填给模型。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreToolUseVerdict {
+    Allow,
+    Deny(String),
+}
+
+/// 运行挂点：模型调用与工具执行前后的唯一扩展链。
 ///
 /// 与 [`ApprovalGate`] 分工：闸门决定调用能否发生，结局只有放行或拒绝；
-/// 挂点只观察，不改写、不否决，适合证据外发、结构化事件流、AI 审查旁路。
-/// 需要拦截能力时用策略与闸门。
-///
-/// 挂点是旁路：方法返回 `()`，没有错误通道。挂点自身的失败（外发超时、
-/// 下游断连）由实现吞掉并降级，不能让一次遥测失败中断任务。所有方法
-/// 都有空实现，实现方只挂关心的点。
+/// 观察方法只做旁路记录，不改写、不否决。执行前否决由
+/// [`RunHooks::pre_tool_use`] 这一个默认方法承载，避免装配第二套挂点链。
+/// 挂点自身失败（外发超时、下游断连）由实现显式转成拒绝原因，不能让
+/// 未决状态被当作放行。
 pub trait RunHooks: Send + Sync {
     /// 一次模型调用即将发出。`request.history` 是裁剪后发给模型的历史。
     fn before_model_call<'a>(&'a self, _request: &'a ModelRequest<'a>) -> BoxFuture<'a, ()> {
@@ -226,6 +237,16 @@ pub trait RunHooks: Send + Sync {
     /// 一次工具调用已执行完毕，观察即将回填。
     fn after_tool_result<'a>(&'a self, _call: &'a ToolCall, _outcome: &'a ToolOutcome) -> BoxFuture<'a, ()> {
         Box::pin(async {})
+    }
+
+    /// 工具执行前的否决裁决。返回 `Deny(reason)` 时调用方必须放弃执行，
+    /// 并把拒绝作为观察回填。默认实现仅保留既有观察语义并放行，因此
+    /// 未装配外部命令挂点的运行行为不变。
+    fn pre_tool_use<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, PreToolUseVerdict> {
+        Box::pin(async move {
+            self.before_tool_call(call).await;
+            PreToolUseVerdict::Allow
+        })
     }
 }
 

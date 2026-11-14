@@ -38,7 +38,10 @@ pub struct ServiceError {
 impl ServiceError {
     /// 构造带稳定错误码的错误；消息不参与调用方的控制流判断。
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { code: code.into(), message: message.into() }
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
     }
 }
 
@@ -79,18 +82,48 @@ pub struct TaskView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServiceCommand {
-    Create { goal: String, kind: TaskKind },
+    Create {
+        goal: String,
+        kind: TaskKind,
+    },
     List,
-    Get { task_id: String },
-    Input { task_id: String, message_id: String, text: String },
-    Approvals { task_id: Option<String> },
-    Decide { approval_id: String, task_id: String, execution_id: String, allow: bool },
-    Cancel { task_id: String },
-    Continue { task_id: String },
-    Fork { task_id: String, goal: Option<String> },
-    Merge { task_id: String },
-    Cleanup { task_id: String },
-    Events { after: u64, limit: usize },
+    Get {
+        task_id: String,
+    },
+    Input {
+        task_id: String,
+        message_id: String,
+        text: String,
+    },
+    Approvals {
+        task_id: Option<String>,
+    },
+    Decide {
+        approval_id: String,
+        task_id: String,
+        execution_id: String,
+        allow: bool,
+    },
+    Cancel {
+        task_id: String,
+    },
+    Continue {
+        task_id: String,
+    },
+    Fork {
+        task_id: String,
+        goal: Option<String>,
+    },
+    Merge {
+        task_id: String,
+    },
+    Cleanup {
+        task_id: String,
+    },
+    Events {
+        after: u64,
+        limit: usize,
+    },
     Shutdown,
 }
 
@@ -98,11 +131,23 @@ pub enum ServiceCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ServiceReply {
-    Task { task: Box<TaskView> },
-    Tasks { tasks: Vec<TaskView> },
-    Accepted { task_id: String, execution_id: Option<String> },
-    PendingApprovals { requests: Vec<PendingApproval> },
-    Events { events: Vec<ServiceEvent>, next: u64 },
+    Task {
+        task: Box<TaskView>,
+    },
+    Tasks {
+        tasks: Vec<TaskView>,
+    },
+    Accepted {
+        task_id: String,
+        execution_id: Option<String>,
+    },
+    PendingApprovals {
+        requests: Vec<PendingApproval>,
+    },
+    Events {
+        events: Vec<ServiceEvent>,
+        next: u64,
+    },
     Shutdown,
 }
 
@@ -154,19 +199,49 @@ pub struct ServiceEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServiceEventPayload {
-    TaskCreated { task: TaskView },
+    TaskCreated {
+        task: TaskView,
+    },
     ExecutionStarted,
-    Audit { event: AuditEvent },
-    ModelCallStarted { role: AgentRole },
-    ModelCallFinished { text: String, calls: Vec<ToolCall>, retried: bool },
-    ApprovalWaiting { request: PendingApproval },
-    ApprovalResolved { approval_id: String, allowed: bool, reason: Option<String> },
-    InputReceived { message_id: String, text: String },
-    InputApplied { message_id: String },
+    Audit {
+        event: AuditEvent,
+    },
+    ModelCallStarted {
+        role: AgentRole,
+    },
+    ModelCallFinished {
+        text: String,
+        calls: Vec<ToolCall>,
+        retried: bool,
+    },
+    ApprovalWaiting {
+        request: PendingApproval,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        allowed: bool,
+        reason: Option<String>,
+    },
+    InputReceived {
+        message_id: String,
+        text: String,
+    },
+    InputApplied {
+        message_id: String,
+    },
     CancelRequested,
-    Stopped { status: TaskStatus, error: Option<String> },
-    Completed { answer: String },
-    Forked { source_task: String },
-    WorkspaceMerged { verification: String },
+    Stopped {
+        status: TaskStatus,
+        error: Option<String>,
+    },
+    Completed {
+        answer: String,
+    },
+    Forked {
+        source_task: String,
+    },
+    WorkspaceMerged {
+        verification: String,
+    },
     WorkspaceRemoved,
 }

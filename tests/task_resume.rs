@@ -18,14 +18,13 @@ use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::agent_run::{AgentDependencies, RunState};
 use qcode_harness::application::context_policy::DefaultContextPolicy;
 use qcode_harness::application::error::ApplicationError;
+use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::application::orchestrator::{EvidenceFactory, Orchestrator};
 use qcode_harness::application::port::{
     ApprovalGate, ApprovalRequest, BoxFuture, Decision, EvidenceSink, NoopHooks, Timestamp,
     ToolInvoker,
 };
-use qcode_harness::application::snapshot::{
-    SessionStore, StoreError, TaskSnapshot, TaskStore,
-};
+use qcode_harness::application::snapshot::{SessionStore, StoreError, TaskSnapshot, TaskStore};
 use qcode_harness::application::task_resume::{self, ResumeCheck, WorktreeChangePolicy};
 use qcode_harness::application::tool_registry::{ToolEntry, ToolRegistry};
 use qcode_harness::application::worktree::WorktreeScanner;
@@ -38,11 +37,10 @@ use qcode_harness::domain::tool::{ToolAnnotations, ToolCall, ToolOutcome, ToolSp
 use qcode_harness::domain::worktree::{WorktreeEntry, WorktreeManifest};
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
 use qcode_harness::infrastructure::clock::SystemClock;
-use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 use qcode_harness::infrastructure::session_store::JsonSessionStore;
 use qcode_harness::infrastructure::task_store::JsonTaskStore;
-use qcode_harness::infrastructure::worktree::{scan_workspace, RootedWorktreeScanner};
+use qcode_harness::infrastructure::worktree::{RootedWorktreeScanner, scan_workspace};
 
 use rig::completion::Message;
 use rig::message::UserContent;
@@ -262,8 +260,8 @@ async fn a_mismatched_session_id_is_rejected() {
 
     let snapshot = store.load(&TaskId::new("t-sid")).unwrap().unwrap();
 
-    let error = task_resume::check_resumable(&snapshot, Some(&SessionId::new("别的会话")))
-        .unwrap_err();
+    let error =
+        task_resume::check_resumable(&snapshot, Some(&SessionId::new("别的会话"))).unwrap_err();
     assert!(
         error.to_string().contains("会话 ID 不一致"),
         "会话 ID 对不上必须被明确拒绝: {error}"
@@ -295,14 +293,24 @@ fn a_modified_worktree_is_detected() {
         hash: 3,
         size: 1,
     });
-    let check = task_resume::check_worktree(&saved, &FixedScanner { manifest: with_extra });
+    let check = task_resume::check_worktree(
+        &saved,
+        &FixedScanner {
+            manifest: with_extra,
+        },
+    );
     assert!(
         matches!(check, ResumeCheck::WorktreeChanged { .. }),
         "新增文件必须被检出，实际 {check:?}"
     );
 
     // 没动过 → 干净。
-    let check = task_resume::check_worktree(&saved, &FixedScanner { manifest: saved.clone() });
+    let check = task_resume::check_worktree(
+        &saved,
+        &FixedScanner {
+            manifest: saved.clone(),
+        },
+    );
     assert_eq!(check, ResumeCheck::Clean);
 }
 
@@ -467,7 +475,10 @@ async fn after_resume_every_step_sees_all_earlier_conclusions() {
     // 最后一步（第 4 步）的请求里，前三步的结论都在。
     let last = history_text(&mock2, 2);
     for conclusion in ["第一步的结论", "第二步的结论", "第三步的结论"] {
-        assert!(last.contains(conclusion), "第 4 步应看见「{conclusion}」: {last}");
+        assert!(
+            last.contains(conclusion),
+            "第 4 步应看见「{conclusion}」: {last}"
+        );
     }
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -622,7 +633,11 @@ async fn resuming_after_committed_rounds_does_not_duplicate_the_step_prompt() {
     let mock1 = MockCompletionModel::from_turns(vec![
         MockTurn::text("第一步的结论"),
         MockTurn::tool_call("call_1", "read_file", json!({"path": "a"})),
-        MockTurn::tool_call("call_2", "write_file", json!({"path": "a", "content": "第二版"})),
+        MockTurn::tool_call(
+            "call_2",
+            "write_file",
+            json!({"path": "a", "content": "第二版"}),
+        ),
         MockTurn::text("第二步的结论"),
         MockTurn::tool_call("call_3", "read_file", json!({"path": "b"})),
     ]);
@@ -637,7 +652,10 @@ async fn resuming_after_committed_rounds_does_not_duplicate_the_step_prompt() {
     assert_eq!(snapshot.task.current_index(), 2, "前两步已完成");
     let last = snapshot.run.session.turns.last().cloned();
     assert!(
-        matches!(last, Some(qcode_harness::domain::session::Turn::Observation(_))),
+        matches!(
+            last,
+            Some(qcode_harness::domain::session::Turn::Observation(_))
+        ),
         "末条应是观察而非交代，否则测的不是半步中断: {last:?}"
     );
 
@@ -704,7 +722,10 @@ async fn a_real_worktree_change_is_refused_before_resuming() {
     // 快照时的工作区是干净的。
     let saved = scan_workspace(&workspace).unwrap();
     let scanner = RootedWorktreeScanner::new(&workspace);
-    assert_eq!(task_resume::check_worktree(&saved, &scanner), ResumeCheck::Clean);
+    assert_eq!(
+        task_resume::check_worktree(&saved, &scanner),
+        ResumeCheck::Clean
+    );
 
     // 有人在中断期间改了文件。
     fs::write(workspace.join("a.txt"), "被人改过了").unwrap();
@@ -873,7 +894,10 @@ async fn a_task_snapshot_on_disk_has_the_documented_shape() {
     let outputs = wire["completed_outputs"].as_array().unwrap();
     assert_eq!(outputs.len(), 1);
     for key in ["step", "role", "answer"] {
-        assert!(outputs[0].get(key).is_some(), "结论应有字段 `{key}`: {outputs:?}");
+        assert!(
+            outputs[0].get(key).is_some(),
+            "结论应有字段 `{key}`: {outputs:?}"
+        );
     }
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -942,7 +966,10 @@ struct RecordingInvoker {
 
 impl ToolInvoker for RecordingInvoker {
     fn invoke<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolOutcome> {
-        self.executed.lock().unwrap().push(call.arguments.to_string());
+        self.executed
+            .lock()
+            .unwrap()
+            .push(call.arguments.to_string());
         Box::pin(async { ToolOutcome::success("文件内容") })
     }
 }
@@ -1161,12 +1188,9 @@ async fn resuming_a_task_interrupted_at_the_approval_gate_asks_the_human_again()
     deps.policy = approval_policy();
     deps.session_store = Some(session_store.clone());
 
-    let mut orchestrator = Orchestrator::new(
-        deps,
-        Budget::new(20),
-        shared_factory(evidence.clone()),
-    )
-    .with_task_store(task_store.clone());
+    let mut orchestrator =
+        Orchestrator::new(deps, Budget::new(20), shared_factory(evidence.clone()))
+            .with_task_store(task_store.clone());
     let outcome = orchestrator.resume(task_snapshot).await.unwrap();
 
     assert_eq!(outcome.answer, "第四步的结论");
@@ -1232,7 +1256,10 @@ async fn resuming_a_task_interrupted_during_a_tool_call_does_not_run_it_again() 
     }
 
     // 会话快照停在"正要执行这一次调用"，副作用可能已经发生。
-    let task_snapshot = task_store.load(&TaskId::new("t-inflight")).unwrap().unwrap();
+    let task_snapshot = task_store
+        .load(&TaskId::new("t-inflight"))
+        .unwrap()
+        .unwrap();
     let session_snapshot = session_store
         .load(&task_snapshot.run.session_id)
         .unwrap()
@@ -1242,7 +1269,11 @@ async fn resuming_a_task_interrupted_during_a_tool_call_does_not_run_it_again() 
         "会话快照应停在执行中，实际 {:?}",
         session_snapshot.state
     );
-    assert_eq!(*invoker.executed.lock().unwrap(), 1, "第一次运行确实调起了工具");
+    assert_eq!(
+        *invoker.executed.lock().unwrap(),
+        1,
+        "第一次运行确实调起了工具"
+    );
 
     // 恢复：这次的执行器会正常返回。
     let second_invoker = Arc::new(RecordingInvoker::default());
@@ -1255,12 +1286,9 @@ async fn resuming_a_task_interrupted_during_a_tool_call_does_not_run_it_again() 
     deps.tools = registry_with(second_invoker.clone());
     deps.session_store = Some(session_store.clone());
 
-    let mut orchestrator = Orchestrator::new(
-        deps,
-        Budget::new(20),
-        shared_factory(evidence.clone()),
-    )
-    .with_task_store(task_store.clone());
+    let mut orchestrator =
+        Orchestrator::new(deps, Budget::new(20), shared_factory(evidence.clone()))
+            .with_task_store(task_store.clone());
     let outcome = orchestrator.resume(task_snapshot).await.unwrap();
 
     assert_eq!(outcome.answer, "第四步的结论");

@@ -23,6 +23,10 @@ dotenvy = "0.15.7"
 # 改用 native-tls：Windows 上直接走系统 schannel。
 # 依赖重命名为 rig，代码里用 `rig::` 引用；lib 本名是 rig_core。
 rig = { package = "rig-core", version = "0.45.0", default-features = false, features = ["reqwest", "native-tls"] }
+# Anthropic Messages 提供方的生产传输：rig 的共享 reqwest 客户端。
+# 该 crate 已是 rig 的 reqwest feature 的传递依赖，这里只是把版本钉给
+# 直接使用；必须显式选 native-tls，默认集是 rustls（验收项见上）。
+rig-reqwest = { version = "0.45.0", default-features = false, features = ["native-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2"

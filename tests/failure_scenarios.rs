@@ -9,27 +9,36 @@ use std::time::{Duration, UNIX_EPOCH};
 use qcode_harness::application::report::{BenchmarkReport, SessionLog, summarize};
 use qcode_harness::domain::evidence::{AuditEvent, Evidence, TokenUsage};
 use qcode_harness::domain::ids::CallId;
-use qcode_harness::domain::mcp::{McpCallFailure, McpFaultKind, McpLifecycleFact, McpLifecycleKind};
+use qcode_harness::domain::mcp::{
+    McpCallFailure, McpFaultKind, McpLifecycleFact, McpLifecycleKind,
+};
 use qcode_harness::domain::tool::{ToolCall, ToolOutcome};
 use serde_json::json;
 
 /// 一条带毫秒时序的证据：序号即毫秒偏移，便于核对墙钟与等待。
 fn ev(sequence: u64, event: AuditEvent) -> Evidence {
-    Evidence::new(sequence, UNIX_EPOCH + Duration::from_millis(sequence * 100), event)
+    Evidence::new(
+        sequence,
+        UNIX_EPOCH + Duration::from_millis(sequence * 100),
+        event,
+    )
 }
 
 fn thought(sequence: u64, turn: u32, text: &str) -> Evidence {
-    ev(sequence, AuditEvent::Thought {
-        turn,
-        text: text.to_owned(),
-        usage: TokenUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cost_usd: None,
+    ev(
+        sequence,
+        AuditEvent::Thought {
+            turn,
+            text: text.to_owned(),
+            usage: TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cost_usd: None,
+            },
         },
-    })
+    )
 }
 
 fn call(name: &str) -> ToolCall {
@@ -188,7 +197,10 @@ fn sandbox_protection_is_tracked_per_run() {
 
     let summary = summarize(&session);
     assert_eq!(summary.sandbox_protected_runs, 2, "两次实际受进程沙箱保护");
-    assert_eq!(summary.sandbox_unprotected_runs, 2, "边界失败与 MCP 各记一次");
+    assert_eq!(
+        summary.sandbox_unprotected_runs, 2,
+        "边界失败与 MCP 各记一次"
+    );
 
     // 未受保护的执行要能落到 JSON，供自动化流水线判定沙箱是否全程生效。
     let json = qcode_harness::application::report::render_json(&BenchmarkReport::from_sessions(&[

@@ -50,7 +50,14 @@ fn invalid_event_lines_do_not_hide_later_readable_events() {
     assert_eq!(summary.sequence_gaps, Some(0));
     assert_eq!(summary.last_sequence, Some(2));
     assert_eq!(summary.corrupt_files.len(), 3);
-    assert_eq!(summary.corrupt_files.iter().map(|issue| issue.line).collect::<Vec<_>>(), vec![Some(2), Some(3), Some(4)]);
+    assert_eq!(
+        summary
+            .corrupt_files
+            .iter()
+            .map(|issue| issue.line)
+            .collect::<Vec<_>>(),
+        vec![Some(2), Some(3), Some(4)]
+    );
     assert!(summary.corrupt_files[1].reason.contains("version"));
 }
 

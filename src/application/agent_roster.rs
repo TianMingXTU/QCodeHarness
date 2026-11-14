@@ -46,8 +46,7 @@ impl AgentRoster {
     /// runner 以它作为角色边界的唯一依据，在调用层校验每一次工具调用
     /// （见 `application::agent_run`）。
     pub fn allowed_tools(&self, role: AgentRole) -> Option<&[String]> {
-        self.find(role)
-            .and_then(|profile| profile.tools.as_deref())
+        self.find(role).and_then(|profile| profile.tools.as_deref())
     }
 
     /// 给每个角色配置模型名与档位。
@@ -91,10 +90,8 @@ impl AgentRoster {
     /// 也不同。共用一个标题会让模型分不清哪条约定优先。
     pub fn with_instructions_section(mut self, header: &str, instructions: &str) -> Self {
         for profile in &mut self.profiles {
-            profile.system_prompt = format!(
-                "{}\n\n{header}\n{instructions}",
-                profile.system_prompt
-            );
+            profile.system_prompt =
+                format!("{}\n\n{header}\n{instructions}", profile.system_prompt);
         }
         self
     }
@@ -173,11 +170,7 @@ mod tests {
                 std::env::temp_dir(),
             )),
         );
-        let registered: Vec<String> = registry
-            .specs()
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect();
+        let registered: Vec<String> = registry.specs().into_iter().map(|spec| spec.name).collect();
         let roster = AgentRoster::builtin();
 
         for role in [
@@ -264,7 +257,12 @@ mod tests {
     fn project_instructions_do_not_change_tool_whitelists() {
         let before = AgentRoster::builtin();
         let after = before.clone().with_project_instructions("随便写点什么");
-        for role in [AgentRole::Planner, AgentRole::Coder, AgentRole::Tester, AgentRole::Reviewer] {
+        for role in [
+            AgentRole::Planner,
+            AgentRole::Coder,
+            AgentRole::Tester,
+            AgentRole::Reviewer,
+        ] {
             assert_eq!(after.allowed_tools(role), before.allowed_tools(role));
         }
     }
@@ -296,8 +294,7 @@ mod tests {
             (AgentRole::Reviewer, Verbosity::High),
         ]);
 
-        let roster =
-            AgentRoster::builtin().with_role_models(&models, &efforts, &verbosities);
+        let roster = AgentRoster::builtin().with_role_models(&models, &efforts, &verbosities);
 
         assert_eq!(
             roster.find(AgentRole::Planner).unwrap().model.as_deref(),
@@ -335,7 +332,8 @@ mod tests {
     fn roles_without_configuration_keep_the_defaults() {
         let models = HashMap::from([(AgentRole::Coder, "coder-model".to_owned())]);
 
-        let roster = AgentRoster::builtin().with_role_models(&models, &HashMap::new(), &HashMap::new());
+        let roster =
+            AgentRoster::builtin().with_role_models(&models, &HashMap::new(), &HashMap::new());
 
         assert_eq!(
             roster.find(AgentRole::Coder).unwrap().model.as_deref(),
@@ -362,7 +360,12 @@ mod tests {
             &HashMap::from([(AgentRole::Tester, Verbosity::High)]),
         );
 
-        for role in [AgentRole::Planner, AgentRole::Coder, AgentRole::Tester, AgentRole::Reviewer] {
+        for role in [
+            AgentRole::Planner,
+            AgentRole::Coder,
+            AgentRole::Tester,
+            AgentRole::Reviewer,
+        ] {
             assert_eq!(
                 after.allowed_tools(role),
                 before.allowed_tools(role),

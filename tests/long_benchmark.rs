@@ -16,15 +16,15 @@ use std::sync::Arc;
 
 use qcode_harness::application::agent_roster::AgentRoster;
 use qcode_harness::application::agent_run::AgentDependencies;
-use qcode_harness::infrastructure::benchmark_runner::{run_long_benchmark, run_benchmark};
 use qcode_harness::application::context_policy::DefaultContextPolicy;
+use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::application::port::{ApprovalGate, EvidenceSink, NoopHooks};
 use qcode_harness::application::tool_registry::ToolRegistry;
 use qcode_harness::domain::budget::Budget;
 use qcode_harness::domain::policy::PolicyEngine;
 use qcode_harness::infrastructure::approval::auto::AutoApproveGate;
+use qcode_harness::infrastructure::benchmark_runner::{run_benchmark, run_long_benchmark};
 use qcode_harness::infrastructure::clock::SystemClock;
-use qcode_harness::application::memory_evidence::MemoryEvidenceSink;
 use qcode_harness::infrastructure::model::rig_chat::RigChatGateway;
 
 use rig::test_utils::{MockCompletionModel, MockTurn};
@@ -106,10 +106,14 @@ async fn the_long_benchmark_exhausts_then_resumes_without_redoing_steps() {
     write_long_task(&benchmarks, "demo-long", 4, 6);
 
     let mock = multi_step_script();
-    let results =
-        run_long_benchmark(&bench_deps(&mock), &Budget::new(30), &benchmarks, &workspace)
-            .await
-            .expect("装载");
+    let results = run_long_benchmark(
+        &bench_deps(&mock),
+        &Budget::new(30),
+        &benchmarks,
+        &workspace,
+    )
+    .await
+    .expect("装载");
 
     let _ = fs::remove_dir_all(&benchmarks);
     assert_eq!(results.len(), 1, "一个长任务一个结果");
@@ -122,11 +126,15 @@ async fn the_long_benchmark_exhausts_then_resumes_without_redoing_steps() {
         "第一次运行应当被故意耗尽的预算打断: {result:?}"
     );
     assert!(
-        result.first_run_failure.contains("已达最大轮数") || result.first_run_failure.contains("预算"),
+        result.first_run_failure.contains("已达最大轮数")
+            || result.first_run_failure.contains("预算"),
         "失败原因应说清是预算耗尽: {}",
         result.first_run_failure
     );
-    assert_eq!(result.first_run_turn_limit, 4, "第一次运行的轮数上限是配置的 4");
+    assert_eq!(
+        result.first_run_turn_limit, 4,
+        "第一次运行的轮数上限是配置的 4"
+    );
     assert!(
         result.first_run_turns <= 4,
         "第一次运行的轮数不能超过上限: {}",
@@ -150,7 +158,10 @@ async fn the_long_benchmark_exhausts_then_resumes_without_redoing_steps() {
         "两段合计恰好是脚本的 9 轮——步骤没有被重做: {result:?}"
     );
     assert!(result.passed, "判据应全过: {:?}", result.failures);
-    assert!(result.repeated_commands.is_empty(), "不应有重复命令: {result:?}");
+    assert!(
+        result.repeated_commands.is_empty(),
+        "不应有重复命令: {result:?}"
+    );
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -166,10 +177,14 @@ async fn the_long_benchmark_fails_when_the_resume_redoes_completed_work() {
     write_long_task(&benchmarks, "demo-long", 4, 12);
 
     let mock = multi_step_script();
-    let results =
-        run_long_benchmark(&bench_deps(&mock), &Budget::new(30), &benchmarks, &workspace)
-            .await
-            .expect("装载");
+    let results = run_long_benchmark(
+        &bench_deps(&mock),
+        &Budget::new(30),
+        &benchmarks,
+        &workspace,
+    )
+    .await
+    .expect("装载");
 
     let _ = fs::remove_dir_all(&benchmarks);
     let result = &results[0];
@@ -196,10 +211,14 @@ async fn a_long_task_whose_first_run_never_fails_is_reported_honestly() {
     write_long_task(&benchmarks, "demo-long", 30, 6);
 
     let mock = multi_step_script();
-    let results =
-        run_long_benchmark(&bench_deps(&mock), &Budget::new(30), &benchmarks, &workspace)
-            .await
-            .expect("装载");
+    let results = run_long_benchmark(
+        &bench_deps(&mock),
+        &Budget::new(30),
+        &benchmarks,
+        &workspace,
+    )
+    .await
+    .expect("装载");
 
     let _ = fs::remove_dir_all(&benchmarks);
     let result = &results[0];
@@ -235,31 +254,49 @@ async fn the_short_benchmark_ignores_long_tasks() {
 
     let short_mock = MockCompletionModel::from_turns([
         MockTurn::text("1"),
-        MockTurn::tool_call("c1", "write_file", json!({"path": "notes.txt", "content": "第二版"})),
+        MockTurn::tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "第二版"}),
+        ),
         MockTurn::text("2"),
         MockTurn::text("3"),
         MockTurn::text("完成"),
     ]);
     let long_mock = multi_step_script();
 
-    let short_results =
-        run_benchmark(&bench_deps(&short_mock), &Budget::new(10), &benchmarks, &workspace)
-            .await
-            .expect("装载");
-    let long_results =
-        run_long_benchmark(&bench_deps(&long_mock), &Budget::new(30), &benchmarks, &workspace)
-            .await
-            .expect("装载");
+    let short_results = run_benchmark(
+        &bench_deps(&short_mock),
+        &Budget::new(10),
+        &benchmarks,
+        &workspace,
+    )
+    .await
+    .expect("装载");
+    let long_results = run_long_benchmark(
+        &bench_deps(&long_mock),
+        &Budget::new(30),
+        &benchmarks,
+        &workspace,
+    )
+    .await
+    .expect("装载");
 
     let _ = fs::remove_dir_all(&benchmarks);
     let _ = fs::remove_dir_all(&workspace);
     assert_eq!(
-        short_results.iter().map(|r| r.task_id.as_str()).collect::<Vec<_>>(),
+        short_results
+            .iter()
+            .map(|r| r.task_id.as_str())
+            .collect::<Vec<_>>(),
         ["short-task"],
         "短任务基准只跑 default 套件"
     );
     assert_eq!(
-        long_results.iter().map(|r| r.task_id.as_str()).collect::<Vec<_>>(),
+        long_results
+            .iter()
+            .map(|r| r.task_id.as_str())
+            .collect::<Vec<_>>(),
         ["long-task"],
         "长任务基准只跑 long 套件"
     );

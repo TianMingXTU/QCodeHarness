@@ -11,8 +11,8 @@ use qcode_harness::application::port::BoxFuture;
 use qcode_harness::application::service::{EventSubscription, TaskService};
 use qcode_harness::domain::budget::Consumption;
 use qcode_harness::domain::service::{
-    EventOrigin, ServiceCommand, ServiceError, ServiceEvent, ServiceEventPayload, ServiceReply,
-    TaskStatus, TaskView, PROTOCOL_VERSION,
+    EventOrigin, PROTOCOL_VERSION, ServiceCommand, ServiceError, ServiceEvent, ServiceEventPayload,
+    ServiceReply, TaskStatus, TaskView,
 };
 use qcode_harness::domain::task::TaskKind;
 use qcode_harness::interface::sdk::SdkClient;
@@ -56,7 +56,10 @@ struct StubService {
 
 impl StubService {
     fn new(bus: Arc<Bus>) -> Self {
-        Self { bus, seen: Mutex::new(Vec::new()) }
+        Self {
+            bus,
+            seen: Mutex::new(Vec::new()),
+        }
     }
 
     fn view(&self) -> TaskView {
@@ -87,19 +90,35 @@ impl TaskService for StubService {
         Box::pin(async move {
             self.seen.lock().unwrap().push(command.clone());
             match command {
-                ServiceCommand::Create { .. } => Ok(ServiceReply::Task { task: Box::new(self.view()) }),
-                ServiceCommand::List => Ok(ServiceReply::Tasks { tasks: vec![self.view()] }),
-                ServiceCommand::Events { after, .. } => Ok(ServiceReply::Events { events: vec![], next: after }),
+                ServiceCommand::Create { .. } => Ok(ServiceReply::Task {
+                    task: Box::new(self.view()),
+                }),
+                ServiceCommand::List => Ok(ServiceReply::Tasks {
+                    tasks: vec![self.view()],
+                }),
+                ServiceCommand::Events { after, .. } => Ok(ServiceReply::Events {
+                    events: vec![],
+                    next: after,
+                }),
                 ServiceCommand::Shutdown => Ok(ServiceReply::Shutdown),
-                ServiceCommand::Get { .. } => Ok(ServiceReply::Task { task: Box::new(self.view()) }),
-                ServiceCommand::Approvals { .. } => Ok(ServiceReply::PendingApprovals { requests: vec![] }),
-                _ => Ok(ServiceReply::Accepted { task_id: "task-1".into(), execution_id: None }),
+                ServiceCommand::Get { .. } => Ok(ServiceReply::Task {
+                    task: Box::new(self.view()),
+                }),
+                ServiceCommand::Approvals { .. } => {
+                    Ok(ServiceReply::PendingApprovals { requests: vec![] })
+                }
+                _ => Ok(ServiceReply::Accepted {
+                    task_id: "task-1".into(),
+                    execution_id: None,
+                }),
             }
         })
     }
 
     fn subscribe(&self, _after: u64) -> Result<Box<dyn EventSubscription>, ServiceError> {
-        Ok(Box::new(BusSubscription { bus: self.bus.clone() }))
+        Ok(Box::new(BusSubscription {
+            bus: self.bus.clone(),
+        }))
     }
 }
 
@@ -107,7 +126,10 @@ fn event(sequence: u64, payload: ServiceEventPayload) -> ServiceEvent {
     ServiceEvent {
         version: PROTOCOL_VERSION,
         sequence,
-        time_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+        time_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
         task_id: Some("task-1".into()),
         session_id: Some("session-1".into()),
         execution_id: Some("execution-1".into()),
@@ -118,17 +140,23 @@ fn event(sequence: u64, payload: ServiceEventPayload) -> ServiceEvent {
 
 async fn read_line<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> String {
     let mut line = String::new();
-    let count = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_line(&mut line))
-        .await
-        .expect("协议应在超时前输出")
-        .unwrap();
+    let count = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("协议应在超时前输出")
+    .unwrap();
     assert!(count > 0, "服务不应提前关闭输出");
     line
 }
 
 #[tokio::test]
 async fn hello_reports_protocol_version_and_unknown_versions_are_rejected() {
-    let bus = Arc::new(Bus { events: Mutex::new(VecDeque::new()), notify: Notify::new() });
+    let bus = Arc::new(Bus {
+        events: Mutex::new(VecDeque::new()),
+        notify: Notify::new(),
+    });
     let service = Arc::new(StubService::new(bus.clone()));
     let server = StdioServer::new(service.clone());
     let (client, server_io) = duplex(16 * 1024);
@@ -145,7 +173,10 @@ async fn hello_reports_protocol_version_and_unknown_versions_are_rejected() {
         id: "r1".into(),
         command: ServiceCommand::List,
     };
-    client_write.write_all(format!("{}\n", serde_json::to_string(&wrong).unwrap()).as_bytes()).await.unwrap();
+    client_write
+        .write_all(format!("{}\n", serde_json::to_string(&wrong).unwrap()).as_bytes())
+        .await
+        .unwrap();
     let response: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
     match response {
         StdioResponse::Error { id, error, .. } => {
@@ -154,25 +185,58 @@ async fn hello_reports_protocol_version_and_unknown_versions_are_rejected() {
         }
         other => panic!("应拒绝未知版本，实际 {other:?}"),
     }
-    assert!(service.seen.lock().unwrap().is_empty(), "被拒绝的请求不能执行命令");
+    assert!(
+        service.seen.lock().unwrap().is_empty(),
+        "被拒绝的请求不能执行命令"
+    );
 
     // 拒绝之后连接仍然可用：合法版本继续处理。
-    let ok = StdioRequest { version: PROTOCOL_VERSION, id: "r2".into(), command: ServiceCommand::List };
-    client_write.write_all(format!("{}\n", serde_json::to_string(&ok).unwrap()).as_bytes()).await.unwrap();
+    let ok = StdioRequest {
+        version: PROTOCOL_VERSION,
+        id: "r2".into(),
+        command: ServiceCommand::List,
+    };
+    client_write
+        .write_all(format!("{}\n", serde_json::to_string(&ok).unwrap()).as_bytes())
+        .await
+        .unwrap();
     let response: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
-    assert!(matches!(response, StdioResponse::Reply { id, result: ServiceReply::Tasks { .. }, .. } if id == "r2"));
+    assert!(
+        matches!(response, StdioResponse::Reply { id, result: ServiceReply::Tasks { .. }, .. } if id == "r2")
+    );
 
-    client_write.write_all(format!("{}\n", serde_json::to_string(&StdioRequest {
-        version: PROTOCOL_VERSION, id: "r3".into(), command: ServiceCommand::Shutdown,
-    }).unwrap()).as_bytes()).await.unwrap();
+    client_write
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&StdioRequest {
+                    version: PROTOCOL_VERSION,
+                    id: "r3".into(),
+                    command: ServiceCommand::Shutdown,
+                })
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
     let response: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
-    assert!(matches!(response, StdioResponse::Reply { result: ServiceReply::Shutdown, .. }));
+    assert!(matches!(
+        response,
+        StdioResponse::Reply {
+            result: ServiceReply::Shutdown,
+            ..
+        }
+    ));
     task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
 async fn commands_round_trip_and_events_are_pushed_on_the_same_stream() {
-    let bus = Arc::new(Bus { events: Mutex::new(VecDeque::new()), notify: Notify::new() });
+    let bus = Arc::new(Bus {
+        events: Mutex::new(VecDeque::new()),
+        notify: Notify::new(),
+    });
     let service = Arc::new(StubService::new(bus.clone()));
     let (client, server_io) = duplex(16 * 1024);
     let (client_read, mut client_write) = tokio::io::split(client);
@@ -185,29 +249,62 @@ async fn commands_round_trip_and_events_are_pushed_on_the_same_stream() {
     let create = StdioRequest {
         version: PROTOCOL_VERSION,
         id: "create-1".into(),
-        command: ServiceCommand::Create { goal: "修复解析".into(), kind: TaskKind::BugFix },
+        command: ServiceCommand::Create {
+            goal: "修复解析".into(),
+            kind: TaskKind::BugFix,
+        },
     };
-    client_write.write_all(format!("{}\n", serde_json::to_string(&create).unwrap()).as_bytes()).await.unwrap();
+    client_write
+        .write_all(format!("{}\n", serde_json::to_string(&create).unwrap()).as_bytes())
+        .await
+        .unwrap();
     let reply: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
-    assert!(matches!(reply, StdioResponse::Reply { id, result: ServiceReply::Task { .. }, .. } if id == "create-1"));
+    assert!(
+        matches!(reply, StdioResponse::Reply { id, result: ServiceReply::Task { .. }, .. } if id == "create-1")
+    );
 
     // 事件与命令回复共用一条 stdout，靠封套类型区分；回放不触发命令。
     bus.push(event(1, ServiceEventPayload::ExecutionStarted));
     let pushed: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
     assert!(matches!(pushed, StdioResponse::Event { event, .. } if event.sequence == 1));
-    assert_eq!(service.seen.lock().unwrap().len(), 1, "事件推送不能伪装成命令");
+    assert_eq!(
+        service.seen.lock().unwrap().len(),
+        1,
+        "事件推送不能伪装成命令"
+    );
 
-    client_write.write_all(format!("{}\n", serde_json::to_string(&StdioRequest {
-        version: PROTOCOL_VERSION, id: "r3".into(), command: ServiceCommand::Shutdown,
-    }).unwrap()).as_bytes()).await.unwrap();
+    client_write
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&StdioRequest {
+                    version: PROTOCOL_VERSION,
+                    id: "r3".into(),
+                    command: ServiceCommand::Shutdown,
+                })
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
     let reply: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
-    assert!(matches!(reply, StdioResponse::Reply { result: ServiceReply::Shutdown, .. }));
+    assert!(matches!(
+        reply,
+        StdioResponse::Reply {
+            result: ServiceReply::Shutdown,
+            ..
+        }
+    ));
     task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
 async fn malformed_lines_are_reported_without_killing_the_connection() {
-    let bus = Arc::new(Bus { events: Mutex::new(VecDeque::new()), notify: Notify::new() });
+    let bus = Arc::new(Bus {
+        events: Mutex::new(VecDeque::new()),
+        notify: Notify::new(),
+    });
     let service = Arc::new(StubService::new(bus));
     let (client, server_io) = duplex(16 * 1024);
     let (client_read, mut client_write) = tokio::io::split(client);
@@ -217,26 +314,64 @@ async fn malformed_lines_are_reported_without_killing_the_connection() {
     let mut reader = BufReader::new(client_read);
     let _hello: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
 
-    client_write.write_all("{ not json\n".as_bytes()).await.unwrap();
+    client_write
+        .write_all("{ not json\n".as_bytes())
+        .await
+        .unwrap();
     let response: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
-    assert!(matches!(response, StdioResponse::Error { error, .. } if error.code == "invalid_request"));
+    assert!(
+        matches!(response, StdioResponse::Error { error, .. } if error.code == "invalid_request")
+    );
 
-    client_write.write_all(format!("{}\n", serde_json::to_string(&StdioRequest {
-        version: PROTOCOL_VERSION, id: "list".into(), command: ServiceCommand::List,
-    }).unwrap()).as_bytes()).await.unwrap();
+    client_write
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&StdioRequest {
+                    version: PROTOCOL_VERSION,
+                    id: "list".into(),
+                    command: ServiceCommand::List,
+                })
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
     let response: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
-    assert!(matches!(response, StdioResponse::Reply { result: ServiceReply::Tasks { .. }, .. }));
+    assert!(matches!(
+        response,
+        StdioResponse::Reply {
+            result: ServiceReply::Tasks { .. },
+            ..
+        }
+    ));
 
-    client_write.write_all(format!("{}\n", serde_json::to_string(&StdioRequest {
-        version: PROTOCOL_VERSION, id: "quit".into(), command: ServiceCommand::Shutdown,
-    }).unwrap()).as_bytes()).await.unwrap();
+    client_write
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&StdioRequest {
+                    version: PROTOCOL_VERSION,
+                    id: "quit".into(),
+                    command: ServiceCommand::Shutdown,
+                })
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
     let _: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
     task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
 async fn sdk_call_matches_request_ids_and_buffers_pushed_events() {
-    let bus = Arc::new(Bus { events: Mutex::new(VecDeque::new()), notify: Notify::new() });
+    let bus = Arc::new(Bus {
+        events: Mutex::new(VecDeque::new()),
+        notify: Notify::new(),
+    });
     let service = Arc::new(StubService::new(bus.clone()));
     let (client, server_io) = duplex(16 * 1024);
     let (server_read, server_write) = tokio::io::split(server_io);
@@ -245,13 +380,23 @@ async fn sdk_call_matches_request_ids_and_buffers_pushed_events() {
 
     let sdk = SdkClient::from_io(client).await.unwrap();
     bus.push(event(1, ServiceEventPayload::ExecutionStarted));
-    let outcome = sdk.call("create-1", ServiceCommand::Create {
-        goal: "检查".into(), kind: TaskKind::Review,
-    }).await.unwrap();
+    let outcome = sdk
+        .call(
+            "create-1",
+            ServiceCommand::Create {
+                goal: "检查".into(),
+                kind: TaskKind::Review,
+            },
+        )
+        .await
+        .unwrap();
     assert!(matches!(outcome, ServiceReply::Task { .. }));
     // call 期间到达的事件被缓存，随后仍可读取，不会被当成回复丢掉。
     assert_eq!(sdk.next_event().await.unwrap().sequence, 1);
-    assert!(matches!(sdk.call("quit", ServiceCommand::Shutdown).await.unwrap(), ServiceReply::Shutdown));
+    assert!(matches!(
+        sdk.call("quit", ServiceCommand::Shutdown).await.unwrap(),
+        ServiceReply::Shutdown
+    ));
     drop(sdk);
     task.await.unwrap().unwrap();
 }
@@ -259,7 +404,8 @@ async fn sdk_call_matches_request_ids_and_buffers_pushed_events() {
 #[tokio::test]
 async fn unsupported_versions_are_rejected_before_decoding_the_command() {
     let service = Arc::new(StubService::new(Arc::new(Bus {
-        events: Mutex::new(VecDeque::new()), notify: Notify::new(),
+        events: Mutex::new(VecDeque::new()),
+        notify: Notify::new(),
     })));
     let (client, server_io) = duplex(16 * 1024);
     let (client_read, mut client_write) = tokio::io::split(client);
@@ -268,7 +414,12 @@ async fn unsupported_versions_are_rejected_before_decoding_the_command() {
     let task = tokio::spawn(async move { server.serve(server_read, server_write).await });
     let mut reader = BufReader::new(client_read);
     let _hello = read_line(&mut reader).await;
-    client_write.write_all(b"{\"version\":999,\"id\":\"newer-client\",\"command\":{\"op\":\"future_command\"}}\n").await.unwrap();
+    client_write
+        .write_all(
+            b"{\"version\":999,\"id\":\"newer-client\",\"command\":{\"op\":\"future_command\"}}\n",
+        )
+        .await
+        .unwrap();
     let reply: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
     assert!(matches!(reply, StdioResponse::Error { id, error, .. }
         if id == "newer-client" && error.code == "unsupported_version"));
@@ -280,7 +431,10 @@ async fn unsupported_versions_are_rejected_before_decoding_the_command() {
 
 #[tokio::test]
 async fn a_partly_received_request_survives_interleaved_events() {
-    let bus = Arc::new(Bus { events: Mutex::new(VecDeque::new()), notify: Notify::new() });
+    let bus = Arc::new(Bus {
+        events: Mutex::new(VecDeque::new()),
+        notify: Notify::new(),
+    });
     let service = Arc::new(StubService::new(bus.clone()));
     let (client, server_io) = duplex(16 * 1024);
     let (client_read, mut client_write) = tokio::io::split(client);
@@ -289,11 +443,17 @@ async fn a_partly_received_request_survives_interleaved_events() {
     let task = tokio::spawn(async move { server.serve(server_read, server_write).await });
     let mut reader = BufReader::new(client_read);
     let _hello = read_line(&mut reader).await;
-    client_write.write_all(b"{\"version\":1,\"id\":\"partial\",").await.unwrap();
+    client_write
+        .write_all(b"{\"version\":1,\"id\":\"partial\",")
+        .await
+        .unwrap();
     bus.push(event(1, ServiceEventPayload::ExecutionStarted));
     let pushed: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
     assert!(matches!(pushed, StdioResponse::Event { .. }));
-    client_write.write_all(b"\"command\":{\"op\":\"list\"}}\n").await.unwrap();
+    client_write
+        .write_all(b"\"command\":{\"op\":\"list\"}}\n")
+        .await
+        .unwrap();
     let reply: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
     assert!(matches!(reply, StdioResponse::Reply { id, .. } if id == "partial"));
     drop(reader);
@@ -304,7 +464,8 @@ async fn a_partly_received_request_survives_interleaved_events() {
 #[tokio::test]
 async fn oversized_frames_are_drained_and_the_next_request_still_works() {
     let service = Arc::new(StubService::new(Arc::new(Bus {
-        events: Mutex::new(VecDeque::new()), notify: Notify::new(),
+        events: Mutex::new(VecDeque::new()),
+        notify: Notify::new(),
     })));
     let (client, server_io) = duplex(16 * 1024);
     let (client_read, mut client_write) = tokio::io::split(client);
@@ -318,7 +479,10 @@ async fn oversized_frames_are_drained_and_the_next_request_still_works() {
     client_write.write_all(&oversized).await.unwrap();
     let reply: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
     assert!(matches!(reply, StdioResponse::Error { error, .. } if error.code == "frame_too_large"));
-    client_write.write_all(b"{\"version\":1,\"id\":\"next\",\"command\":{\"op\":\"list\"}}\n").await.unwrap();
+    client_write
+        .write_all(b"{\"version\":1,\"id\":\"next\",\"command\":{\"op\":\"list\"}}\n")
+        .await
+        .unwrap();
     let reply: StdioResponse = serde_json::from_str(&read_line(&mut reader).await).unwrap();
     assert!(matches!(reply, StdioResponse::Reply { id, .. } if id == "next"));
     drop(reader);
@@ -331,21 +495,33 @@ async fn sdk_demultiplexes_concurrent_out_of_order_replies() {
     let (client, server_io) = duplex(16 * 1024);
     let server = tokio::spawn(async move {
         let (read, mut write) = tokio::io::split(server_io);
-        write.write_all(b"{\"type\":\"hello\",\"version\":1}\n").await.unwrap();
+        write
+            .write_all(b"{\"type\":\"hello\",\"version\":1}\n")
+            .await
+            .unwrap();
         let mut read = BufReader::new(read);
         let first: StdioRequest = serde_json::from_str(&read_line(&mut read).await).unwrap();
         let second: StdioRequest = serde_json::from_str(&read_line(&mut read).await).unwrap();
         for request in [second, first] {
             let reply = StdioResponse::Reply {
                 version: PROTOCOL_VERSION,
-                result: ServiceReply::Accepted { task_id: request.id.clone(), execution_id: None },
+                result: ServiceReply::Accepted {
+                    task_id: request.id.clone(),
+                    execution_id: None,
+                },
                 id: request.id,
             };
-            write.write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes()).await.unwrap();
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                .await
+                .unwrap();
         }
     });
     let sdk = SdkClient::from_io(client).await.unwrap();
-    let (left, right) = tokio::join!(sdk.call("left", ServiceCommand::List), sdk.call("right", ServiceCommand::List));
+    let (left, right) = tokio::join!(
+        sdk.call("left", ServiceCommand::List),
+        sdk.call("right", ServiceCommand::List)
+    );
     assert!(matches!(left.unwrap(), ServiceReply::Accepted { task_id, .. } if task_id == "left"));
     assert!(matches!(right.unwrap(), ServiceReply::Accepted { task_id, .. } if task_id == "right"));
     server.await.unwrap();
@@ -358,13 +534,22 @@ async fn sdk_reports_event_overflow_after_preserving_buffered_events() {
     let (release, wait_release) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (_read, mut write) = tokio::io::split(server_io);
-        write.write_all(b"{\"type\":\"hello\",\"version\":1}\n").await.unwrap();
+        write
+            .write_all(b"{\"type\":\"hello\",\"version\":1}\n")
+            .await
+            .unwrap();
         for sequence in 1..=qcode_harness::interface::sdk::SDK_EVENT_CAPACITY + 1 {
             let response = StdioResponse::Event {
                 version: PROTOCOL_VERSION,
-                event: Box::new(event(sequence as u64, ServiceEventPayload::ExecutionStarted)),
+                event: Box::new(event(
+                    sequence as u64,
+                    ServiceEventPayload::ExecutionStarted,
+                )),
             };
-            write.write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes()).await.unwrap();
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+                .await
+                .unwrap();
         }
         sent.send(()).unwrap();
         wait_release.await.unwrap();
@@ -372,7 +557,12 @@ async fn sdk_reports_event_overflow_after_preserving_buffered_events() {
     let sdk = SdkClient::from_io(client).await.unwrap();
     received.await.unwrap();
     // 等待断连通过命令通道被确认，期间不消费事件，使溢出可确定复现。
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), sdk.call("after-overflow", ServiceCommand::List)).await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sdk.call("after-overflow", ServiceCommand::List),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.unwrap_err().code, "lagged");
     for sequence in 1..=qcode_harness::interface::sdk::SDK_EVENT_CAPACITY {
         assert_eq!(sdk.next_event().await.unwrap().sequence, sequence as u64);

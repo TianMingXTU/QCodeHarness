@@ -16,9 +16,13 @@ struct Workspace(PathBuf);
 
 impl Workspace {
     fn new(name: &str) -> Self {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "qch-cli-doctor-{name}-{}-{stamp}", std::process::id()
+            "qch-cli-doctor-{name}-{}-{stamp}",
+            std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(".env"), "").unwrap();
@@ -71,15 +75,28 @@ fn maintenance_modes_parse_without_a_task_and_accept_json_in_any_order() {
 #[test]
 fn maintenance_modes_reject_other_intents_in_either_order() {
     let extras: &[&[&str]] = &[
-        &["修复问题"], &["--yes"], &["--ai-review"],
-        &["--resume", "s1"], &["--resume-task", "t1"], &["--force-worktree"],
-        &["--list-sessions"], &["--kind", "review"],
-        &["--report"], &["--report-dir", "evidence"],
-        &["--benchmark"], &["--benchmark-long"],
-        &["--stdio"], &["--interactive"], &["--text"], &["--tui"],
-        &["--mcp-reconnect", "demo"], &["--list-extensions"],
-        &["--install-extension", "demo.toml"], &["--enable-extension", "demo"],
-        &["--disable-extension", "demo"], &["--permissions", "read_file"],
+        &["修复问题"],
+        &["--yes"],
+        &["--ai-review"],
+        &["--resume", "s1"],
+        &["--resume-task", "t1"],
+        &["--force-worktree"],
+        &["--list-sessions"],
+        &["--kind", "review"],
+        &["--report"],
+        &["--report-dir", "evidence"],
+        &["--benchmark"],
+        &["--benchmark-long"],
+        &["--stdio"],
+        &["--interactive"],
+        &["--text"],
+        &["--tui"],
+        &["--mcp-reconnect", "demo"],
+        &["--list-extensions"],
+        &["--install-extension", "demo.toml"],
+        &["--enable-extension", "demo"],
+        &["--disable-extension", "demo"],
+        &["--permissions", "read_file"],
         &["--permissions", ""],
     ];
     for mode in ["--doctor", "--rotate-events"] {
@@ -107,11 +124,18 @@ fn help_overrides_maintenance_modes() {
 fn doctor_json_succeeds_without_model_credentials_and_leaves_no_state() {
     let workspace = Workspace::new("json");
     let output = workspace.run(&["--doctor", "--json"]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report: Value = serde_json::from_slice(&output.stdout).expect("stdout 只包含诊断 JSON");
     assert_eq!(report["schema_version"], 1);
     let checks = report["checks"].as_array().unwrap();
-    let model = checks.iter().find(|check| check["code"] == "model_configuration").unwrap();
+    let model = checks
+        .iter()
+        .find(|check| check["code"] == "model_configuration")
+        .unwrap();
     assert_eq!(model["status"], "warn");
     assert!(model["message"].as_str().unwrap().contains("LLM_API_KEY"));
     assert!(!workspace.0.join(".qcodeharness").exists());
@@ -122,10 +146,18 @@ fn doctor_reports_invalid_configuration_without_failing_the_command() {
     let workspace = Workspace::new("invalid-config");
     fs::write(workspace.0.join("config.toml"), "[run\nmax_turns = 3").unwrap();
     let output = workspace.run(&["--doctor", "--json"]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let configuration = report["checks"].as_array().unwrap().iter()
-        .find(|check| check["code"] == "configuration").unwrap();
+    let configuration = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["code"] == "configuration")
+        .unwrap();
     assert_eq!(configuration["status"], "error");
     assert!(configuration["recommendation"].is_string());
 }
@@ -134,8 +166,16 @@ fn doctor_reports_invalid_configuration_without_failing_the_command() {
 fn doctor_text_succeeds_without_model_credentials() {
     let workspace = Workspace::new("text");
     let output = workspace.run(&["--doctor"]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(String::from_utf8(output.stdout).unwrap().starts_with("QCodeHarness doctor v1\n"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .starts_with("QCodeHarness doctor v1\n")
+    );
 }
 
 #[test]
@@ -146,7 +186,14 @@ fn invalid_arguments_start_with_a_stable_code_and_exit_two() {
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.lines().next().unwrap().starts_with("cli_invalid_args: "), "{stderr}");
+        assert!(
+            stderr
+                .lines()
+                .next()
+                .unwrap()
+                .starts_with("cli_invalid_args: "),
+            "{stderr}"
+        );
     }
 }
 
@@ -161,14 +208,23 @@ fn rotate_json_preserves_data_and_is_independent_of_configuration() {
 
     let output = workspace.run(&["--rotate-events", "--json"]);
 
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report: Value = serde_json::from_slice(&output.stdout).expect("stdout 只包含归档 JSON");
     assert_eq!(report.as_object().unwrap().len(), 4);
     assert_eq!(report["archived"], true);
     assert_eq!(report["empty_run"], false);
     let archive = PathBuf::from(report["archive_path"].as_str().unwrap());
     assert_eq!(fs::read(&archive).unwrap(), original);
-    assert!(report["recommendation"].as_str().unwrap().contains("游标 0"));
+    assert!(
+        report["recommendation"]
+            .as_str()
+            .unwrap()
+            .contains("游标 0")
+    );
     assert!(fs::read(&log).unwrap().is_empty());
 
     let output = workspace.run(&["--rotate-events", "--json"]);

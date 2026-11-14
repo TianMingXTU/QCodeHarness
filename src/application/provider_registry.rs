@@ -24,7 +24,11 @@ impl ProviderRegistry {
     /// 重复 id 不覆盖：同时登记两家同名提供方通常是配置错误，静默替换
     /// 会让"默认是谁"取决于代码顺序。
     pub fn register(&mut self, provider: Arc<dyn LlmProvider>) -> bool {
-        if self.providers.iter().any(|known| known.id() == provider.id()) {
+        if self
+            .providers
+            .iter()
+            .any(|known| known.id() == provider.id())
+        {
             return false;
         }
         self.providers.push(provider);
@@ -47,8 +51,8 @@ impl ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::port::{BoxFuture, ModelGateway, ModelReply, ModelRequest};
     use crate::application::error::ApplicationError;
+    use crate::application::port::{BoxFuture, ModelGateway, ModelReply, ModelRequest};
 
     /// 永不调用的网关：注册表测试只关心选择，不关心调用。
     struct UnusedGateway;

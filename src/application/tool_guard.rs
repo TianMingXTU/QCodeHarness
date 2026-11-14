@@ -228,7 +228,10 @@ mod tests {
         let spec = read_spec();
 
         let read = call("read_file", json!({"path": "a.txt"}));
-        assert_eq!(guard.inspect(&read, &GuardContext::new(&spec)), GuardVerdict::Pass);
+        assert_eq!(
+            guard.inspect(&read, &GuardContext::new(&spec)),
+            GuardVerdict::Pass
+        );
 
         let write = call("write_file", json!({"path": "a.txt"}));
         assert!(matches!(
@@ -269,8 +272,7 @@ mod tests {
         // 越界绝对路径：升级，理由就是嫌疑文本本身。
         let command = "echo x > D:/outside/x.txt";
         let outside = call("run_command", json!({"command": command}));
-        let expected =
-            crate::domain::sandbox::write_escape_suspect(command).expect("应判为嫌疑");
+        let expected = crate::domain::sandbox::write_escape_suspect(command).expect("应判为嫌疑");
         assert_eq!(
             guard.inspect(&outside, &GuardContext::new(&spec)),
             GuardVerdict::RequireApproval(expected),
@@ -317,15 +319,17 @@ mod tests {
     #[test]
     fn chain_prefers_the_first_deny_but_reports_its_source() {
         // RequireApproval 之后又来了 Deny：合并取 Deny。
-        let chain: Vec<Arc<dyn ToolGuard>> = vec![
-            Arc::new(BoundaryEscalationGuard),
-            Arc::new(DenyGuard),
-        ];
+        let chain: Vec<Arc<dyn ToolGuard>> =
+            vec![Arc::new(BoundaryEscalationGuard), Arc::new(DenyGuard)];
         // 越界命令：升级守卫投 RequireApproval，DenyGuard 投 Deny。
-        let outside = call("run_command", json!({"command": "echo x > D:/outside/x.txt"}));
+        let outside = call(
+            "run_command",
+            json!({"command": "echo x > D:/outside/x.txt"}),
+        );
         let spec = read_spec();
 
-        let (verdict, strictest_index) = run_guard_chain(&chain, &outside, &GuardContext::new(&spec));
+        let (verdict, strictest_index) =
+            run_guard_chain(&chain, &outside, &GuardContext::new(&spec));
         assert!(matches!(verdict, GuardVerdict::Deny(_)));
         assert_eq!(strictest_index, Some(1));
         assert_eq!(chain[1].name(), "deny-all");

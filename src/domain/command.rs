@@ -311,8 +311,8 @@ fn lex(command: &str) -> Vec<DraftSegment> {
                 // 链接符，必须结束当前目标并分段。例如
                 // `echo x > local.txt&D:\outside\run.cmd` 中 `&` 后是路径，
                 // 并入 current 会让真实越界目标从模型中消失。
-                Some(digit) if digit.is_ascii_digit()
-                    && pending.is_some() && current.is_empty() =>
+                Some(digit)
+                    if digit.is_ascii_digit() && pending.is_some() && current.is_empty() =>
                 {
                     // 只落下 `&`：数字留给下一轮循环并进 current。
                     current.push('&');
@@ -434,13 +434,12 @@ fn flush_word(
         // 空引号目标没有路径可判，但仍要保留这次重定向，否则 pending 会被
         // 下一个操作覆盖，重定向目标列表将不完整。只处理显式空引号词；
         // 重定向后的普通空格仍需等待真正的目标词元。
-        if was_quoted
-            && let Some(op) = pending.take() {
-                redirects.push(Redirect {
-                    op,
-                    target: String::new(),
-                });
-            }
+        if was_quoted && let Some(op) = pending.take() {
+            redirects.push(Redirect {
+                op,
+                target: String::new(),
+            });
+        }
         return;
     }
     let text = std::mem::take(current);
@@ -624,10 +623,7 @@ mod tests {
             .collect();
         assert_eq!(
             targets,
-            vec![
-                (&RedirectOp::Output, ""),
-                (&RedirectOp::Output, "/tmp/out"),
-            ]
+            vec![(&RedirectOp::Output, ""), (&RedirectOp::Output, "/tmp/out"),]
         );
     }
 

@@ -49,7 +49,11 @@ impl ServerHandler for DemoServer {
         .unwrap()
         .clone();
         Ok(ListToolsResult::with_all_items(vec![
-            Tool::new("fetch_page", "读取一个示例页面并返回其文本内容", page_schema),
+            Tool::new(
+                "fetch_page",
+                "读取一个示例页面并返回其文本内容",
+                page_schema,
+            ),
             Tool::new("send_message", "发送一条消息到演示渠道", message_schema),
         ]))
     }
@@ -64,10 +68,9 @@ impl ServerHandler for DemoServer {
                 "示例页面内容：QCodeHarness 的 MCP 通道连通正常。",
             )])
             .into()),
-            "send_message" => Ok(CallToolResult::success(vec![ContentBlock::text(
-                "消息已送出（演示）",
-            )])
-            .into()),
+            "send_message" => {
+                Ok(CallToolResult::success(vec![ContentBlock::text("消息已送出（演示）")]).into())
+            }
             other => Err(ErrorData::invalid_params(format!("未知工具 {other}"), None)),
         }
     }

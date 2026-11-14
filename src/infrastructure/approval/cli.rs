@@ -10,9 +10,7 @@
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
-use crate::application::port::{
-    ApprovalGate, ApprovalRequest, BoxFuture, CancelHandle, Decision,
-};
+use crate::application::port::{ApprovalGate, ApprovalRequest, BoxFuture, CancelHandle, Decision};
 use crate::domain::policy::PolicyScope;
 
 /// 本会话内的一条信任记录。
@@ -81,7 +79,12 @@ impl CliApprovalGate {
     ///
     /// 独立成函数便于测试：测试不能抢占进程的 stdin，但可以用 `&[u8]`
     /// 提供输入。
-    fn decide_from(&self, reader: &mut dyn BufRead, writer: &mut dyn Write, request: &ApprovalRequest) -> Decision {
+    fn decide_from(
+        &self,
+        reader: &mut dyn BufRead,
+        writer: &mut dyn Write,
+        request: &ApprovalRequest,
+    ) -> Decision {
         // 带 reason 的请求是策略追加的复核，典型场景是越界写入升级。
         // 这类请求必须每次由人过目，因此会话信任整体失效：不查信任，
         // 也不接受 `a` / `p`。否则模型重发同一条越界命令时，会被第一次
@@ -91,12 +94,15 @@ impl CliApprovalGate {
         // 上一个进程里且未获答复，不能当作"人已批准"。
         let trustable = request.reason.is_none() && !request.resumed;
 
-        if trustable
-            && let Some(note) = self.trust_note(&request.call) {
-                let _ = writeln!(writer, "[审批] {} 已在会话内放行，自动通过", request.call.name);
-                let _ = writeln!(writer, "        （{note}）");
-                return Ok(());
-            }
+        if trustable && let Some(note) = self.trust_note(&request.call) {
+            let _ = writeln!(
+                writer,
+                "[审批] {} 已在会话内放行，自动通过",
+                request.call.name
+            );
+            let _ = writeln!(writer, "        （{note}）");
+            return Ok(());
+        }
 
         // `p` 之后用户可能留空取消，此时回到主问题，因此用循环处理。
         loop {
@@ -108,11 +114,7 @@ impl CliApprovalGate {
                 "参数:   {}",
                 serde_json::to_string(&request.call.arguments).unwrap_or_else(|_| "{}".to_owned())
             );
-            let _ = writeln!(
-                writer,
-                "风险:   {}",
-                risk_summary(&request.annotations)
-            );
+            let _ = writeln!(writer, "风险:   {}", risk_summary(&request.annotations));
             if let Some(reason) = &request.reason {
                 let _ = writeln!(writer, "复核:   {reason}");
             }
@@ -126,10 +128,7 @@ impl CliApprovalGate {
             let _ = write!(writer, "批准执行？");
             let _ = write!(writer, "[y] 允许  [n] 否决  ");
             if trustable {
-                let _ = write!(
-                    writer,
-                    "[a] 本会话允许此精确调用  [p] 本会话按前缀允许  "
-                );
+                let _ = write!(writer, "[a] 本会话允许此精确调用  [p] 本会话按前缀允许  ");
             } else {
                 let _ = write!(writer, "（本次复核不适用会话信任）  ");
             }
@@ -293,9 +292,12 @@ impl CliApprovalGate {
 /// 两者都没有时返回 `None`（如 git_status、多数 MCP 工具），调用方据此
 /// 判定无法按前缀放行。空作用域会匹配一切，等同放行整个工具。
 fn matchable_argument(call: &crate::domain::tool::ToolCall) -> Option<&'static str> {
-    ["command", "path"]
-        .into_iter()
-        .find(|key| call.arguments.get(*key).and_then(serde_json::Value::as_str).is_some())
+    ["command", "path"].into_iter().find(|key| {
+        call.arguments
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    })
 }
 
 /// 把用户输入的前缀写入调用实际携带的参数字段。
@@ -344,7 +346,11 @@ fn scope_for(call: &crate::domain::tool::ToolCall, input: &str) -> Option<Policy
 /// 而用户面前的调用是一条链，只覆盖前半截的前缀会让人误以为整条链都被
 /// 记住。
 fn suggested_prefix(call: &crate::domain::tool::ToolCall) -> Option<String> {
-    if let Some(command) = call.arguments.get("command").and_then(serde_json::Value::as_str) {
+    if let Some(command) = call
+        .arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+    {
         if crate::domain::policy::chains_another_command(command) {
             return None;
         }
@@ -353,7 +359,10 @@ fn suggested_prefix(call: &crate::domain::tool::ToolCall) -> Option<String> {
         let subcommand = words.next()?;
         return Some(format!("{program} {subcommand}"));
     }
-    let path = call.arguments.get("path").and_then(serde_json::Value::as_str)?;
+    let path = call
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)?;
     let (directory, _) = path.rsplit_once('/')?;
     if directory.is_empty() {
         return None;
@@ -393,7 +402,10 @@ impl ApprovalGate for CliApprovalGate {
 
     /// 绑定取消通道，之后用户按 `q` 能真正中止整个运行。
     fn bind_cancel(&self, cancel: CancelHandle) {
-        *self.cancel.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cancel);
+        *self
+            .cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cancel);
     }
 }
 
@@ -515,7 +527,6 @@ mod tests {
         }
     }
 
-
     /// 用内存 reader/writer 执行一次审批，返回裁决。
     fn decide(gate: &CliApprovalGate, input: &str, req: &ApprovalRequest) -> Decision {
         let mut reader = Cursor::new(input.as_bytes());
@@ -551,7 +562,10 @@ mod tests {
         let decision = decide(&gate, "\n", &request("write_file"));
 
         let reason = decision.expect_err("空输入必须否决");
-        assert!(reason.contains("视为否决"), "原因应说明是 fail-closed: {reason}");
+        assert!(
+            reason.contains("视为否决"),
+            "原因应说明是 fail-closed: {reason}"
+        );
     }
 
     #[test]
@@ -570,7 +584,10 @@ mod tests {
         let decision = decide(&gate, "", &request("write_file"));
 
         let reason = decision.expect_err("EOF 必须否决");
-        assert!(reason.contains("视为否决"), "原因应说明是 fail-closed: {reason}");
+        assert!(
+            reason.contains("视为否决"),
+            "原因应说明是 fail-closed: {reason}"
+        );
     }
 
     /// `q` 在绑定了取消通道时真正中止运行。
@@ -587,7 +604,10 @@ mod tests {
         let decision = decide(&gate, "q\n", &request("write_file"));
 
         let reason = decision.expect_err("q 应否决");
-        assert!(reason.contains("中止"), "原因应说明是用户主动中止: {reason}");
+        assert!(
+            reason.contains("中止"),
+            "原因应说明是用户主动中止: {reason}"
+        );
         assert!(
             cancel.is_cancelled(),
             "绑定取消通道后，q 必须真正请求中止运行"
@@ -601,7 +621,10 @@ mod tests {
         let decision = decide(&gate, "q\n", &request("write_file"));
 
         let reason = decision.expect_err("q 应否决");
-        assert!(reason.contains("中止"), "原因应说明是用户主动中止: {reason}");
+        assert!(
+            reason.contains("中止"),
+            "原因应说明是用户主动中止: {reason}"
+        );
         assert!(
             reason.contains("运行继续"),
             "无法中止运行时要如实说明: {reason}"
@@ -644,7 +667,10 @@ mod tests {
 
         // 同前缀的另一条命令自动通过。
         let same_prefix = request_with("run_command", json!({"command": "cargo test --lib"}));
-        assert!(decide(&gate, "", &same_prefix).is_ok(), "前缀内的命令应自动放行");
+        assert!(
+            decide(&gate, "", &same_prefix).is_ok(),
+            "前缀内的命令应自动放行"
+        );
 
         // 裸命令也在前缀内：用户写 "cargo test" 时没带尾部空格。
         let bare = request_with("run_command", json!({"command": "cargo test"}));
@@ -652,7 +678,10 @@ mod tests {
 
         // 前缀外的命令仍然要问。
         let dangerous = request_with("run_command", json!({"command": "rm -rf /"}));
-        assert!(decide(&gate, "", &dangerous).is_err(), "前缀外的命令不得被放行");
+        assert!(
+            decide(&gate, "", &dangerous).is_err(),
+            "前缀外的命令不得被放行"
+        );
     }
 
     /// `p` 对文件类工具放行的是路径前缀。
@@ -662,7 +691,10 @@ mod tests {
         assert!(decide(&gate, "p\nsrc/\n", &request("write_file")).is_ok());
 
         let inside = request_with("write_file", json!({"path": "src/lib.rs", "content": "x"}));
-        assert!(decide(&gate, "", &inside).is_ok(), "路径前缀内的写入应自动放行");
+        assert!(
+            decide(&gate, "", &inside).is_ok(),
+            "路径前缀内的写入应自动放行"
+        );
 
         let outside = request_with("write_file", json!({"path": "docs/a.md", "content": "x"}));
         assert!(
@@ -748,12 +780,19 @@ mod tests {
     #[test]
     fn prefix_prompt_explains_the_scope_of_the_grant() {
         let gate = CliApprovalGate::new();
-        let mut reader = Cursor::new(b"p
+        let mut reader = Cursor::new(
+            b"p
 
-".as_slice());
+"
+            .as_slice(),
+        );
         let mut sink = Vec::new();
 
-        let _ = gate.decide_from(&mut reader, &mut sink, &request_with("run_command", json!({"command": "ls"})));
+        let _ = gate.decide_from(
+            &mut reader,
+            &mut sink,
+            &request_with("run_command", json!({"command": "ls"})),
+        );
         let printed = String::from_utf8(sink).expect("输出是 UTF-8");
 
         assert!(printed.contains("不再询问"), "应说明放行范围: {printed}");
@@ -778,7 +817,10 @@ mod tests {
         assert!(decide(&gate, "", &same_prefix).is_ok());
 
         // 复核请求仍会询问；`a` 不被接受，既不记信任也不放行。
-        assert!(decide(&gate, "a\n", &req).is_err(), "复核请求不得被 `a` 放行");
+        assert!(
+            decide(&gate, "a\n", &req).is_err(),
+            "复核请求不得被 `a` 放行"
+        );
         assert_eq!(gate.trusted_entries(), 1, "复核请求不得写入信任");
 
         // `p` 同样不被接受。
@@ -797,7 +839,11 @@ mod tests {
         let mut reader = Cursor::new(b"y\n".as_slice());
         let mut sink = Vec::new();
 
-        let _ = gate.decide_from(&mut reader, &mut sink, &escalated_request(r"echo hi > C:\x"));
+        let _ = gate.decide_from(
+            &mut reader,
+            &mut sink,
+            &escalated_request(r"echo hi > C:\x"),
+        );
         let printed = String::from_utf8(sink).expect("输出是 UTF-8");
 
         assert!(printed.contains("复核"), "应标明这是复核: {printed}");
@@ -837,10 +883,7 @@ mod tests {
 
         // 同样参数，但这次是重新询问：必须照问，读不到输入就否决。
         let decision = decide(&gate, "", &resumed_request("write_file"));
-        assert!(
-            decision.is_err(),
-            "重新询问不得被会话信任免掉"
-        );
+        assert!(decision.is_err(), "重新询问不得被会话信任免掉");
     }
 
     #[test]
@@ -864,7 +907,10 @@ mod tests {
     #[test]
     fn suggested_prefix_takes_the_first_two_words_of_a_command() {
         assert_eq!(
-            suggested_prefix(&call_with("run_command", json!({"command": "cargo test --lib foo"}))),
+            suggested_prefix(&call_with(
+                "run_command",
+                json!({"command": "cargo test --lib foo"})
+            )),
             Some("cargo test".to_owned()),
             "参数不该进候选：候选是给后续调用用的，带上这次特有的参数就永远匹配不上"
         );
@@ -892,7 +938,10 @@ mod tests {
     #[test]
     fn suggested_prefix_for_a_path_is_its_directory() {
         assert_eq!(
-            suggested_prefix(&call_with("write_file", json!({"path": "src/domain/policy.rs"}))),
+            suggested_prefix(&call_with(
+                "write_file",
+                json!({"path": "src/domain/policy.rs"})
+            )),
             Some("src/domain/".to_owned())
         );
     }
@@ -915,7 +964,10 @@ mod tests {
     #[test]
     fn chained_commands_get_no_suggestion() {
         assert_eq!(
-            suggested_prefix(&call_with("run_command", json!({"command": "cargo test && git push"}))),
+            suggested_prefix(&call_with(
+                "run_command",
+                json!({"command": "cargo test && git push"})
+            )),
             None
         );
     }
@@ -955,10 +1007,16 @@ mod tests {
 
         // 建议范围生效：同命令头的另一条调用不再询问。
         let same_head = request_with("run_command", json!({"command": "cargo test --doc"}));
-        assert!(decide(&gate, "", &same_head).is_ok(), "cargo test 一族应已被信任");
+        assert!(
+            decide(&gate, "", &same_head).is_ok(),
+            "cargo test 一族应已被信任"
+        );
         // 换子命令仍会询问：建议范围没有覆盖整个 cargo。
         let other = request_with("run_command", json!({"command": "cargo build"}));
-        assert!(decide(&gate, "", &other).is_err(), "cargo build 不在建议范围内");
+        assert!(
+            decide(&gate, "", &other).is_err(),
+            "cargo build 不在建议范围内"
+        );
     }
 
     /// 用户可以输入自己的前缀：建议只减少输入，不代替用户决定。

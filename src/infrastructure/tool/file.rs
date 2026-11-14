@@ -397,11 +397,9 @@ impl ToolInvoker for WriteFile {
                 args.content.clone()
             };
             match tokio::fs::write(path.as_path(), content.as_bytes()).await {
-                Ok(()) => ToolOutcome::success(format!(
-                    "已写入 {} 字节到 `{}`",
-                    content.len(),
-                    args.path
-                )),
+                Ok(()) => {
+                    ToolOutcome::success(format!("已写入 {} 字节到 `{}`", content.len(), args.path))
+                }
                 Err(error) => ToolOutcome::failed(format!("写入 `{}` 失败: {error}", args.path)),
             }
         })
@@ -449,8 +447,8 @@ mod tests {
     async fn unknown_tool_name_is_refused_by_the_registry() {
         // 路由由注册表负责，兜底拒绝也由注册表给出：模型指定未注册的
         // 工具时返回 refused，不 panic。
-        use std::sync::Arc;
         use crate::application::tool_registry::{ToolEntry, ToolRegistry};
+        use std::sync::Arc;
         let registry = ToolRegistry::new(vec![ToolEntry {
             spec: WriteFile::spec(),
             invoker: Arc::new(WriteFile::new(workspace())),
@@ -486,9 +484,7 @@ mod tests {
     }
 
     fn lines(count: usize) -> String {
-        (1..=count)
-            .map(|index| format!("第{index}行\n"))
-            .collect()
+        (1..=count).map(|index| format!("第{index}行\n")).collect()
     }
 
     #[tokio::test]
@@ -509,15 +505,30 @@ mod tests {
         let dir = temp_dir_with("long.txt", lines(10).as_bytes());
         let tools = ReadFile::new(WorkspaceRoot::new(&dir));
         let outcome = tools
-            .invoke(&call(READ_FILE, json!({"path": "long.txt", "max_lines": 3})))
+            .invoke(&call(
+                READ_FILE,
+                json!({"path": "long.txt", "max_lines": 3}),
+            ))
             .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Success);
-        assert!(outcome.content.starts_with("第1行\n第2行\n第3行"), "{}", outcome.content);
+        assert!(
+            outcome.content.starts_with("第1行\n第2行\n第3行"),
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("共 10 行"), "{}", outcome.content);
-        assert!(outcome.content.contains("仅显示前 3 行"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("仅显示前 3 行"),
+            "{}",
+            outcome.content
+        );
         // 截断说明需提到定位工具与调参入口。
-        assert!(outcome.content.contains("search_text"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("search_text"),
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("max_lines"), "{}", outcome.content);
     }
 
@@ -528,7 +539,10 @@ mod tests {
         let dir = temp_dir_with("crlf.txt", b"line1\r\nline2\r\nline3\r\n");
         let tools = ReadFile::new(WorkspaceRoot::new(&dir));
         let outcome = tools
-            .invoke(&call(READ_FILE, json!({"path": "crlf.txt", "max_lines": 2})))
+            .invoke(&call(
+                READ_FILE,
+                json!({"path": "crlf.txt", "max_lines": 2}),
+            ))
             .await;
 
         assert_eq!(outcome.status, OutcomeStatus::Success);
@@ -548,8 +562,15 @@ mod tests {
             .invoke(&call(READ_FILE, json!({"path": "default.txt"})))
             .await;
 
-        assert!(outcome.content.contains("仅显示前 400 行"), "{}", outcome.content);
-        assert!(!outcome.content.contains("第401行"), "默认上限之后的内容不应出现");
+        assert!(
+            outcome.content.contains("仅显示前 400 行"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            !outcome.content.contains("第401行"),
+            "默认上限之后的内容不应出现"
+        );
     }
 
     #[tokio::test]
@@ -557,11 +578,21 @@ mod tests {
         let dir = temp_dir_with("huge.txt", lines(2500).as_bytes());
         let tools = ReadFile::new(WorkspaceRoot::new(&dir));
         let outcome = tools
-            .invoke(&call(READ_FILE, json!({"path": "huge.txt", "max_lines": 99_999})))
+            .invoke(&call(
+                READ_FILE,
+                json!({"path": "huge.txt", "max_lines": 99_999}),
+            ))
             .await;
 
-        assert!(outcome.content.contains("仅显示前 2000 行"), "{}", outcome.content);
-        assert!(!outcome.content.contains("第2500行"), "硬上限之后的内容不应出现");
+        assert!(
+            outcome.content.contains("仅显示前 2000 行"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            !outcome.content.contains("第2500行"),
+            "硬上限之后的内容不应出现"
+        );
     }
 
     #[tokio::test]
@@ -632,9 +663,20 @@ mod tests {
             .invoke(&call(READ_FILES, json!({"paths": ["a.txt", "b.txt"]})))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
-        let a_at = outcome.content.find("a.txt").expect("应有 a.txt 的分节标题");
-        let b_at = outcome.content.find("b.txt").expect("应有 b.txt 的分节标题");
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
+        let a_at = outcome
+            .content
+            .find("a.txt")
+            .expect("应有 a.txt 的分节标题");
+        let b_at = outcome
+            .content
+            .find("b.txt")
+            .expect("应有 b.txt 的分节标题");
         assert!(
             a_at < b_at,
             "分节顺序应跟随 paths 的顺序: {}",
@@ -660,7 +702,12 @@ mod tests {
             .await;
 
         // 有文件读成功，整批即为成功，模型需要拿到已读到的内容。
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(
             outcome.content.contains("AAA\nBBB"),
             "读得到的文件必须回来: {}",
@@ -672,7 +719,11 @@ mod tests {
             outcome.content
         );
         // 每个失败单独列出，不合并为"部分失败"。
-        assert!(outcome.content.contains("missing.txt"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("missing.txt"),
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("UTF-8"), "{}", outcome.content);
         assert!(outcome.content.contains("受保护"), "{}", outcome.content);
         // 失败原因不得包含读到的内容。
@@ -727,9 +778,18 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("共 10 行"), "{}", outcome.content);
-        assert!(outcome.content.contains("仅显示前 3 行"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("仅显示前 3 行"),
+            "{}",
+            outcome.content
+        );
         assert!(
             !outcome.content.contains("第4行"),
             "超限部分不应出现: {}",
@@ -845,7 +905,12 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("crlf.txt")).unwrap(),
             "new\r\nlines\r\n"
@@ -872,7 +937,12 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Success, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Success,
+            "{}",
+            outcome.content
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("fresh.txt")).unwrap(),
             "a\nb\n"
@@ -906,12 +976,29 @@ mod tests {
         std::fs::write(dir.join(".git/config"), "[core]\n").expect("写 .git/config");
         let tools = WriteFile::new(WorkspaceRoot::new(&dir));
 
-        for path in [".git/config", "./.git/config", ".env", ".qcodeharness/sessions/x.jsonl"] {
+        for path in [
+            ".git/config",
+            "./.git/config",
+            ".env",
+            ".qcodeharness/sessions/x.jsonl",
+        ] {
             let outcome = tools
-                .invoke(&call(WRITE_FILE, json!({"path": path, "content": "恶意覆盖"})))
+                .invoke(&call(
+                    WRITE_FILE,
+                    json!({"path": path, "content": "恶意覆盖"}),
+                ))
                 .await;
-            assert_eq!(outcome.status, OutcomeStatus::Refused, "`{path}`: {}", outcome.content);
-            assert!(outcome.content.contains("受保护"), "`{path}`: {}", outcome.content);
+            assert_eq!(
+                outcome.status,
+                OutcomeStatus::Refused,
+                "`{path}`: {}",
+                outcome.content
+            );
+            assert!(
+                outcome.content.contains("受保护"),
+                "`{path}`: {}",
+                outcome.content
+            );
         }
 
         assert_eq!(
@@ -933,8 +1020,17 @@ mod tests {
 
         for path in [".git/config", ".env"] {
             let outcome = tools.invoke(&call(READ_FILE, json!({"path": path}))).await;
-            assert_eq!(outcome.status, OutcomeStatus::Refused, "`{path}`: {}", outcome.content);
-            assert!(!outcome.content.contains("secret"), "凭据不得出现在观察里: {}", outcome.content);
+            assert_eq!(
+                outcome.status,
+                OutcomeStatus::Refused,
+                "`{path}`: {}",
+                outcome.content
+            );
+            assert!(
+                !outcome.content.contains("secret"),
+                "凭据不得出现在观察里: {}",
+                outcome.content
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -951,7 +1047,12 @@ mod tests {
             .invoke(&call(LIST_DIR, json!({"path": ".qcodeharness"})))
             .await;
 
-        assert_eq!(outcome.status, OutcomeStatus::Refused, "{}", outcome.content);
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Refused,
+            "{}",
+            outcome.content
+        );
         assert!(outcome.content.contains("受保护"), "{}", outcome.content);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -127,10 +127,14 @@ impl WorkspacePath {
                 )
             });
         if escapes {
-            return Err(PathRejected::Escape { raw: raw.to_owned() });
+            return Err(PathRejected::Escape {
+                raw: raw.to_owned(),
+            });
         }
         if is_protected_path(relative) {
-            return Err(PathRejected::Protected { raw: raw.to_owned() });
+            return Err(PathRejected::Protected {
+                raw: raw.to_owned(),
+            });
         }
         Ok(Self(root.0.join(relative)))
     }
@@ -154,7 +158,10 @@ mod tests {
     #[test]
     fn relative_path_joins_workspace() {
         let resolved = WorkspacePath::resolve(&workspace(), "src/main.rs").unwrap();
-        assert_eq!(resolved.as_path(), workspace().as_path().join("src/main.rs"));
+        assert_eq!(
+            resolved.as_path(),
+            workspace().as_path().join("src/main.rs")
+        );
     }
 
     #[test]
@@ -188,7 +195,10 @@ mod tests {
     #[test]
     fn allows_current_dir_component() {
         let resolved = WorkspacePath::resolve(&workspace(), "./README.md").unwrap();
-        assert_eq!(resolved.as_path(), workspace().as_path().join("./README.md"));
+        assert_eq!(
+            resolved.as_path(),
+            workspace().as_path().join("./README.md")
+        );
     }
 
     // ── 受保护路径 ────────────────────────────────────────────────────
@@ -263,14 +273,22 @@ mod tests {
     /// 路径是 `".env "`，用户很难认出它。
     #[test]
     fn protected_names_survive_trailing_spaces_and_dots() {
-        for rejected in [".env ", ".ENV  ", ".env .", ".env.", ".env..", ".git ", ".GIT ."] {
+        for rejected in [
+            ".env ", ".ENV  ", ".env .", ".env.", ".env..", ".git ", ".GIT .",
+        ] {
             assert!(
                 WorkspacePath::resolve(&workspace(), rejected).is_err(),
                 "`{rejected}` 归一化后命中受保护名单，应被拒绝"
             );
         }
         // 反向用例：末尾无空格或点、剥离后不匹配的路径都放行。
-        for allowed in [".envx", ".envrc", ".envrc.d/keep.txt", "notes .txt", "src/main.rs"] {
+        for allowed in [
+            ".envx",
+            ".envrc",
+            ".envrc.d/keep.txt",
+            "notes .txt",
+            "src/main.rs",
+        ] {
             assert!(
                 WorkspacePath::resolve(&workspace(), allowed).is_ok(),
                 "`{allowed}` 不该被误杀"

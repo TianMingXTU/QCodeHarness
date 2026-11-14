@@ -198,8 +198,8 @@ mod tests {
 
     #[test]
     fn execution_metadata_does_not_change_persisted_outcomes() {
-        let outcome = ToolOutcome::failed("命令超时")
-            .with_execution(ExecutionBoundary::process(false, true));
+        let outcome =
+            ToolOutcome::failed("命令超时").with_execution(ExecutionBoundary::process(false, true));
         let old_shape = json!({"content": "命令超时", "status": "Failed"});
         assert_eq!(serde_json::to_value(&outcome).unwrap(), old_shape);
         let restored: ToolOutcome = serde_json::from_value(old_shape).unwrap();

@@ -292,7 +292,9 @@ async fn future_version_is_structured_and_leaves_original_bytes_untouched() {
     assert!(error.message.contains("升级"), "{error}");
     assert!(error.message.contains("备份"), "{error}");
     assert!(
-        error.message.contains(&repo.state_path().display().to_string()),
+        error
+            .message
+            .contains(&repo.state_path().display().to_string()),
         "{error}"
     );
     assert_eq!(fs::read(repo.state_path()).unwrap(), original);

@@ -7,8 +7,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde::Serialize;
@@ -232,14 +232,8 @@ mod tests {
         let path = dir.join("s.jsonl");
         let sink = JsonlEvidenceSink::open(&path).expect("打开证据文件");
 
-        sink.record(
-            SystemTime::UNIX_EPOCH,
-            thought_event(1, "第一条"),
-        );
-        sink.record(
-            SystemTime::UNIX_EPOCH,
-            thought_event(2, "第二条"),
-        );
+        sink.record(SystemTime::UNIX_EPOCH, thought_event(1, "第一条"));
+        sink.record(SystemTime::UNIX_EPOCH, thought_event(2, "第二条"));
 
         let mut content = String::new();
         File::open(&path)
@@ -337,7 +331,9 @@ mod tests {
         let content = std::fs::read_to_string(&path).expect("读回");
         let events: Vec<Evidence> = content
             .lines()
-            .map(|line| serde_json::from_str::<Evidence>(line).expect("每行都能反序列化成 Evidence"))
+            .map(|line| {
+                serde_json::from_str::<Evidence>(line).expect("每行都能反序列化成 Evidence")
+            })
             .collect();
 
         assert_eq!(events.len(), 3);

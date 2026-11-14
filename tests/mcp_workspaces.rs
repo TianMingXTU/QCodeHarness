@@ -3,7 +3,10 @@
 use std::path::PathBuf;
 
 use qcode_harness::domain::platform::Platform;
-use qcode_harness::infrastructure::mcp::{config::{McpConfig, McpServerConfig}, connect_all_in};
+use qcode_harness::infrastructure::mcp::{
+    config::{McpConfig, McpServerConfig},
+    connect_all_in,
+};
 
 struct Temp(PathBuf);
 
@@ -15,8 +18,16 @@ impl Drop for Temp {
 
 #[tokio::test]
 async fn configured_servers_observe_the_execution_workspace_as_their_current_directory() {
-    let root = Temp(std::env::temp_dir().join(format!("qch-mcp-cwd-{}-{}",
-        std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())));
+    let root = Temp(
+        std::env::temp_dir().join(format!(
+            "qch-mcp-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )),
+    );
     let workspace = root.0.join("isolated task");
     std::fs::create_dir_all(&workspace).unwrap();
     let recorded = workspace.join("cwd.txt");
@@ -28,13 +39,20 @@ async fn configured_servers_observe_the_execution_workspace_as_their_current_dir
     };
     let mut args: Vec<String> = shell_args.iter().map(|arg| (*arg).into()).collect();
     args.push(script.into());
-    let config = McpConfig { mcp_servers: vec![McpServerConfig {
-        name: "cwd-probe".into(), command: program.into(), args,
-    }] };
+    let config = McpConfig {
+        mcp_servers: vec![McpServerConfig {
+            name: "cwd-probe".into(),
+            command: program.into(),
+            args,
+        }],
+    };
     // 探针写完当前目录就退出，不伪造 MCP 握手。连接失败不影响目录事实。
     let (sources, warnings) = connect_all_in(&config, None, &workspace).await;
     assert!(sources.is_empty());
     assert_eq!(warnings.len(), 1);
     let observed = std::fs::read_to_string(recorded).unwrap();
-    assert_eq!(std::fs::canonicalize(observed.trim()).unwrap(), std::fs::canonicalize(&workspace).unwrap());
+    assert_eq!(
+        std::fs::canonicalize(observed.trim()).unwrap(),
+        std::fs::canonicalize(&workspace).unwrap()
+    );
 }

@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::sandbox::PlatformCapabilities;
+use super::sandbox_fact::SandboxSliceFact;
 
 /// 诊断项状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +187,12 @@ pub struct DoctorFacts {
     pub auto_approve_raw: Option<String>,
     /// 当前平台具备的隔离能力。
     pub capabilities: PlatformCapabilities,
+    /// R2 系统级沙箱各切片的状态事实：能力、状态、承担机制或未实测原因。
+    ///
+    /// 与 `capabilities` 分开：后者描述进程级能否整树终止，前者描述文件
+    /// 系统/网络/MCP 子进程能否真隔离。`--doctor` 永不启动模型或子进程，
+    /// 因此该字段只能来自进程内探测，不能写"实测通过"。
+    pub sandbox_slices: Vec<SandboxSliceFact>,
     /// 快照版本事实。
     pub snapshots: SnapshotFacts,
     /// 事件日志回放事实。
@@ -196,6 +203,39 @@ pub struct DoctorFacts {
     pub state: StateFacts,
     /// 事件日志当前字节数。
     pub journal_bytes: u64,
+    /// Provider 连通性诊断事实：凭据是否存在与探测结果。
+    pub provider_connectivity: Option<ProviderConnectivityFacts>,
+}
+
+/// Provider 连通性诊断的纯事实：凭据是否存在与探测结果。
+///
+/// 携带 status，不携带凭据值或探测响应正文；detail 只应放非敏感摘要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderConnectivityFacts {
+    pub credential_present: bool,
+    pub probe: ProviderConnectivityProbe,
+    pub detail: Option<String>,
+}
+
+/// 连通探测结果。未探测不算成功，保持 `Unknown` 与 `Ok` 的区别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderConnectivityProbe {
+    Ok,
+    Unauthorized,
+    Timeout,
+    Unreachable,
+    Unknown,
+}
+
+impl ProviderConnectivityFacts {
+    /// 未提供探测事实时的中性输入：凭据按缺失判，探测按 Unknown 判。
+    pub fn unknown() -> Self {
+        Self {
+            credential_present: false,
+            probe: ProviderConnectivityProbe::Unknown,
+            detail: None,
+        }
+    }
 }
 
 impl SnapshotFacts {
@@ -253,7 +293,11 @@ pub fn snapshot_version_status(
     } else {
         DoctorStatus::Ok
     };
-    (status, facts.run_versions.values().sum(), facts.task_versions.values().sum())
+    (
+        status,
+        facts.run_versions.values().sum(),
+        facts.task_versions.values().sum(),
+    )
 }
 
 #[cfg(test)]
