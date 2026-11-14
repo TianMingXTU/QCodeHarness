@@ -18,6 +18,22 @@ P13 交互与集成已交付：常驻任务服务、版本化 stdio 协议、Rus
 [docs/roadmap.md](docs/roadmap.md) 的 P15 行为准，不宣称三平台 OS 级文件/网络隔离
 已实测。
 
+R0 发布收尾 Gate（仓库内交付，不打 tag、不发 Release）：
+
+1. `cargo check`、`cargo test`、`cargo build --release`、
+   `cargo build --examples` 全绿，`cargo tree -i rustls` 为空。
+2. `.github/workflows/release.yml` 四目标构建，生成 `SHA256SUMS`；GPG 私钥
+   只从 CI Secret 注入工作进程内存，不写入仓库，未配置时跳过签名且保留校验和。
+3. `scripts/install|rollback|verify-checksums` 的 POSIX 与 PowerShell 两套脚本
+   齐备；`scripts/smoke.sh` / `smoke.ps1` 在独立临时根演练校验、安装、
+   `--version`、`--doctor --json`、只读基准、回滚与快照版本拒绝路径。
+4. 三平台 CI 执行 `cargo test --locked --test release_smoke_contract`；
+   `tests/release_pipeline.rs` 锁定签名 Secret 映射。
+5. 新机器按 [docs/install.md](docs/install.md) 从零安装并通过冒烟，回滚演练
+   一次成功；快照校验拒绝路径有测试。
+6. 本阶段只把 `v1.0.0` 行为交付到工作树；创建 tag、触发 Release、上传产物
+   与注入签名密钥均为人工动作，验收记录后方可执行。
+
 ### 新增
 
 - 常驻任务服务：`TaskService` / `TaskFactory` / `EventJournal` / `ExecutionControl`

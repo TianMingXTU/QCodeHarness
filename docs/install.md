@@ -11,9 +11,9 @@
 - `README.md`、`CHANGELOG.md`、`LICENSE`、`QCODEHARNESS.md`；
 - `.env.example`、`config.example.toml`、`policy.example.toml`、`mcp.example.toml`；
 - `docs/`（含本文件与完整用法）；
-- `scripts/`：安装、回滚与校验脚本（`install.sh` / `install.ps1` /
+- `scripts/`：安装、回滚、校验与冒烟脚本（`install.sh` / `install.ps1` /
   `rollback.sh` / `rollback.ps1` / `verify-checksums.sh` /
-  `verify-checksums.ps1`）；
+  `verify-checksums.ps1` / `smoke.sh` / `smoke.ps1`）；
 - `SHA256SUMS`，以及（发布时配置了签名密钥才有）各产物的 `.sig`。
 
 ## 先校验，再安装
@@ -112,6 +112,21 @@ current/bin/QCodeHarness "阅读 Cargo.toml，说明本项目用了哪些依赖"
 
 无人值守时设 `QCH_AUTO_APPROVE=1` 跳过逐次审批（权限边界仍由内置策略与
 越界写入检查兜住）。默认每个非只读工具执行前都要人工审批。
+
+发行包验收另有全链路演练脚本，顺序是校验、安装到显式临时根、
+`--version`、`--doctor --json`、只读基准冒烟、安装候选版本并回滚、
+构造不兼容快照确认恢复被拒绝。它不调用模型、不联网、不碰已有安装：
+
+```bash
+# POSIX（Linux / macOS）
+sh scripts/smoke.sh 解压目录 --root 临时安装根
+# Windows（PowerShell 5.1）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke.ps1 -SourceDir <解压目录> -Root <临时安装根>
+```
+
+退出码 0 表示全链路通过，1 表示校验、安装、冒烟或回滚失败，2 表示参数
+错误。CI 三平台通过 `cargo test --locked --test release_smoke_contract`
+在独立临时目录里造发行包并执行同一套脚本。
 
 ## 升级
 
