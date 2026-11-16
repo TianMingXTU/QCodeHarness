@@ -1,6 +1,6 @@
 //! 发布流水线契约测试。
 //!
-//! 验收要求（docs/competitive-plan.md R0）：GPG 签名密钥只从 CI Secret 注入。
+//! 验收要求（CHANGELOG.md R0 发布收尾 Gate 第 2 条）：GPG 签名密钥只从 CI Secret 注入。
 //! GitHub Actions 不会把 secrets 自动暴露为环境变量，签名步骤若缺
 //! `env:` 映射，脚本里的 `${QCH_SIGNING_KEY:-}` 永远为空，签名静默跳过。
 //! 这里断言签名步骤显式声明了从 Secret 到环境变量的映射。
